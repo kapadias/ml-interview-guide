@@ -60,12 +60,65 @@ A standard $3 \times 3$ convolution from 256 to 256 channels requires $3^2 \time
 
 \textbf{What it is.} A family of architectures designed for mobile and embedded inference, built on depthwise separable convolutions with progressive refinements across versions.
 
+\subsubsection*{MobileNetV1: Depthwise Separable Convolutions Throughout}
+
+\textbf{MobileNetV1} (2017) replaced every standard convolution in the network with a depthwise separable convolution. The cost reduction is significant:
+
+\begin{mathresult}{Depthwise Separable Cost Reduction}
+\begin{equation}
+\text{Standard conv cost:} \quad D_K^2 \cdot M \cdot N \cdot D_F^2
+\end{equation}
+\begin{equation}
+\text{Depthwise separable cost:} \quad D_K^2 \cdot M \cdot D_F^2 + M \cdot N \cdot D_F^2
+\end{equation}
+\begin{equation}
+\text{Reduction factor:} \quad \frac{1}{N} + \frac{1}{D_K^2}
+\end{equation}
+where $D_K$ is kernel size, $M$ is input channels, $N$ is output channels, and $D_F$ is feature map spatial size. For $3 \times 3$ convolutions with typical channel counts ($N \gg 1$): reduction $\approx \frac{1}{9} + \frac{1}{N} \approx 8$--$9\times$ fewer FLOPs.
+\end{mathresult}
+
+\textbf{Width multiplier $\alpha$ and resolution multiplier $\rho$.} Two hyperparameters for tuning the accuracy-latency tradeoff without redesigning the architecture:
 \begin{itemize}
-    \item \textbf{MobileNetV1} (2017): Replaced standard convolutions with depthwise separable convolutions throughout. Introduced a width multiplier $\alpha$ (scales channel count) and a resolution multiplier $\rho$ (scales input resolution) for tuning the accuracy-latency tradeoff.
+    \item \textbf{Width multiplier $\alpha \in (0, 1]$}: Scales the number of channels at every layer by $\alpha$. Cost scales as $\alpha^2$ (both input and output channels shrink). Common settings: $\alpha \in \{1.0, 0.75, 0.5, 0.25\}$.
+    \item \textbf{Resolution multiplier $\rho \in (0, 1]$}: Scales the input resolution. Cost scales as $\rho^2$ (spatial dimensions shrink). Common settings: $224, 192, 160, 128$.
+\end{itemize}
+Together, they provide a smooth Pareto curve from high-accuracy to ultra-low-latency operating points.
 
-    \item \textbf{MobileNetV2} (2018): Introduced the \textit{inverted residual block}---expand channels with a $1 \times 1$ conv, apply depthwise conv in the expanded space, then project back down with a $1 \times 1$ conv. Residual connections on the narrow (bottleneck) representations. Linear bottleneck (no activation after the final projection) to prevent information loss in low-dimensional spaces.
+\subsubsection*{MobileNetV2: Inverted Residual Blocks}
 
-    \item \textbf{MobileNetV3} (2019): Architecture found via NAS, combined with manual refinements. Added squeeze-and-excitation (SE) blocks for channel attention, h-swish activation ($x \cdot \frac{\text{ReLU6}(x+3)}{6}$) as a hardware-efficient approximation of Swish.
+\textbf{MobileNetV2} (2018) introduced the \textit{inverted residual block}, which reverses the standard bottleneck structure:
+\begin{enumerate}
+    \item \textbf{Expand}: $1 \times 1$ pointwise convolution expands channels by expansion factor $t$ (typically $t = 6$)
+    \item \textbf{Depthwise}: $3 \times 3$ depthwise convolution operates in the high-dimensional expanded space
+    \item \textbf{Project}: $1 \times 1$ pointwise convolution projects back to a low-dimensional bottleneck
+\end{enumerate}
+The residual (skip) connection bridges the \textit{narrow} bottleneck layers---the opposite of a standard ResNet residual block, which skips across the wide layers. This is why it is called ``inverted.''
+
+\textbf{Linear bottleneck.} The projection layer (step 3) uses \textit{no activation function}---no ReLU, no nonlinearity. This is critical: ReLU sets negative values to zero, which irreversibly destroys information. In high-dimensional expanded spaces (step 1--2), the information can survive ReLU because it is spread across many channels. But in the low-dimensional bottleneck, even a few zeroed channels cause significant information loss. Removing the activation at the projection preserves the full representational capacity of the bottleneck.
+
+\begin{keyinsight}[Why Inverted Residuals Work]
+The key insight is the combination of where skip connections go and where nonlinearities are applied. Skip connections on the \textit{low-dimensional} bottleneck preserve information across layers (low-dimensional signals are fragile and benefit from residual shortcuts). The \textit{high-dimensional} expanded intermediate layers provide the expressiveness needed for complex feature transformations---there is enough capacity here for ReLU6 to discard redundant information without harm. This design maximizes representational power per FLOP: expensive operations (depthwise conv, ReLU) happen in the expanded space where they are useful, while cheap skip connections protect the compact representation.
+\end{keyinsight}
+
+\subsubsection*{MobileNetV3: NAS + Manual Refinements}
+
+\textbf{MobileNetV3} (2019) used a two-stage approach to architecture design:
+\begin{itemize}
+    \item \textbf{Neural Architecture Search (NAS)}: Platform-aware NAS (MnasNet-style) optimized for real device latency, searching over block types, kernel sizes, expansion ratios, and channel counts.
+    \item \textbf{NetAdapt}: Layer-wise fine-tuning of channel counts to meet a specific latency target, applied on top of the NAS-found architecture.
+    \item \textbf{Squeeze-and-excitation (SE) blocks}: Added channel attention in select blocks---each channel is re-weighted by a learned function of the global average-pooled features. Added only where the accuracy gain justifies the latency cost.
+    \item \textbf{h-swish activation}: $x \cdot \frac{\text{ReLU6}(x+3)}{6}$, a hardware-efficient piecewise-linear approximation of Swish ($x \cdot \sigma(x)$). Avoids the expensive sigmoid computation while retaining the smooth, non-monotonic shape that benefits optimization.
+\end{itemize}
+
+\begin{warningbox}
+Depthwise convolutions are \textit{memory-bandwidth bound}, not compute-bound. They have very low arithmetic intensity (FLOPs per byte of memory accessed): each filter has only $D_K^2$ parameters but must be loaded from memory for every spatial position. On GPUs optimized for high arithmetic intensity (many FLOPs per memory access), depthwise convolutions dramatically underutilize compute. A model with $8 \times$ fewer FLOPs may only be $2$--$3 \times$ faster on a GPU. Depthwise separable convolutions are most efficient on CPUs, mobile NPUs, and DSPs, which have lower arithmetic intensity ceilings and benefit directly from FLOP reduction.
+\end{warningbox}
+
+\textbf{When to use each version:}
+\begin{itemize}
+    \item \textbf{MobileNetV1}: When extreme simplicity is needed (easy to implement, port, and debug) or as a teaching baseline. Outclassed by V2/V3 on the accuracy-latency Pareto frontier.
+    \item \textbf{MobileNetV2}: The best general-purpose mobile backbone. Excellent trade-off between accuracy, latency, and implementation complexity. Widely supported across all mobile inference runtimes. The default choice for most mobile deployment scenarios.
+    \item \textbf{MobileNetV3}: When maximum accuracy within a mobile latency budget is required and the deployment target supports all required operators (SE, h-swish). Particularly strong for detection and segmentation backbones (MobileNetV3 + SSDLite, MobileNetV3 + DeepLabV3).
 \end{itemize}
 
 %------------------------------------------------------------------------------
@@ -461,9 +514,9 @@ Practical usage & Research exploration & Production architecture design \\
 \begin{interviewq}
 \textbf{Q: Design an efficient architecture for on-device ML (phone, $<$100ms latency, $<$50MB model).}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 I would use a staged approach, starting from the highest-impact techniques and checking against the constraints at each step.
 
@@ -479,32 +532,32 @@ I would use a staged approach, starting from the highest-impact techniques and c
 
 \textbf{Budget check for a vision task:} MobileNetV3-Small ($\sim$2.5M params) + INT8 quantization = $\sim$2.5MB model, $\sim$5--15ms on modern phone CPUs. Well within both the 50MB and 100ms constraints. For NLP: TinyBERT (14.5M params) + INT8 = $\sim$14MB, $\sim$10--30ms for short sequences on mobile.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Take a large model and just quantize it to INT4''---compression alone cannot make a 7B model fit in 50MB. Architecture choice comes first.
     \item ``FLOPs determine latency''---mobile latency depends on memory bandwidth, operator support, and hardware delegation. Depthwise convolutions have low FLOPs but poor arithmetic intensity on some hardware.
     \item Skipping the runtime optimization step---this is often the largest speedup source and candidates who ignore it miss easy wins.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Systematic compression thinking (not jumping to one technique), awareness of the accuracy-latency-size Pareto curve, practical deployment knowledge (runtimes, export formats), and willingness to start with a mobile-native architecture rather than compressing a large model.
+\interviewtest{Systematic compression thinking (not jumping to one technique), awareness of the accuracy-latency-size Pareto curve, practical deployment knowledge (runtimes, export formats), and willingness to start with a mobile-native architecture rather than compressing a large model.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Mentions distillation, quantization, and a mobile-friendly architecture. Gets the basic pipeline right.
-    \item \textbf{L6:} Starts with architecture selection (MobileNet, EfficientNet), provides specific model sizes and latency estimates, discusses the runtime optimization step, and checks the solution against constraints at each step.
-    \item \textbf{L7:} Discusses hardware-aware NAS for custom hardware targets, NPU/DSP delegation strategies, mixed-precision quantization (keep sensitive layers at higher precision), and the tradeoff between on-device inference vs.\ edge server deployment. Knows about specific mobile ML frameworks (CoreML, TFLite, ExecuTorch) and their relative strengths.
+    \item \badgeLfive{L5} Mentions distillation, quantization, and a mobile-friendly architecture. Gets the basic pipeline right.
+    \item \badgeLsix{L6} Starts with architecture selection (MobileNet, EfficientNet), provides specific model sizes and latency estimates, discusses the runtime optimization step, and checks the solution against constraints at each step.
+    \item \badgeLseven{L7} Discusses hardware-aware NAS for custom hardware targets, NPU/DSP delegation strategies, mixed-precision quantization (keep sensitive layers at higher precision), and the tradeoff between on-device inference vs.\ edge server deployment. Knows about specific mobile ML frameworks (CoreML, TFLite, ExecuTorch) and their relative strengths.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you decide between distillation and pruning?'' ``What if the model needs to handle 512-token inputs?'' ``How would you measure quality regression from compression?'' ``What changes if the target is a server GPU instead of mobile?''
+\followups{``How do you decide between distillation and pruning?'' ``What if the model needs to handle 512-token inputs?'' ``How would you measure quality regression from compression?'' ``What changes if the target is a server GPU instead of mobile?''}
 \end{interviewq}
 
 %--- Question 2: Trade-off - MoE vs dense ---
 \begin{interviewq}
 \textbf{Q: When would you choose MoE over dense scaling, and vice versa?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 The decision depends on the deployment constraints, training infrastructure, and task characteristics.
 
@@ -525,32 +578,32 @@ The decision depends on the deployment constraints, training infrastructure, and
 
 \textbf{Rule of thumb:} If you are training from scratch at large scale with good infrastructure, MoE gives you better quality per FLOP. If you are deploying a single model on limited hardware, dense is simpler and often more memory-efficient.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``MoE has more parameters so it's always better''---MoE's parameters are not free; they all consume memory even though only a subset is activated per token.
     \item ``MoE and dense models have the same memory footprint if they have the same active parameters''---total parameters must be stored; MoE's memory is $3$--$4\times$ higher than its active parameter count suggests.
     \item Ignoring the infrastructure complexity---MoE training requires expert parallelism with all-to-all communication, which is significantly harder to implement and tune than standard data or tensor parallelism.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding that MoE's ``free parameters'' are not truly free (memory cost), awareness of the systems implications (expert parallelism, communication), and ability to map architectural choices to deployment constraints.
+\interviewtest{Understanding that MoE's ``free parameters'' are not truly free (memory cost), awareness of the systems implications (expert parallelism, communication), and ability to map architectural choices to deployment constraints.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows MoE decouples parameter count from compute cost. Can name a MoE model (Mixtral, Switch Transformer). Understands the basic memory vs.\ compute tradeoff.
-    \item \textbf{L6:} Provides a concrete decision framework based on constraints (memory-bound vs.\ compute-bound). Discusses load balancing, routing collapse during fine-tuning, and the MoE effect on serving infrastructure. Knows that KV cache is unaffected by MoE (shared attention).
-    \item \textbf{L7:} Discusses shared expert designs (DeepSeek-MoE), expert merging for serving (reduce memory by combining similar experts), and the interaction between MoE and quantization (can you quantize experts independently?). Reasons about MoE scaling laws vs.\ dense scaling laws and when MoE's compute-optimal frontier is favorable.
+    \item \badgeLfive{L5} Knows MoE decouples parameter count from compute cost. Can name a MoE model (Mixtral, Switch Transformer). Understands the basic memory vs.\ compute tradeoff.
+    \item \badgeLsix{L6} Provides a concrete decision framework based on constraints (memory-bound vs.\ compute-bound). Discusses load balancing, routing collapse during fine-tuning, and the MoE effect on serving infrastructure. Knows that KV cache is unaffected by MoE (shared attention).
+    \item \badgeLseven{L7} Discusses shared expert designs (DeepSeek-MoE), expert merging for serving (reduce memory by combining similar experts), and the interaction between MoE and quantization (can you quantize experts independently?). Reasons about MoE scaling laws vs.\ dense scaling laws and when MoE's compute-optimal frontier is favorable.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How does MoE affect the KV cache?'' ``What happens if you fine-tune a MoE model on a narrow domain?'' ``How would you serve a MoE model on consumer hardware?'' ``Can you combine MoE with quantization?''
+\followups{``How does MoE affect the KV cache?'' ``What happens if you fine-tune a MoE model on a narrow domain?'' ``How would you serve a MoE model on consumer hardware?'' ``Can you combine MoE with quantization?''}
 \end{interviewq}
 
 %--- Question 3: Trade-off - Transformer vs Mamba ---
 \begin{interviewq}
 \textbf{Q: You're building a system that processes 100K-token documents. Compare transformer vs Mamba for this use case.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 At 100K tokens, the choice depends on what the task requires from those long contexts.
 
@@ -575,32 +628,32 @@ At 100K tokens, the choice depends on what the task requires from those long con
     \item \textbf{Best of both worlds:} A hybrid architecture (Jamba-style) with Mamba layers for efficient long-range propagation and a few attention layers for retrieval-critical processing.
 \end{enumerate}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Transformers can't handle 100K tokens''---they can with Flash Attention and RoPE extensions, it is just expensive. The question is whether the cost is justified.
     \item ``Mamba is always better for long sequences''---Mamba's fixed state is lossy. For precise retrieval tasks, attention's exact lookup is irreplaceable.
     \item Ignoring the hybrid option---in practice, the field is converging on hybrid architectures that combine SSM and attention layers.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Whether you understand the fundamental tradeoff (attention = precise but quadratic; SSM = efficient but lossy), can match architecture to task requirements, and know the practical systems implications (KV cache memory, actual throughput, not just theoretical complexity).
+\interviewtest{Whether you understand the fundamental tradeoff (attention = precise but quadratic; SSM = efficient but lossy), can match architecture to task requirements, and know the practical systems implications (KV cache memory, actual throughput, not just theoretical complexity).}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows transformers are quadratic and SSMs are linear. Understands the basic precision-efficiency tradeoff. Can recommend the right choice for simple scenarios.
-    \item \textbf{L6:} Quantifies the KV cache size for a 100K-context transformer. Explains why Mamba's state is lossy (fixed-size compression of history). Proposes hybrid architectures and knows Jamba. Discusses the RAG alternative (chunking + retrieval may be more practical than any single-model solution at 100K tokens).
-    \item \textbf{L7:} Discusses ring attention and context parallelism for distributing long-context attention across GPUs. Knows about Mamba-2's structured state space duality and its improved hardware efficiency. Can reason about when the ``long context'' is actually needed vs.\ when retrieval/summarization pipelines are better engineering solutions.
+    \item \badgeLfive{L5} Knows transformers are quadratic and SSMs are linear. Understands the basic precision-efficiency tradeoff. Can recommend the right choice for simple scenarios.
+    \item \badgeLsix{L6} Quantifies the KV cache size for a 100K-context transformer. Explains why Mamba's state is lossy (fixed-size compression of history). Proposes hybrid architectures and knows Jamba. Discusses the RAG alternative (chunking + retrieval may be more practical than any single-model solution at 100K tokens).
+    \item \badgeLseven{L7} Discusses ring attention and context parallelism for distributing long-context attention across GPUs. Knows about Mamba-2's structured state space duality and its improved hardware efficiency. Can reason about when the ``long context'' is actually needed vs.\ when retrieval/summarization pipelines are better engineering solutions.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``What is the KV cache size for a 100K-context transformer?'' ``How does Mamba handle in-context learning?'' ``Could you use RAG instead of processing the full 100K context?'' ``What is Jamba and why is it interesting?''
+\followups{``What is the KV cache size for a 100K-context transformer?'' ``How does Mamba handle in-context learning?'' ``Could you use RAG instead of processing the full 100K context?'' ``What is Jamba and why is it interesting?''}
 \end{interviewq}
 
 %--- Question 4: Estimation - MoE compute savings ---
 \begin{interviewq}
 \textbf{Q: Estimate the compute savings of a MoE model with 8 experts, top-2 routing, vs a dense model of the same quality.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 Let me work through this with concrete numbers, using Mixtral 8x7B as a reference.
 
@@ -631,32 +684,32 @@ For a model comparable to a dense 45B (Mixtral's effective quality level):
 
 \textbf{General formula:} For $N$ experts with top-$k$ routing, the compute reduction vs.\ a dense model with equivalent total parameters is approximately $\frac{N}{k}$ for the FFN portion. Since FFN is $\sim$2/3$ of transformer FLOPs, the overall speedup is roughly $\frac{1}{1/3 + (2/3) \cdot (k/N)}$. For $N=8, k=2$: $\frac{1}{1/3 + 2/3 \cdot 1/4} = \frac{1}{1/3 + 1/6} = \frac{1}{1/2} = 2\times$.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``$8\times$ compute savings because only 1/8 of experts are used''---top-2 routing means $2/8 = 1/4$ of experts, and attention parameters are shared (not reduced at all).
     \item Forgetting that attention is shared and only FFN is sparse---this is the most common estimation error.
     \item ``Memory savings too''---memory is the \textit{opposite} of saved; you need to hold all experts in memory.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Can you decompose a system into its components (shared attention vs.\ sparse FFN) and estimate each correctly? Do you understand the distinction between compute savings and memory costs?
+\interviewtest{Can you decompose a system into its components (shared attention vs.\ sparse FFN) and estimate each correctly? Do you understand the distinction between compute savings and memory costs?}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows MoE activates a subset of experts and correctly identifies that top-2 from 8 experts means 2/8 of FFN is active. Gets the rough magnitude right.
-    \item \textbf{L6:} Separates shared attention from sparse FFN in the calculation. Provides the general formula. Discusses the gap between theoretical speedup and practical speedup (communication overhead, load imbalance).
-    \item \textbf{L7:} Reasons about the interaction between MoE sparsity and hardware utilization (small expert FFNs may not saturate GPU compute, reducing the effective speedup). Discusses expert parallelism communication costs quantitatively (all-to-all volume $\propto$ batch\_size $\times$ hidden\_dim). Knows about capacity factor and dropped token tradeoffs.
+    \item \badgeLfive{L5} Knows MoE activates a subset of experts and correctly identifies that top-2 from 8 experts means 2/8 of FFN is active. Gets the rough magnitude right.
+    \item \badgeLsix{L6} Separates shared attention from sparse FFN in the calculation. Provides the general formula. Discusses the gap between theoretical speedup and practical speedup (communication overhead, load imbalance).
+    \item \badgeLseven{L7} Reasons about the interaction between MoE sparsity and hardware utilization (small expert FFNs may not saturate GPU compute, reducing the effective speedup). Discusses expert parallelism communication costs quantitatively (all-to-all volume $\propto$ batch\_size $\times$ hidden\_dim). Knows about capacity factor and dropped token tradeoffs.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``What if we use top-1 instead of top-2?'' ``How does this change for training vs.\ inference?'' ``How does expert parallelism affect the actual wall-clock speedup?'' ``What is the memory overhead of MoE vs.\ the compute savings?''
+\followups{``What if we use top-1 instead of top-2?'' ``How does this change for training vs.\ inference?'' ``How does expert parallelism affect the actual wall-clock speedup?'' ``What is the memory overhead of MoE vs.\ the compute savings?''}
 \end{interviewq}
 
 %--- Question 5: Trade-off - INT8 vs INT4 vs FP8 ---
 \begin{interviewq}
 \textbf{Q: INT8 vs INT4 vs FP8 quantization---what is your decision framework?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 The choice depends on three factors: target hardware, acceptable accuracy loss, and whether you are quantizing for inference or training.
 
@@ -691,32 +744,32 @@ Best method & SmoothQuant, W8A8 & GPTQ, AWQ, GGUF & Native FP8 (torch.float8) \\
     \item Training $\to$ FP8 on H100+ for $\sim$$2\times$ throughput; otherwise BF16
 \end{enumerate}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``INT4 is always better because it uses less memory''---INT4 has meaningful accuracy degradation, especially on reasoning tasks. The right precision depends on your accuracy budget.
     \item ``FP8 and INT8 are the same thing in different formats''---FP8 has floating-point dynamic range (can represent very small and very large values); INT8 has fixed range determined by the scale/zero-point. FP8 handles activation outliers more naturally.
     \item ``Quantization doesn't affect model quality''---it does, especially at INT4 and below. Always benchmark on your specific task, not just perplexity.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Do you understand the tradeoff space (memory vs.\ accuracy vs.\ hardware support)? Can you make a practical recommendation based on deployment constraints rather than defaulting to ``lower is better''?
+\interviewtest{Do you understand the tradeoff space (memory vs.\ accuracy vs.\ hardware support)? Can you make a practical recommendation based on deployment constraints rather than defaulting to ``lower is better''?}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows INT8 is nearly lossless and INT4 degrades quality. Can name at least one method per precision level (GPTQ, SmoothQuant).
-    \item \textbf{L6:} Provides the decision framework above. Understands the difference between weight-only quantization (W4A16) and weight+activation quantization (W8A8). Knows that attention layers are more sensitive to quantization than FFN layers. Discusses FP8's per-tensor scaling mechanism.
-    \item \textbf{L7:} Discusses mixed-precision quantization strategies (keep sensitive layers at higher precision, identified by Hessian-based sensitivity analysis). Knows about the SmoothQuant insight (migrating quantization difficulty via mathematically equivalent scaling). Can reason about when quantization-aware training (QAT) is worth the cost vs.\ PTQ.
+    \item \badgeLfive{L5} Knows INT8 is nearly lossless and INT4 degrades quality. Can name at least one method per precision level (GPTQ, SmoothQuant).
+    \item \badgeLsix{L6} Provides the decision framework above. Understands the difference between weight-only quantization (W4A16) and weight+activation quantization (W8A8). Knows that attention layers are more sensitive to quantization than FFN layers. Discusses FP8's per-tensor scaling mechanism.
+    \item \badgeLseven{L7} Discusses mixed-precision quantization strategies (keep sensitive layers at higher precision, identified by Hessian-based sensitivity analysis). Knows about the SmoothQuant insight (migrating quantization difficulty via mathematically equivalent scaling). Can reason about when quantization-aware training (QAT) is worth the cost vs.\ PTQ.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How does SmoothQuant handle activation outliers?'' ``Why does INT4 degrade math and code more than general text?'' ``Can you combine INT4 weights with INT8 activations?'' ``What is the GGUF format and why does it matter for CPU inference?''
+\followups{``How does SmoothQuant handle activation outliers?'' ``Why does INT4 degrade math and code more than general text?'' ``Can you combine INT4 weights with INT8 activations?'' ``What is the GGUF format and why does it matter for CPU inference?''}
 \end{interviewq}
 
 %--- Question 6: Debugging - Quantized model domain failure ---
 \begin{interviewq}
 \textbf{Q: Your quantized model performs well on benchmarks but fails on specific domains (code, math). Why?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 This is a common and insidious failure mode of quantization. The root cause is that \textbf{quantization is not uniformly harmful---it disproportionately affects tasks requiring precise numerical reasoning and token-level accuracy}.
 
@@ -744,32 +797,32 @@ This is a common and insidious failure mode of quantization. The root cause is t
     \item \textbf{Use a larger base model:} A 70B model quantized to INT4 almost always outperforms a 7B model at FP16 on reasoning tasks. Larger models have more redundancy to absorb quantization error.
 \end{enumerate}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Quantization affects all tasks equally''---this contradicts well-established empirical findings. Reasoning and structured output tasks are disproportionately affected.
     \item ``Just use lower-bit quantization and fine-tune''---fine-tuning after quantization helps general quality but does not specifically address the domain sensitivity without domain-specific data.
     \item ``Perplexity is a good proxy for domain performance''---perplexity can look fine while code pass rates drop by 20\%. Always use task-specific metrics.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Do you understand that quantization is not a uniform quality degradation? Can you reason about \textit{why} certain tasks are more sensitive? Can you propose targeted fixes rather than generic ``use more bits'' advice?
+\interviewtest{Do you understand that quantization is not a uniform quality degradation? Can you reason about \textit{why} certain tasks are more sensitive? Can you propose targeted fixes rather than generic ``use more bits'' advice?}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows that quantization affects different tasks differently and that reasoning tasks are more sensitive. Proposes using higher precision as a fix.
-    \item \textbf{L6:} Explains the mechanistic reasons (activation outliers, error compounding in reasoning chains, attention sensitivity). Proposes mixed-precision quantization and per-layer sensitivity analysis as targeted solutions.
-    \item \textbf{L7:} Discusses the connection between outlier features and quantization difficulty (Dettmers' LLM.int8() work). Knows about SmoothQuant's migration technique as a principled solution. Can reason about the interaction between model size and quantization robustness (larger models are more robust) and its implications for model selection.
+    \item \badgeLfive{L5} Knows that quantization affects different tasks differently and that reasoning tasks are more sensitive. Proposes using higher precision as a fix.
+    \item \badgeLsix{L6} Explains the mechanistic reasons (activation outliers, error compounding in reasoning chains, attention sensitivity). Proposes mixed-precision quantization and per-layer sensitivity analysis as targeted solutions.
+    \item \badgeLseven{L7} Discusses the connection between outlier features and quantization difficulty (Dettmers' LLM.int8() work). Knows about SmoothQuant's migration technique as a principled solution. Can reason about the interaction between model size and quantization robustness (larger models are more robust) and its implications for model selection.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How would you identify which layers to keep at higher precision?'' ``Does quantization-aware training help with this?'' ``Is it better to quantize a larger model to INT4 or use a smaller model at FP16?'' ``How do activation outliers form during training?''
+\followups{``How would you identify which layers to keep at higher precision?'' ``Does quantization-aware training help with this?'' ``Is it better to quantize a larger model to INT4 or use a smaller model at FP16?'' ``How do activation outliers form during training?''}
 \end{interviewq}
 
 %--- Question 7: Architecture Design - Knowledge distillation pipeline ---
 \begin{interviewq}
 \textbf{Q: Knowledge distillation: design a pipeline to compress a 70B teacher to a 7B student.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 For LLM distillation at this scale, the \textbf{data-level distillation} approach (generate training data from the teacher, then train the student on it) dominates the classical logit-matching approach, primarily because it does not require simultaneous forward passes through both the 70B teacher and the 7B student.
 
@@ -798,32 +851,32 @@ Benchmark on held-out tasks (MMLU, HumanEval, GSM8K, MT-Bench). The student shou
 \textbf{Step 5: Post-training optimization.}
 Apply INT8 quantization to the distilled 7B model for deployment. The 7B student + INT8 quantization gives a $\sim$$10\times$ model size reduction from the 70B teacher with $\sim$5--15\% quality loss.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Match logits between teacher and student for every training example''---this requires running the 70B model on every forward pass, which is prohibitively expensive. Data-level distillation avoids this.
     \item ``Just train the student on the same data as the teacher''---the student benefits from the teacher's \textit{output distribution}, not the same input data. The teacher's soft labels encode richer information.
     \item ``Layer-by-layer distillation from 70B to 7B''---the architectures have different depths, widths, and hidden dimensions. Layer matching does not apply cleanly across scale differences this large.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Do you know the modern LLM distillation pipeline (data generation, not logit matching)? Can you design a complete pipeline with practical details (data diversity, quality filtering, training schedule)?
+\interviewtest{Do you know the modern LLM distillation pipeline (data generation, not logit matching)? Can you design a complete pipeline with practical details (data diversity, quality filtering, training schedule)?}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows the concept of knowledge distillation and that it involves training a smaller model to mimic a larger one. Can describe the basic KL-based loss.
-    \item \textbf{L6:} Proposes data-level distillation as the primary approach for LLM-to-LLM compression. Discusses data diversity, chain-of-thought generation, and quality filtering. Provides a multi-phase training pipeline with concrete hyperparameters.
-    \item \textbf{L7:} Discusses the tradeoff between data-level and logit-level distillation quantitatively. Knows about on-policy distillation (generate student completions, have teacher score them, train on teacher-preferred outputs). References successful examples (Orca, Phi, Alpaca) and their specific innovations. Considers the legal/licensing implications of distilling from proprietary models.
+    \item \badgeLfive{L5} Knows the concept of knowledge distillation and that it involves training a smaller model to mimic a larger one. Can describe the basic KL-based loss.
+    \item \badgeLsix{L6} Proposes data-level distillation as the primary approach for LLM-to-LLM compression. Discusses data diversity, chain-of-thought generation, and quality filtering. Provides a multi-phase training pipeline with concrete hyperparameters.
+    \item \badgeLseven{L7} Discusses the tradeoff between data-level and logit-level distillation quantitatively. Knows about on-policy distillation (generate student completions, have teacher score them, train on teacher-preferred outputs). References successful examples (Orca, Phi, Alpaca) and their specific innovations. Considers the legal/licensing implications of distilling from proprietary models.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How much data do you need?'' ``How do you ensure the student doesn't just memorize the teacher's outputs?'' ``Can you distill reasoning ability or just surface-level patterns?'' ``What is the difference between distillation and fine-tuning on synthetic data?''
+\followups{``How much data do you need?'' ``How do you ensure the student doesn't just memorize the teacher's outputs?'' ``Can you distill reasoning ability or just surface-level patterns?'' ``What is the difference between distillation and fine-tuning on synthetic data?''}
 \end{interviewq}
 
 %--- Question 8: Debugging - MoE routing collapse ---
 \begin{interviewq}
 \textbf{Q: MoE routing collapse: what is it, how do you detect it, and how do you fix it?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{What routing collapse is.} During training, the router learns to send most or all tokens to a small subset of ``popular'' experts while the remaining experts receive little to no data. This creates a positive feedback loop: popular experts train on more data, become better, and attract even more tokens. Starved experts never improve and waste parameters. In the extreme case, a MoE with 8 experts degenerates into a model using 1--2 experts, losing the capacity advantage entirely.
 
@@ -852,32 +905,32 @@ Apply INT8 quantization to the distilled 7B model for deployment. The 7B student
     \item \textbf{For fine-tuning specifically:} Freeze the router weights (use pretrained routing) and only fine-tune expert parameters. Or merge experts before fine-tuning and use a dense model.
 \end{enumerate}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Just increase the load balancing loss coefficient''---too high a coefficient forces uniform routing at the expense of specialization, which is worse than mild imbalance. The tradeoff is specialization vs.\ utilization.
     \item ``Routing collapse doesn't matter if the model loss is decreasing''---the model may converge to a poor solution where it effectively uses only 2 of 8 experts, wasting 75\% of its parameters.
     \item Not monitoring expert utilization during training---routing collapse is silent unless you track per-expert statistics.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Do you understand the training dynamics of MoE models beyond just the architecture? Can you diagnose a subtle failure mode from symptoms? Do you know multiple mitigation strategies and their tradeoffs?
+\interviewtest{Do you understand the training dynamics of MoE models beyond just the architecture? Can you diagnose a subtle failure mode from symptoms? Do you know multiple mitigation strategies and their tradeoffs?}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows routing collapse exists and that it means some experts are underutilized. Can describe the load balancing loss as a solution.
-    \item \textbf{L6:} Explains the rich-get-richer dynamics mechanistically. Lists multiple detection methods (utilization tracking, router entropy, weight norms). Provides several fixes with tradeoffs (balancing loss coefficient tuning, expert choice routing, noise injection).
-    \item \textbf{L7:} Discusses expert choice routing and its guarantees. Knows about the router z-loss and its interaction with the balancing loss. Understands the fine-tuning-specific collapse problem and proposes router freezing or expert merging. Can reason about the relationship between batch size and load balancing stability.
+    \item \badgeLfive{L5} Knows routing collapse exists and that it means some experts are underutilized. Can describe the load balancing loss as a solution.
+    \item \badgeLsix{L6} Explains the rich-get-richer dynamics mechanistically. Lists multiple detection methods (utilization tracking, router entropy, weight norms). Provides several fixes with tradeoffs (balancing loss coefficient tuning, expert choice routing, noise injection).
+    \item \badgeLseven{L7} Discusses expert choice routing and its guarantees. Knows about the router z-loss and its interaction with the balancing loss. Understands the fine-tuning-specific collapse problem and proposes router freezing or expert merging. Can reason about the relationship between batch size and load balancing stability.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``What is the expert capacity factor?'' ``How does expert choice routing differ from token choice routing?'' ``What happens to the dropped tokens when expert capacity is exceeded?'' ``How do you balance specialization vs.\ utilization?''
+\followups{``What is the expert capacity factor?'' ``How does expert choice routing differ from token choice routing?'' ``What happens to the dropped tokens when expert capacity is exceeded?'' ``How do you balance specialization vs.\ utilization?''}
 \end{interviewq}
 
 %--- Question 9: Trade-off - Structured vs unstructured pruning ---
 \begin{interviewq}
 \textbf{Q: Structured vs unstructured pruning---which actually gives real speedup?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 The short answer is: \textbf{structured pruning gives real speedup on current hardware; unstructured pruning mostly does not}---unless you have specialized sparse hardware support.
 
@@ -903,32 +956,32 @@ The short answer is: \textbf{structured pruning gives real speedup on current ha
     \item Want the best compression pipeline $\to$ structured pruning $+$ quantization (combine both)
 \end{enumerate}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``90\% sparsity means $10\times$ speedup''---unstructured sparsity does not translate to speedup on dense hardware. This is the most common misconception.
     \item ``Pruning is free---just remove small weights''---pruning requires fine-tuning to recover accuracy, and identifying which weights to prune (magnitude, gradient, Hessian-based) is itself nontrivial.
     \item Treating all pruning methods as equivalent without distinguishing structured from unstructured.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Do you understand the gap between theoretical sparsity and actual hardware speedup? Can you reason about why hardware architecture determines which compression techniques are effective?
+\interviewtest{Do you understand the gap between theoretical sparsity and actual hardware speedup? Can you reason about why hardware architecture determines which compression techniques are effective?}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Knows the difference between structured and unstructured pruning. Understands that structured pruning produces smaller dense tensors while unstructured produces sparse matrices.
-    \item \textbf{L6:} Explains why unstructured pruning does not give GPU speedup (irregular memory access, tensor core assumptions). Knows about N:M sparsity as the hardware exception. Provides the decision framework above with concrete speedup numbers.
-    \item \textbf{L7:} Discusses the interaction between pruning and quantization (prune first, then quantize). Knows about SparseGPT and its Hessian-based approach. Can reason about the lottery ticket hypothesis and its practical implications (sparse subnetworks exist but finding them is expensive). Discusses emerging sparse hardware beyond N:M (e.g., Cerebras, Graphcore support for general sparsity).
+    \item \badgeLfive{L5} Knows the difference between structured and unstructured pruning. Understands that structured pruning produces smaller dense tensors while unstructured produces sparse matrices.
+    \item \badgeLsix{L6} Explains why unstructured pruning does not give GPU speedup (irregular memory access, tensor core assumptions). Knows about N:M sparsity as the hardware exception. Provides the decision framework above with concrete speedup numbers.
+    \item \badgeLseven{L7} Discusses the interaction between pruning and quantization (prune first, then quantize). Knows about SparseGPT and its Hessian-based approach. Can reason about the lottery ticket hypothesis and its practical implications (sparse subnetworks exist but finding them is expensive). Discusses emerging sparse hardware beyond N:M (e.g., Cerebras, Graphcore support for general sparsity).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``What is 2:4 sparsity and how does it work in hardware?'' ``Can you combine pruning with quantization?'' ``What is SparseGPT?'' ``How do you decide which channels or heads to prune?''
+\followups{``What is 2:4 sparsity and how does it work in hardware?'' ``Can you combine pruning with quantization?'' ``What is SparseGPT?'' ``How do you decide which channels or heads to prune?''}
 \end{interviewq}
 
 %--- Question 10: Architecture Design - On-device efficient architecture ---
 \begin{interviewq}
 \textbf{Q: Design an efficient architecture for real-time video understanding on edge devices.}
 
-\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqlow{}
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqlow}
 
-\textbf{Strong answer:}
+\stronganswer
 
 Video understanding on edge devices (e.g., smart cameras, drones, AR glasses) requires processing temporal sequences of frames under extreme latency and power constraints. This is fundamentally harder than image classification because of the temporal dimension.
 
@@ -959,21 +1012,21 @@ For 30fps video at $<$100ms latency per action classification:
     \item Total: $\sim$8--12ms per classification step, well within budget
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Use a 3D CNN (C3D, SlowFast) on the edge''---3D convolutions are extremely compute-intensive and not feasible on edge devices. The temporal shift module achieves comparable accuracy at zero extra FLOPs.
     \item ``Process every frame through the full model''---this ignores temporal redundancy and wastes 90\% of compute on nearly identical frames.
     \item ``Use a Vision Transformer for each frame''---ViT variants are 5--10$\times$ more expensive than MobileNets at comparable accuracy on mobile hardware.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Can you design a system under extreme resource constraints? Do you understand that efficiency requires architectural innovation (temporal shift, key frame selection), not just model compression? Can you provide concrete latency estimates?
+\interviewtest{Can you design a system under extreme resource constraints? Do you understand that efficiency requires architectural innovation (temporal shift, key frame selection), not just model compression? Can you provide concrete latency estimates?}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Proposes a mobile-friendly backbone and mentions quantization. Understands that video adds a temporal dimension that must be handled efficiently.
-    \item \textbf{L6:} Designs the spatial-temporal decomposition. Proposes temporal redundancy reduction (key frame strategy). Provides concrete latency estimates for the target hardware. Knows about TSM and its zero-cost temporal modeling.
-    \item \textbf{L7:} Designs dynamic compute allocation (early exit, adaptive resolution). Discusses the key frame selection policy (how to trigger a full recompute---scene change detection, confidence drop). Knows about neural architecture search for edge video models (e.g., X3D, MoViNet). Considers power consumption alongside latency (important for battery-powered devices).
+    \item \badgeLfive{L5} Proposes a mobile-friendly backbone and mentions quantization. Understands that video adds a temporal dimension that must be handled efficiently.
+    \item \badgeLsix{L6} Designs the spatial-temporal decomposition. Proposes temporal redundancy reduction (key frame strategy). Provides concrete latency estimates for the target hardware. Knows about TSM and its zero-cost temporal modeling.
+    \item \badgeLseven{L7} Designs dynamic compute allocation (early exit, adaptive resolution). Discusses the key frame selection policy (how to trigger a full recompute---scene change detection, confidence drop). Knows about neural architecture search for edge video models (e.g., X3D, MoViNet). Considers power consumption alongside latency (important for battery-powered devices).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you handle scene changes in the key frame approach?'' ``What is the temporal shift module and why is it zero-cost?'' ``How would you adapt this for action detection (localization, not just classification)?'' ``What hardware acceleration is available on modern phones for this?''
+\followups{``How do you handle scene changes in the key frame approach?'' ``What is the temporal shift module and why is it zero-cost?'' ``How would you adapt this for action detection (localization, not just classification)?'' ``What hardware acceleration is available on modern phones for this?''}
 \end{interviewq}

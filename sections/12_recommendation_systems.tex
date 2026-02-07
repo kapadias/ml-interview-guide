@@ -260,39 +260,108 @@ Separate encoders for users and items:
 \caption{Wide \& Deep: combines memorization (wide) with generalization (deep).}
 \end{figure}
 
-\textbf{Wide component}: Memorize specific feature combinations
+\textbf{Wide component --- memorization.} The wide side is a generalized linear model over raw features and their \textit{cross-product transformations}:
 \begin{equation}
 y_{wide} = \mathbf{w}^T[\mathbf{x}, \phi(\mathbf{x})]
 \end{equation}
-where $\phi(\mathbf{x})$ is cross-product transformation.
+where $\phi(\mathbf{x})$ is a set of cross-product features. A cross-product transformation is a binary feature that fires only when \textit{all} of its constituent features are active. Concretely, in the original Google Play Store paper, one cross-product feature was:
+\[
+\phi_k(\vx) = \prod_{i=1}^{d} x_i^{c_{ki}} \quad \text{where } c_{ki} \in \{0,1\}
+\]
+For example, if $x_{\text{installed\_netflix}} = 1$ and $x_{\text{query=``streaming''}} = 1$, then the cross-product feature $\phi(\vx) = x_{\text{installed\_netflix}} \times x_{\text{query=``streaming''}} = 1$. This cross-product ``memorizes'' that users who have Netflix installed \textit{and} search for ``streaming'' tend to install certain apps. The wide side excels at memorizing these specific, high-signal co-occurrences from historical data.
 
-\textbf{Deep component}: Generalize from embeddings
+\textbf{Deep component --- generalization.} The deep side maps sparse categorical features into low-dimensional embeddings, then passes them through an MLP:
 \begin{equation}
 y_{deep} = \text{MLP}(\text{Embed}(\mathbf{x}))
 \end{equation}
+Because embeddings map semantically similar features to nearby vectors, the deep component can generalize to feature combinations never seen in training. A user who installed ``Hulu'' may get similar recommendations to one who installed ``Netflix,'' even if ``Hulu + streaming'' was never explicitly observed.
 
-\textbf{Combined}:
+\textbf{Combined prediction (joint training)}:
 \begin{equation}
 \hat{y} = \sigma(y_{wide} + y_{deep})
 \end{equation}
 
+\textbf{Joint training vs.\ ensemble.} Wide\&Deep uses \textit{joint training}, not an ensemble. In an ensemble, wide and deep models are trained independently, and their predictions are combined at inference. In joint training, gradients flow through both components simultaneously, which means the wide side can learn to memorize patterns that the deep side fails to generalize, and vice versa. This produces a smaller, more balanced model: the wide side only needs a few hundred cross-product features (not millions) because it only has to compensate for the deep side's gaps.
+
+\textbf{Limitations.}
+\begin{itemize}
+    \item \textbf{Manual feature engineering}: The wide side requires a domain expert to manually select which cross-product features to include. This is the biggest drawback---it does not scale across teams or domains without significant feature engineering effort.
+    \item \textbf{Domain expertise needed}: Choosing which features to cross requires understanding the business (e.g., knowing that ``installed app'' $\times$ ``impression app'' is a strong signal for Google Play). Poor choices degrade memorization quality.
+    \item \textbf{Limited cross order}: Cross-products are typically 2nd or 3rd order. Higher-order crosses are combinatorially expensive and suffer from sparsity.
+\end{itemize}
+
+\textbf{When to use.} Wide\&Deep is a strong baseline when you have rich categorical features and domain experts available to design cross-product features. The original use case---Google Play Store app recommendation---is characteristic: the feature space includes installed apps, impression apps, and user demographics, all of which have well-understood interactions. For teams without bandwidth for feature engineering, DCN or DeepFM are better choices.
+
+\textbf{Practical comparison: Wide\&Deep vs.\ DCN vs.\ DeepFM.}
+\begin{itemize}
+    \item \textbf{Wide\&Deep}: Best when you have strong domain knowledge and can hand-craft high-value crosses. Simplest to debug because the wide features are interpretable.
+    \item \textbf{DCN / DCN-v2}: Best when you want explicit feature crosses of bounded degree \textit{without} manual engineering. Automates the wide side. Preferred for large feature spaces where manual crosses are impractical.
+    \item \textbf{DeepFM}: Best when second-order interactions dominate. The FM layer is parameter-efficient (shares embeddings with the deep side) and requires no feature engineering. Slightly less expressive than DCN for higher-order interactions.
+\end{itemize}
+All three share the same deep component; they differ only in how they handle explicit feature interactions.
+
 \subsection{Deep Cross Network (DCN)}
+\label{sec:dcn}
 
-\textbf{Problem with Wide\&Deep}: Manual feature engineering for cross-products.
+\textbf{What it is.} DCN (Wang et al., Google, 2017) replaces the manually engineered wide component of Wide\&Deep with a \textit{cross network} that automatically learns explicit feature interactions of bounded degree. The architecture has two parallel streams: a cross network and a deep network (standard MLP), whose outputs are concatenated before a final prediction layer. DCN automates the ``wide'' part of Wide\&Deep---no domain expert needed.
 
-\textbf{DCN solution}: Learn cross features automatically.
+\textbf{Cross-layer mechanism.} Each cross layer takes the original input $\vx_0$ and the current layer's output $\vx_l$, and computes:
 
 \begin{mathresult}{Cross Network Layer}
 \begin{equation}
-\mathbf{x}_{l+1} = \mathbf{x}_0 \mathbf{x}_l^T \mathbf{w}_l + \mathbf{b}_l + \mathbf{x}_l
+\vx_{l+1} = \vx_0 \, \vx_l^T \vw_l + \vb_l + \vx_l
 \end{equation}
+where $\vx_0 \in \mathbb{R}^d$ is the initial input (concatenation of all embeddings and dense features), $\vw_l, \vb_l \in \mathbb{R}^d$ are learnable parameters, and the residual connection $+\,\vx_l$ ensures that each layer adds \textit{new} interactions on top of existing ones.
 \end{mathresult}
+
+\textbf{Step-by-step breakdown} (whiteboard this):
+\begin{enumerate}
+    \item Compute the scalar $\alpha = \vx_l^T \vw_l$ (dot product, $O(d)$).
+    \item Multiply $\vx_0 \cdot \alpha$ to produce a vector that mixes the original features scaled by a learned function of the current layer's output.
+    \item Add bias $\vb_l$ and the residual $\vx_l$.
+\end{enumerate}
+The outer product $\vx_0 \vx_l^T$ is never materialized as a $d \times d$ matrix---the parenthesization $\vx_0 (\vx_l^T \vw_l)$ keeps computation at $O(d)$ per layer, not $O(d^2)$.
+
+\textbf{Why this captures explicit polynomial interactions.} Unrolling the recursion shows that the output of the $l$-th cross layer is a polynomial of $\vx_0$ with degree $l+1$. After layer 1: $\vx_1 = \vx_0 (\vx_0^T \vw_0) + \vb_0 + \vx_0$, which contains second-order terms $x_i \cdot x_j$. After layer 2, third-order terms appear ($x_i \cdot x_j \cdot x_k$), and so on. Unlike an MLP that must \textit{implicitly} approximate these interactions through multiple nonlinear layers, the cross network produces them \textit{explicitly} and with far fewer parameters: each layer adds only $2d$ parameters ($\vw_l$ and $\vb_l$).
 
 Each layer adds one degree of feature interaction:
 \begin{itemize}
-    \item Layer 1: 2nd order interactions
+    \item Layer 1: 2nd order interactions (pairwise)
     \item Layer 2: 3rd order interactions
     \item Layer $l$: $(l+1)$th order interactions
+\end{itemize}
+
+\begin{keyinsight}[Why Explicit Crosses Beat Implicit MLP Interactions]
+An MLP \textit{can} in theory learn feature crosses, but it does so inefficiently: it must use multiple layers and many hidden units to approximate even simple second-order interactions like $x_i \cdot x_j$. The cross network produces these directly with $O(d)$ parameters per layer. This matters most for \textbf{categorical-heavy data} where specific feature co-occurrences (e.g., ``user\_country $\times$ item\_language'') are strong signals. Empirically, cross networks converge faster and achieve better AUC on sparse, high-cardinality feature spaces than equivalently-sized MLPs.
+\end{keyinsight}
+
+\textbf{DCN-v2 improvements} (Wang et al., Google, 2021). The original DCN cross layer uses a rank-1 weight: $\vx_0 (\vx_l^T \vw_l)$, which limits each layer to learning one ``direction'' of interaction per layer. DCN-v2 makes two key changes:
+\begin{enumerate}
+    \item \textbf{Full-rank weight matrix}: Replace vector $\vw_l$ with matrix $\mW_l \in \mathbb{R}^{d \times d}$:
+    \begin{equation}
+    \vx_{l+1} = \vx_0 \odot (\mW_l \vx_l + \vb_l) + \vx_l
+    \end{equation}
+    where $\odot$ is element-wise product. This is strictly more expressive: each layer can learn a subspace of interactions rather than a single direction. In practice, a \textit{low-rank} approximation $\mW_l = \mU_l \mV_l^T$ (with $\mU_l, \mV_l \in \mathbb{R}^{d \times r}$, $r \ll d$) is used to control parameter count.
+    \item \textbf{Mixture of experts (MoE) variant}: Instead of a single cross matrix, DCN-v2 can use $K$ expert cross layers with a gating network that soft-routes inputs to different experts. This increases capacity without proportionally increasing per-example compute.
+\end{enumerate}
+
+\begin{warningbox}
+DCN-v2's full-rank cross layer has $O(d^2)$ parameters per layer (vs.\ $O(d)$ for DCN-v1). For a concatenated input of dimension $d = 10{,}000$ (common when many embedding vectors are concatenated), a single cross layer would have 100M parameters. Always use the low-rank variant ($\mW = \mU \mV^T$ with $r \ll d$) or the MoE formulation in production. Monitor the rank $r$ as a hyperparameter: too small loses expressiveness, too large blows up memory.
+\end{warningbox}
+
+\textbf{Comparison to Wide\&Deep.} DCN is conceptually ``Wide\&Deep with the wide side automated.'' The table below highlights the key differences:
+\begin{itemize}
+    \item \textbf{Feature engineering}: Wide\&Deep requires manual cross-products; DCN learns them.
+    \item \textbf{Interaction order}: Wide\&Deep crosses are typically 2nd order (hand-picked); DCN captures up to $(L+1)$th order where $L$ is the number of cross layers.
+    \item \textbf{Parameters}: Wide\&Deep's wide side has $O(|\text{cross features}|)$ parameters; DCN's cross network has $O(L \cdot d)$ (v1) or $O(L \cdot d \cdot r)$ (v2).
+\end{itemize}
+
+\textbf{When to use DCN.}
+\begin{itemize}
+    \item \textbf{Large feature spaces}: When you have hundreds of categorical features and manual crossing is impractical.
+    \item \textbf{Categorical-heavy data}: DCN shines when explicit co-occurrence patterns are predictive (ads, e-commerce).
+    \item \textbf{Replacing manual feature engineering}: If your team is spending significant effort designing cross-product features, DCN-v2 is the drop-in replacement.
+    \item \textbf{Production ranking models}: DCN-v2 is used in Google's production ranking systems and has been shown to match or outperform DeepFM with fewer parameters.
 \end{itemize}
 
 %==============================================================================
@@ -924,9 +993,9 @@ Position bias is the biggest confound in recommendation evaluation. Users click 
 \begin{interviewq}
 \textbf{Q: Design a recommendation system for a video streaming platform with 100M users and 1M videos.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 I would structure this as a multi-stage pipeline with offline and online components.
 
@@ -961,31 +1030,31 @@ I would structure this as a multi-stage pipeline with offline and online compone
     \item A/B test every model change, measuring watch time, session length, and 28-day retention.
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item Proposing a single model that scores all 1M videos (shows no understanding of computational constraints)
     \item Optimizing only for clicks (leads to clickbait; ignores satisfaction and retention)
     \item Ignoring the cold-start problem for new videos
 \end{itemize}
 
-\textbf{What the interviewer is testing:} End-to-end systems thinking, ability to decompose a vague problem into concrete stages, awareness of latency/compute constraints, multi-objective optimization awareness.
+\interviewtest{End-to-end systems thinking, ability to decompose a vague problem into concrete stages, awareness of latency/compute constraints, multi-objective optimization awareness.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Clean pipeline description with correct stages and reasonable model choices.
-    \item \textbf{L6:} Discusses multi-task learning, explores diversity-relevance tradeoff, proposes specific metrics (watch time, completion rate, retention).
-    \item \textbf{L7:} Considers feedback loops (popularity bias amplification), long-term user satisfaction vs.\ short-term engagement, counterfactual evaluation, and position bias correction in training data.
+    \item \badgeLfive{L5} Clean pipeline description with correct stages and reasonable model choices.
+    \item \badgeLsix{L6} Discusses multi-task learning, explores diversity-relevance tradeoff, proposes specific metrics (watch time, completion rate, retention).
+    \item \badgeLseven{L7} Considers feedback loops (popularity bias amplification), long-term user satisfaction vs.\ short-term engagement, counterfactual evaluation, and position bias correction in training data.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you handle cold start for new users?'' ``How do you handle cold start for new videos?'' ``How do you evaluate offline vs. online?'' ``How would you detect and mitigate a filter bubble?''
+\followups{``How do you handle cold start for new users?'' ``How do you handle cold start for new videos?'' ``How do you evaluate offline vs. online?'' ``How would you detect and mitigate a filter bubble?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: How do you handle the cold start problem for new users and new items?}
 
-\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 Cold start requires different strategies for users vs. items, and the key insight is that it is a \textit{data} problem, not a \textit{model} problem---the best solution is to design the system to collect useful signals quickly.
 
@@ -1004,31 +1073,31 @@ Cold start requires different strategies for users vs. items, and the key insigh
     \item Use CLIP-style cross-modal embeddings to bridge the gap between content features and collaborative signals.
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Just use collaborative filtering'' (impossible without interaction data)
     \item Ignoring the exploration-exploitation tradeoff
     \item Not distinguishing between user cold start and item cold start
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Practical problem-solving for a fundamental recommendation challenge, understanding that different components of the system handle cold start at different stages.
+\interviewtest{Practical problem-solving for a fundamental recommendation challenge, understanding that different components of the system handle cold start at different stages.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Lists strategies for both users and items, mentions exploration.
-    \item \textbf{L6:} Quantifies when cold start ``ends'' (5--10 interactions for users, 100+ impressions for items), discusses bandit algorithms, mentions content-collaborative bridging.
-    \item \textbf{L7:} Considers the interaction between cold start and the multi-stage pipeline (cold items need boosting at the candidate generation stage, not just re-ranking), and discusses how the rate of data collection differs across domains (e-commerce vs.\ streaming vs.\ news).
+    \item \badgeLfive{L5} Lists strategies for both users and items, mentions exploration.
+    \item \badgeLsix{L6} Quantifies when cold start ``ends'' (5--10 interactions for users, 100+ impressions for items), discusses bandit algorithms, mentions content-collaborative bridging.
+    \item \badgeLseven{L7} Considers the interaction between cold start and the multi-stage pipeline (cold items need boosting at the candidate generation stage, not just re-ranking), and discusses how the rate of data collection differs across domains (e-commerce vs.\ streaming vs.\ news).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you balance exploration vs. exploitation?'' ``When does cold start stop being a problem?'' ``How would you evaluate whether your cold start strategy is working?''
+\followups{``How do you balance exploration vs. exploitation?'' ``When does cold start stop being a problem?'' ``How would you evaluate whether your cold start strategy is working?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Your recommendation model has great offline metrics but poor online performance. What went wrong?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 The offline-online gap in recommendations has several common root causes, and I would investigate them systematically:
 
@@ -1046,23 +1115,23 @@ The offline-online gap in recommendations has several common root causes, and I 
 
 \textbf{Mitigations}: Use temporal train-test splits (never random splits for time-dependent data), apply inverse propensity weighting or position-debiased training, validate offline wins with A/B tests before deploying, and monitor calibration (the gap between predicted and actual probabilities).
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``The offline metrics must be wrong'' (the gap is expected and real)
     \item Not mentioning selection bias or position bias
     \item Assuming offline and online metrics should always agree
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding of the fundamental offline-online gap, awareness of bias in logged data, and practical debugging methodology.
+\interviewtest{Understanding of the fundamental offline-online gap, awareness of bias in logged data, and practical debugging methodology.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Identifies the gap and lists 2--3 causes (selection bias, temporal shift, metric mismatch).
-    \item \textbf{L6:} Discusses counterfactual evaluation, position debiasing, propensity scoring, and temporal splits. Mentions calibration.
-    \item \textbf{L7:} Proposes a systematic debugging framework (check features, check labels, check data pipeline timing, run A/B with holdout), discusses how to design offline evaluation to be more predictive of online outcomes, mentions replay-based evaluation methods.
+    \item \badgeLfive{L5} Identifies the gap and lists 2--3 causes (selection bias, temporal shift, metric mismatch).
+    \item \badgeLsix{L6} Discusses counterfactual evaluation, position debiasing, propensity scoring, and temporal splits. Mentions calibration.
+    \item \badgeLseven{L7} Proposes a systematic debugging framework (check features, check labels, check data pipeline timing, run A/B with holdout), discusses how to design offline evaluation to be more predictive of online outcomes, mentions replay-based evaluation methods.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you design a good A/B test for recommendations?'' ``How do you detect feature leakage?'' ``What is counterfactual evaluation and when would you use it?''
+\followups{``How do you design a good A/B test for recommendations?'' ``How do you detect feature leakage?'' ``What is counterfactual evaluation and when would you use it?''}
 \end{interviewq}
 
 % ---- NEW QUESTIONS (12) ----
@@ -1072,9 +1141,9 @@ The offline-online gap in recommendations has several common root causes, and I 
 \begin{interviewq}
 \textbf{Q: Design the ranking model for an e-commerce product ads system.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{Problem formulation.} The ranking model scores $\sim$100 ads for a given user query/context. The objective is to maximize $\text{pCTR} \times \text{pCVR} \times \text{bid}$ (expected value to the platform). This requires multi-task prediction of CTR and CVR.
 
@@ -1096,31 +1165,31 @@ The offline-online gap in recommendations has several common root causes, and I 
 
 \textbf{Calibration.} Post-model temperature scaling on pCTR and pCVR, validated with daily reliability plots. Recalibrate weekly or when distribution shift is detected.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item Proposing a single-task CTR model (ignores the CVR prediction needed for auction)
     \item Not mentioning sample selection bias for CVR
     \item Ignoring calibration (pCTR is multiplied by bid---miscalibration directly impacts revenue)
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Ability to design a complete ranking model with multi-task learning, feature engineering awareness, understanding of ads-specific challenges (calibration, auction interaction, selection bias).
+\interviewtest{Ability to design a complete ranking model with multi-task learning, feature engineering awareness, understanding of ads-specific challenges (calibration, auction interaction, selection bias).}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Correct multi-stage pipeline, reasonable feature list, basic multi-task model.
-    \item \textbf{L6:} ESMM for CVR, DIN attention, calibration pipeline, quantitative latency analysis.
-    \item \textbf{L7:} Considers delayed conversions (attribution window), multi-touch attribution, position bias in training data, and how the auction mechanism interacts with model predictions.
+    \item \badgeLfive{L5} Correct multi-stage pipeline, reasonable feature list, basic multi-task model.
+    \item \badgeLsix{L6} ESMM for CVR, DIN attention, calibration pipeline, quantitative latency analysis.
+    \item \badgeLseven{L7} Considers delayed conversions (attribution window), multi-touch attribution, position bias in training data, and how the auction mechanism interacts with model predictions.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you handle delayed conversions?'' ``How would you add a quality/relevance objective?'' ``What happens when the model's pCVR is miscalibrated by 2x?''
+\followups{``How do you handle delayed conversions?'' ``How would you add a quality/relevance objective?'' ``What happens when the model's pCVR is miscalibrated by 2x?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Design a real-time personalized notification system.}
 
-\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqmed{}
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{Problem formulation.} The system decides: (1) which notifications to send to each user, (2) when to send them, and (3) how to phrase/personalize the content. The objective is to maximize long-term user engagement and retention while respecting a per-user notification budget (to avoid fatigue).
 
@@ -1148,31 +1217,31 @@ The final send decision optimizes: $\text{score} = p(\text{open}) \times p(\text
     \item \textbf{Counterfactual evaluation}: You cannot observe the outcome of a notification not sent. Use randomized holdout groups (small \% of users receive no notifications) to measure incremental lift.
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item Ignoring notification fatigue and unsubscribe risk (sending too many is worse than sending too few)
     \item Treating this as a simple CTR problem (the long-term retention dimension is critical)
     \item Not considering time-of-day optimization
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Multi-objective optimization, understanding of long-term vs.\ short-term tradeoffs, volume control as a constraint, real-time system design, and counterfactual reasoning.
+\interviewtest{Multi-objective optimization, understanding of long-term vs.\ short-term tradeoffs, volume control as a constraint, real-time system design, and counterfactual reasoning.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Basic ranking model for notification relevance, mentions fatigue.
-    \item \textbf{L6:} Multi-task model with explicit unsubscribe prediction, time-of-day optimization, notification budget.
-    \item \textbf{L7:} Counterfactual evaluation design, incremental lift measurement, long-term retention modeling, discusses how to detect and correct for notification-driven engagement loops vs.\ organic engagement.
+    \item \badgeLfive{L5} Basic ranking model for notification relevance, mentions fatigue.
+    \item \badgeLsix{L6} Multi-task model with explicit unsubscribe prediction, time-of-day optimization, notification budget.
+    \item \badgeLseven{L7} Counterfactual evaluation design, incremental lift measurement, long-term retention modeling, discusses how to detect and correct for notification-driven engagement loops vs.\ organic engagement.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you measure the incremental value of a notification?'' ``How do you prevent the model from only sending notifications to already-engaged users?'' ``How do you set the notification budget per user?''
+\followups{``How do you measure the incremental value of a notification?'' ``How do you prevent the model from only sending notifications to already-engaged users?'' ``How do you set the notification budget per user?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Design the embedding infrastructure for a recommendation system with 1B items.}
 
-\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqlow{}
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqlow}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{Scale analysis.} 1B items with dimension-128 embeddings in FP32: $1\text{B} \times 128 \times 4 = 512$ GB. This is just the item embedding table. Add user embeddings (say 2B users $\times$ 128-d $= 1$ TB) and hundreds of other categorical features, and we are looking at multiple terabytes of embedding parameters.
 
@@ -1199,23 +1268,23 @@ The final send decision optimizes: $\text{score} = p(\text{open}) \times p(\text
 
 \textbf{Freshness.} New items need embeddings quickly. Use content-based embeddings (CLIP, text encoder) as initialization, then update collaboratively as interaction data accumulates. Feature hashing provides a fallback embedding for items not yet in the table.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item Assuming all embeddings fit in GPU memory
     \item Not considering the popularity distribution (power law) for tiered storage
     \item Ignoring the training-vs-serving difference in embedding access patterns
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Systems thinking at scale, understanding of memory hierarchies, ability to reason about hot/cold data distributions, and knowledge of modern embedding infrastructure (parameter servers, tiered storage, ANN indexing).
+\interviewtest{Systems thinking at scale, understanding of memory hierarchies, ability to reason about hot/cold data distributions, and knowledge of modern embedding infrastructure (parameter servers, tiered storage, ANN indexing).}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Recognizes the scale problem, mentions sharding and ANN indexing.
-    \item \textbf{L6:} Designs tiered storage, calculates memory requirements, discusses mixed-dimension embeddings and feature hashing.
-    \item \textbf{L7:} Designs the full end-to-end system including training infrastructure (parameter servers, async updates), serving latency optimization (caching, batching, prefetching), freshness pipeline for new items, and cost analysis (GPU vs.\ CPU vs.\ SSD trade-offs).
+    \item \badgeLfive{L5} Recognizes the scale problem, mentions sharding and ANN indexing.
+    \item \badgeLsix{L6} Designs tiered storage, calculates memory requirements, discusses mixed-dimension embeddings and feature hashing.
+    \item \badgeLseven{L7} Designs the full end-to-end system including training infrastructure (parameter servers, async updates), serving latency optimization (caching, batching, prefetching), freshness pipeline for new items, and cost analysis (GPU vs.\ CPU vs.\ SSD trade-offs).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you handle embedding drift over time?'' ``What if an item goes viral and needs to move from cold to hot storage?'' ``How do you version embeddings across model updates?''
+\followups{``How do you handle embedding drift over time?'' ``What if an item goes viral and needs to move from cold to hot storage?'' ``How do you version embeddings across model updates?''}
 \end{interviewq}
 
 % === Estimation (3) ===
@@ -1223,9 +1292,9 @@ The final send decision optimizes: $\text{score} = p(\text{open}) \times p(\text
 \begin{interviewq}
 \textbf{Q: Estimate the memory required for DLRM embedding tables with 100M users, 10M items, and 1000 categorical features.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqhigh{}
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 I will break this down by component.
 
@@ -1255,31 +1324,31 @@ Let me assume average embedding dimension 64 for other features (smaller than us
 
 \textbf{Caveat}: In a real production system at Meta scale, the user ID space can be much larger (billions), and there can be thousands of categorical features with vocabularies reaching hundreds of millions. This is how you get to trillions of parameters.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item Forgetting to account for optimizer state memory (2--3$\times$ the parameter memory)
     \item Treating all 1000 features as having the same vocabulary size
     \item Not recognizing that the user embedding table is the largest single component
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Back-of-the-envelope estimation skills, understanding of where memory goes in recommendation models, practical awareness of hardware constraints.
+\interviewtest{Back-of-the-envelope estimation skills, understanding of where memory goes in recommendation models, practical awareness of hardware constraints.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Computes total correctly, identifies embedding tables as the bottleneck.
-    \item \textbf{L6:} Breaks down by feature cardinality, includes optimizer state, proposes sharding.
-    \item \textbf{L7:} Discusses mixed-dimension embeddings as an optimization, mentions FP16 embeddings to halve memory, considers the implications for training infrastructure (parameter servers vs.\ GPU model parallelism).
+    \item \badgeLfive{L5} Computes total correctly, identifies embedding tables as the bottleneck.
+    \item \badgeLsix{L6} Breaks down by feature cardinality, includes optimizer state, proposes sharding.
+    \item \badgeLseven{L7} Discusses mixed-dimension embeddings as an optimization, mentions FP16 embeddings to halve memory, considers the implications for training infrastructure (parameter servers vs.\ GPU model parallelism).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How would you shard these tables across GPUs?'' ``What if you need to double the embedding dimension---what breaks?'' ``How would mixed-dimension embeddings reduce this?''
+\followups{``How would you shard these tables across GPUs?'' ``What if you need to double the embedding dimension---what breaks?'' ``How would mixed-dimension embeddings reduce this?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Your ads ranking model needs to score 100 candidates in $<$50ms. What architecture constraints does this impose?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 The 50ms budget for 100 candidates shapes every architectural decision. Let me decompose the latency budget.
 
@@ -1313,31 +1382,31 @@ The 50ms budget for 100 candidates shapes every architectural decision. Let me d
     \item Model accuracy vs.\ serving cost (the optimal model may be too expensive; the right answer is the best model that fits in budget).
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item Not batching the 100 candidates (scoring one at a time is orders of magnitude slower)
     \item Proposing a Transformer with self-attention over candidates (quadratic in candidate count)
     \item Ignoring feature fetching latency (often dominates the total budget)
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Ability to reason quantitatively about serving constraints, awareness that model architecture decisions are constrained by latency budgets, practical knowledge of inference optimization.
+\interviewtest{Ability to reason quantitatively about serving constraints, awareness that model architecture decisions are constrained by latency budgets, practical knowledge of inference optimization.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Identifies key constraints (depth, embedding dimension, batching).
-    \item \textbf{L6:} Decomposes the latency budget into components, discusses hardware choices, proposes concrete tradeoffs.
-    \item \textbf{L7:} Considers model distillation from a more accurate offline model, discusses the interaction between pre-ranking and ranking (shift complexity to pre-ranking to relax ranking budget), proposes profiling methodology to identify actual bottlenecks.
+    \item \badgeLfive{L5} Identifies key constraints (depth, embedding dimension, batching).
+    \item \badgeLsix{L6} Decomposes the latency budget into components, discusses hardware choices, proposes concrete tradeoffs.
+    \item \badgeLseven{L7} Considers model distillation from a more accurate offline model, discusses the interaction between pre-ranking and ranking (shift complexity to pre-ranking to relax ranking budget), proposes profiling methodology to identify actual bottlenecks.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How would you profile and optimize the model?'' ``What if the business wants to add 500 more features?'' ``How does quantization help here?''
+\followups{``How would you profile and optimize the model?'' ``What if the business wants to add 500 more features?'' ``How does quantization help here?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Calculate the daily training data volume for an ads system serving 1B impressions/day.}
 
-\textbf{Difficulty:} L7 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqlow{}
+\badgeLseven{L7} \quad \badgetype{Estimation} \quad \badgefreq{\freqlow}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{Per-impression data.}
 \begin{itemize}
@@ -1357,23 +1426,23 @@ The 50ms budget for 100 candidates shapes every architectural decision. Let me d
     \item \textbf{Feature engineering pipeline}: Features must be computed and joined in near-real-time. This requires a streaming pipeline (Kafka + Flink/Spark Streaming) that processes raw events into feature-enriched training examples.
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item Underestimating the feature vector size (it is not just user ID and item ID)
     \item Not considering the downstream implications (storage, training throughput, feature pipeline)
     \item Confusing raw event logs with processed training examples
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Ability to estimate at scale, understanding of the full data pipeline from raw events to training examples, awareness that data I/O is often the bottleneck (not compute) for recommendation training.
+\interviewtest{Ability to estimate at scale, understanding of the full data pipeline from raw events to training examples, awareness that data I/O is often the bottleneck (not compute) for recommendation training.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Reasonable per-impression estimate, correct order of magnitude.
-    \item \textbf{L6:} Breaks down by feature type, discusses storage and training throughput implications.
-    \item \textbf{L7:} Considers the full pipeline (streaming feature computation, data freshness requirements, impact of delayed labels on training window), discusses sampling strategies (e.g., negative downsampling to reduce volume, with calibration correction).
+    \item \badgeLfive{L5} Reasonable per-impression estimate, correct order of magnitude.
+    \item \badgeLsix{L6} Breaks down by feature type, discusses storage and training throughput implications.
+    \item \badgeLseven{L7} Considers the full pipeline (streaming feature computation, data freshness requirements, impact of delayed labels on training window), discusses sampling strategies (e.g., negative downsampling to reduce volume, with calibration correction).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you handle delayed conversion labels?'' ``What if you need to retrain hourly instead of daily?'' ``How do you do negative downsampling and what does it do to calibration?''
+\followups{``How do you handle delayed conversion labels?'' ``What if you need to retrain hourly instead of daily?'' ``How do you do negative downsampling and what does it do to calibration?''}
 \end{interviewq}
 
 % === Debugging (2) ===
@@ -1381,9 +1450,9 @@ The 50ms budget for 100 candidates shapes every architectural decision. Let me d
 \begin{interviewq}
 \textbf{Q: Your CTR model's offline AUC improved by 0.5\% but online revenue dropped 3\%. Diagnose.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 This is a classic and dangerous scenario. A 0.5\% AUC lift is meaningful, so the model is genuinely better at \textit{ranking}. But revenue dropped, which means the model is making the auction \textit{worse}. I would investigate in this order:
 
@@ -1397,31 +1466,31 @@ This is a classic and dangerous scenario. A 0.5\% AUC lift is meaningful, so the
 
 \textbf{5. Selection bias amplification.} The new model may serve a more concentrated set of ads (less diversity), which reduces the competitive pressure in auctions. With fewer competing ads, winning bids drop. \textit{Diagnosis}: Measure auction density (number of eligible ads per impression) and diversity of served ads.
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``The AUC improvement is small, so it is probably noise'' (0.5\% is significant at scale)
     \item Not considering calibration as the first hypothesis
     \item Blaming the A/B test infrastructure without investigating model-level causes first
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding that AUC and revenue are different metrics that can diverge, knowledge of calibration's role in auction economics, systematic debugging methodology.
+\interviewtest{Understanding that AUC and revenue are different metrics that can diverge, knowledge of calibration's role in auction economics, systematic debugging methodology.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Identifies calibration and offline-online gap as possible causes.
-    \item \textbf{L6:} Explains the auction mechanism ($\text{pCTR} \times \text{bid}$), discusses how miscalibration affects advertiser budget pacing, proposes reliability plots.
-    \item \textbf{L7:} Considers second-order ecosystem effects (advertiser budget depletion, auction dynamics, ad diversity), proposes a systematic investigation framework with specific metrics to check at each step.
+    \item \badgeLfive{L5} Identifies calibration and offline-online gap as possible causes.
+    \item \badgeLsix{L6} Explains the auction mechanism ($\text{pCTR} \times \text{bid}$), discusses how miscalibration affects advertiser budget pacing, proposes reliability plots.
+    \item \badgeLseven{L7} Considers second-order ecosystem effects (advertiser budget depletion, auction dynamics, ad diversity), proposes a systematic investigation framework with specific metrics to check at each step.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How would you fix the calibration?'' ``How do you prevent this from happening in future launches?'' ``What guardrail metrics would you add to the A/B test?''
+\followups{``How would you fix the calibration?'' ``How do you prevent this from happening in future launches?'' ``What guardrail metrics would you add to the A/B test?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Your recommendation model shows high engagement but users are churning. What is happening?}
 
-\textbf{Difficulty:} L7 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+\badgeLseven{L7} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 This is a \textit{metric misalignment} problem---the model is optimizing for a proxy (engagement) that has diverged from the true objective (long-term retention). Several mechanisms can cause this.
 
@@ -1450,23 +1519,23 @@ This is a \textit{metric misalignment} problem---the model is optimizing for a p
     \item Use constrained optimization: maximize engagement subject to a minimum diversity and satisfaction threshold.
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``The engagement is high so the model is working correctly'' (confuses proxy with objective)
     \item Not considering the feedback loop between recommendations and user behavior
     \item Proposing only technical fixes without considering the content quality dimension
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding of Goodhart's Law in ML systems (``when a measure becomes a target, it ceases to be a good measure''), ability to reason about long-term vs.\ short-term tradeoffs, responsible AI awareness.
+\interviewtest{Understanding of Goodhart's Law in ML systems (``when a measure becomes a target, it ceases to be a good measure''), ability to reason about long-term vs.\ short-term tradeoffs, responsible AI awareness.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Identifies the engagement-satisfaction gap, proposes adding diversity.
-    \item \textbf{L6:} Discusses specific mechanisms (filter bubble, regrettable consumption), proposes satisfaction metrics and counterfactual evaluation.
-    \item \textbf{L7:} Frames this as a fundamental metric alignment problem, proposes multi-objective optimization with explicit satisfaction constraints, discusses how to measure long-term user value, and considers the feedback loop between model behavior and content creator incentives.
+    \item \badgeLfive{L5} Identifies the engagement-satisfaction gap, proposes adding diversity.
+    \item \badgeLsix{L6} Discusses specific mechanisms (filter bubble, regrettable consumption), proposes satisfaction metrics and counterfactual evaluation.
+    \item \badgeLseven{L7} Frames this as a fundamental metric alignment problem, proposes multi-objective optimization with explicit satisfaction constraints, discusses how to measure long-term user value, and considers the feedback loop between model behavior and content creator incentives.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you measure user satisfaction without surveys?'' ``How would you A/B test a change that improves long-term retention but reduces short-term engagement?'' ``What signals indicate a filter bubble?''
+\followups{``How do you measure user satisfaction without surveys?'' ``How would you A/B test a change that improves long-term retention but reduces short-term engagement?'' ``What signals indicate a filter bubble?''}
 \end{interviewq}
 
 % === Trade-off (2) ===
@@ -1474,9 +1543,9 @@ This is a \textit{metric misalignment} problem---the model is optimizing for a p
 \begin{interviewq}
 \textbf{Q: Two-Tower vs. interaction-based models for candidate generation---when would you use each?}
 
-\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{Two-Tower (decomposed)} models encode users and items independently, then score via dot product. \textbf{Interaction-based} models (DLRM, DCN, DIN) take both user and item features as input and compute joint representations with cross-features and attention.
 
@@ -1503,31 +1572,31 @@ This is a \textit{metric misalignment} problem---the model is optimizing for a p
     \item \textbf{Hybrid}: Some systems use a Two-Tower retrieval model enhanced with lightweight cross-features at the embedding level (e.g., query-item attention in the item tower during training). This improves retrieval quality without sacrificing serving efficiency.
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Always use interaction-based models because they are more accurate'' (ignores computational constraints)
     \item Not recognizing that the choice is driven by the computational budget at each pipeline stage
     \item Conflating retrieval and ranking (they have fundamentally different constraints)
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding of the expressiveness-efficiency tradeoff, awareness that different pipeline stages have different computational budgets, practical recommendation system knowledge.
+\interviewtest{Understanding of the expressiveness-efficiency tradeoff, awareness that different pipeline stages have different computational budgets, practical recommendation system knowledge.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Correctly identifies Two-Tower for retrieval and interaction-based for ranking, explains the computational reason.
-    \item \textbf{L6:} Discusses the expressiveness gap and how pre-ranking bridges it, mentions ANN indexing constraints.
-    \item \textbf{L7:} Considers hybrid approaches (cross-attention in the training loss but dot-product at serving), discusses how to improve Two-Tower quality (hard negatives, mixed negatives, knowledge distillation from the ranking model).
+    \item \badgeLfive{L5} Correctly identifies Two-Tower for retrieval and interaction-based for ranking, explains the computational reason.
+    \item \badgeLsix{L6} Discusses the expressiveness gap and how pre-ranking bridges it, mentions ANN indexing constraints.
+    \item \badgeLseven{L7} Considers hybrid approaches (cross-attention in the training loss but dot-product at serving), discusses how to improve Two-Tower quality (hard negatives, mixed negatives, knowledge distillation from the ranking model).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``Can you make Two-Tower models more expressive without losing pre-computation?'' ``How do you generate hard negatives for Two-Tower training?'' ``What ANN algorithm would you use and why?''
+\followups{``Can you make Two-Tower models more expressive without losing pre-computation?'' ``How do you generate hard negatives for Two-Tower training?'' ``What ANN algorithm would you use and why?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Shared-bottom vs. MMoE vs. PLE for multi-task ads modeling---give me a decision framework.}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 The choice depends on the \textit{degree of task relatedness} and the \textit{number of tasks}.
 
@@ -1544,23 +1613,23 @@ The choice depends on the \textit{degree of task relatedness} and the \textit{nu
     \item \textbf{Consider complexity.} PLE has more hyperparameters (number of shared experts, number of task-specific experts, number of extraction layers). Only pay this complexity cost when simpler architectures demonstrably suffer from task conflict.
 \end{enumerate}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Always use PLE because it is the most advanced'' (unnecessary complexity when tasks are aligned)
     \item Not knowing what negative transfer is
     \item Ignoring the diagnostic step (comparing multi-task vs.\ single-task baselines)
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding of the multi-task learning spectrum, ability to make principled architecture choices based on task properties, awareness of negative transfer and how to detect it.
+\interviewtest{Understanding of the multi-task learning spectrum, ability to make principled architecture choices based on task properties, awareness of negative transfer and how to detect it.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Describes all three architectures correctly, states that PLE handles conflicts better.
-    \item \textbf{L6:} Provides the correlation-based decision framework, discusses negative transfer detection, mentions expert capture in MMoE.
-    \item \textbf{L7:} Discusses gradient-based diagnostics (cosine similarity of task gradients), proposes adaptive methods (gradient surgery, PCGrad), considers the interaction between multi-task architecture and the auction (each task's prediction quality affects revenue differently).
+    \item \badgeLfive{L5} Describes all three architectures correctly, states that PLE handles conflicts better.
+    \item \badgeLsix{L6} Provides the correlation-based decision framework, discusses negative transfer detection, mentions expert capture in MMoE.
+    \item \badgeLseven{L7} Discusses gradient-based diagnostics (cosine similarity of task gradients), proposes adaptive methods (gradient surgery, PCGrad), considers the interaction between multi-task architecture and the auction (each task's prediction quality affects revenue differently).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How do you weight the losses for different tasks?'' ``What is PCGrad and when would you use it?'' ``How do you decide the number of experts?''
+\followups{``How do you weight the losses for different tasks?'' ``What is PCGrad and when would you use it?'' ``How do you decide the number of experts?''}
 \end{interviewq}
 
 % === Conceptual (2) ===
@@ -1568,9 +1637,9 @@ The choice depends on the \textit{degree of task relatedness} and the \textit{nu
 \begin{interviewq}
 \textbf{Q: Explain the sample selection bias problem in CVR prediction. How does ESMM solve it?}
 
-\textbf{Difficulty:} L6 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqmed{}
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{The problem.} In ads, a conversion (purchase, install, sign-up) can only happen after a click. The natural approach is to train a CVR model on clicked impressions: $p(\text{conversion} | \text{click})$. The problem is that at serving time, the model must score \textit{all} impressions, not just clicked ones. The training distribution (clicked impressions) is a biased subset of the serving distribution (all impressions).
 
@@ -1592,31 +1661,31 @@ Both the CTR task and the CTCVR task ($p(\text{conversion} | \text{impression})$
     \item The multiplicative structure guarantees that $0 \leq p(\text{CVR}) \leq 1$ and that the relationship between CTR, CVR, and CTCVR is consistent.
 \end{itemize}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Just train CVR on all impressions with conversion labels'' (this naively labels all non-clicked impressions as non-conversions, which is correct but misses the point that the CVR model would have been biased had it only trained on clicks)
     \item Confusing sample selection bias with class imbalance (they are different problems)
     \item Not understanding why the training/serving distribution mismatch matters
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding of a subtle but critical bias in ads ML, ability to explain the mathematical decomposition, awareness of how training distribution affects model quality.
+\interviewtest{Understanding of a subtle but critical bias in ads ML, ability to explain the mathematical decomposition, awareness of how training distribution affects model quality.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Correctly explains the bias and ESMM's decomposition.
-    \item \textbf{L6:} Discusses the data sparsity benefit, explains why the multiplicative structure is important, mentions the transfer learning benefit of shared embeddings.
-    \item \textbf{L7:} Discusses delayed conversions (the conversion label may not be available at training time due to attribution windows), proposes solutions (delayed feedback modeling, waiting periods), and considers alternative approaches (inverse propensity weighting on the clicked subset).
+    \item \badgeLfive{L5} Correctly explains the bias and ESMM's decomposition.
+    \item \badgeLsix{L6} Discusses the data sparsity benefit, explains why the multiplicative structure is important, mentions the transfer learning benefit of shared embeddings.
+    \item \badgeLseven{L7} Discusses delayed conversions (the conversion label may not be available at training time due to attribution windows), proposes solutions (delayed feedback modeling, waiting periods), and considers alternative approaches (inverse propensity weighting on the clicked subset).
 \end{itemize}
 
-\textbf{Common follow-ups:} ``What if the CTR model is poorly calibrated---does this break ESMM?'' ``How do you handle delayed conversions in ESMM?'' ``What other biases exist in the training data besides selection bias?''
+\followups{``What if the CTR model is poorly calibrated---does this break ESMM?'' ``How do you handle delayed conversions in ESMM?'' ``What other biases exist in the training data besides selection bias?''}
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Why do recommendation models need calibration? What happens if pCTR is systematically over-confident?}
 
-\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
 
-\textbf{Strong answer:}
+\stronganswer
 
 \textbf{Why calibration matters.} In a recommendation or ads system, the model's predicted probability is not just used for \textit{ranking}---it is used for \textit{decision-making}. Specifically:
 \begin{itemize}
@@ -1634,23 +1703,23 @@ Both the CTR task and the CTCVR task ($p(\text{conversion} | \text{impression})$
     \item \textbf{Ranking preserved.} Note that if the over-confidence is uniform across all ads (e.g., all pCTRs are 2$\times$ too high), the \textit{ranking} is unchanged---the same ads win. The problem is entirely in the pricing and budgeting. This is why AUC (a ranking metric) can be high while revenue drops.
 \end{enumerate}
 
-\textbf{Red flags} (what NOT to say):
+\redflags
 \begin{itemize}
     \item ``Calibration does not matter if the ranking is correct'' (in ads, pricing depends on absolute probabilities)
     \item Not distinguishing between ranking quality and calibration quality
     \item Thinking calibration is only a ``nice to have''
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding of why calibration is revenue-critical in ads (not just a theoretical concern), ability to trace the downstream consequences of miscalibration through the auction system.
+\interviewtest{Understanding of why calibration is revenue-critical in ads (not just a theoretical concern), ability to trace the downstream consequences of miscalibration through the auction system.}
 
-\textbf{What separates good from great:}
+\goodgreat
 \begin{itemize}
-    \item \textbf{L5:} Explains that pCTR is used in pricing, gives the basic over-confidence consequence (advertisers overpay).
-    \item \textbf{L6:} Traces the full cascade (overpay $\rightarrow$ budget exhaustion $\rightarrow$ reduced fill rate $\rightarrow$ revenue drop), explains why AUC and calibration are orthogonal.
-    \item \textbf{L7:} Discusses continuous calibration monitoring (daily reliability plots), how calibration interacts with model updates and distribution shift, and proposes guardrail metrics (calibration error, revenue per impression) for model launches.
+    \item \badgeLfive{L5} Explains that pCTR is used in pricing, gives the basic over-confidence consequence (advertisers overpay).
+    \item \badgeLsix{L6} Traces the full cascade (overpay $\rightarrow$ budget exhaustion $\rightarrow$ reduced fill rate $\rightarrow$ revenue drop), explains why AUC and calibration are orthogonal.
+    \item \badgeLseven{L7} Discusses continuous calibration monitoring (daily reliability plots), how calibration interacts with model updates and distribution shift, and proposes guardrail metrics (calibration error, revenue per impression) for model launches.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How would you measure calibration?'' ``What calibration method would you use and why?'' ``How often do you need to recalibrate?''
+\followups{``How would you measure calibration?'' ``What calibration method would you use and why?'' ``How often do you need to recalibrate?''}
 \end{interviewq}
 
 \subsection{Feature Interaction Models}
