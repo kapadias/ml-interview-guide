@@ -2,7 +2,7 @@
 \label{chap:recommendation}
 
 \begin{tldr}
-This chapter covers the complete landscape of recommendation systems: collaborative filtering (matrix factorization, neural CF), content-based methods, deep learning approaches (Two-Tower, Wide\&Deep, DCN), and sequential recommendations. We emphasize practical system design patterns including two-stage retrieval-ranking architecture, cold start solutions, and real-time vs. batch tradeoffs.
+This chapter covers the complete landscape of recommendation systems: collaborative filtering (matrix factorization, neural CF), content-based methods, deep learning approaches (Two-Tower, Wide\&Deep, DCN, DLRM, DIN/DIEN, DeepFM), multi-task models for ads (MMoE, PLE, ESMM), sequential recommendations, and the full ads ML pipeline from candidate generation through auction. We emphasize practical system design patterns including multi-stage retrieval-ranking architecture, pCTR/pCVR calibration, embedding table infrastructure at trillion-parameter scale, and cold start solutions. If you are interviewing for any ads, ranking, or recommendation role at a FAANG company, this chapter is your primary study material.
 \end{tldr}
 
 \section{Recommendation System Fundamentals}
@@ -33,14 +33,14 @@ Implicit & Clicks, views, purchases, time spent & Dense, noisy, only positive si
 \end{tabularx}
 \end{table}
 
-\begin{keyinsight}
+\begin{keyinsight}{Why Implicit Feedback Dominates Production}
 Most production systems use \textbf{implicit feedback} because:
 \begin{itemize}
     \item Much more abundant (every interaction vs. rare ratings)
     \item Less effort from users
     \item More representative of actual behavior
 \end{itemize}
-Challenge: Non-interaction doesn't mean dislike—it might mean unawareness.
+Challenge: Non-interaction doesn't mean dislike---it might mean unawareness.
 \end{keyinsight}
 
 \subsection{Taxonomy of Approaches}
@@ -53,14 +53,14 @@ Challenge: Non-interaction doesn't mean dislike—it might mean unawareness.
     leaf/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.5cm, fill=lightgreen, font=\footnotesize}
 ]
     \node[box] (root) {Recommendation};
-    
+
     \node[box, below left=1cm and 1.5cm of root] (cf) {Collaborative\\Filtering};
     \node[box, below=1cm of root] (cb) {Content-Based};
     \node[box, below right=1cm and 1.5cm of root] (hybrid) {Hybrid};
-    
+
     \node[leaf, below left=0.8cm and 0cm of cf] (mf) {Matrix Factorization};
     \node[leaf, below right=0.8cm and 0cm of cf] (ncf) {Neural CF};
-    
+
     \draw[-] (root) -- (cf);
     \draw[-] (root) -- (cb);
     \draw[-] (root) -- (hybrid);
@@ -144,19 +144,19 @@ Weighted ALS & Weight by confidence & Implicit feedback \\
     % Input
     \node[emb] (user_emb) {User Emb};
     \node[emb, right=2cm of user_emb] (item_emb) {Item Emb};
-    
+
     % GMF path
     \node[concat, below=1cm of $(user_emb)!0.5!(item_emb)$, xshift=-2cm] (gmf) {Element-wise $\odot$};
-    
+
     % MLP path
     \node[concat, below=1cm of $(user_emb)!0.5!(item_emb)$, xshift=2cm] (concat) {Concatenate};
     \node[mlp, below=0.5cm of concat] (mlp1) {MLP Layer};
     \node[mlp, below=0.5cm of mlp1] (mlp2) {MLP Layer};
-    
+
     % Fusion
     \node[concat, below=1.5cm of $(gmf)!0.5!(mlp2)$] (fusion) {Concatenate};
     \node[box, fill=orange!30, below=0.5cm of fusion] (output) {Output Layer};
-    
+
     % Edges
     \draw[->] (user_emb) -- (gmf);
     \draw[->] (item_emb) -- (gmf);
@@ -167,7 +167,7 @@ Weighted ALS & Weight by confidence & Implicit feedback \\
     \draw[->] (gmf) -- (fusion);
     \draw[->] (mlp2) -- (fusion);
     \draw[->] (fusion) -- (output);
-    
+
     % Labels
     \node[left=0.5cm of gmf, font=\small\itshape] {GMF};
     \node[right=0.5cm of mlp1, font=\small\itshape] {MLP};
@@ -235,16 +235,16 @@ Separate encoders for users and items:
     % Wide
     \node[wide] (wide_in) {Sparse Features};
     \node[wide, below=0.5cm of wide_in] (cross) {Cross-Product};
-    
+
     % Deep
     \node[deep, right=2cm of wide_in] (deep_in) {Dense + Sparse};
     \node[deep, below=0.5cm of deep_in] (emb) {Embeddings};
     \node[deep, below=0.5cm of emb] (mlp1) {MLP};
     \node[deep, below=0.5cm of mlp1] (mlp2) {MLP};
-    
+
     % Output
     \node[box, fill=orange!30, below=1cm of $(cross)!0.5!(mlp2)$] (output) {Output};
-    
+
     % Edges
     \draw[->] (wide_in) -- (cross);
     \draw[->] (deep_in) -- (emb);
@@ -252,7 +252,7 @@ Separate encoders for users and items:
     \draw[->] (mlp1) -- (mlp2);
     \draw[->] (cross) -- (output);
     \draw[->] (mlp2) -- (output);
-    
+
     % Labels
     \node[left=0.3cm of cross, font=\small\itshape] {Memorization};
     \node[right=0.3cm of mlp1, font=\small\itshape] {Generalization};
@@ -295,19 +295,279 @@ Each layer adds one degree of feature interaction:
     \item Layer $l$: $(l+1)$th order interactions
 \end{itemize}
 
-\subsection{Feature Interaction Models}
+%==============================================================================
+\subsection{DLRM: Deep Learning Recommendation Model}
+\label{sec:dlrm}
+%==============================================================================
+
+\textbf{What it is.} DLRM (Naumov et al., Meta, 2019) is the production recommendation architecture that powers Meta's ads and feed ranking. It is the clearest example of how industrial recommendation differs from academic models: the architecture itself is straightforward, but the \textit{scale} of the embedding tables makes it one of the largest model classes in existence (trillions of parameters in production).
+
+\textbf{Architecture.} DLRM has four stages:
+\begin{enumerate}
+    \item \textbf{Embedding lookup}: Each categorical feature (user ID, item ID, ad campaign, device type, etc.) is mapped to a dense vector via its own embedding table. There may be hundreds or thousands of such tables.
+    \item \textbf{Bottom MLP}: Dense/continuous features (e.g., user age, item price, time of day) pass through a small MLP that projects them to the same dimensionality as the embeddings.
+    \item \textbf{Feature interaction layer}: All embedding vectors and the bottom MLP output are combined via pairwise dot products, producing a vector of $\binom{n}{2}$ interaction terms (where $n$ is the number of feature groups). This is the key operation that captures second-order feature interactions explicitly.
+    \item \textbf{Top MLP}: The concatenation of the interaction terms and the bottom MLP output passes through a larger MLP that produces the final prediction (e.g., click probability).
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, minimum width=1.8cm, minimum height=0.6cm, rounded corners=2pt, font=\small},
+    emb/.style={box, fill=lightblue, minimum width=1.2cm},
+    mlp/.style={box, fill=lightgreen},
+    interact/.style={box, fill=lightyellow, minimum width=4cm},
+    label/.style={font=\footnotesize\itshape}
+]
+    % Embedding tables
+    \node[emb] (e1) at (0,0) {Emb 1};
+    \node[emb, right=0.3cm of e1] (e2) {Emb 2};
+    \node[right=0.2cm of e2, font=\small] (dots) {$\cdots$};
+    \node[emb, right=0.2cm of dots] (en) {Emb $n$};
+    \node[label, above=0.2cm of e2] {Categorical features};
+
+    % Bottom MLP
+    \node[mlp, right=1.5cm of en] (bmlp) {Bottom MLP};
+    \node[label, above=0.2cm of bmlp] {Dense features};
+
+    % Interaction layer
+    \node[interact, below=1.2cm of $(e2)!0.5!(bmlp)$] (inter) {Interaction Layer (pairwise dot products)};
+
+    % Top MLP
+    \node[mlp, below=0.8cm of inter, minimum width=3cm] (tmlp) {Top MLP};
+
+    % Output
+    \node[box, fill=orange!30, below=0.6cm of tmlp] (out) {$\sigma(\cdot) \rightarrow$ pCTR};
+
+    % Edges
+    \draw[->] (e1.south) -- ++(0,-0.3) -| ([xshift=-1.5cm]inter.north);
+    \draw[->] (e2.south) -- ++(0,-0.3) -| ([xshift=-0.5cm]inter.north);
+    \draw[->] (en.south) -- ++(0,-0.3) -| ([xshift=0.5cm]inter.north);
+    \draw[->] (bmlp.south) -- ++(0,-0.3) -| ([xshift=1.5cm]inter.north);
+    \draw[->] (inter) -- (tmlp);
+    \draw[->] (tmlp) -- (out);
+\end{tikzpicture}
+\caption{DLRM architecture: embedding tables for sparse features + bottom MLP for dense features feed into a pairwise interaction layer, then a top MLP produces the prediction.}
+\label{fig:dlrm}
+\end{figure}
+
+\textbf{How DLRM differs from Wide\&Deep.} Wide\&Deep relies on manually engineered cross-product features in the wide component. DLRM replaces this with \textit{learned} embedding interactions---the dot-product interaction layer automatically captures second-order feature crosses between any pair of embedding vectors. This eliminates the feature engineering bottleneck while preserving the ability to model explicit interactions.
+
+\textbf{Why embedding tables dominate memory.} In a production DLRM at Meta, over 99\% of the model parameters reside in embedding tables. A single user-ID embedding table with 1 billion users and dimension 64 requires $1\text{B} \times 64 \times 4\text{B (FP32)} = 256$ GB. Multiply by hundreds of categorical features, and you reach trillions of parameters. The MLPs are comparatively tiny (millions of parameters). This creates a unique systems challenge: the model is \textit{memory-bound by embeddings}, not by compute. See Section~\ref{sec:embedding_systems} for how this is handled at scale.
+
+\textbf{Scaling challenges:}
+\begin{itemize}
+    \item Embedding tables are too large for a single GPU or even a single machine---they must be sharded across many devices
+    \item Embedding lookups are sparse and irregular, making them hard to parallelize efficiently
+    \item The interaction layer produces $O(n^2)$ terms; with hundreds of features, this requires careful pruning or approximation
+    \item Training requires model parallelism for embeddings + data parallelism for MLPs (a ``hybrid parallel'' approach)
+\end{itemize}
+
+%==============================================================================
+\subsection{DIN and DIEN: Attention over User Behavior}
+\label{sec:din_dien}
+%==============================================================================
+
+\textbf{The problem.} Standard models (DLRM, Wide\&Deep) represent user history as a fixed-length vector: typically a mean-pooled or sum-pooled embedding of all past interactions. This throws away a critical signal---\textit{which past behaviors are relevant to the current candidate item}. A user who bought running shoes, cookbooks, and headphones has diverse interests; when ranking a new pair of sneakers, the running shoe purchase is far more relevant than the cookbook.
+
+\subsubsection{DIN: Deep Interest Network}
+
+\textbf{What it is.} DIN (Zhou et al., Alibaba, 2018) introduces a local activation unit---essentially an attention mechanism---that weights each behavior embedding by its relevance to the \textit{candidate item} before aggregation.
+
+\textbf{How it works:}
+\begin{equation}
+\vv_u = \sum_{j=1}^{T} \alpha(\mathbf{e}_j, \mathbf{e}_{ad}) \cdot \mathbf{e}_j
+\end{equation}
+where $\mathbf{e}_j$ is the embedding of the $j$-th behavior item, $\mathbf{e}_{ad}$ is the candidate item embedding, and $\alpha(\cdot, \cdot)$ is an attention function (typically a small MLP that takes the concatenation, difference, and element-wise product of the two embeddings). The attention weights are \textit{not} normalized with softmax---DIN uses raw scores, allowing the total magnitude to vary (higher for users with more relevant history).
+
+\textbf{Why it matters.} DIN was a breakthrough for e-commerce CTR prediction because user behavior is inherently diverse and context-dependent. Mean-pooling treats all past items equally, which dilutes the relevant signal. DIN's attention mechanism learns to ``activate'' only the relevant subset of history for each candidate.
+
+\subsubsection{DIEN: Deep Interest Evolution Network}
+
+\textbf{What it adds.} DIEN (Zhou et al., Alibaba, 2019) extends DIN by modeling how user interests \textit{evolve over time}. It adds two components:
+\begin{enumerate}
+    \item \textbf{Interest extractor layer}: A GRU that processes the behavior sequence chronologically, producing hidden states $\vh_1, \ldots, \vh_T$ that capture temporal patterns.
+    \item \textbf{Interest evolution layer}: A second GRU (called AUGRU---Attention-based Update GRU) where the update gate is modulated by the attention score between each hidden state and the candidate item. This allows the model to track how the \textit{relevant} interest evolves, filtering out irrelevant behaviors at each timestep.
+\end{enumerate}
+
+\textbf{When temporal modeling matters:}
+\begin{itemize}
+    \item \textbf{E-commerce}: Strong temporal patterns (seasonal shopping, evolving preferences, purchase funnels). DIEN significantly outperforms DIN.
+    \item \textbf{News/content}: Interests shift rapidly within a session but historical trends are less predictive. Simpler attention (DIN or SASRec) often suffices.
+    \item \textbf{Video streaming}: Mixed---both long-term preferences (genre) and recent context (what you watched today) matter.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Sequential recommendation model comparison}
+\begin{tabularx}{\textwidth}{lXXXl}
+\toprule
+\textbf{Model} & \textbf{Mechanism} & \textbf{Strengths} & \textbf{Limitations} & \textbf{Temporal?} \\
+\midrule
+DIN & Target-item attention & Simple, effective, fast & No temporal dynamics & No \\
+DIEN & GRU + attention & Models interest evolution & Slower (sequential GRU) & Yes \\
+SASRec & Causal self-attention & Parallelizable, long-range & No target-item conditioning & Yes \\
+BERT4Rec & Bidirectional attention & Better representations & Cannot use future at inference & Yes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\subsection{DeepFM: Automating Feature Crosses}
+\label{sec:deepfm}
+%==============================================================================
+
+\textbf{What it is.} DeepFM (Guo et al., 2017) replaces the hand-crafted wide component of Wide\&Deep with a Factorization Machine (FM) layer that automatically learns all second-order feature interactions. The architecture has two parallel components that share the same input embeddings:
+
+\begin{enumerate}
+    \item \textbf{FM component}: Computes every pairwise interaction between feature embeddings using the FM formulation. Given $n$ feature embeddings $\mathbf{e}_1, \ldots, \mathbf{e}_n$, the FM output is the sum of all pairwise dot products:
+    \begin{equation}
+    y_{FM} = \sum_{i=1}^{n}\sum_{j=i+1}^{n} \langle \mathbf{e}_i, \mathbf{e}_j \rangle
+    \end{equation}
+    This computes in $O(nk)$ time (not $O(n^2 k)$) using the factorization trick.
+
+    \item \textbf{Deep component}: The same embeddings are concatenated and passed through an MLP to learn higher-order interactions implicitly. Identical to the deep side of Wide\&Deep.
+\end{enumerate}
+
+\textbf{Output}: $\hat{y} = \sigma(y_{FM} + y_{deep} + w_0 + \sum_i w_i x_i)$, where the last two terms are the bias and linear terms.
+
+\textbf{Key advantage over Wide\&Deep}: No feature engineering. The FM layer automatically discovers useful second-order feature crosses, while the deep component handles arbitrary higher-order interactions. Wide\&Deep requires a domain expert to manually specify which cross-product features to include in the wide component.
 
 \begin{table}[H]
 \centering
 \caption{Feature interaction model comparison}
-\begin{tabularx}{\textwidth}{lXXX}
+\begin{tabularx}{\textwidth}{lXXXl}
 \toprule
-\textbf{Model} & \textbf{Interaction Type} & \textbf{Order} & \textbf{Complexity} \\
+\textbf{Model} & \textbf{Interaction Mechanism} & \textbf{Interaction Order} & \textbf{Feature Engineering} & \textbf{Year} \\
 \midrule
-FM & Factorized & 2nd order & $O(nk)$ \\
-DeepFM & FM + MLP & 2nd + implicit higher & Medium \\
-DCN & Cross network & Explicit up to $L$th & Low per layer \\
-AutoInt & Self-attention & Automatic & Higher \\
+Wide\&Deep & Manual cross-products + MLP & 2nd (manual) + implicit & Heavy (wide side) & 2016 \\
+DeepFM & FM + MLP & 2nd (auto) + implicit & None & 2017 \\
+DCN & Cross network + MLP & Explicit up to $L$th & None & 2017 \\
+DCN-v2 & Low-rank cross net + MLP & Explicit up to $L$th & None & 2021 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{DCN-v2 improvements over DCN}: Replaces the rank-1 cross layer ($\vx_0 \vx_l^T \vw$) with a full-rank matrix ($\vx_0 \odot (\mW \vx_l + \vb)$), increasing expressiveness. Also introduces a mixture-of-experts variant for the cross layers. In practice, DCN-v2 matches or outperforms DeepFM with fewer parameters.
+
+%==============================================================================
+\section{Multi-Task Models for Ads}
+\label{sec:multitask_ads}
+%==============================================================================
+
+\textbf{Why ads need multi-task learning.} An ads ranking system must simultaneously predict multiple outcomes for each ad impression:
+\begin{itemize}
+    \item \textbf{CTR} (click-through rate): Will the user click?
+    \item \textbf{CVR} (conversion rate): Will the user purchase/install/sign up?
+    \item \textbf{Engagement}: Will the user watch the video? Dwell on the page?
+    \item \textbf{Satisfaction / quality}: Is this ad relevant and non-annoying?
+\end{itemize}
+
+Training separate models for each objective is wasteful (duplicate feature extraction) and suboptimal (no transfer learning between related tasks). Multi-task learning shares a common representation while maintaining task-specific prediction heads.
+
+\subsection{Shared-Bottom Architecture}
+
+The simplest approach: a shared feature extraction backbone (embeddings + MLP) feeds into separate task-specific output towers.
+
+\textbf{Problem: gradient conflicts.} When tasks are negatively correlated (e.g., maximizing click-through vs. minimizing bounce rate), gradients from different task losses pull the shared layers in opposing directions. The shared representation becomes a compromise that serves no task well. This is called \textit{negative transfer}, and it is the central challenge of multi-task recommendation.
+
+\subsection{MMoE: Mixture-of-Experts Multi-Task}
+
+\textbf{What it is.} MMoE (Ma et al., Google, 2018) replaces the single shared backbone with multiple expert sub-networks. Each task has its own gating network that learns to weight the experts differently, enabling tasks to selectively use shared vs. task-specific computation.
+
+\textbf{How it works:}
+\begin{equation}
+\vh_k = \sum_{i=1}^{n} g_k^{(i)}(\vx) \cdot f_i(\vx)
+\end{equation}
+where $f_i(\vx)$ is the output of expert $i$, $g_k^{(i)}(\vx)$ is the gating weight for expert $i$ from the gate of task $k$ (a softmax over a linear projection of $\vx$), and $\vh_k$ is the input to task $k$'s tower.
+
+\textbf{Key insight}: If tasks are closely related, the gates learn similar expert weightings (soft parameter sharing). If tasks conflict, each gate can specialize to different experts (approaching separate models). This provides a smooth interpolation between shared-bottom and separate models.
+
+\subsection{PLE: Progressive Layered Extraction}
+
+\textbf{What it adds over MMoE.} PLE (Tang et al., Tencent, 2020) introduces explicit task-specific experts alongside shared experts, organized into multiple extraction layers. At each layer, each task has its own set of experts plus access to shared experts, and gating networks control the mixing. The progressive stacking allows task-specific representations to become increasingly specialized in deeper layers.
+
+\textbf{Why it works better than MMoE:} In MMoE, all experts are shared, and tasks compete for expert capacity. If one task dominates the gradient, its gate can ``capture'' most experts, starving other tasks. PLE prevents this by reserving dedicated experts for each task. Empirically, PLE shows consistent improvements over MMoE on tasks with significant conflict (e.g., CTR + long-term satisfaction).
+
+\subsection{ESMM: Entire Space Multi-Task Model}
+
+\textbf{The sample selection bias problem.} CVR models are typically trained only on \textit{clicked} impressions (since conversion can only happen after a click). But at inference time, the model must score \textit{all} impressions---most of which were never clicked. This creates a distribution mismatch: the training set is biased toward items that the CTR model already thought were clickable.
+
+\textbf{How ESMM solves it.} ESMM (Ma et al., Alibaba, 2018) decomposes the prediction as:
+\begin{equation}
+p(\text{conversion} | \text{impression}) = p(\text{click} | \text{impression}) \times p(\text{conversion} | \text{click, impression})
+\end{equation}
+
+The CTR task ($p(\text{click}|\text{impression})$) and CTCVR task ($p(\text{conversion}|\text{impression})$) are both trained on the \textit{entire} impression space, eliminating the selection bias. The CVR prediction is obtained implicitly as the ratio CTCVR/CTR. Both towers share an embedding layer and are trained jointly.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, minimum width=1.6cm, minimum height=0.6cm, rounded corners=2pt, font=\small},
+    expert/.style={box, fill=lightblue},
+    gate/.style={box, fill=lightyellow, minimum width=1cm},
+    tower/.style={box, fill=lightgreen},
+    label/.style={font=\small\bfseries}
+]
+    % ---- Shared-Bottom ----
+    \node[label] at (0, 4.5) {Shared-Bottom};
+    \node[box, fill=lightgray, minimum width=2.2cm] (sb_shared) at (0, 3.3) {Shared MLP};
+    \node[tower] (sb_t1) at (-0.8, 2.0) {Task 1};
+    \node[tower] (sb_t2) at (0.8, 2.0) {Task 2};
+    \draw[->] (sb_shared) -- (sb_t1);
+    \draw[->] (sb_shared) -- (sb_t2);
+
+    % ---- MMoE ----
+    \node[label] at (5, 4.5) {MMoE};
+    \node[expert] (m_e1) at (3.8, 3.3) {Exp 1};
+    \node[expert] (m_e2) at (5, 3.3) {Exp 2};
+    \node[expert] (m_e3) at (6.2, 3.3) {Exp 3};
+    \node[gate] (m_g1) at (4.2, 2.3) {Gate 1};
+    \node[gate] (m_g2) at (5.8, 2.3) {Gate 2};
+    \node[tower] (m_t1) at (4.2, 1.3) {Task 1};
+    \node[tower] (m_t2) at (5.8, 1.3) {Task 2};
+    \draw[->, gray] (m_e1) -- (m_g1);
+    \draw[->, gray] (m_e2) -- (m_g1);
+    \draw[->, gray] (m_e3) -- (m_g1);
+    \draw[->, gray] (m_e1) -- (m_g2);
+    \draw[->, gray] (m_e2) -- (m_g2);
+    \draw[->, gray] (m_e3) -- (m_g2);
+    \draw[->] (m_g1) -- (m_t1);
+    \draw[->] (m_g2) -- (m_t2);
+
+    % ---- PLE ----
+    \node[label] at (10.5, 4.5) {PLE};
+    \node[expert, fill=blue!20] (p_s1) at (10.5, 3.3) {Shared};
+    \node[expert, fill=red!15] (p_e1) at (9.0, 3.3) {Task-1};
+    \node[expert, fill=green!15] (p_e2) at (12.0, 3.3) {Task-2};
+    \node[gate] (p_g1) at (9.5, 2.3) {Gate 1};
+    \node[gate] (p_g2) at (11.5, 2.3) {Gate 2};
+    \node[tower] (p_t1) at (9.5, 1.3) {Task 1};
+    \node[tower] (p_t2) at (11.5, 1.3) {Task 2};
+    \draw[->, gray] (p_s1) -- (p_g1);
+    \draw[->, gray] (p_s1) -- (p_g2);
+    \draw[->, gray] (p_e1) -- (p_g1);
+    \draw[->, gray] (p_e2) -- (p_g2);
+    \draw[->] (p_g1) -- (p_t1);
+    \draw[->] (p_g2) -- (p_t2);
+\end{tikzpicture}
+\caption{Multi-task architectures: Shared-Bottom has gradient conflicts. MMoE adds gated experts but all are shared. PLE separates task-specific experts from shared experts, resolving negative transfer.}
+\label{fig:multitask_comparison}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Multi-task architecture comparison for ads ranking}
+\begin{tabularx}{\textwidth}{lXXXl}
+\toprule
+\textbf{Architecture} & \textbf{Shared vs.\ Specific} & \textbf{Gradient Conflict} & \textbf{Best For} & \textbf{Year} \\
+\midrule
+Shared-bottom & Fully shared backbone & High & Closely related tasks & -- \\
+MMoE & Shared experts, per-task gates & Medium & Moderately related tasks & 2018 \\
+PLE & Shared + task-specific experts & Low & Conflicting tasks (CTR+CVR) & 2020 \\
+ESMM & Probabilistic decomposition & N/A (compositional) & CVR with selection bias & 2018 \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -349,6 +609,149 @@ Apply BERT-style masked prediction to sequences:
 \textbf{Trade-off}: Better representation learning, but can't use future context at inference.
 
 %==============================================================================
+\section{Ads ML Pipeline}
+\label{sec:ads_pipeline}
+%==============================================================================
+
+\textbf{The full picture.} An ads system is not a single model---it is a multi-stage pipeline where each stage trades off precision for computational budget. Understanding this pipeline end-to-end is the single most important topic for ads ML interviews.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.4cm,
+    stage/.style={rectangle, draw, minimum width=2.6cm, minimum height=1.4cm, rounded corners=3pt, font=\small, align=center},
+    arrow/.style={->, very thick, >=stealth},
+    label/.style={font=\footnotesize}
+]
+    \node[stage, fill=lightgray] (corpus) {Ad Corpus\\{\footnotesize 10M+ ads}};
+    \node[stage, fill=lightblue, right=0.6cm of corpus] (cg) {Candidate\\Generation\\{\footnotesize $\rightarrow$ 1000 ads}};
+    \node[stage, fill=blue!15, right=0.6cm of cg] (pr) {Pre-Ranking\\{\footnotesize $\rightarrow$ 100 ads}};
+    \node[stage, fill=lightgreen, right=0.6cm of pr] (rank) {Full Ranking\\{\footnotesize $\rightarrow$ scored}};
+    \node[stage, fill=lightyellow, right=0.6cm of rank] (auction) {Auction\\{\footnotesize $\rightarrow$ winner}};
+
+    \draw[arrow] (corpus) -- (cg);
+    \draw[arrow] (cg) -- (pr);
+    \draw[arrow] (pr) -- (rank);
+    \draw[arrow] (rank) -- (auction);
+
+    % Latency labels
+    \node[label, below=0.3cm of cg] {$<$10ms};
+    \node[label, below=0.3cm of pr] {$<$5ms};
+    \node[label, below=0.3cm of rank] {$<$50ms};
+    \node[label, below=0.3cm of auction] {$<$5ms};
+
+    % Model labels
+    \node[label, above=0.3cm of cg, text=deepblue] {Two-Tower + ANN};
+    \node[label, above=0.3cm of pr, text=deepblue] {Distilled model};
+    \node[label, above=0.3cm of rank, text=deepblue] {DLRM / DIN};
+    \node[label, above=0.3cm of auction, text=deepblue] {pCTR $\times$ bid};
+\end{tikzpicture}
+\caption{Ads ML pipeline with latency budgets. Each stage narrows the candidate set with increasingly expensive models.}
+\label{fig:ads_pipeline}
+\end{figure}
+
+\subsection{Stage 1: Candidate Generation}
+
+\textbf{Goal}: From tens of millions of eligible ads, retrieve $\sim$1,000 relevant candidates in under 10ms.
+
+\textbf{Architecture}: A Two-Tower model (Section~\ref{sec:deep_recsys}) encodes the user context and ad separately. Ad embeddings are pre-computed and indexed in an approximate nearest neighbor (ANN) structure (HNSW, ScaNN, or FAISS). At serving time, only the user tower runs online; the user embedding is used to query the ANN index.
+
+\textbf{Why Two-Tower for retrieval}: The decomposed architecture is the only option at this scale. Interaction-based models (DLRM, DCN) cannot score 10M candidates in 10ms because they require joint user-item computation. Two-Tower enables pre-computation of the item side, reducing online cost to a single user-tower forward pass + ANN lookup.
+
+\textbf{Multiple retrieval channels}: Production systems run multiple candidate generators in parallel---collaborative filtering, content-based, popularity, re-targeting, and geographic targeting---then merge results. This improves recall and diversity.
+
+\subsection{Stage 2: Pre-Ranking}
+
+\textbf{Goal}: Reduce $\sim$1,000 candidates to $\sim$100 in under 5ms, using a lightweight model.
+
+\textbf{Architecture}: Typically a distilled version of the full ranking model---same feature set but a much smaller network (e.g., 2-layer MLP instead of 5). Some systems use the Two-Tower retrieval scores with feature augmentation. The key constraint is that the model must be fast enough to score 1,000 candidates within the latency budget.
+
+\textbf{Why this stage exists}: The full ranking model (DLRM with hundreds of features, DIN with attention over behavior sequences) is too expensive to run on 1,000 candidates. Pre-ranking acts as a cheap filter that removes clearly irrelevant candidates, allowing the full model to focus its compute budget on the most promising set.
+
+\subsection{Stage 3: Full Ranking}
+
+\textbf{Goal}: Produce precise pCTR (predicted click-through rate) and pCVR (predicted conversion rate) scores for $\sim$100 candidates using the full model.
+
+\textbf{Architecture}: This is where the heavy models live---DLRM, DIN/DIEN, DCN-v2, or multi-task models (MMoE/PLE) that predict CTR, CVR, and engagement simultaneously. The model uses the richest feature set: user profile, ad features, user behavior history with attention, contextual features, and cross-features.
+
+\textbf{Latency budget}: $\sim$50ms total for 100 candidates. This is where most of the ML innovation happens and where architectural decisions (number of layers, embedding dimensions, attention mechanisms) are tuned against the latency wall.
+
+\subsection{Stage 4: Auction}
+
+\textbf{How ads are ranked for display.} The auction combines model predictions with advertiser bids. In a standard second-price auction with expected-value bidding:
+\begin{equation}
+\text{Ad rank score} = \text{pCTR} \times \text{bid}
+\end{equation}
+The ad with the highest rank score wins the impression. The winner pays the minimum bid that would have won (second-price mechanism). For conversion-optimized campaigns, the formula extends to $\text{pCTR} \times \text{pCVR} \times \text{bid}$.
+
+\begin{keyinsight}{Why the Pipeline is Funnel-Shaped}
+Each stage trades precision for speed. Candidate generation uses a simple model (dot product) but covers the entire corpus. Full ranking uses a complex model (hundreds of features, attention mechanisms) but only on $\sim$100 items. This funnel shape is necessary because the total latency budget (typically $<$100ms end-to-end) is fixed, while the compute cost per item increases by orders of magnitude at each stage. The pre-ranking stage is the ``bridge'' that makes this economically feasible---without it, you either use a weak model on all candidates (poor quality) or a strong model on too few candidates (poor recall).
+\end{keyinsight}
+
+%==============================================================================
+\section{pCTR/pCVR and Calibration}
+\label{sec:calibration}
+%==============================================================================
+
+\textbf{Why calibration matters.} In ads ranking, the model's predicted probability (pCTR, pCVR) is directly multiplied by the bid to determine the ad's rank score and the price the advertiser pays. If pCTR is systematically over-estimated by 20\%, the advertiser is charged as if their ad is 20\% more likely to be clicked than it actually is. This silently wastes ad budget, erodes advertiser trust, and ultimately reduces platform revenue as advertisers lower bids or leave.
+
+\textbf{Calibration definition.} A model is \textit{calibrated} if, among all instances where the model predicts probability $p$, the true positive rate is indeed $p$. Formally: $\Pr(y=1 \mid \hat{p} = p) = p$ for all $p \in [0,1]$.
+
+\textbf{Common calibration methods:}
+\begin{itemize}
+    \item \textbf{Platt scaling}: Fit a logistic regression $\sigma(a \cdot z + b)$ on the model's raw logit $z$ using a held-out validation set. Simple, one-dimensional, effective when the model is approximately calibrated but with a monotonic bias.
+    \item \textbf{Isotonic regression}: Fit a non-parametric monotone function from predicted scores to true probabilities. More flexible than Platt scaling, handles non-monotonic miscalibration, but can overfit with small validation sets.
+    \item \textbf{Temperature scaling}: Divide logits by a learned temperature $T$ before the sigmoid: $\sigma(z / T)$. If $T > 1$, predictions become less confident (spreads probabilities toward 0.5). If $T < 1$, predictions become more confident. Widely used for neural networks because it preserves the ranking order.
+\end{itemize}
+
+\begin{warningbox}
+An uncalibrated CTR model can silently destroy ad revenue. If pCTR is 2$\times$ over-confident, the auction charges advertisers double the fair price. Advertisers with budget caps burn through their budgets twice as fast, reducing total ad inventory fill. Conversely, under-confident pCTR means advertisers pay less than fair value---the platform leaves money on the table. Calibration is not optional in ads; it is a revenue-critical component that must be monitored continuously with daily reliability plots.
+\end{warningbox}
+
+%==============================================================================
+\section{Embedding Table Systems}
+\label{sec:embedding_systems}
+%==============================================================================
+
+\textbf{The scale.} Production recommendation models at Meta, Google, and ByteDance have embedding tables that contain trillions of parameters. A single DLRM can have 99\%+ of its parameters in embeddings, with the MLP layers accounting for less than 0.1\%. This inverts the typical deep learning assumption that ``the model'' is the neural network---in recommendation systems, the model is overwhelmingly a collection of lookup tables.
+
+\begin{keyinsight}{Embedding Tables Are the Memory Bottleneck, Not the Model}
+For a DLRM with 1,000 categorical features, average vocabulary size 10M, and embedding dimension 64: total embedding parameters $= 1{,}000 \times 10\text{M} \times 64 = 640\text{B}$ parameters $= 2.56$ TB in FP32. The MLP layers might total 10M parameters ($\sim$40 MB). When someone says ``Meta's recommendation model has trillions of parameters,'' they mean trillions of \textit{embedding} parameters. The systems challenge is storing and serving these tables, not training the MLP.
+\end{keyinsight}
+
+\subsection{Sharding Strategies}
+
+Embedding tables must be distributed across many devices. The three primary strategies are:
+
+\begin{table}[H]
+\centering
+\caption{Embedding table sharding strategies}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Strategy} & \textbf{How It Works} & \textbf{Pros} & \textbf{Cons} \\
+\midrule
+Table-wise & Each table on a different device & Simple, no cross-device lookup & Unbalanced if tables vary in size \\
+Row-wise & Rows of each table split across devices & Balanced load & Every lookup may span devices \\
+Column-wise & Each device stores part of the embedding dimension & Balanced; output is partial embedding & Requires concatenation after lookup \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+In practice, systems like Meta's FBGEMM and TorchRec use a combination: large tables are row-wise sharded, small tables are grouped onto the same device (table-wise), and extremely large tables may use column-wise sharding to distribute even a single lookup.
+
+\subsection{Mixed-Dimension Embeddings}
+
+Not all items need the same embedding dimension. Popular items with millions of interactions have enough training signal to support a high-dimensional embedding (e.g., 128-d). Long-tail items with few interactions overfit at high dimensions and are better served by smaller embeddings (e.g., 16-d). Mixed-dimension embedding tables assign larger dimensions to frequent items and smaller dimensions to rare ones, reducing total memory by 30--50\% with minimal quality loss.
+
+\subsection{Feature Hashing}
+
+\textbf{Problem}: For features with extremely large or unbounded vocabularies (e.g., search queries, URL paths, n-grams), maintaining an explicit embedding table is infeasible.
+
+\textbf{Solution}: Hash the feature value to a fixed-size table: $\text{index} = \text{hash}(\text{feature\_value}) \mod |\text{table}|$. Collisions are inevitable but tolerable---hash collisions act as a form of implicit regularization.
+
+\textbf{Improvements}: Double hashing (use two hash functions, combine embeddings) and complementary partitioning reduce collision impact. Feature hashing is also essential for cold-start items that do not yet have a dedicated embedding entry.
+
+%==============================================================================
 \section{System Design for Recommendations}
 \label{sec:recsys_system}
 %==============================================================================
@@ -368,12 +771,12 @@ Apply BERT-style masked prediction to sequences:
     \node[stage, right=1cm of retrieval] (ranking) {Ranking};
     \node[stage, right=1cm of ranking] (rerank) {Re-ranking /\\Business Logic};
     \node[box, fill=lightgreen, right=1cm of rerank] (output) {Top K};
-    
+
     % Numbers
     \node[below=0.2cm of retrieval, font=\small] {$\rightarrow$ 1000s};
     \node[below=0.2cm of ranking, font=\small] {$\rightarrow$ 100s};
     \node[below=0.2cm of rerank, font=\small] {$\rightarrow$ 10s};
-    
+
     % Edges
     \draw[->] (corpus) -- (retrieval);
     \draw[->] (retrieval) -- (ranking);
@@ -507,104 +910,764 @@ Fairness & Equal exposure across items/groups \\
 \end{tabularx}
 \end{table}
 
-\begin{interviewq}
-\textbf{Q: Design a recommendation system for a video streaming platform with 100M users and 1M videos.}
-
-\textbf{System Design:}
-
-\textbf{1. Data}:
-\begin{itemize}
-    \item User features: Demographics, watch history, preferences
-    \item Video features: Genre, cast, duration, thumbnail
-    \item Interactions: Watch time, completion rate, explicit ratings
-\end{itemize}
-
-\textbf{2. Candidate Generation (target: 10ms)}:
-\begin{itemize}
-    \item Two-Tower model: User encoder + Video encoder
-    \item Pre-compute video embeddings, store in HNSW index
-    \item Multiple sources: Collaborative, content-based, trending
-    \item Retrieve ~1000 candidates per source
-\end{itemize}
-
-\textbf{3. Ranking (target: 50ms)}:
-\begin{itemize}
-    \item DCN or DeepFM with rich features
-    \item User-video cross features
-    \item Context features (time, device, location)
-    \item Score ~3000 candidates, keep top 100
-\end{itemize}
-
-\textbf{4. Re-ranking}:
-\begin{itemize}
-    \item Diversify by genre/type
-    \item Freshness boosting for new releases
-    \item Continue watching prioritization
-    \item Business rules (promoted content)
-\end{itemize}
-
-\textbf{5. Online Learning}:
-\begin{itemize}
-    \item Stream watch events to update features
-    \item Periodic model retraining (daily/weekly)
-    \item A/B testing framework for model comparison
-\end{itemize}
-
-\textbf{Common follow-ups:} ``How do you handle cold start for new users?'' (Content-based features, popular items, ask for preferences during onboarding.) ``How do you evaluate offline vs online?'' (Offline: NDCG, Recall@K. Online: CTR, watch time, engagement. They often disagree!)
-\end{interviewq}
-
 \begin{warningbox}
 Position bias is the biggest confound in recommendation evaluation. Users click more on items shown at the top, regardless of relevance. If you train on click data without correcting for position bias, your model learns to replicate the existing ranking, not to find the best items. Use inverse propensity weighting or position-debiased training.
 \end{warningbox}
 
+%==============================================================================
+\section{Interview Questions}
+\label{sec:recsys_interview}
+%==============================================================================
+
+% ---- REWRITTEN EXISTING QUESTIONS (3) ----
+
+\begin{interviewq}
+\textbf{Q: Design a recommendation system for a video streaming platform with 100M users and 1M videos.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+I would structure this as a multi-stage pipeline with offline and online components.
+
+\textbf{1. Problem formulation.} The primary objective is maximizing long-term engagement (watch time, retention), not just click-through rate. The ranking function should optimize a weighted combination: $\text{score} = w_1 \cdot p(\text{click}) + w_2 \cdot p(\text{complete}) + w_3 \cdot \hat{t}_{\text{watch}}$, where weights are tuned via online experiments.
+
+\textbf{2. Candidate generation ($<$10ms, $\rightarrow$ 1000).}
+\begin{itemize}
+    \item Two-Tower model with user encoder (watch history, demographics) and video encoder (content features, metadata). Pre-compute video embeddings into HNSW index.
+    \item Multiple retrieval channels: collaborative (watched-together), content-based (genre/actor similarity), trending, ``continue watching,'' social graph signals.
+    \item Merge and deduplicate candidates from all channels.
+\end{itemize}
+
+\textbf{3. Ranking ($<$50ms, 1000 $\rightarrow$ 100).}
+\begin{itemize}
+    \item Multi-task model (MMoE or PLE) predicting click, completion rate, and expected watch time jointly.
+    \item DIN-style attention over watch history weighted by candidate video.
+    \item Rich features: user profile, video metadata, time-of-day, device type, thumbnail embedding, user-video cross features.
+\end{itemize}
+
+\textbf{4. Re-ranking ($\rightarrow$ final list).}
+\begin{itemize}
+    \item Diversify by genre/type (avoid 10 action movies in a row).
+    \item Boost fresh releases and ``continue watching'' items.
+    \item Apply business rules (promoted content, parental controls).
+    \item Exploration slots for new/cold-start content.
+\end{itemize}
+
+\textbf{5. Online learning and evaluation.}
+\begin{itemize}
+    \item Stream watch events to update user features in real time.
+    \item Retrain models daily or weekly on fresh data.
+    \item A/B test every model change, measuring watch time, session length, and 28-day retention.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Proposing a single model that scores all 1M videos (shows no understanding of computational constraints)
+    \item Optimizing only for clicks (leads to clickbait; ignores satisfaction and retention)
+    \item Ignoring the cold-start problem for new videos
+\end{itemize}
+
+\textbf{What the interviewer is testing:} End-to-end systems thinking, ability to decompose a vague problem into concrete stages, awareness of latency/compute constraints, multi-objective optimization awareness.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Clean pipeline description with correct stages and reasonable model choices.
+    \item \textbf{L6:} Discusses multi-task learning, explores diversity-relevance tradeoff, proposes specific metrics (watch time, completion rate, retention).
+    \item \textbf{L7:} Considers feedback loops (popularity bias amplification), long-term user satisfaction vs.\ short-term engagement, counterfactual evaluation, and position bias correction in training data.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you handle cold start for new users?'' ``How do you handle cold start for new videos?'' ``How do you evaluate offline vs. online?'' ``How would you detect and mitigate a filter bubble?''
+\end{interviewq}
+
 \begin{interviewq}
 \textbf{Q: How do you handle the cold start problem for new users and new items?}
 
-\textbf{What the interviewer is testing:} Practical problem-solving for a fundamental recommendation challenge.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} Cold start requires different strategies for users vs. items:
+\textbf{Strong answer:}
+
+Cold start requires different strategies for users vs. items, and the key insight is that it is a \textit{data} problem, not a \textit{model} problem---the best solution is to design the system to collect useful signals quickly.
 
 \textbf{New users (no interaction history):}
 \begin{itemize}
-    \item Use content-based features (demographics, device, location)
-    \item Show popular/trending items (non-personalized baseline)
-    \item Ask explicit preferences during onboarding
-    \item Use bandits to quickly learn preferences from early interactions
+    \item Start with popularity-based and content-based recommendations (demographics, device, location, referral source).
+    \item Ask explicit preferences during onboarding (``select genres you enjoy'').
+    \item Use contextual bandits (Thompson sampling, epsilon-greedy) to quickly learn preferences from the first few interactions.
+    \item Leverage transfer signals: if the user signed in with a social account, use social graph features.
 \end{itemize}
 
 \textbf{New items (no user interactions):}
 \begin{itemize}
-    \item Use item content features (text, images, category) to place in embedding space
-    \item Boost exposure in candidate generation to collect interaction data
-    \item Transfer knowledge from similar items
-    \item Use CLIP-style embeddings to bridge the content-interaction gap
+    \item Use item content features (text description, images, category, price) to place the item in embedding space near similar known items.
+    \item Boost exploration: deliberately show the new item to a small percentage of users to collect interaction data. Use inverse propensity weighting to correct for the exploration bias.
+    \item Use CLIP-style cross-modal embeddings to bridge the gap between content features and collaborative signals.
 \end{itemize}
 
-\textbf{The key insight}: Cold start is a data problem, not a model problem. The best solution is usually to design the system to collect useful signals quickly (exploration) rather than trying to make perfect predictions from no data.
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just use collaborative filtering'' (impossible without interaction data)
+    \item Ignoring the exploration-exploitation tradeoff
+    \item Not distinguishing between user cold start and item cold start
+\end{itemize}
 
-\textbf{Common follow-ups:} ``How do you balance exploration vs exploitation?'' (Thompson sampling or epsilon-greedy bandits for new items/users.) ``When does cold start stop being a problem?'' (After 5-10 interactions for users, 100+ impressions for items.)
+\textbf{What the interviewer is testing:} Practical problem-solving for a fundamental recommendation challenge, understanding that different components of the system handle cold start at different stages.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Lists strategies for both users and items, mentions exploration.
+    \item \textbf{L6:} Quantifies when cold start ``ends'' (5--10 interactions for users, 100+ impressions for items), discusses bandit algorithms, mentions content-collaborative bridging.
+    \item \textbf{L7:} Considers the interaction between cold start and the multi-stage pipeline (cold items need boosting at the candidate generation stage, not just re-ranking), and discusses how the rate of data collection differs across domains (e-commerce vs.\ streaming vs.\ news).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you balance exploration vs. exploitation?'' ``When does cold start stop being a problem?'' ``How would you evaluate whether your cold start strategy is working?''
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: Your recommendation model has great offline metrics but poor online performance. What went wrong?}
 
-\textbf{What the interviewer is testing:} Understanding of the offline-online gap, a critical production ML challenge.
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} The offline-online gap in recommendations has several common causes:
+\textbf{Strong answer:}
+
+The offline-online gap in recommendations has several common root causes, and I would investigate them systematically:
 
 \begin{enumerate}
-    \item \textbf{Selection bias}: Offline data only contains items that were previously shown. The model never sees counterfactual outcomes (what would the user have clicked if shown a different item?).
+    \item \textbf{Selection bias}: Offline data only contains items that were previously shown. The model never sees counterfactual outcomes. If the offline evaluation uses the same biased data, metrics look good but the model has not actually learned to find better items---it has learned to replicate the existing policy.
 
-    \item \textbf{Popularity bias}: Offline metrics reward predicting popular items, but online value comes from personalized discovery.
+    \item \textbf{Position bias}: Offline metrics computed on historical click data inherit position bias. Items shown at the top get clicked regardless of true relevance. A model that memorizes position effects will have high offline AUC but no real ranking improvement online.
 
-    \item \textbf{Temporal shift}: Offline evaluation uses historical data, but user preferences and item catalog change over time.
+    \item \textbf{Temporal distribution shift}: Offline evaluation uses historical data, but the live user population and item catalog have shifted. A model trained on December holiday data may fail in January.
 
-    \item \textbf{Proxy metric mismatch}: Offline metrics (AUC, NDCG) may not correlate with business metrics (revenue, retention, engagement).
+    \item \textbf{Proxy metric mismatch}: Offline metrics (AUC, NDCG) may not correlate with the actual business metric (revenue, retention, engagement). High AUC does not guarantee high revenue---the model may be accurate for easy predictions but miscalibrated on the high-value tail.
 
-    \item \textbf{Presentation bias}: Offline evaluation ignores UI effects (position, context, device) that significantly affect online behavior.
+    \item \textbf{Feature leakage or data leakage}: Features computed with future information in the offline pipeline (e.g., item popularity computed over the full time range including the test period) inflate offline metrics but are unavailable at serving time.
 \end{enumerate}
 
-\textbf{Mitigations}: Use unbiased evaluation methods (IPS-weighted metrics), temporal train-test splits (not random), and always validate offline wins with A/B tests before deploying.
+\textbf{Mitigations}: Use temporal train-test splits (never random splits for time-dependent data), apply inverse propensity weighting or position-debiased training, validate offline wins with A/B tests before deploying, and monitor calibration (the gap between predicted and actual probabilities).
 
-\textbf{Common follow-ups:} ``How do you design a good A/B test for recommendations?'' (Random user-level assignment, sufficient sample size, guard against novelty effects by running 2+ weeks.)
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``The offline metrics must be wrong'' (the gap is expected and real)
+    \item Not mentioning selection bias or position bias
+    \item Assuming offline and online metrics should always agree
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of the fundamental offline-online gap, awareness of bias in logged data, and practical debugging methodology.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies the gap and lists 2--3 causes (selection bias, temporal shift, metric mismatch).
+    \item \textbf{L6:} Discusses counterfactual evaluation, position debiasing, propensity scoring, and temporal splits. Mentions calibration.
+    \item \textbf{L7:} Proposes a systematic debugging framework (check features, check labels, check data pipeline timing, run A/B with holdout), discusses how to design offline evaluation to be more predictive of online outcomes, mentions replay-based evaluation methods.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you design a good A/B test for recommendations?'' ``How do you detect feature leakage?'' ``What is counterfactual evaluation and when would you use it?''
 \end{interviewq}
+
+% ---- NEW QUESTIONS (12) ----
+
+% === Architecture Design (3) ===
+
+\begin{interviewq}
+\textbf{Q: Design the ranking model for an e-commerce product ads system.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+\textbf{Problem formulation.} The ranking model scores $\sim$100 ads for a given user query/context. The objective is to maximize $\text{pCTR} \times \text{pCVR} \times \text{bid}$ (expected value to the platform). This requires multi-task prediction of CTR and CVR.
+
+\textbf{Architecture.} I would use a PLE-based multi-task model with ESMM-style probabilistic decomposition for CVR to handle sample selection bias.
+
+\textbf{Features (four groups):}
+\begin{itemize}
+    \item \textbf{User}: Demographics, purchase history embeddings, behavioral segments, session-level features (recent searches, cart contents).
+    \item \textbf{Ad/product}: Category, brand, price, image embedding (from pre-trained vision model), text embedding, seller quality score.
+    \item \textbf{Context}: Query text embedding, device, time of day, day of week, location, page position.
+    \item \textbf{Cross}: Query-product relevance score, user-category affinity, price sensitivity (user price range vs.\ product price).
+\end{itemize}
+
+\textbf{User behavior modeling.} Apply DIN-style attention over the user's recent purchase and click history, weighted by relevance to the candidate product. For e-commerce, temporal interest evolution matters (seasonal patterns, purchase funnels), so DIEN may outperform DIN---I would A/B test both.
+
+\textbf{Training.} Binary cross-entropy for CTR on impression-level data. ESMM decomposition for CVR to avoid sample selection bias. Joint training with gradient-scaled multi-task loss: $\loss = \alpha \loss_{\text{CTR}} + \beta \loss_{\text{CTCVR}}$. Daily retraining with a sliding window of the most recent 7--14 days of data.
+
+\textbf{Serving.} Model quantized to INT8 for inference. Latency target: $<$50ms for 100 candidates. Batch all candidates in a single forward pass. Serve from GPU instances for throughput.
+
+\textbf{Calibration.} Post-model temperature scaling on pCTR and pCVR, validated with daily reliability plots. Recalibrate weekly or when distribution shift is detected.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Proposing a single-task CTR model (ignores the CVR prediction needed for auction)
+    \item Not mentioning sample selection bias for CVR
+    \item Ignoring calibration (pCTR is multiplied by bid---miscalibration directly impacts revenue)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Ability to design a complete ranking model with multi-task learning, feature engineering awareness, understanding of ads-specific challenges (calibration, auction interaction, selection bias).
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correct multi-stage pipeline, reasonable feature list, basic multi-task model.
+    \item \textbf{L6:} ESMM for CVR, DIN attention, calibration pipeline, quantitative latency analysis.
+    \item \textbf{L7:} Considers delayed conversions (attribution window), multi-touch attribution, position bias in training data, and how the auction mechanism interacts with model predictions.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you handle delayed conversions?'' ``How would you add a quality/relevance objective?'' ``What happens when the model's pCVR is miscalibrated by 2x?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design a real-time personalized notification system.}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Problem formulation.} The system decides: (1) which notifications to send to each user, (2) when to send them, and (3) how to phrase/personalize the content. The objective is to maximize long-term user engagement and retention while respecting a per-user notification budget (to avoid fatigue).
+
+\textbf{Core model: Multi-task ranking with volume control.}
+\begin{itemize}
+    \item \textbf{Task 1}: $p(\text{open} | \text{user, notification, context})$---will the user open this notification?
+    \item \textbf{Task 2}: $p(\text{positive\_action} | \text{open})$---given an open, will the user take a desirable action?
+    \item \textbf{Task 3}: $p(\text{unsubscribe} | \text{user, notification\_volume})$---will this notification contribute to unsubscribe/fatigue?
+\end{itemize}
+
+The final send decision optimizes: $\text{score} = p(\text{open}) \times p(\text{positive\_action}) - \lambda \cdot p(\text{unsubscribe})$, where $\lambda$ is a tunable parameter controlling the aggression level. Only send if the score exceeds a user-specific threshold (calibrated to enforce a maximum notification frequency per user).
+
+\textbf{Architecture.}
+\begin{itemize}
+    \item Feature store with real-time user context (last app session, recent interactions, current location, time zone, device state).
+    \item Multi-task PLE model for the three prediction tasks.
+    \item Time-of-day optimization: learn per-user send-time preferences from historical open patterns.
+    \item Content selection: from a candidate pool of notifications (social triggers, content recommendations, promotions, reminders), rank by the combined score above.
+\end{itemize}
+
+\textbf{Critical design considerations.}
+\begin{itemize}
+    \item \textbf{Volume control}: Hard cap on daily/weekly notifications per user. Use a budget-constrained optimization (knapsack formulation) across all candidate notifications.
+    \item \textbf{Freshness}: Social notifications (``friend posted'') have short shelf life; promotional notifications tolerate delay.
+    \item \textbf{Counterfactual evaluation}: You cannot observe the outcome of a notification not sent. Use randomized holdout groups (small \% of users receive no notifications) to measure incremental lift.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Ignoring notification fatigue and unsubscribe risk (sending too many is worse than sending too few)
+    \item Treating this as a simple CTR problem (the long-term retention dimension is critical)
+    \item Not considering time-of-day optimization
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Multi-objective optimization, understanding of long-term vs.\ short-term tradeoffs, volume control as a constraint, real-time system design, and counterfactual reasoning.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Basic ranking model for notification relevance, mentions fatigue.
+    \item \textbf{L6:} Multi-task model with explicit unsubscribe prediction, time-of-day optimization, notification budget.
+    \item \textbf{L7:} Counterfactual evaluation design, incremental lift measurement, long-term retention modeling, discusses how to detect and correct for notification-driven engagement loops vs.\ organic engagement.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you measure the incremental value of a notification?'' ``How do you prevent the model from only sending notifications to already-engaged users?'' ``How do you set the notification budget per user?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design the embedding infrastructure for a recommendation system with 1B items.}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+\textbf{Scale analysis.} 1B items with dimension-128 embeddings in FP32: $1\text{B} \times 128 \times 4 = 512$ GB. This is just the item embedding table. Add user embeddings (say 2B users $\times$ 128-d $= 1$ TB) and hundreds of other categorical features, and we are looking at multiple terabytes of embedding parameters.
+
+\textbf{Storage layer.}
+\begin{itemize}
+    \item \textbf{Hot embeddings} (top 1\% by access frequency, $\sim$10M items): Stored in GPU HBM for fast inference. These account for 80\%+ of all lookups.
+    \item \textbf{Warm embeddings} (next 10\%, $\sim$100M items): Stored in host DRAM with GPU-accessible pinned memory. Fetched on demand with prefetching.
+    \item \textbf{Cold embeddings} (remaining 89\%, $\sim$890M items): Stored on SSD-backed parameter servers. Higher latency but acceptable for long-tail items that appear infrequently.
+\end{itemize}
+
+\textbf{Training infrastructure.}
+\begin{itemize}
+    \item Row-wise sharding of embedding tables across a parameter server cluster (Meta uses up to thousands of embedding-server nodes for a single model).
+    \item Asynchronous embedding updates: the dense MLP parameters use synchronous data parallelism, but embedding updates use bounded-staleness asynchronous SGD (embedding gradients are sparse, so staleness has minimal impact).
+    \item Mixed-dimension embeddings: popular items get 128-d, medium items get 64-d, long-tail items get 16-d. This reduces total memory by $\sim$40\%.
+\end{itemize}
+
+\textbf{Serving infrastructure.}
+\begin{itemize}
+    \item For candidate generation: pre-compute all 1B item embeddings and index in a distributed ANN system (FAISS with IVF or ScaNN). The index is sharded across machines, each holding $\sim$50--100M embeddings.
+    \item For ranking: online embedding lookup from the tiered storage system. Batch all candidate items in a single RPC to the embedding server. Latency target: $<$5ms per batch of 100 lookups (achieved via batching, caching, and SSD optimization).
+    \item Embedding cache: LRU cache in serving hosts for recently accessed embeddings. Cache hit rates typically exceed 90\% due to the heavy-tailed popularity distribution.
+\end{itemize}
+
+\textbf{Freshness.} New items need embeddings quickly. Use content-based embeddings (CLIP, text encoder) as initialization, then update collaboratively as interaction data accumulates. Feature hashing provides a fallback embedding for items not yet in the table.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Assuming all embeddings fit in GPU memory
+    \item Not considering the popularity distribution (power law) for tiered storage
+    \item Ignoring the training-vs-serving difference in embedding access patterns
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systems thinking at scale, understanding of memory hierarchies, ability to reason about hot/cold data distributions, and knowledge of modern embedding infrastructure (parameter servers, tiered storage, ANN indexing).
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Recognizes the scale problem, mentions sharding and ANN indexing.
+    \item \textbf{L6:} Designs tiered storage, calculates memory requirements, discusses mixed-dimension embeddings and feature hashing.
+    \item \textbf{L7:} Designs the full end-to-end system including training infrastructure (parameter servers, async updates), serving latency optimization (caching, batching, prefetching), freshness pipeline for new items, and cost analysis (GPU vs.\ CPU vs.\ SSD trade-offs).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you handle embedding drift over time?'' ``What if an item goes viral and needs to move from cold to hot storage?'' ``How do you version embeddings across model updates?''
+\end{interviewq}
+
+% === Estimation (3) ===
+
+\begin{interviewq}
+\textbf{Q: Estimate the memory required for DLRM embedding tables with 100M users, 10M items, and 1000 categorical features.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+I will break this down by component.
+
+\textbf{User embedding table.} 100M users $\times$ 128-d $\times$ 4 bytes (FP32) $= 51.2$ GB.
+
+\textbf{Item embedding table.} 10M items $\times$ 128-d $\times$ 4 bytes $= 5.12$ GB.
+
+\textbf{Other categorical features.} This is the dominant term. With 1,000 features, the key question is the average vocabulary size. In practice, these range widely:
+\begin{itemize}
+    \item High-cardinality (user city, ad campaign ID): $\sim$1M entries each, maybe 50 such features
+    \item Medium-cardinality (device model, content category): $\sim$10K entries each, maybe 200 such features
+    \item Low-cardinality (OS type, day of week): $\sim$100 entries each, maybe 750 such features
+\end{itemize}
+
+Let me assume average embedding dimension 64 for other features (smaller than user/item):
+\begin{itemize}
+    \item High-card: $50 \times 1\text{M} \times 64 \times 4 = 12.8$ GB
+    \item Medium-card: $200 \times 10\text{K} \times 64 \times 4 = 0.51$ GB
+    \item Low-card: $750 \times 100 \times 64 \times 4 = 0.019$ GB (negligible)
+\end{itemize}
+
+\textbf{Total embedding memory}: $51.2 + 5.12 + 12.8 + 0.5 \approx 70$ GB. The user embedding table alone would not fit on a single 80 GB A100.
+
+\textbf{MLP parameters}: Typically $<$100M parameters $\approx$ 0.4 GB. Negligible compared to embeddings.
+
+\textbf{Training memory}: With Adam optimizer, each parameter needs 12 bytes (4 param + 4 first moment + 4 second moment): $\sim$210 GB total. This requires multi-GPU model parallelism for the embedding tables, with data parallelism for the MLP.
+
+\textbf{Caveat}: In a real production system at Meta scale, the user ID space can be much larger (billions), and there can be thousands of categorical features with vocabularies reaching hundreds of millions. This is how you get to trillions of parameters.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Forgetting to account for optimizer state memory (2--3$\times$ the parameter memory)
+    \item Treating all 1000 features as having the same vocabulary size
+    \item Not recognizing that the user embedding table is the largest single component
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Back-of-the-envelope estimation skills, understanding of where memory goes in recommendation models, practical awareness of hardware constraints.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Computes total correctly, identifies embedding tables as the bottleneck.
+    \item \textbf{L6:} Breaks down by feature cardinality, includes optimizer state, proposes sharding.
+    \item \textbf{L7:} Discusses mixed-dimension embeddings as an optimization, mentions FP16 embeddings to halve memory, considers the implications for training infrastructure (parameter servers vs.\ GPU model parallelism).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you shard these tables across GPUs?'' ``What if you need to double the embedding dimension---what breaks?'' ``How would mixed-dimension embeddings reduce this?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your ads ranking model needs to score 100 candidates in $<$50ms. What architecture constraints does this impose?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+The 50ms budget for 100 candidates shapes every architectural decision. Let me decompose the latency budget.
+
+\textbf{Latency breakdown.}
+\begin{itemize}
+    \item Feature fetching (feature store lookups, embedding lookups): $\sim$10--15ms
+    \item Model inference (forward pass for 100 candidates): $\sim$20--30ms
+    \item Post-processing (calibration, business rules): $\sim$5ms
+    \item Network overhead: $\sim$5ms
+\end{itemize}
+
+\textbf{Model constraints for the 20--30ms inference budget.}
+\begin{itemize}
+    \item \textbf{MLP depth}: Typically 3--5 layers maximum. Each additional layer adds $\sim$0.5--1ms on GPU, more on CPU. Going to 10+ layers is infeasible.
+    \item \textbf{Embedding dimension}: 64--128 is typical. Dimension 256+ significantly increases the interaction layer cost ($O(n^2 d)$ for pairwise dot products).
+    \item \textbf{Attention over behavior sequences (DIN/DIEN)}: The sequence length must be capped---typically 50--200 recent behaviors. Longer histories require pre-computed user representations rather than live attention.
+    \item \textbf{Number of features}: Hundreds of features are feasible (embedding lookups are batched). Thousands of features with high-dimensional embeddings may exceed the budget.
+    \item \textbf{Batching}: All 100 candidates should be scored in a single batched forward pass (not 100 individual passes). This amortizes the per-inference overhead.
+\end{itemize}
+
+\textbf{Hardware choice.}
+\begin{itemize}
+    \item \textbf{GPU serving}: Batching 100 candidates is efficient on GPU. A T4 or A10 GPU can typically score 100 candidates through a production DLRM in $<$10ms.
+    \item \textbf{CPU serving}: Feasible for simpler models with INT8 quantization, but may struggle with DIN-style attention. Often used for pre-ranking (simpler model, more candidates).
+\end{itemize}
+
+\textbf{What I would trade off.}
+\begin{itemize}
+    \item Behavior sequence length vs.\ model depth (more history or deeper MLP, not both).
+    \item Number of cross-features vs.\ embedding dimension (wider embeddings or more feature interactions, not both).
+    \item Model accuracy vs.\ serving cost (the optimal model may be too expensive; the right answer is the best model that fits in budget).
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Not batching the 100 candidates (scoring one at a time is orders of magnitude slower)
+    \item Proposing a Transformer with self-attention over candidates (quadratic in candidate count)
+    \item Ignoring feature fetching latency (often dominates the total budget)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Ability to reason quantitatively about serving constraints, awareness that model architecture decisions are constrained by latency budgets, practical knowledge of inference optimization.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies key constraints (depth, embedding dimension, batching).
+    \item \textbf{L6:} Decomposes the latency budget into components, discusses hardware choices, proposes concrete tradeoffs.
+    \item \textbf{L7:} Considers model distillation from a more accurate offline model, discusses the interaction between pre-ranking and ranking (shift complexity to pre-ranking to relax ranking budget), proposes profiling methodology to identify actual bottlenecks.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you profile and optimize the model?'' ``What if the business wants to add 500 more features?'' ``How does quantization help here?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Calculate the daily training data volume for an ads system serving 1B impressions/day.}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+\textbf{Per-impression data.}
+\begin{itemize}
+    \item \textbf{Feature vector}: A typical ads ranking model uses $\sim$500--1000 features. Most are categorical (stored as feature ID + hash, $\sim$8 bytes each) with some dense features ($\sim$4 bytes each). Estimate $\sim$1000 features $\times$ 8 bytes $= 8$ KB per impression.
+    \item \textbf{Labels}: Click (1 bit), conversion (1 bit), dwell time, engagement signals. $\sim$100 bytes per impression including metadata (timestamp, position, etc.).
+    \item \textbf{Behavior sequences}: If we store the user's recent behavior history per example (for DIN-style models), and the sequence is 100 items $\times$ 8 bytes $= 800$ bytes.
+    \item \textbf{Total per impression}: $\sim$8 KB + 100 B + 800 B $\approx$ 9 KB. Round to $\sim$10 KB.
+\end{itemize}
+
+\textbf{Daily volume.} $1\text{B impressions} \times 10$ KB $= 10$ TB/day of raw training data.
+
+\textbf{Downstream implications.}
+\begin{itemize}
+    \item \textbf{Storage}: 10 TB/day $\times$ 14-day training window $= 140$ TB of active training data. Stored in a distributed file system (HDFS, GCS, S3).
+    \item \textbf{Training throughput}: To train on one full day's data in 4 hours (quarter of the data freshness target), the training pipeline needs to process $10$ TB / 4 hours $\approx$ 700 MB/s of sustained data throughput across the training cluster.
+    \item \textbf{Training compute}: At $\sim$10K floating point operations per impression (for a DLRM forward + backward), $1\text{B} \times 10\text{K} = 10^{13}$ FLOPs per epoch. A single A100 at 300 TFLOPS processes this in $\sim$33 seconds---the bottleneck is data I/O and embedding lookups, not compute.
+    \item \textbf{Feature engineering pipeline}: Features must be computed and joined in near-real-time. This requires a streaming pipeline (Kafka + Flink/Spark Streaming) that processes raw events into feature-enriched training examples.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Underestimating the feature vector size (it is not just user ID and item ID)
+    \item Not considering the downstream implications (storage, training throughput, feature pipeline)
+    \item Confusing raw event logs with processed training examples
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Ability to estimate at scale, understanding of the full data pipeline from raw events to training examples, awareness that data I/O is often the bottleneck (not compute) for recommendation training.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Reasonable per-impression estimate, correct order of magnitude.
+    \item \textbf{L6:} Breaks down by feature type, discusses storage and training throughput implications.
+    \item \textbf{L7:} Considers the full pipeline (streaming feature computation, data freshness requirements, impact of delayed labels on training window), discusses sampling strategies (e.g., negative downsampling to reduce volume, with calibration correction).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you handle delayed conversion labels?'' ``What if you need to retrain hourly instead of daily?'' ``How do you do negative downsampling and what does it do to calibration?''
+\end{interviewq}
+
+% === Debugging (2) ===
+
+\begin{interviewq}
+\textbf{Q: Your CTR model's offline AUC improved by 0.5\% but online revenue dropped 3\%. Diagnose.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+This is a classic and dangerous scenario. A 0.5\% AUC lift is meaningful, so the model is genuinely better at \textit{ranking}. But revenue dropped, which means the model is making the auction \textit{worse}. I would investigate in this order:
+
+\textbf{1. Calibration regression.} AUC measures ranking quality, not probability accuracy. The new model may rank correctly but be miscalibrated. If pCTR is systematically over-predicted (e.g., by 1.5$\times$), the auction charges advertisers more than the fair price. Advertisers with daily budgets burn through them faster, reducing total ad fill later in the day. Net effect: better ranking, less total revenue. \textit{Diagnosis}: Compare predicted vs.\ actual CTR across deciles (reliability plot). If the curve deviates from the diagonal, the model needs recalibration.
+
+\textbf{2. Distribution shift between offline and online.} The offline evaluation may be on a historical data slice that does not represent current traffic. The model may perform well on the test set but poorly on the live distribution. \textit{Diagnosis}: Compare feature distributions between the offline test set and live traffic.
+
+\textbf{3. Advertiser ecosystem effects.} A model change affects which ads win auctions. If the new model shifts impressions away from high-bid advertisers toward low-bid ones (even if the low-bid ads have higher true CTR), revenue drops because $\text{revenue} = \text{pCTR} \times \text{bid}$, and the bid term matters. AUC does not account for bid values at all. \textit{Diagnosis}: Compare average winning bid before and after.
+
+\textbf{4. Feature pipeline inconsistency.} Features computed offline may differ from those computed in real-time (different code paths, different data freshness). The model may be relying on a feature that is stale or computed differently at serving time. \textit{Diagnosis}: Log serving-time features and compare with offline features for the same impressions.
+
+\textbf{5. Selection bias amplification.} The new model may serve a more concentrated set of ads (less diversity), which reduces the competitive pressure in auctions. With fewer competing ads, winning bids drop. \textit{Diagnosis}: Measure auction density (number of eligible ads per impression) and diversity of served ads.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``The AUC improvement is small, so it is probably noise'' (0.5\% is significant at scale)
+    \item Not considering calibration as the first hypothesis
+    \item Blaming the A/B test infrastructure without investigating model-level causes first
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding that AUC and revenue are different metrics that can diverge, knowledge of calibration's role in auction economics, systematic debugging methodology.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies calibration and offline-online gap as possible causes.
+    \item \textbf{L6:} Explains the auction mechanism ($\text{pCTR} \times \text{bid}$), discusses how miscalibration affects advertiser budget pacing, proposes reliability plots.
+    \item \textbf{L7:} Considers second-order ecosystem effects (advertiser budget depletion, auction dynamics, ad diversity), proposes a systematic investigation framework with specific metrics to check at each step.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you fix the calibration?'' ``How do you prevent this from happening in future launches?'' ``What guardrail metrics would you add to the A/B test?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your recommendation model shows high engagement but users are churning. What is happening?}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+This is a \textit{metric misalignment} problem---the model is optimizing for a proxy (engagement) that has diverged from the true objective (long-term retention). Several mechanisms can cause this.
+
+\textbf{1. Engagement trap / attention hijacking.} The model has learned to recommend content that drives compulsive engagement (doomscrolling, outrage content, sensationalized clickbait) rather than content that leaves users satisfied. Users spend more time per session but feel worse afterward and eventually leave. This is common in social media and news feeds.
+
+\textbf{2. Filter bubble / echo chamber.} The model exploits known preferences so aggressively that recommendations become repetitive. Short-term engagement is high (users click on familiar content), but users get bored from lack of novelty and diverse discovery. Catalog coverage and diversity metrics would reveal this.
+
+\textbf{3. Recommending ``regrettable'' consumption.} Content the user clicks on but later regrets (e.g., time-wasting videos, low-quality articles). The model sees clicks and watch-time as positive signals, but the user's satisfaction is negative. Surveys or post-consumption signals (``was this worth your time?'') would reveal the gap.
+
+\textbf{4. Notification/re-engagement spam.} If the system drives engagement through aggressive notifications or re-engagement emails, users may engage when pulled back but resent the interruption, leading to eventual unsubscribe and churn.
+
+\textbf{Investigation.}
+\begin{itemize}
+    \item Segment churn analysis: which user segments are churning? New users (onboarding failure) or long-term users (fatigue)?
+    \item Content quality audit: what content types are being promoted? Measure quality indicators (completion rate, shares, saves vs.\ just clicks).
+    \item Diversity metrics: catalog coverage, intra-list diversity, novelty. Are these declining?
+    \item Satisfaction surveys: periodically ask users about recommendation quality. Compare survey responses between churning and retained cohorts.
+    \item Counterfactual analysis: compare engagement and retention between users who received the model's recommendations vs.\ a control group with more diverse recommendations.
+\end{itemize}
+
+\textbf{Fixes.}
+\begin{itemize}
+    \item Add long-term satisfaction signals to the objective function (e.g., predict 7-day return rate, not just session engagement).
+    \item Add diversity constraints to the re-ranking stage.
+    \item Implement a ``regret'' detector using post-consumption signals and penalize regrettable recommendations.
+    \item Use constrained optimization: maximize engagement subject to a minimum diversity and satisfaction threshold.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``The engagement is high so the model is working correctly'' (confuses proxy with objective)
+    \item Not considering the feedback loop between recommendations and user behavior
+    \item Proposing only technical fixes without considering the content quality dimension
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of Goodhart's Law in ML systems (``when a measure becomes a target, it ceases to be a good measure''), ability to reason about long-term vs.\ short-term tradeoffs, responsible AI awareness.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies the engagement-satisfaction gap, proposes adding diversity.
+    \item \textbf{L6:} Discusses specific mechanisms (filter bubble, regrettable consumption), proposes satisfaction metrics and counterfactual evaluation.
+    \item \textbf{L7:} Frames this as a fundamental metric alignment problem, proposes multi-objective optimization with explicit satisfaction constraints, discusses how to measure long-term user value, and considers the feedback loop between model behavior and content creator incentives.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you measure user satisfaction without surveys?'' ``How would you A/B test a change that improves long-term retention but reduces short-term engagement?'' ``What signals indicate a filter bubble?''
+\end{interviewq}
+
+% === Trade-off (2) ===
+
+\begin{interviewq}
+\textbf{Q: Two-Tower vs. interaction-based models for candidate generation---when would you use each?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+\textbf{Two-Tower (decomposed)} models encode users and items independently, then score via dot product. \textbf{Interaction-based} models (DLRM, DCN, DIN) take both user and item features as input and compute joint representations with cross-features and attention.
+
+\textbf{Two-Tower for candidate generation:}
+\begin{itemize}
+    \item Item embeddings are pre-computed offline and indexed in an ANN structure.
+    \item At serving time, only the user tower runs online, and the ANN retrieves top-K items in sub-millisecond time.
+    \item Scales to billions of items because the cost is independent of corpus size.
+    \item \textbf{Limitation}: Cannot model user-item interactions (no cross-features). The dot product is the only interaction, which limits expressiveness.
+\end{itemize}
+
+\textbf{Interaction-based for ranking:}
+\begin{itemize}
+    \item User and item features interact through cross networks, attention, and MLPs.
+    \item Much more expressive---can capture subtle patterns like ``this user prefers cheap items in this category but premium items in that category.''
+    \item \textbf{Limitation}: Cannot pre-compute item representations because the score depends on the user-item pair jointly. Must score each candidate individually.
+    \item Computationally infeasible for millions of candidates.
+\end{itemize}
+
+\textbf{Decision framework.}
+\begin{itemize}
+    \item \textbf{Candidate generation (10M $\rightarrow$ 1K)}: Two-Tower is the only viable option. The retrieval must be sub-linear in corpus size.
+    \item \textbf{Ranking (1K $\rightarrow$ 100)}: Interaction-based models are preferred for their expressiveness. The candidate set is small enough for joint scoring.
+    \item \textbf{Hybrid}: Some systems use a Two-Tower retrieval model enhanced with lightweight cross-features at the embedding level (e.g., query-item attention in the item tower during training). This improves retrieval quality without sacrificing serving efficiency.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Always use interaction-based models because they are more accurate'' (ignores computational constraints)
+    \item Not recognizing that the choice is driven by the computational budget at each pipeline stage
+    \item Conflating retrieval and ranking (they have fundamentally different constraints)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of the expressiveness-efficiency tradeoff, awareness that different pipeline stages have different computational budgets, practical recommendation system knowledge.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly identifies Two-Tower for retrieval and interaction-based for ranking, explains the computational reason.
+    \item \textbf{L6:} Discusses the expressiveness gap and how pre-ranking bridges it, mentions ANN indexing constraints.
+    \item \textbf{L7:} Considers hybrid approaches (cross-attention in the training loss but dot-product at serving), discusses how to improve Two-Tower quality (hard negatives, mixed negatives, knowledge distillation from the ranking model).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Can you make Two-Tower models more expressive without losing pre-computation?'' ``How do you generate hard negatives for Two-Tower training?'' ``What ANN algorithm would you use and why?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Shared-bottom vs. MMoE vs. PLE for multi-task ads modeling---give me a decision framework.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+The choice depends on the \textit{degree of task relatedness} and the \textit{number of tasks}.
+
+\textbf{Shared-bottom.} All tasks share a single feature extraction backbone, with task-specific output heads. Works well when tasks are highly correlated (e.g., predicting CTR and long-click-rate, which are nearly the same signal). Fails when tasks conflict---the shared representation becomes a poor compromise. Use when: $\leq$2 closely related tasks, or as a baseline.
+
+\textbf{MMoE.} Multiple shared expert sub-networks with per-task gating. Each task learns its own mixture of experts, enabling selective parameter sharing. The experts are all ``shared'' in that every task's gate has access to every expert. Works well for moderately related tasks (e.g., CTR + video completion rate). Limitation: with conflicting tasks, a dominant task's gradients can still capture most experts. Use when: 2--5 tasks with moderate correlation.
+
+\textbf{PLE.} Adds explicit task-specific experts alongside shared experts, organized in progressive layers. Each task has dedicated experts that other tasks cannot access, preventing expert capture. The shared experts handle common patterns while task-specific experts handle task-unique patterns. Use when: tasks have significant conflict (e.g., CTR + long-term satisfaction, which can be negatively correlated).
+
+\textbf{Decision framework:}
+\begin{enumerate}
+    \item \textbf{Compute task correlation.} If task labels have Pearson correlation $> 0.8$, shared-bottom is fine. If $0.3$--$0.8$, use MMoE. If $< 0.3$ or negative, use PLE.
+    \item \textbf{Monitor for negative transfer.} Train a shared-bottom model and per-task single-task models. If shared-bottom is worse than single-task for any task, you have negative transfer---upgrade to MMoE or PLE.
+    \item \textbf{Consider complexity.} PLE has more hyperparameters (number of shared experts, number of task-specific experts, number of extraction layers). Only pay this complexity cost when simpler architectures demonstrably suffer from task conflict.
+\end{enumerate}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Always use PLE because it is the most advanced'' (unnecessary complexity when tasks are aligned)
+    \item Not knowing what negative transfer is
+    \item Ignoring the diagnostic step (comparing multi-task vs.\ single-task baselines)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of the multi-task learning spectrum, ability to make principled architecture choices based on task properties, awareness of negative transfer and how to detect it.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Describes all three architectures correctly, states that PLE handles conflicts better.
+    \item \textbf{L6:} Provides the correlation-based decision framework, discusses negative transfer detection, mentions expert capture in MMoE.
+    \item \textbf{L7:} Discusses gradient-based diagnostics (cosine similarity of task gradients), proposes adaptive methods (gradient surgery, PCGrad), considers the interaction between multi-task architecture and the auction (each task's prediction quality affects revenue differently).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you weight the losses for different tasks?'' ``What is PCGrad and when would you use it?'' ``How do you decide the number of experts?''
+\end{interviewq}
+
+% === Conceptual (2) ===
+
+\begin{interviewq}
+\textbf{Q: Explain the sample selection bias problem in CVR prediction. How does ESMM solve it?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{The problem.} In ads, a conversion (purchase, install, sign-up) can only happen after a click. The natural approach is to train a CVR model on clicked impressions: $p(\text{conversion} | \text{click})$. The problem is that at serving time, the model must score \textit{all} impressions, not just clicked ones. The training distribution (clicked impressions) is a biased subset of the serving distribution (all impressions).
+
+Specifically, the CTR model acts as a gatekeeper: only impressions with high predicted CTR get clicked and enter the CVR training set. This means the CVR model never sees negative examples from the ``would not have been clicked'' region of feature space. It overfits to the patterns of clicked impressions and performs poorly on the full impression space.
+
+Additionally, the clicked impression set is much smaller than the full impression set, leading to a \textit{data sparsity} problem for CVR training.
+
+\textbf{ESMM's solution.} Instead of training CVR on clicked impressions, ESMM introduces an auxiliary task:
+\begin{equation}
+p(\text{conversion} | \text{impression}) = \underbrace{p(\text{click} | \text{impression})}_{\text{CTR task}} \times \underbrace{p(\text{conversion} | \text{click, impression})}_{\text{CVR task (implicit)}}
+\end{equation}
+
+Both the CTR task and the CTCVR task ($p(\text{conversion} | \text{impression})$) are trained on the \textit{entire impression space}. The CTR labels are available for all impressions (click or no click). The CTCVR labels are also available for all impressions (conversion or no conversion). The CVR prediction is never trained directly---it is obtained implicitly as CTCVR / CTR.
+
+\textbf{Why this works.}
+\begin{itemize}
+    \item Both tasks use the entire impression space, eliminating selection bias.
+    \item The CTR task provides a transfer learning signal to the shared embedding layer, improving representations for the sparser CTCVR task.
+    \item The multiplicative structure guarantees that $0 \leq p(\text{CVR}) \leq 1$ and that the relationship between CTR, CVR, and CTCVR is consistent.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just train CVR on all impressions with conversion labels'' (this naively labels all non-clicked impressions as non-conversions, which is correct but misses the point that the CVR model would have been biased had it only trained on clicks)
+    \item Confusing sample selection bias with class imbalance (they are different problems)
+    \item Not understanding why the training/serving distribution mismatch matters
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of a subtle but critical bias in ads ML, ability to explain the mathematical decomposition, awareness of how training distribution affects model quality.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly explains the bias and ESMM's decomposition.
+    \item \textbf{L6:} Discusses the data sparsity benefit, explains why the multiplicative structure is important, mentions the transfer learning benefit of shared embeddings.
+    \item \textbf{L7:} Discusses delayed conversions (the conversion label may not be available at training time due to attribution windows), proposes solutions (delayed feedback modeling, waiting periods), and considers alternative approaches (inverse propensity weighting on the clicked subset).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What if the CTR model is poorly calibrated---does this break ESMM?'' ``How do you handle delayed conversions in ESMM?'' ``What other biases exist in the training data besides selection bias?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why do recommendation models need calibration? What happens if pCTR is systematically over-confident?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+\textbf{Why calibration matters.} In a recommendation or ads system, the model's predicted probability is not just used for \textit{ranking}---it is used for \textit{decision-making}. Specifically:
+\begin{itemize}
+    \item \textbf{Auction pricing}: In ads, the ad rank score is $\text{pCTR} \times \text{bid}$, and the price charged to the advertiser is a function of pCTR. If pCTR is wrong, the pricing is wrong.
+    \item \textbf{Budget pacing}: Advertisers set daily budgets. The system estimates how much each impression will cost (based on pCTR) to pace spending evenly. Miscalibrated pCTR causes incorrect pacing.
+    \item \textbf{Threshold-based decisions}: Some systems use absolute probability thresholds (e.g., suppress ads with pCTR $< 0.001$). Miscalibration shifts which ads pass these thresholds.
+\end{itemize}
+
+\textbf{What happens if pCTR is systematically over-confident (e.g., 2$\times$ actual):}
+\begin{enumerate}
+    \item \textbf{Advertisers overpay.} The auction charges based on pCTR, so advertisers pay for clicks they are unlikely to receive. Ad ROI drops.
+    \item \textbf{Budget exhaustion.} Advertisers with daily budget caps burn through them faster (the system thinks each impression is more valuable than it is). Ads stop showing by mid-day, leaving inventory unfilled in the afternoon.
+    \item \textbf{Reduced fill rate.} With advertiser budgets exhausted early, fewer ads compete for impressions later in the day, reducing revenue.
+    \item \textbf{Advertiser churn.} Advertisers who consistently overpay relative to actual performance reduce their bids or leave the platform.
+    \item \textbf{Ranking preserved.} Note that if the over-confidence is uniform across all ads (e.g., all pCTRs are 2$\times$ too high), the \textit{ranking} is unchanged---the same ads win. The problem is entirely in the pricing and budgeting. This is why AUC (a ranking metric) can be high while revenue drops.
+\end{enumerate}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Calibration does not matter if the ranking is correct'' (in ads, pricing depends on absolute probabilities)
+    \item Not distinguishing between ranking quality and calibration quality
+    \item Thinking calibration is only a ``nice to have''
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of why calibration is revenue-critical in ads (not just a theoretical concern), ability to trace the downstream consequences of miscalibration through the auction system.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Explains that pCTR is used in pricing, gives the basic over-confidence consequence (advertisers overpay).
+    \item \textbf{L6:} Traces the full cascade (overpay $\rightarrow$ budget exhaustion $\rightarrow$ reduced fill rate $\rightarrow$ revenue drop), explains why AUC and calibration are orthogonal.
+    \item \textbf{L7:} Discusses continuous calibration monitoring (daily reliability plots), how calibration interacts with model updates and distribution shift, and proposes guardrail metrics (calibration error, revenue per impression) for model launches.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you measure calibration?'' ``What calibration method would you use and why?'' ``How often do you need to recalibrate?''
+\end{interviewq}
+
+\subsection{Feature Interaction Models}
+
+\begin{table}[H]
+\centering
+\caption{Feature interaction model comparison (comprehensive)}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Model} & \textbf{Interaction Type} & \textbf{Order} & \textbf{Complexity} \\
+\midrule
+FM & Factorized & 2nd order & $O(nk)$ \\
+DeepFM & FM + MLP & 2nd + implicit higher & Medium \\
+DCN & Cross network & Explicit up to $L$th & Low per layer \\
+DCN-v2 & Full-rank cross + MLP & Explicit up to $L$th & Medium \\
+DLRM & Pairwise dot product + MLP & 2nd + implicit higher & Medium \\
+AutoInt & Self-attention & Automatic & Higher \\
+\bottomrule
+\end{tabularx}
+\end{table}

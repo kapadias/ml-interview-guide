@@ -355,55 +355,383 @@ This works because embeddings capture relational structure, not just similarity.
 Static word embeddings (Word2Vec, GloVe) are rarely the right choice for modern applications. Always prefer contextual embeddings from pre-trained models. The main exception: when you need extremely fast, fixed-vocabulary lookup (e.g., a feature in a tabular model) or when operating in very low-resource settings.
 \end{warningbox}
 
+%==============================================================================
+\section{Tokenization and Embedding Interaction}
+\label{sec:tokenization_embedding}
+%==============================================================================
+
+\subsection{Subword Tokenization}
+
+Modern models use subword tokenization (BPE, WordPiece, SentencePiece) rather than word-level or character-level tokenization. This interacts directly with embedding quality.
+
+\textbf{BPE (Byte Pair Encoding)} iteratively merges the most frequent character pairs to build a vocabulary. A word like ``unhappiness'' might be tokenized as \texttt{[un, happi, ness]}.
+
+\begin{table}[H]
+\centering
+\caption{Tokenization strategy and embedding quality trade-offs}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Strategy} & \textbf{Advantages} & \textbf{Disadvantages} \\
+\midrule
+Word-level & Clean semantics per token & OOV problem, huge vocabulary \\
+Character-level & No OOV, tiny vocabulary & Long sequences, weak semantics per token \\
+BPE/WordPiece & No OOV, moderate vocab & Frequent words get single token; rare words get fragmented \\
+Byte-level (GPT-2+) & Universal across languages & Some tokens are meaningless byte sequences \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Vocabulary size trade-off}: Larger vocabularies mean more embedding parameters ($|V| \times d$) and more single-token representations (better per-token semantics), but also larger memory footprint and sparser training signal per token. Common sizes: 32K (GPT-2), 50K (BERT), 128K (LLaMA 3)---the trend is toward larger vocabularies as models scale.
+
+\textbf{Key interaction}: Rare words get split into many subword tokens. Each subword has its own embedding, and the model must compose them through attention layers to reconstruct the word's meaning. This means embedding quality for rare words depends on the model's depth and attention capacity, not just the embedding table itself.
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:embedding_questions}
+%==============================================================================
+
+%--- Rewritten Q1 ---
+
+\begin{interviewq}
+\textbf{Q: Your embedding space shows that unrelated items cluster together. Diagnose and fix.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+Unrelated items clustering together in embedding space means the model has failed to learn discriminative representations. I would diagnose the root cause before applying fixes.
+
+\textbf{Step 1: Characterize the failure.} Compute the average pairwise cosine similarity for random pairs---if it's $>0.8$, this is likely \textit{embedding collapse} (all embeddings converging to a similar region), not just local clustering errors. Plot the singular value spectrum of the embedding matrix: if the effective rank is much lower than the embedding dimension (e.g., 95\% of variance captured by 10 out of 768 dimensions), the embeddings have collapsed to a low-dimensional subspace.
+
+\textbf{Step 2: Check for collapse causes.} (a) \textit{Insufficient negative mining}: If contrastive training uses only random negatives, the model can achieve low loss by mapping everything to a general ``content'' region. Hard negatives force the model to make fine-grained distinctions. (b) \textit{Temperature too high}: In InfoNCE loss, $\loss = -\log \frac{\exp(\text{sim}^+/\tau)}{\sum \exp(\text{sim}/\tau)}$, a high $\tau$ makes the softmax ``softer,'' reducing the penalty for similar negative scores. Lower $\tau$ (e.g., 0.05--0.1) forces sharper discrimination. (c) \textit{Learning rate too high}: The model may have overshot to a degenerate minimum. (d) \textit{Batch size too small}: With in-batch negatives, small batches provide weak negative signal.
+
+\textbf{Step 3: Check for data issues.} (a) \textit{Duplicate or near-duplicate positives}: If the training data has many near-identical pairs labeled as positive, the model learns to cluster everything together. (b) \textit{Label noise}: Incorrect positive labels (unrelated items paired together) directly teach the model to cluster unrelated items. Audit a random sample of training pairs. (c) \textit{Distributional imbalance}: If 80\% of items belong to one category, the model may learn a representation dominated by that category.
+
+\textbf{Fixes, in order of effort:} (1) Add hard negatives (BM25 or model-mined). (2) Lower the temperature ($\tau$). (3) Increase batch size for more in-batch negatives. (4) Add a uniformity loss term (VICReg-style) that penalizes embeddings for being too similar. (5) Apply L2 normalization to the embedding output to project onto the unit hypersphere. (6) Clean the training data.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just increase the embedding dimension''---dimension doesn't help if the model collapses to a low-rank subspace.
+    \item ``Retrain with more data''---this doesn't address the structural cause (collapse, bad negatives, label noise).
+    \item Not distinguishing between full collapse (all items cluster) and partial failure (specific categories cluster wrongly).
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systematic embedding debugging methodology---can you move from symptom (bad clusters) to diagnosis (collapse vs. data issue vs. training issue) to targeted fix, rather than guessing?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies embedding collapse as a likely cause, proposes hard negatives and temperature tuning.
+    \item \textbf{L6:} Uses singular value analysis to characterize the collapse, distinguishes between global collapse and local clustering errors, and proposes uniformity-based regularization (VICReg, Barlow Twins).
+    \item \textbf{L7:} Connects to the theory of representation learning---the uniformity-alignment framework (Wang \& Isola, 2020) where good embeddings need both alignment (similar items close) and uniformity (embeddings spread over the hypersphere). Proposes monitoring both metrics during training as early-warning signals.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you detect collapse early during training?'' ``What is the uniformity-alignment trade-off?'' ``How does the VICReg loss prevent collapse without negatives?''
+\end{interviewq}
+
+%--- Rewritten Q2 ---
+
+\begin{interviewq}
+\textbf{Q: Design an embedding system for a product catalog with 100M items.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+This requires end-to-end design: data, model, training, serving, and update strategy.
+
+\textbf{Data and features.} Each product has: title (text), description (text), images, category taxonomy, price, attributes (brand, size, color). The embedding should capture multi-modal product semantics for downstream tasks (search, recommendation, duplicate detection).
+
+\textbf{Model architecture.} I would use a two-tower approach with multi-modal fusion. For the text tower: a pre-trained sentence encoder (E5 or BGE) processes the concatenated title + description. For the image tower: a ViT or CLIP image encoder processes the primary product image. Fuse with a lightweight cross-attention layer or simple concatenation + projection to produce a final 256-dim product embedding (256-dim is a practical trade-off for 100M items---lower dimension reduces index size).
+
+\textbf{Training.} Use contrastive learning with multiple signal types: (a) co-purchase pairs as positives (users who bought A also bought B), (b) co-click pairs (weaker positive signal, weight accordingly), (c) same-category random items as semi-hard negatives, (d) random items as easy negatives. Mixed negative strategy with in-batch negatives + 20\% mined hard negatives. Train with InfoNCE loss, $\tau = 0.07$.
+
+\textbf{Memory estimation.} 100M items $\times$ 256 dims $\times$ 4 bytes (FP32) = 100 GB. With FP16: 50 GB. With product quantization (PQ): $\sim$12 GB (96 bytes per vector). A single high-memory machine can handle this; for redundancy, shard across 4 machines.
+
+\textbf{Serving.} HNSW index for approximate nearest neighbor retrieval. Build time: $\sim$hours for 100M vectors. Query latency: $<$5ms for top-100 retrieval. Use Faiss or Milvus as the vector database. Separate the embedding computation (model inference) from the retrieval (ANN lookup)---cache product embeddings and recompute only when products are updated.
+
+\textbf{Update strategy.} New products: compute embedding on ingestion, insert into ANN index (HNSW supports incremental inserts). Model retraining: weekly, with full re-indexing. Monitor embedding drift: compare the distribution of new embeddings against historical ones; large drift signals a data distribution change.
+
+\textbf{Scaling considerations.} (a) Matryoshka embeddings: train with a Matryoshka loss so embeddings can be truncated to 128-dim for coarse retrieval, then use full 256-dim for re-ranking. (b) Tiered storage: hot items (top 10M by traffic) in memory, cold items on SSD with IVF-PQ. (c) Regional sharding for global catalogs.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Using a cross-encoder for 100M items---this doesn't scale for retrieval.
+    \item Not estimating memory and serving latency---this is an engineering interview, numbers matter.
+    \item Ignoring the update strategy---product catalogs change daily.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} End-to-end system design thinking---not just the model but the data pipeline, training strategy, serving infrastructure, and operational considerations for a real-world embedding system at scale.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Proposes a reasonable model and training approach, mentions ANN indexing.
+    \item \textbf{L6:} Adds memory estimation, discusses multi-modal fusion, proposes an update strategy, and mentions Matryoshka embeddings for flexible dimensionality.
+    \item \textbf{L7:} Designs for operational reality---tiered storage for hot/cold items, monitoring for embedding drift, A/B testing framework for embedding model updates, and discusses how embedding changes ripple through downstream systems (search quality, recommendations, ad targeting).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you evaluate embedding quality offline before deploying?'' ``How do you handle cold-start items with no interaction data?'' ``What happens when the embedding model is updated but the ANN index still has old embeddings?''
+\end{interviewq}
+
+%--- New Q3 ---
+
+\begin{interviewq}
+\textbf{Q: Static vs contextual embeddings---when would you still use static embeddings?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+Static embeddings (Word2Vec, GloVe, FastText) assign a single fixed vector per word regardless of context. Contextual embeddings (BERT, GPT, etc.) produce different vectors for the same word depending on surrounding tokens. Contextual embeddings are generally superior for NLP tasks, but static embeddings still have legitimate use cases.
+
+\textbf{When static embeddings are preferable:}
+
+(1) \textbf{Feature inputs to non-NLP models.} When words are features in a tabular model (e.g., product brand name as a feature in a gradient-boosted tree), you need a fixed-dimensional vector per word. A static embedding lookup is $O(1)$, while BERT requires a full forward pass. For a recommendation system processing millions of events per second, static embeddings for categorical features are practical; BERT is not.
+
+(2) \textbf{Extremely low-latency requirements.} Static embeddings are a single lookup: load the embedding table into memory, index by word ID. Latency is microseconds. Contextual embeddings require model inference (milliseconds to tens of milliseconds). For applications like autocomplete suggestions with $<$1ms budget, static embeddings are the only option.
+
+(3) \textbf{Edge/mobile deployment.} A FastText model with 50K words at 100 dimensions is $\sim$20 MB. A distilled BERT is $\sim$250 MB. For on-device NLP with strict memory constraints, static embeddings fit.
+
+(4) \textbf{Morphologically rich languages with limited data.} FastText embeddings decompose words into character n-grams, so they handle out-of-vocabulary words (new morphological forms) gracefully without any fine-tuning data. This is valuable for low-resource languages where you can't fine-tune BERT.
+
+(5) \textbf{Initialization for downstream models.} Pre-trained static embeddings can initialize embedding layers in custom architectures where you don't want to use a full Transformer backbone (e.g., lightweight text classification models, RNN-based sequence taggers in constrained environments).
+
+\textbf{When to always use contextual:} Any task where word sense disambiguation matters (most NLP tasks), sentence-level understanding is needed, or quality is prioritized over latency/cost.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Static embeddings are obsolete''---this ignores real production constraints.
+    \item ``Use BERT for everything''---this is impractical for high-throughput or low-resource settings.
+    \item Not mentioning FastText's morphological advantage for OOV words.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Practical engineering judgment---knowing when the ``best'' approach is not the right approach due to constraints, and being able to articulate the trade-off clearly.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Names 2--3 scenarios with clear reasoning (latency, memory, features for tabular models).
+    \item \textbf{L6:} Adds the FastText morphological advantage, discusses how to distill contextual embeddings into static ones (compute BERT embeddings offline, then use as fixed features), and mentions that many production systems use static embeddings as a first-pass feature with contextual models only in later stages.
+    \item \textbf{L7:} Discusses hybrid architectures (static embeddings for candidate generation at million-QPS, contextual for re-ranking at thousand-QPS), and the cost-quality Pareto frontier across the embedding complexity spectrum.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you distill contextual embeddings into static ones?'' ``Can you get contextual-like quality with static embedding techniques?'' ``How do you handle polysemy with static embeddings?''
+\end{interviewq}
+
+%--- New Q4 ---
+
+\begin{interviewq}
+\textbf{Q: Estimate the memory for an embedding table with 50K vocab, 768 dimensions in FP16 vs INT8.}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{FP32 (baseline for reference):} $50{,}000 \times 768 \times 4$ bytes = $50{,}000 \times 3{,}072$ = 153,600,000 bytes $\approx$ \textbf{146.5 MB}.
+
+\textbf{FP16:} $50{,}000 \times 768 \times 2$ bytes = 76,800,000 bytes $\approx$ \textbf{73.2 MB}. Half the FP32 size---this is the standard for most model serving.
+
+\textbf{INT8:} $50{,}000 \times 768 \times 1$ byte = 38,400,000 bytes $\approx$ \textbf{36.6 MB}. Plus quantization parameters: for per-row quantization (one scale and zero-point per vocabulary entry), add $50{,}000 \times 2 \times 4$ bytes (scale + zero-point in FP32) = 400 KB---negligible overhead.
+
+\textbf{Practical context:} A 50K vocab at 768-dim is small (BERT-sized). For modern LLMs with 128K vocab and 4096-dim embeddings: $128{,}000 \times 4{,}096 \times 2$ bytes (FP16) = 1.05 GB just for the embedding table. This is why LLMs often tie input and output embedding weights (saving one copy) and why vocabulary size is a significant architectural decision.
+
+\textbf{Memory beyond the embedding table:} In production, the embedding table is often a small fraction of total memory. The dominant costs are: (1) model weights (for a 7B model, $\sim$14 GB in FP16), (2) KV cache during inference ($\sim$1--4 GB depending on batch size and sequence length), (3) activation memory during training. The embedding table matters most when it's the primary artifact---e.g., in a pure retrieval system where you store embeddings for millions of items in a vector database.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Getting the byte sizes wrong: FP32 = 4 bytes, FP16/BF16 = 2 bytes, INT8 = 1 byte.
+    \item Forgetting quantization overhead (scale/zero-point per group or per row).
+    \item Not contextualizing the estimate---73 MB is nothing for a GPU, but matters for edge deployment.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Back-of-envelope calculation skills, understanding of precision formats, and ability to put numbers in practical context.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correct calculation for FP16 and INT8, with clear arithmetic.
+    \item \textbf{L6:} Adds quantization parameter overhead, scales the calculation to modern LLM vocabulary sizes, and discusses weight tying.
+    \item \textbf{L7:} Discusses practical deployment implications---how embedding table size interacts with model parallelism (embedding tables are often replicated across all GPUs), how vocabulary size affects throughput (larger softmax over vocabulary), and the trade-off between vocabulary size and sequence length for a fixed compute budget.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How does the output embedding (LM head) relate to the input embedding?'' ``What is weight tying and why is it used?'' ``How would you quantize an embedding table without losing retrieval quality?''
+\end{interviewq}
+
+%--- New Q5 ---
+
+\begin{interviewq}
+\textbf{Q: What is embedding collapse and how do you detect/prevent it?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Definition.} Embedding collapse occurs when a learned embedding function maps all (or most) inputs to a small region of the embedding space, losing discriminative power. In the extreme case, all embeddings converge to a single point. In milder forms, embeddings occupy a low-dimensional subspace of the full embedding space (dimensional collapse).
+
+\textbf{Why it happens.} Collapse is a \textit{degenerate global minimum} of many loss functions. Consider a contrastive loss: if all embeddings are identical, the positive similarity and negative similarity are both maximal and equal, so the loss is $-\log(1/N)$---a constant. The model can reach this state by learning a constant function, which is easier than learning discriminative features. Collapse typically occurs when the loss doesn't have sufficient repulsive forces to push embeddings apart.
+
+\textbf{Types of collapse:}
+\begin{itemize}
+    \item \textbf{Complete collapse}: All embeddings map to (approximately) the same vector. Cosine similarity between random pairs is $>0.99$.
+    \item \textbf{Dimensional collapse}: Embeddings use only a few dimensions of the available space. The embedding matrix has low effective rank. Detected by SVD: if the top $k \ll d$ singular values capture $>95\%$ of variance, the embeddings are effectively $k$-dimensional.
+    \item \textbf{Cluster collapse}: Embeddings collapse into a few clusters regardless of true semantic categories. All items within each cluster are indistinguishable.
+\end{itemize}
+
+\textbf{Detection metrics:}
+\begin{enumerate}
+    \item \textbf{Average pairwise cosine similarity}: Sample 10K random pairs; healthy range is 0.0--0.3; $>$0.7 signals collapse.
+    \item \textbf{Singular value spectrum}: Compute SVD of the embedding matrix. Plot singular values on a log scale. A sharp drop-off (first few singular values dominate) indicates dimensional collapse.
+    \item \textbf{Uniformity metric} (Wang \& Isola, 2020): $\mathcal{L}_{\text{uniform}} = \log \E[\exp(-2\|\vz_i - \vz_j\|^2)]$. More negative = more uniform distribution on the hypersphere = healthier embeddings.
+    \item \textbf{Downstream task performance}: If training loss looks fine but downstream recall/accuracy doesn't improve, collapse is likely.
+\end{enumerate}
+
+\textbf{Prevention strategies:}
+\begin{itemize}
+    \item \textbf{Contrastive losses with sufficient negatives}: InfoNCE with large batch sizes and hard negatives creates strong repulsive forces.
+    \item \textbf{Explicit decorrelation}: Barlow Twins loss penalizes off-diagonal elements of the cross-correlation matrix. VICReg adds explicit variance, invariance, and covariance regularization terms.
+    \item \textbf{Asymmetric architectures}: BYOL and SimSiam avoid collapse through predictor networks and stop-gradient operations, even without negatives.
+    \item \textbf{L2 normalization}: Projecting to the unit hypersphere prevents magnitude collapse. Combined with temperature scaling, this is standard practice.
+    \item \textbf{Batch normalization on projections}: BN in the projection head (SimCLR) implicitly decorrelates dimensions, resisting dimensional collapse.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Collapse means the model is underfitting''---collapse is a specific pathology of the embedding space geometry, not general underfitting.
+    \item ``More training data prevents collapse''---collapse is a property of the loss function and architecture, not data quantity.
+    \item Not distinguishing between complete collapse and dimensional collapse---they have different causes and fixes.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Whether you understand the geometry of embedding spaces, can identify the degenerate solutions that loss functions admit, and know practical tools for detection and prevention.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Defines collapse, explains why it's a problem, and proposes contrastive loss with hard negatives as prevention.
+    \item \textbf{L6:} Distinguishes between complete and dimensional collapse, uses SVD for diagnosis, and knows about VICReg/Barlow Twins decorrelation losses.
+    \item \textbf{L7:} Explains why BYOL/SimSiam avoid collapse without negatives (the predictor + stop-gradient creates an implicit negative force), connects to the uniformity-alignment framework, and discusses how to monitor collapse risk in production embedding training pipelines.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Why doesn't BYOL collapse even without negative samples?'' ``What is the role of the projection head in preventing collapse?'' ``How does temperature in contrastive loss affect the collapse risk?''
+\end{interviewq}
+
+%--- New Q6 ---
+
+\begin{interviewq}
+\textbf{Q: How does subword tokenization (BPE) interact with embedding quality?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+Subword tokenization (BPE, WordPiece, SentencePiece) determines the granularity at which embeddings are learned, and this has direct consequences for embedding quality.
+
+\textbf{Frequency-quality correlation.} Frequent words get single tokens (``the,'' ``is'') and therefore have dedicated embedding vectors trained on millions of examples. Rare words get split into multiple subword tokens (``photosynthesis'' $\to$ \texttt{[photo, synth, esis]}). Each subword has its own embedding, but the model must \textit{compose} them through subsequent layers (attention, FFN) to reconstruct the word's meaning. This composition is lossy---the model has seen fewer training examples of this specific combination, so the composed representation is noisier.
+
+\textbf{Vocabulary size trade-off.} Larger vocabularies (128K in LLaMA 3 vs. 32K in GPT-2) mean more words get single-token representations. Benefits: better per-token semantics, shorter sequences (fewer tokens per text $\to$ fits more context in the window, faster inference). Costs: larger embedding table (more parameters, more memory), each token seen less frequently during training (sparser signal). The optimal vocabulary size depends on the training data size---more data can support a larger vocabulary.
+
+\textbf{Embedding quality impacts by token type:}
+\begin{itemize}
+    \item \textit{Common words} (single token): High-quality embeddings---many training examples, clear semantic signal.
+    \item \textit{Subword fragments} (``un,'' ``ing,'' ``tion''): Embeddings capture morphological/syntactic patterns rather than standalone semantics. Quality depends on how consistently the fragment is used across contexts.
+    \item \textit{Rare/domain-specific words} (multi-token): Quality depends on the composition mechanism. Transformers handle this better than RNNs because attention can directly connect all subword tokens.
+    \item \textit{Non-English and code tokens}: Often heavily fragmented in English-centric tokenizers, leading to poor per-token embeddings and longer sequences. Multilingual tokenizers (SentencePiece trained on diverse data) mitigate this.
+\end{itemize}
+
+\textbf{Practical implications for embedding-based retrieval:} (1) If your domain has specialized vocabulary (medical terms, product names, code identifiers), the tokenizer may fragment these heavily, degrading retrieval quality. Fine-tuning on domain data helps because the model learns to compose these fragments correctly. (2) For sentence embeddings, the pooling strategy interacts with tokenization---mean pooling over many fragment tokens dilutes the semantic signal compared to pooling over fewer whole-word tokens.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``BPE is just about handling OOV words''---it fundamentally shapes the embedding space structure.
+    \item ``Larger vocabulary is always better''---there's a data-dependent optimal size.
+    \item Not knowing that BPE tokenization affects non-English languages disproportionately (more fragmentation $\to$ longer sequences $\to$ worse quality).
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of how the tokenization layer---often treated as a black box---directly impacts the learned representations and downstream task quality.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Explains the frequency-quality correlation and the vocabulary size trade-off.
+    \item \textbf{L6:} Discusses the composition mechanism (how Transformers reconstruct word meaning from fragments), the impact on retrieval quality, and multilingual tokenization issues.
+    \item \textbf{L7:} Connects to recent work on byte-level models (MegaByte, byte-pair models) that bypass tokenization entirely, discusses how tokenizer-free approaches change the embedding quality landscape, and addresses the interaction between tokenization and compute efficiency (fewer tokens $\to$ cheaper training but potentially worse per-token embeddings).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you choose vocabulary size for a new language model?'' ``How does tokenization affect multilingual models?'' ``What are Matryoshka embeddings and how do they address the dimension trade-off?''
+\end{interviewq}
+
+%--- New Q7 ---
+
 \begin{interviewq}
 \textbf{Q: How would you debug poor embedding quality?}
 
-\textbf{What the interviewer is testing:} Systematic debugging methodology, understanding of embedding space geometry.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} I would investigate systematically:
+\textbf{Strong answer:}
 
-\begin{enumerate}
-    \item \textbf{Visualize}: t-SNE/UMAP to check if similar items cluster
+I would investigate in a systematic order, moving from cheap diagnostics to more expensive ones.
 
-    \item \textbf{Check for collapse}:
-    \begin{itemize}
-        \item Compute average pairwise cosine similarity (should be moderate, not high)
-        \item Plot singular value distribution (should decay gradually)
-    \end{itemize}
+\textbf{Step 1: Visualize.} Use UMAP (preferred over t-SNE for preserving global structure) to project embeddings to 2D. Check if semantically similar items form clusters and if dissimilar items are separated. Color-code by known categories. If the visualization shows no meaningful structure, the embeddings are fundamentally broken.
 
-    \item \textbf{Nearest neighbor analysis}: Do nearest neighbors make semantic sense?
+\textbf{Step 2: Quantitative cluster analysis.} Compute average intra-class cosine similarity (should be high, e.g., $>0.6$) and inter-class cosine similarity (should be low, e.g., $<0.3$). If both are high, this is embedding collapse. If both are moderate, the embeddings are under-trained. If intra-class is low, the model hasn't learned category-level structure---check training data quality.
 
-    \item \textbf{Downstream task}: Evaluate on simple task (classification with frozen embeddings)
+\textbf{Step 3: Nearest neighbor sanity check.} For 50--100 diverse query items, retrieve the top-10 nearest neighbors by cosine similarity. Manually inspect: do neighbors make semantic sense? Are there systematic errors (e.g., neighbors always share surface keywords but not deeper meaning)? This catches both embedding quality issues and similarity metric issues.
 
-    \item \textbf{Training diagnostics}:
-    \begin{itemize}
-        \item Loss curves (is loss actually decreasing?)
-        \item Gradient norms (vanishing/exploding?)
-        \item Learning rate (too high/low?)
-    \end{itemize}
-\end{enumerate}
+\textbf{Step 4: Singular value analysis.} Compute SVD of a sample embedding matrix. If the singular value spectrum drops off sharply (top 5\% of dimensions capture $>90\%$ of variance), the embeddings suffer from dimensional collapse---they aren't using the full representational capacity.
 
-\textbf{Common follow-ups:} ``What does embedding collapse look like?'' (All embeddings cluster near a single point; cosine similarity $>$ 0.9 for random pairs.) ``How do you fix it?'' (Add contrastive loss, increase negative sampling, check temperature.)
+\textbf{Step 5: Downstream task evaluation.} Test embeddings on a simple proxy task (k-NN classification with frozen embeddings). If proxy performance is poor, the embeddings don't capture relevant features. If proxy performance is good but the actual downstream task is poor, the issue is in the downstream model, not the embeddings.
+
+\textbf{Step 6: Training diagnostics.} Check loss curves (is loss still decreasing?), gradient norms (vanishing/exploding?), and learning rate schedule. If using contrastive learning, monitor the temperature parameter---too high ($>0.5$) makes the loss too easy, too low ($<0.01$) can cause instability.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Jumping to ``retrain with more data'' before diagnosing the actual issue.
+    \item Only using t-SNE visualization---this doesn't preserve global structure and can be misleading.
+    \item Not computing quantitative metrics---``the UMAP looks fine'' is not a diagnosis.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systematic debugging methodology for embedding spaces, understanding of embedding geometry (cosine similarity, singular values, dimensionality), and the ability to distinguish between different failure modes.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Proposes visualization + nearest neighbor check + downstream evaluation.
+    \item \textbf{L6:} Adds quantitative metrics (intra/inter-class similarity, singular value analysis), distinguishes between collapse and underfitting, and checks training diagnostics.
+    \item \textbf{L7:} Proposes a monitoring pipeline that runs these diagnostics automatically during training (not just post-hoc), and discusses how embedding quality metrics should be integrated into model release gates.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What does embedding collapse look like in UMAP?'' ``How do you distinguish between bad embeddings and a bad evaluation metric?'' ``How would you set up automated embedding quality monitoring?''
 \end{interviewq}
+
+%--- New Q8 ---
 
 \begin{interviewq}
 \textbf{Q: You need to build a semantic search system. How do you choose and evaluate embeddings?}
 
-\textbf{What the interviewer is testing:} Practical embedding selection for production systems, evaluation methodology.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} Embedding selection for search:
+\textbf{Strong answer:}
 
-\begin{enumerate}
-    \item \textbf{Start with a strong pre-trained model}: E5, BGE, or GTE --- these are instruction-tuned for retrieval and outperform vanilla BERT/sentence-BERT on most benchmarks.
+\textbf{Step 1: Start with strong baselines.} Modern instruction-tuned embedding models (E5, BGE, GTE, Cohere Embed) outperform vanilla BERT and Sentence-BERT on retrieval benchmarks (MTEB). Start with the top-ranked model on MTEB that fits your latency and memory budget. For most use cases, a 768-dim model producing normalized embeddings with cosine similarity is the default choice.
 
-    \item \textbf{Evaluate on your domain}: General benchmarks (MTEB) may not reflect your data. Construct a small evaluation set with relevance labels from your domain.
+\textbf{Step 2: Evaluate on your domain.} General benchmarks (MTEB) may not reflect your specific data distribution. Create a domain-specific evaluation set: 200--500 queries with human-annotated relevant documents (relevance grades: 0/1/2 or more). Compute Recall@K (can the system find relevant docs in top K?), NDCG@K (are they ranked correctly?), and MRR (how early does the first relevant result appear?).
 
-    \item \textbf{Key metrics}: Recall@K (can the system find relevant docs?), NDCG (are they ranked correctly?), latency (can you serve it?).
+\textbf{Step 3: Decide on fine-tuning.} If off-the-shelf recall@100 is $<$80\% on your domain evaluation set, fine-tune. Even a small amount of labeled data (1K--5K query-document pairs) significantly improves domain-specific performance. Use contrastive learning with hard negatives mined from BM25 retrieval. If labeled data is scarce, try GPL (Generative Pseudo-Labeling): generate synthetic queries for your documents using an LLM, then train contrastively.
 
-    \item \textbf{Fine-tune if needed}: If off-the-shelf performance is insufficient, fine-tune with contrastive learning on your domain data. Even 1K labeled pairs can significantly improve domain-specific retrieval.
+\textbf{Step 4: Dimension trade-off.} Higher dimensions capture more information but increase storage ($N \times d \times \text{bytes}$) and ANN index latency. Standard: 768-dim. For massive scale ($>$100M docs): use Matryoshka embeddings which allow truncation to 256 or 128 dimensions at inference time with graceful quality degradation, or use product quantization (PQ) to compress each vector. Evaluate quality at each dimension to find the knee of the quality-cost curve.
 
-    \item \textbf{Dimension trade-off}: Higher dimensions capture more information but increase storage and latency. 768-dim is common; Matryoshka embeddings let you truncate dimensions at inference time.
-\end{enumerate}
+\textbf{Step 5: Similarity metric selection.} If embeddings are L2-normalized (most modern models do this by default), cosine similarity equals dot product, and dot product is faster for ANN search. If embeddings are not normalized, cosine similarity is more robust (invariant to embedding magnitude). In practice: normalize during indexing and use dot product at query time.
 
-\textbf{Common follow-ups:} ``Cosine vs dot product for retrieval?'' (Cosine if embeddings are not normalized; dot product if you normalize during indexing.) ``How do you handle updates to the embedding model?'' (Full re-indexing, or use adaptor layers.)
+\textbf{Step 6: End-to-end evaluation.} Don't evaluate embeddings in isolation. Test the full pipeline (embedding + ANN index + optional reranker) because ANN approximation introduces recall loss, and a reranker can compensate for embedding weaknesses. The system-level metric (e.g., user click-through rate) is what ultimately matters.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Use BERT embeddings''---vanilla BERT's [CLS] token is a poor sentence embedding without fine-tuning (Sentence-BERT showed this).
+    \item Evaluating only on perplexity or training loss---retrieval quality must be measured with retrieval metrics.
+    \item Not considering the ANN index's recall loss as part of the evaluation.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Practical embedding selection methodology, ability to evaluate end-to-end, and awareness of the trade-offs between quality, latency, and cost in a production retrieval system.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Recommends a strong pre-trained model, evaluates on domain data, and fine-tunes if needed.
+    \item \textbf{L6:} Adds dimension trade-off analysis, Matryoshka embeddings, and the distinction between embedding-level and system-level evaluation. Discusses GPL for low-resource fine-tuning.
+    \item \textbf{L7:} Designs the evaluation as an ongoing process (not one-time): embedding A/B tests in production, monitoring for query distribution drift, and a feedback loop where user interactions improve the embedding model over time.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Cosine vs dot product for retrieval---when do they differ?'' ``How do you handle updates to the embedding model in production?'' ``What is Matryoshka training and why is it useful?''
 \end{interviewq}

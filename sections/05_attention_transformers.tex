@@ -675,17 +675,33 @@ where $m = \max_j x_j$. Can be computed incrementally as blocks arrive.
 \begin{interviewq}
 \textbf{Q: Explain Flash Attention. Why is it faster even though it does the same computation?}
 
-\textbf{What the interviewer is testing:} Understanding of hardware-aware algorithm design, memory hierarchy (SRAM vs HBM), and the difference between compute-bound and memory-bound operations.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} Flash Attention computes \textit{exactly} the same result as standard attention, but reorganizes the computation to minimize memory I/O:
+\textbf{Strong answer:} Flash Attention computes \textit{exactly} the same result as standard attention, but reorganizes the computation to minimize memory I/O:
 
 \begin{enumerate}
-    \item \textbf{Problem}: Standard attention materializes the full $n \times n$ matrix in slow HBM memory. The bottleneck is reading/writing this matrix, not computing it.
-    \item \textbf{Solution}: Process attention in tiles that fit in fast SRAM. Use the online softmax trick to compute exact softmax incrementally without ever materializing the full matrix.
-    \item \textbf{Result}: Memory drops from $O(n^2)$ to $O(n)$. Speed improves 2-4$\times$ because operations become compute-bound rather than memory-bound.
+    \item \textbf{Problem}: Standard attention materializes the full $n \times n$ matrix in slow HBM memory (40 GB on A100, $\sim$2 TB/s bandwidth). The bottleneck is reading/writing this matrix, not computing it---attention is memory-bound, not compute-bound.
+    \item \textbf{Solution}: Process attention in tiles that fit in fast SRAM (20 MB on A100, $\sim$19 TB/s bandwidth). Use the online softmax trick to compute exact softmax incrementally without ever materializing the full matrix. Each tile computes a partial softmax, maintaining running max and sum statistics that get corrected as new tiles arrive.
+    \item \textbf{Result}: Memory drops from $O(n^2)$ to $O(n)$. Speed improves 2--4$\times$ because operations become compute-bound rather than memory-bound. Enables longer sequences that would otherwise OOM.
 \end{enumerate}
 
-\textbf{Common follow-ups:} ``What's the online softmax trick?'' ``When would Flash Attention NOT help?'' (Small sequences where attention isn't the bottleneck.)
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Flash Attention is an approximation'' --- it computes the \textit{exact} same result
+    \item ``It reduces the number of FLOPs'' --- the FLOPs are identical; the speedup comes from reduced memory I/O
+    \item Not knowing about SRAM vs HBM distinction
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of hardware-aware algorithm design, memory hierarchy (SRAM vs HBM), and the difference between compute-bound and memory-bound operations.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Explains the tiling approach and that it's exact, not approximate. Knows memory drops from $O(n^2)$ to $O(n)$.
+    \item \textbf{L6:} Can explain the online softmax trick, knows the SRAM/HBM sizes on A100, understands the arithmetic intensity shift from memory-bound to compute-bound. Mentions Flash Attention 2 improvements (better parallelism, causal masking optimization).
+    \item \textbf{L7:} Discusses implications for system design: Flash Attention changes which operations are the bottleneck (now FFN, not attention). Knows that FA doesn't help for decode phase (which is memory-bound for a different reason: loading model weights, not attention matrix). Can reason about when IO-aware algorithms matter beyond attention.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What's the online softmax trick?'' ``When would Flash Attention NOT help?'' (Small sequences where attention isn't the bottleneck; decode phase where the bottleneck is weight loading, not attention matrix.) ``What changed in Flash Attention 2 vs 1?'' (Better work partitioning across thread blocks, reduced non-matmul FLOPs.)
 \end{interviewq}
 
 %==============================================================================
@@ -829,60 +845,690 @@ With $f=4$: FLOPs per layer $\approx 24nd^2 + 4n^2d$
 \begin{interviewq}
 \textbf{Q: Estimate the memory required to train a 7B parameter model with batch size 1, sequence length 2048.}
 
-\textbf{What the interviewer is testing:} Can you do back-of-envelope calculations for ML systems? Do you know the memory components of training (parameters, gradients, optimizer states, activations)?
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} Memory components:
+\textbf{Strong answer:} Break it into four components:
+
 \begin{enumerate}
-    \item \textbf{Parameters}: 7B $\times$ 4 bytes (FP32) = 28 GB
-    \item \textbf{Gradients}: 7B $\times$ 4 bytes = 28 GB
-    \item \textbf{Optimizer states (Adam)}: 7B $\times$ 8 bytes = 56 GB (momentum + variance)
-    \item \textbf{Activations}: Roughly 2--4$\times$ parameter count for typical models $\approx$ 56--112 GB
+    \item \textbf{Parameters}: 7B $\times$ 2 bytes (BF16) = 14 GB
+    \item \textbf{Gradients}: 7B $\times$ 2 bytes (BF16) = 14 GB
+    \item \textbf{Optimizer states (AdamW)}: Master weights in FP32 (7B $\times$ 4 = 28 GB) + momentum (7B $\times$ 4 = 28 GB) + variance (7B $\times$ 4 = 28 GB) = 84 GB
+    \item \textbf{Activations}: For a 32-layer model with $d=4096$, seq=2048, batch=1: each layer stores attention input, QKV projections, attention scores, FFN intermediates. Roughly $\sim$34 \textrm{bytes/param} $\times$ seq $\times$ batch for typical Transformers $\approx$ 16--30 GB (highly dependent on checkpointing)
 \end{enumerate}
 
-Total: ~168-224 GB minimum
+\textbf{Total}: $\sim$130--140 GB without gradient checkpointing. With mixed-precision training (BF16 compute, FP32 master weights).
 
-\textbf{Solutions for limited memory}:
+\textbf{To fit on 1$\times$ A100 80GB}: Need ZeRO-3 (shard optimizer states + gradients + params across GPUs), or at minimum ZeRO-2 + gradient checkpointing on 2$\times$ A100.
+
+\textbf{Red flags} (what NOT to say):
 \begin{itemize}
-    \item Mixed precision (FP16/BF16): Halves parameter/gradient memory
-    \item Gradient checkpointing: Trade compute for activation memory
-    \item ZeRO: Distribute optimizer states across GPUs
-    \item Gradient accumulation: Smaller effective batch size per step
+    \item ``7B $\times$ 4 bytes = 28 GB, so 28 GB total'' --- forgetting gradients, optimizer states, and activations
+    \item Not knowing that Adam stores 2 extra copies (momentum + variance) per parameter
+    \item Saying ``just use FP16'' without mentioning the optimizer states still need FP32
 \end{itemize}
+
+\textbf{What the interviewer is testing:} Can you do back-of-envelope calculations for ML systems? Do you know the memory breakdown of training? Can you reason about what fits on which hardware?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies all 4 memory components. Gets the right order of magnitude (>100 GB). Mentions mixed precision as a solution.
+    \item \textbf{L6:} Gives precise byte counts per component. Knows Adam has 12 bytes/param overhead (FP32 master + momentum + variance). Can recommend specific ZeRO stages. Knows gradient checkpointing trades $\sim$33\% more compute for $\sim$60\% activation memory savings.
+    \item \textbf{L7:} Discusses memory fragmentation overhead ($\sim$10--20\% extra). Knows activation memory depends on sequence length quadratically (attention) vs linearly (FFN). Can compare FSDP vs DeepSpeed ZeRO tradeoffs. Mentions that communication volume differs by ZeRO stage.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What changes if we use sequence length 32K instead of 2K?'' (Activation memory explodes due to $O(n^2)$ attention, unless Flash Attention is used.) ``How many A100s do you need to train this model?'' ``What's the difference between ZeRO-1, ZeRO-2, and ZeRO-3?''
 \end{interviewq}
 
 \begin{interviewq}
 \textbf{Q: How does RoPE encode position information? Why is it preferred over learned positional embeddings?}
 
-\textbf{What the interviewer is testing:} Whether you understand how modern LLMs handle position, and the extrapolation problem.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} RoPE rotates query and key vectors by an angle proportional to their position. The dot product of rotated Q and K naturally depends only on their relative position (because $R_m^T R_n = R_{n-m}$).
+\textbf{Strong answer:} RoPE (Rotary Position Embedding) encodes position by rotating query and key vectors in 2D subspaces. Each pair of dimensions $(2i, 2i+1)$ gets rotated by angle $m\theta_i$ where $m$ is the position and $\theta_i = 10000^{-2i/d}$ controls the frequency.
 
-Three advantages over learned embeddings:
+The key mathematical property: the dot product of two rotated vectors depends only on their \textit{relative} position:
+\[(\mR_m \vq)^T (\mR_n \vk) = \vq^T \mR_{n-m} \vk\]
+
+Three advantages over learned positional embeddings:
 \begin{itemize}
-    \item \textbf{Relative position for free}: No separate relative position mechanism needed.
-    \item \textbf{Extrapolation}: Can extend to longer sequences than training (with techniques like NTK-aware scaling or YaRN).
-    \item \textbf{No extra parameters}: Position information is injected through rotation, not additional embeddings.
+    \item \textbf{Relative position for free}: No separate relative position mechanism needed --- it emerges from the rotation structure.
+    \item \textbf{Extrapolation}: Can extend to longer sequences than training. With techniques like NTK-aware scaling or YaRN, a model trained on 4K context can work at 32K+.
+    \item \textbf{No extra parameters}: Position is injected through rotation, not learned embeddings. No $L_{max}$ limit.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How would you extend a RoPE-based model trained on 4K context to 32K?'' (NTK-aware interpolation, YaRN, or progressive training on longer contexts.)
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``RoPE adds position embeddings to the input'' --- it \textit{rotates} Q and K, it doesn't add to input
+    \item ``RoPE works at any length without modification'' --- naive extrapolation fails; you need interpolation techniques
+    \item Confusing RoPE with sinusoidal encodings (different mechanism, similar inspiration)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Whether you understand how modern LLMs handle position, the extrapolation problem, and why the field moved away from learned embeddings.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Explains rotation concept, relative position property, and advantages over learned embeddings. Knows LLaMA and most modern LLMs use RoPE.
+    \item \textbf{L6:} Can explain the frequency design ($\theta_i$ values), why different dimensions capture different position scales (low dimensions = fine-grained, high dimensions = coarse). Knows Position Interpolation vs NTK-aware scaling for context extension.
+    \item \textbf{L7:} Understands why extrapolation fails (OOD rotation angles at unseen positions), can compare RoPE vs ALiBi tradeoffs (ALiBi extrapolates better but RoPE is more expressive). Knows about the ``lost in the middle'' phenomenon and how position encoding relates to it.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you extend a RoPE-based model from 4K to 128K context?'' ``Compare RoPE vs ALiBi.'' ``Why does naive extrapolation fail?''
 \end{interviewq}
 
 \begin{interviewq}
-\textbf{Q: What is Grouped-Query Attention and why does LLaMA 2 use it?}
+\textbf{Q: Compare MHA, GQA, and MQA. When would you choose each?}
 
-\textbf{What the interviewer is testing:} Understanding of inference optimization, KV cache memory, and quality-speed trade-offs.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
 
-\textbf{A:} GQA shares key-value heads among groups of query heads. LLaMA 2 uses 32 query heads but only 8 KV heads, meaning each KV head is shared by 4 query heads.
+\textbf{Strong answer:} These are three points on the spectrum of KV head sharing:
 
-\textbf{Why it matters for inference:}
 \begin{itemize}
-    \item KV cache stores past keys and values for autoregressive generation.
-    \item With standard MHA, KV cache = $2 \times n_{layers} \times n_{heads} \times d_{head} \times \text{seq\_len} \times \text{bytes}$.
-    \item GQA with 8 instead of 32 KV heads gives a $4\times$ reduction in KV cache memory.
-    \item This means you can serve more concurrent users or longer sequences with the same GPU memory.
+    \item \textbf{MHA} (Multi-Head Attention): Each query head has its own KV head. $h$ KV heads total. Maximum quality, maximum KV cache.
+    \item \textbf{GQA} (Grouped-Query Attention): Groups of query heads share KV heads. $g$ KV heads where $g < h$. LLaMA 2 uses 32 query heads, 8 KV heads --- $4\times$ KV cache reduction with minimal quality loss.
+    \item \textbf{MQA} (Multi-Query Attention): All query heads share a single KV head. Maximum KV cache reduction ($h\times$), but noticeable quality degradation.
 \end{itemize}
 
-Quality loss is minimal---GQA performs nearly as well as full MHA, much better than MQA (1 KV head).
+\textbf{Decision framework:}
+\begin{itemize}
+    \item \textbf{Training from scratch, serving many concurrent users}: GQA (best quality/efficiency tradeoff). This is the modern default.
+    \item \textbf{Training quality is paramount, inference cost secondary}: MHA. Used when you'll distill or quantize for serving anyway.
+    \item \textbf{Extreme latency constraint, small model}: MQA. Used in PaLM, Falcon. Acceptable when model capacity is large enough to compensate.
+\end{itemize}
 
-\textbf{Common follow-ups:} ``How would you convert an MHA model to GQA?'' (Average the KV heads within each group during conversion, then fine-tune.)
+\textbf{Concrete KV cache math}: For a 70B model (80 layers, $d_{head}=128$, BF16) at 4K context:
+\begin{itemize}
+    \item MHA (64 KV heads): $2 \times 80 \times 64 \times 128 \times 4096 \times 2 = 10.7$ GB/sequence
+    \item GQA (8 KV heads): $2 \times 80 \times 8 \times 128 \times 4096 \times 2 = 1.3$ GB/sequence
+    \item MQA (1 KV head): $2 \times 80 \times 1 \times 128 \times 4096 \times 2 = 0.17$ GB/sequence
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``GQA reduces computation'' --- it primarily reduces \textit{memory}, not FLOPs (the QKV projections are similar)
+    \item Not knowing GQA exists (it's the standard in all 2023+ LLMs)
+    \item Confusing KV cache with model weight memory
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of inference optimization, KV cache memory math, and quality-speed trade-offs in serving.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly explains all three variants and that GQA is the modern default. Knows it reduces KV cache.
+    \item \textbf{L6:} Can calculate KV cache sizes for specific models. Understands that GQA also improves inference throughput by reducing memory bandwidth for KV reads. Knows how to convert MHA $\to$ GQA (average KV heads within groups, fine-tune).
+    \item \textbf{L7:} Understands the interaction with PagedAttention (smaller KV per page = better memory utilization). Knows that GQA's benefit is proportional to the decode-to-prefill ratio of the workload. Can reason about KV cache quantization as an orthogonal optimization.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you convert an existing MHA model to GQA?'' ``What's the impact on training speed vs inference speed?'' ``How does GQA interact with KV cache quantization?''
+\end{interviewq}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:attention_interview}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q: Why does attention scale by $1/\sqrt{d_k}$? What happens if you don't?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} First Principles \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:} The dot product of two random vectors with independent entries of mean 0 and variance 1 has variance equal to $d_k$ (the dimension). As $d_k$ grows, dot products become large in magnitude, pushing softmax into saturation regions where:
+
+\begin{itemize}
+    \item The output becomes nearly one-hot (one attention weight $\approx 1$, rest $\approx 0$)
+    \item Gradients through softmax vanish (derivative of saturated softmax $\approx 0$)
+    \item The model can't learn smooth attention patterns
+\end{itemize}
+
+Dividing by $\sqrt{d_k}$ restores unit variance: if $\vq, \vk \sim \mathcal{N}(0, 1)$ per component, then $\Var(\vq^T \vk) = d_k$, so $\Var(\vq^T \vk / \sqrt{d_k}) = 1$.
+
+\textbf{Without scaling:} Training becomes unstable. Attention patterns degenerate to hard attention (one token gets all weight). The model loses the ability to softly blend information from multiple positions.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``It's just a normalization trick'' without explaining \textit{why} it's needed
+    \item Not connecting to softmax saturation and vanishing gradients
+    \item Saying $\Var(\vq^T \vk) = d_k^2$ (it's $d_k$, not $d_k^2$)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you reason about mathematical properties from first principles? Do you understand the interaction between dot products, softmax, and gradients?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Explains variance growth and softmax saturation. Gets the $\sqrt{d_k}$ normalization right.
+    \item \textbf{L6:} Can derive the variance formula. Notes that this is specific to dot-product attention (additive attention doesn't need scaling). Connects to temperature-scaled softmax.
+    \item \textbf{L7:} Discusses that in practice, Q and K aren't random --- learned correlations can still cause saturation even with scaling. Mentions QK-Norm (normalizing Q and K before dot product) as an alternative used in some architectures. Notes that the $\sqrt{d_k}$ scaling is equivalent to initializing $\mW^Q, \mW^K$ with std $\sim 1/\sqrt{d_k}$.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What if we used additive attention --- would we need scaling?'' ``What's the connection to temperature in softmax?'' ``How does this interact with mixed precision training?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Calculate the FLOPs for a single forward pass through a 7B parameter Transformer.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:} A useful rule of thumb: for a Transformer, forward pass FLOPs $\approx 2 \times$ parameters $\times$ tokens. Backward is $\approx 2\times$ forward. So total training FLOPs per token $\approx 6P$.
+
+\textbf{Deriving it:} For a 7B model ($L=32$ layers, $d=4096$, $h=32$, FFN $=11008$ for SwiGLU):
+
+Per layer, per token:
+\begin{itemize}
+    \item QKV projection: $3 \times 2 \times d^2 = 6d^2$ FLOPs (3 projections, each $2d^2$ for matmul)
+    \item Attention scores: $2nd$ FLOPs (Q $\times$ K$^T$, per token: $2d$ for each of $n$ positions)
+    \item Attention $\times$ Values: $2nd$ FLOPs
+    \item Output projection: $2d^2$ FLOPs
+    \item FFN (SwiGLU): $3 \times 2 \times d \times d_{ff} = 6 \times d \times 11008 \approx 6 \times d \times 2.67d = 16d^2$ (gate + up + down projections)
+    \item Total per layer: $\approx 24d^2 + 4nd$ FLOPs per token
+\end{itemize}
+
+For $L=32, d=4096, n=2048$:
+\begin{itemize}
+    \item Per layer: $24 \times 4096^2 + 4 \times 2048 \times 4096 \approx 402M + 33.5M \approx 436M$
+    \item Total: $32 \times 436M \approx 14B$ FLOPs per token
+    \item Which matches $2P = 2 \times 7B = 14B$ FLOPs per token
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Not knowing the $2P$ rule of thumb (or at least the $\sim 6P$ for training)
+    \item Forgetting that matrix multiply of $(m \times k) \times (k \times n)$ costs $2mkn$ FLOPs (multiply + add)
+    \item Ignoring the attention $O(n^2 d)$ term (matters at long context)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Ability to do back-of-envelope compute calculations. Understanding of where FLOPs go in a Transformer.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows the $2P$ forward, $6P$ training rule. Gets the right order of magnitude.
+    \item \textbf{L6:} Can derive per-layer breakdown. Knows the attention term ($4n^2d$) vs projection term ($24nd^2$). Can identify when attention FLOPs dominate (when $n > 6d$, roughly $n > 24K$ for $d=4096$).
+    \item \textbf{L7:} Can convert FLOPs to wall-clock time given GPU specs (A100 = 312 TFLOPS BF16). Knows MFU (Model FLOPs Utilization) is typically 40--60\%. Can estimate total training cost: Chinchilla-optimal for 7B $\approx$ 140B tokens $\rightarrow$ $6 \times 7B \times 140B = 5.88 \times 10^{21}$ FLOPs $\approx$ 30K A100-hours.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How does this change at 128K context?'' ``What's the training cost in GPU-hours?'' ``Where does the $6P$ come from?'' (2P forward + 4P backward.)
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Calculate the KV cache memory for serving LLaMA 70B at 128K context length.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+KV cache formula: $\text{Memory} = 2 \times n_{\text{layers}} \times n_{\text{KV heads}} \times d_{\text{head}} \times \text{seq\_len} \times \text{bytes}$
+
+LLaMA 70B specs: 80 layers, 8 KV heads (GQA), $d_{\text{head}} = 128$, BF16 (2 bytes).
+
+\begin{align}
+\text{KV cache per sequence} &= 2 \times 80 \times 8 \times 128 \times 128{,}000 \times 2 \text{ bytes} \\
+&= 2 \times 80 \times 8 \times 128 \times 128{,}000 \times 2 \\
+&= 2 \times 80 \times 8 \times 128 \times 256{,}000 \\
+&\approx 41.9 \text{ GB per sequence}
+\end{align}
+
+\textbf{Implication}: The KV cache alone for a single 128K sequence (42 GB) exceeds the weight of the model in INT4 (35 GB). This is why long-context serving is fundamentally a memory problem, not a compute problem.
+
+\textbf{For comparison at different context lengths:}
+\begin{itemize}
+    \item 4K context: $\sim$1.3 GB/sequence
+    \item 32K context: $\sim$10.5 GB/sequence
+    \item 128K context: $\sim$41.9 GB/sequence
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Forgetting the factor of 2 (keys AND values)
+    \item Using full 64 heads instead of 8 GQA KV heads
+    \item Not realizing KV cache grows linearly with sequence length
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you size LLM serving infrastructure? Do you understand the KV cache bottleneck?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly applies the formula, gets the right answer. Knows KV cache is the memory bottleneck for long context.
+    \item \textbf{L6:} Discusses mitigation strategies: KV cache quantization (INT8 halves it), PagedAttention (reduces fragmentation waste), GQA (already reflected in LLaMA 70B's 8 KV heads).
+    \item \textbf{L7:} Reasons about system-level implications: at 128K with 42 GB KV cache per sequence, batch size is effectively 1 on a single 80 GB A100 (after model weights). Proposes disaggregated prefill/decode, or prefix caching for shared system prompts. Mentions H100 with 188 GB HBM3 or multi-GPU serving as solutions.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you reduce this KV cache size?'' ``What batch size can you support on 8xA100?'' ``How does prefix caching help for chatbot workloads?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why is self-attention permutation equivariant? Why does this matter for Transformers?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} First Principles \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:} Self-attention computes each output as a weighted combination of all values, where weights depend on query-key similarity. If you permute the input positions, every output gets the same weights (just reordered) because:
+
+\begin{enumerate}
+    \item Q, K, V are linear projections of the input --- permuting input permutes Q, K, V
+    \item Attention weights $\alpha_{ij} = \softmax(\vq_i^T \vk_j / \sqrt{d_k})$ depend only on content, not position
+    \item Each output $\vy_i = \sum_j \alpha_{ij} \vv_j$ uses the same values with the same weights
+\end{enumerate}
+
+Formally: $\text{SelfAttn}(\pi(\mX)) = \pi(\text{SelfAttn}(\mX))$ for any permutation $\pi$.
+
+\textbf{Why this matters:}
+\begin{itemize}
+    \item \textbf{Self-attention alone cannot distinguish position}. ``The cat sat on the mat'' and ``mat the on sat cat The'' produce identical outputs.
+    \item \textbf{Positional encodings are mandatory}, not optional. Without them, a Transformer is a bag-of-tokens model.
+    \item \textbf{This is different from CNNs} (translation equivariant, local receptive field implicitly encodes position) and \textbf{RNNs} (sequential processing inherently encodes order).
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Self-attention is permutation invariant'' --- it's \textit{equivariant} (output permutes with input), not \textit{invariant} (output unchanged)
+    \item ``Transformers don't need positional encodings because of causal masking'' --- causal masking helps but doesn't fully resolve position ambiguity
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of fundamental Transformer properties and why architectural choices (positional encodings) are necessary.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly explains equivariance, distinguishes from invariance, and connects to the need for positional encodings.
+    \item \textbf{L6:} Notes that this is actually a \textit{feature} for set-input tasks (point clouds, graph nodes). Explains how causal masking breaks pure equivariance but doesn't fully encode absolute position.
+    \item \textbf{L7:} Discusses implications for architectural choices: why ViT needs CLS tokens, why BERT's position embeddings are critical for NLU tasks, how DeepSets/Set Transformer exploit this for set functions. Relates to group theory: attention respects the symmetric group $S_n$.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What's the difference between equivariant and invariant?'' ``When is permutation equivariance desirable?'' ``Does causal masking break equivariance?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Pre-norm vs Post-norm Transformers --- which would you choose and why?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Pre-norm} (used in GPT-3, LLaMA, most modern LLMs):
+\[\mH' = \mH + \text{SubLayer}(\text{LayerNorm}(\mH))\]
+
+\textbf{Post-norm} (original Transformer):
+\[\mH' = \text{LayerNorm}(\mH + \text{SubLayer}(\mH))\]
+
+\textbf{Choose Pre-norm} (the modern default) because:
+\begin{enumerate}
+    \item \textbf{Much more stable training}: The residual path is clean --- gradients flow directly through $\mH' = \mH + f(\cdot)$ without passing through LayerNorm. This prevents vanishing gradients in deep networks.
+    \item \textbf{No learning rate warmup needed}: Post-norm requires careful warmup; pre-norm is stable from step 1.
+    \item \textbf{Scales to deeper models}: 100+ layer pre-norm Transformers train reliably. Post-norm often fails beyond 24 layers without special initialization.
+\end{enumerate}
+
+\textbf{The case for Post-norm}: When it converges, it can achieve slightly better final quality. Some evidence suggests the LayerNorm on the residual stream provides a beneficial regularization effect. This is why some models (PaLM) use Post-norm with careful initialization (e.g., the $1/\sqrt{2N}$ scaling from DeepNet).
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``They're basically the same'' --- the training dynamics are fundamentally different
+    \item Not knowing which one modern LLMs use (pre-norm)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of training stability, gradient flow, and why architectural defaults exist.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows pre-norm is the modern default. Can explain the gradient flow argument.
+    \item \textbf{L6:} Understands the quality gap (post-norm can be slightly better when stable). Knows about DeepNet-style initialization that makes post-norm viable for deep models. Can connect to the broader principle of ``clean residual paths.''
+    \item \textbf{L7:} Discusses the interaction with other stabilization techniques (QK-Norm, $\mu$P). Notes that the ``pre-norm is always better'' narrative is oversimplified --- some recent work shows post-norm with proper initialization can match or exceed pre-norm.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What happens to gradient magnitudes in very deep post-norm networks?'' ``What's the connection to ResNet's skip connections?'' ``How does the $1/\sqrt{2N}$ scaling work?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your Transformer model shows degrading perplexity at 32K context despite being trained on 8K. Diagnose and fix.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Root cause}: Position encoding extrapolation failure. The model encounters position indices it never saw during training.
+
+\textbf{Diagnosis steps:}
+\begin{enumerate}
+    \item \textbf{Verify the symptom}: Plot perplexity vs. position within the sequence. If perplexity is fine up to $\sim$8K then degrades sharply, it's position encoding failure.
+    \item \textbf{Identify the encoding type}:
+    \begin{itemize}
+        \item Learned embeddings: Hard failure --- no embedding exists for position > 8K
+        \item RoPE: Soft failure --- rotation angles at positions > 8K are out-of-distribution
+        \item ALiBi: Usually extrapolates well --- if using ALiBi and still failing, the issue is likely elsewhere (e.g., attention sink, lost-in-the-middle)
+    \end{itemize}
+\end{enumerate}
+
+\textbf{Fixes} (for RoPE, the most common case):
+\begin{enumerate}
+    \item \textbf{Position Interpolation} (quick): Scale positions by $8K/32K$ so they map back to the training range. Fine-tune for $\sim$1000 steps on 32K data. Fast but lossy for short contexts.
+    \item \textbf{NTK-aware scaling}: Modify the base frequency in RoPE ($\theta' = \theta \times \alpha^{d/(d-2)}$). Better preservation of short-range resolution.
+    \item \textbf{YaRN}: Combines NTK scaling with attention scaling and temperature correction. Currently best results for RoPE extension.
+    \item \textbf{Continued pre-training}: Train on progressively longer sequences (8K $\to$ 16K $\to$ 32K). Most reliable but most expensive.
+\end{enumerate}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just train on 32K data from the start'' --- doesn't address the existing model
+    \item ``RoPE can extrapolate to any length'' --- it cannot without intervention
+    \item Not considering that the issue might be \textit{attention pattern} degradation, not just position
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Debugging methodology for LLM behavior, understanding of context length limitations, knowledge of position encoding techniques.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies position encoding as the culprit. Suggests fine-tuning on longer data.
+    \item \textbf{L6:} Knows Position Interpolation vs NTK-aware scaling vs YaRN. Can propose a specific fix and estimate the cost (1K fine-tuning steps).
+    \item \textbf{L7:} Considers secondary issues: attention sinks (first few tokens get disproportionate attention at long context), lost-in-the-middle phenomenon, and whether the model's effective context window matches its theoretical one. Proposes evaluation methodology (needle-in-a-haystack test at various depths).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What's the difference between PI and NTK-aware scaling?'' ``How would you evaluate if the fix worked?'' ``What's the 'lost in the middle' problem?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design the attention mechanism for a model that must process 1 million token documents.}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:} Standard attention at 1M tokens is infeasible: the attention matrix alone would be $10^{12}$ elements ($\sim$2 TB in FP16). Even Flash Attention can't help --- the $O(n^2)$ compute is $\sim$$10^{15}$ FLOPs per layer.
+
+\textbf{Approach}: Hierarchical / multi-resolution attention:
+
+\begin{enumerate}
+    \item \textbf{Local attention} (sliding window, $w=4096$): Each token attends to its local window. $O(nw)$ compute. Captures local context.
+    \item \textbf{Global summary tokens}: Every 4K tokens, insert a summary token that attends globally to all other summary tokens. This gives $n/4096 \approx 250$ global tokens --- full attention among them is feasible ($250^2$ matrix).
+    \item \textbf{Cross-attention from local to global}: Local tokens cross-attend to the nearest global summary tokens for long-range information.
+\end{enumerate}
+
+\textbf{Alternative approaches}:
+\begin{itemize}
+    \item \textbf{Ring Attention}: Distribute the sequence across GPUs, each handles a chunk. Pass KV blocks ring-wise. Scales to arbitrary length with enough GPUs.
+    \item \textbf{Mamba / SSM}: Replace attention with state-space models. $O(n)$ compute, $O(1)$ memory per step. Trade-off: weaker on tasks requiring precise long-range lookups (e.g., retrieval).
+    \item \textbf{Sparse attention patterns}: Longformer/BigBird-style with global + local. Proven at 16K--64K but engineering-heavy at 1M.
+    \item \textbf{RAG + chunking}: Don't process 1M tokens at once. Chunk, embed, retrieve relevant chunks, process in normal context window. Often the most practical solution.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just use Flash Attention'' --- FA reduces memory but compute is still $O(n^2)$
+    \item ``Train on 1M tokens'' --- without architectural changes this is intractable
+    \item Not considering the practical alternative (RAG + chunking)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you design novel architectures under extreme constraints? Do you understand the compute/memory/quality tradeoffs?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies the $O(n^2)$ problem and suggests sparse attention or chunking.
+    \item \textbf{L6:} Proposes a concrete architecture (hierarchical attention with local + global). Considers Ring Attention for distributed approach. Mentions SSMs as an alternative.
+    \item \textbf{L7:} Reasons about what tasks actually need 1M-token attention vs what can be solved with retrieval. Considers hybrid architectures (Transformer + Mamba layers). Proposes evaluation criteria: does the task require precise retrieval from arbitrary positions (favors attention) or sequential summarization (favors SSMs)?
+\end{itemize}
+
+\textbf{Common follow-ups:} ``When would RAG be better than long-context?'' ``Compare this to Mamba for document understanding.'' ``How would you evaluate if the model actually uses long-range context?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What changed between GPT-2 (2019) and LLaMA (2023) architecturally? Why each change?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+Six key changes, each with a clear motivation:
+
+\begin{enumerate}
+    \item \textbf{Post-norm $\to$ Pre-norm (RMSNorm)}: Stabilizes training for deep networks. RMSNorm is 10--15\% faster than LayerNorm (drops mean computation).
+    \item \textbf{Learned position embeddings $\to$ RoPE}: Enables relative position encoding, better extrapolation to longer sequences, no maximum length limit.
+    \item \textbf{GELU $\to$ SwiGLU}: Gating provides multiplicative interaction. Better empirical performance. Uses 3 weight matrices (up, gate, down) instead of 2, so FFN expansion adjusted from 4$\times$ to $\sim$2.67$\times$.
+    \item \textbf{MHA $\to$ GQA} (LLaMA 2): Reduces KV cache for inference by sharing KV heads across query head groups. Minimal quality impact.
+    \item \textbf{Bias terms removed}: Slightly fewer parameters, marginal speedup, no quality loss. Simpler.
+    \item \textbf{Vocabulary size 50K $\to$ 32K}: LLaMA uses SentencePiece BPE vs GPT-2's BPE. Smaller vocab = smaller embedding table, but this varies by model.
+\end{enumerate}
+
+\textbf{The meta-lesson}: Every change was motivated by either \textit{training stability} (pre-norm, RMSNorm), \textit{inference efficiency} (GQA, no bias), or \textit{better quality per FLOP} (SwiGLU, RoPE). The architecture evolved toward simplicity and efficiency, not complexity.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Not knowing any changes beyond ``it got bigger''
+    \item Saying ``LLaMA uses a different architecture'' --- it's the same Transformer, with component-level improvements
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Awareness of modern LLM architecture evolution and understanding of \textit{why} each design choice was made.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Names at least 4 of the 6 changes with correct motivations.
+    \item \textbf{L6:} Explains the \textit{why} behind each change (stability, efficiency, quality). Can discuss the SwiGLU expansion factor adjustment. Knows that these choices are now standard across Mistral, Qwen, Yi, etc.
+    \item \textbf{L7:} Discusses what might change next: QK-Norm for extreme scale, mixture of experts (Mixtral), deeper-and-narrower vs wider-and-shallower tradeoffs, potential move to post-norm with proper initialization, $\mu$P for hyperparameter transfer across scales.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Why RMSNorm specifically rather than LayerNorm?'' ``What's the SwiGLU expansion factor and why?'' ``What do you expect to change next?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Compare Transformer vs SSM (Mamba) architectures. When would you choose each?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Transformer} & \textbf{Mamba (SSM)} \\
+\midrule
+Per-token compute & $O(nd)$ attention + $O(d^2)$ FFN & $O(d^2)$ (no attention matrix) \\
+Memory (inference) & $O(n)$ KV cache & $O(d)$ fixed state \\
+Long-range retrieval & Excellent (explicit token-to-token attention) & Weaker (information must pass through compressed state) \\
+Training parallelism & Excellent (full parallel over sequence) & Good (parallel scan, but less mature) \\
+Ecosystem/tooling & Mature (Flash Attention, vLLM, etc.) & Early stage \\
+In-context learning & Strong & Emerging, but weaker on precise retrieval \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Decision framework:}
+\begin{itemize}
+    \item \textbf{Choose Transformer when}: Tasks require precise information retrieval from context (RAG, QA, code with long dependencies), you need strong in-context learning, or serving infrastructure maturity matters.
+    \item \textbf{Choose Mamba when}: Sequences are very long (>100K tokens), throughput at inference matters more than retrieval quality, or memory is severely constrained (fixed-size state vs growing KV cache).
+    \item \textbf{Hybrid (Jamba, Zamba)}: Interleave Transformer and Mamba layers. Get retrieval capability from attention layers + efficiency from SSM layers. Increasingly popular.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Mamba will replace Transformers'' --- Transformers still dominate for language tasks requiring retrieval/ICL
+    \item ``SSMs are just RNNs'' --- the selective mechanism and parallel scan make them fundamentally different from classical RNNs
+    \item Ignoring the hybrid approach (which is likely the future)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Awareness of alternatives to attention, ability to reason about architectural tradeoffs, understanding of where each architecture excels.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows Mamba is $O(n)$ vs Transformer's $O(n^2)$ attention, and that Mamba has a fixed-size state. Can name a basic tradeoff.
+    \item \textbf{L6:} Understands \textit{why} Mamba is weaker at retrieval (information must be compressed into a fixed-size state, causing information bottleneck). Knows about hybrid architectures. Can reason about when the efficiency gains actually matter in practice.
+    \item \textbf{L7:} Discusses the theoretical expressiveness gap (attention can implement arbitrary lookups; SSMs are limited by state dimension). Mentions that for language modeling perplexity, Mamba matches Transformers at same compute budget, but downstream task performance (especially retrieval-heavy) diverges. Can reason about whether hybrid architectures can get the best of both worlds.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Why can't Mamba do retrieval as well as attention?'' ``What's the selective mechanism in Mamba?'' ``How do hybrid architectures like Jamba work?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your model's attention patterns show all heads attending to the same positions (typically position 0 or EOS). What's happening?}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+This is the \textbf{attention sink} phenomenon. Causes and diagnosis:
+
+\textbf{What's happening}: Certain positions (usually position 0, BOS, or EOS tokens) accumulate disproportionate attention regardless of content. This occurs because:
+\begin{enumerate}
+    \item Softmax requires attention weights to sum to 1. When no other position is particularly relevant, the model ``dumps'' attention mass on a default position.
+    \item Position 0 is special in autoregressive models --- it's visible to all tokens and becomes a learned ``no-op'' attention target.
+    \item This is a feature, not a bug --- these ``sink tokens'' act as a rest state for heads that have nothing useful to attend to.
+\end{enumerate}
+
+\textbf{When it's a problem:}
+\begin{itemize}
+    \item \textbf{Not a problem}: If only some heads show sinks and overall model quality is good. Many heads specialize as positional/syntactic heads, and sink behavior is normal for others.
+    \item \textbf{Problem}: If \textit{all} heads converge to sinks, the model has collapsed --- it's not learning meaningful attention patterns. This indicates training issues (LR too high, loss of representational diversity).
+\end{itemize}
+
+\textbf{Fixes if problematic:}
+\begin{itemize}
+    \item Add a dedicated ``sink token'' at position 0 (StreamingLLM approach) for inference efficiency
+    \item Check for head diversity --- use auxiliary loss to encourage diverse attention patterns
+    \item For KV cache eviction: always keep the sink token's KV, even when evicting others (StreamingLLM insight)
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``This is a bug and the model is broken'' --- attention sinks are expected behavior
+    \item Not knowing about the StreamingLLM connection
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Deep understanding of attention mechanics in practice, awareness of attention sink literature, debugging LLM behavior.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Recognizes this as a common pattern. Knows it's related to softmax normalization.
+    \item \textbf{L6:} Explains the ``rest state'' interpretation. Distinguishes between healthy sink behavior (some heads) vs pathological (all heads). Mentions StreamingLLM.
+    \item \textbf{L7:} Connects to KV cache eviction strategies (must preserve sink tokens). Discusses implications for attention head pruning (sink heads might be prunable). Relates to the broader question of what attention heads actually compute and how to interpret them.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How does StreamingLLM use attention sinks?'' ``Can you prune attention heads that only attend to sinks?'' ``What does this tell us about the model's residual stream?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Estimate the ratio of attention FLOPs to FFN FLOPs at different sequence lengths. When does attention become the bottleneck?}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+Per Transformer layer per token:
+\begin{itemize}
+    \item \textbf{Attention FLOPs}: QKV projection ($6d^2$) + attention scores ($2nd$) + attention $\times$ values ($2nd$) + output projection ($2d^2$) = $8d^2 + 4nd$
+    \item \textbf{FFN FLOPs} (SwiGLU): $3 \times 2 \times d \times (8d/3) = 16d^2$
+    \item \textbf{Ratio}: Attention / FFN = $(8d^2 + 4nd) / 16d^2 = 0.5 + n/(4d)$
+\end{itemize}
+
+For $d = 4096$:
+\begin{itemize}
+    \item $n = 2K$: ratio = $0.5 + 2048/16384 = 0.625$ --- FFN dominates
+    \item $n = 8K$: ratio = $0.5 + 8192/16384 = 1.0$ --- roughly equal
+    \item $n = 32K$: ratio = $0.5 + 32768/16384 = 2.5$ --- attention dominates
+    \item $n = 128K$: ratio = $0.5 + 131072/16384 = 8.5$ --- attention overwhelmingly dominates
+\end{itemize}
+
+\textbf{Crossover point}: Attention and FFN FLOPs are equal when $n = 2d$. For $d=4096$, this is $n \approx 8K$.
+
+\textbf{Practical implication}: Below 8K tokens, optimizing FFN (MoE, quantization) gives more speedup. Above 8K, optimizing attention (Flash Attention, sparse attention, GQA) is more important.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Attention is always the bottleneck'' --- it depends on sequence length
+    \item Not knowing the $O(n^2 d)$ vs $O(nd^2)$ distinction
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Quantitative reasoning about Transformer compute. Can you identify which component to optimize?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows attention is $O(n^2 d)$ and FFN is $O(nd^2)$. Can state which dominates at long vs short sequences.
+    \item \textbf{L6:} Can derive the crossover point ($n \approx 2d$). Gives concrete numbers for specific models and sequence lengths.
+    \item \textbf{L7:} Distinguishes training (all tokens processed in parallel, attention usually subdominant) from inference (decode phase: $n=1$ per step, FFN totally dominates for weight loading). Notes that Flash Attention changes the practical bottleneck even when attention theoretically dominates (by making attention compute-bound instead of memory-bound).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How does this analysis change for inference vs training?'' ``Where should you spend your optimization effort for a 128K-context model?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You need to modify a standard Transformer for real-time streaming applications (e.g., live transcription). What changes?}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+Standard Transformers assume full-sequence access. Streaming requires three fundamental modifications:
+
+\textbf{1. Causal + finite-window attention}:
+\begin{itemize}
+    \item Cannot attend to future tokens (causal constraint --- already standard for decoders)
+    \item Cannot attend to infinitely far in the past (memory constraint)
+    \item Solution: Sliding window attention with window size $w$. Each token attends to the most recent $w$ tokens only. Latency = processing time for one chunk.
+\end{itemize}
+
+\textbf{2. Streaming-compatible state}:
+\begin{itemize}
+    \item KV cache must be bounded. Either: (a) fixed window with eviction, or (b) StreamingLLM approach (keep sink tokens + recent window)
+    \item Alternative: Replace attention with SSM (Mamba) for $O(1)$ state per layer
+    \item Hybrid: Use Mamba for most layers, attention for 1--2 layers with bounded window
+\end{itemize}
+
+\textbf{3. Chunked processing}:
+\begin{itemize}
+    \item Process input in fixed-size chunks (e.g., 100ms of audio frames)
+    \item Overlap chunks slightly to avoid boundary artifacts
+    \item Carry forward the bounded state between chunks
+\end{itemize}
+
+\textbf{Concrete example --- streaming ASR (Whisper-style)}:
+\begin{itemize}
+    \item Encoder: Process 30-second audio chunks with sliding window attention ($w$=500 frames)
+    \item Decoder: Autoregressive, but reset state at chunk boundaries
+    \item Latency target: <200ms algorithmic latency (processing time + buffering)
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just use a standard Transformer with causal masking'' --- that still requires unbounded KV cache
+    \item Not addressing the memory growth problem for long streams
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you adapt architectures for specific constraints? Understanding of streaming vs batch processing tradeoffs.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies the need for causal masking and bounded context.
+    \item \textbf{L6:} Proposes sliding window attention, mentions StreamingLLM. Discusses latency-quality tradeoff of window size.
+    \item \textbf{L7:} Proposes a complete system: chunked processing with state carryover, specific window sizes with justification, consideration of Mamba/SSM for streaming, and evaluation methodology (WER vs latency Pareto curve for ASR).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What's the latency-quality tradeoff of window size?'' ``How would you evaluate streaming vs batch quality?'' ``What about tasks that need full-document context?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Flash Attention vs Linear Attention --- when would you use each?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Flash Attention}: Exact standard attention with hardware-aware tiling. $O(n^2)$ compute, $O(n)$ memory. Same quality as standard attention.
+
+\textbf{Linear Attention}: Replace softmax with a decomposable kernel: $\phi(\vq)^T\phi(\vk)$ instead of $\softmax(\vq^T\vk/\sqrt{d_k})$. Rearrange computation: instead of computing $n \times n$ attention matrix first, compute $\phi(\mK)^T\mV$ (a $d \times d$ matrix), then multiply by $\phi(\vq)$. Result: $O(nd^2)$ compute, $O(d^2)$ memory --- linear in sequence length.
+
+\textbf{Decision framework:}
+\begin{itemize}
+    \item \textbf{$n < 32K$}: Use Flash Attention. The $O(n^2)$ compute is manageable, and you get exact attention. Linear attention's quality gap is not worth the compute savings.
+    \item \textbf{$32K < n < 128K$}: Depends on quality requirements. Flash Attention still works but becomes expensive. If approximate attention is acceptable, linear methods can help.
+    \item \textbf{$n > 128K$}: Seriously consider linear attention, sparse attention, or SSMs. Flash Attention's $O(n^2)$ compute becomes prohibitive ($128K^2 \approx 16B$ operations per layer per head).
+    \item \textbf{Inference streaming}: Linear attention has an $O(d^2)$ recurrent state, enabling efficient streaming without KV cache growth. This is its killer use case.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Linear attention is always better because it's $O(n)$'' --- it sacrifices quality
+    \item ``Flash Attention is $O(n)$'' --- it's $O(n)$ \textit{memory}, but still $O(n^2)$ \textit{compute}
+    \item Conflating Flash Attention (hardware optimization) with linear attention (algorithmic approximation)
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding that Flash Attention and linear attention solve different problems (hardware efficiency vs algorithmic complexity).
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly states that Flash Attention is exact while linear attention is approximate. Knows Flash is $O(n^2)$ compute.
+    \item \textbf{L6:} Explains the kernel trick behind linear attention. Identifies the streaming use case. Quantifies the crossover point ($\sim$32K).
+    \item \textbf{L7:} Discusses recent work combining both (e.g., Hedgehog: learning the kernel $\phi$ to approximate softmax more closely). Notes that in practice, Mamba/SSMs have largely displaced linear attention for the ``efficient long-context'' niche because they achieve better quality at similar efficiency.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What's the kernel trick in linear attention?'' ``Why have SSMs been more successful than linear attention?'' ``Can you combine Flash Attention with sparse attention patterns?''
 \end{interviewq}

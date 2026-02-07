@@ -669,109 +669,668 @@ Track per-layer gradient statistics during training:
 \textbf{Practical use.} Most useful for SGD. Less necessary for Adam, which is more robust to LR choice, but still helpful for sanity checking.
 
 %==============================================================================
+\section{GPU Memory Estimation}
+\label{sec:memory_estimation}
+%==============================================================================
+
+Estimating GPU memory is an essential skill for any ML engineer. Every interview about training at scale will involve back-of-the-envelope memory math. The key is to know the components and their byte costs.
+
+\subsection{Memory Components During Training}
+
+A model with $P$ parameters consumes memory across four main categories:
+
+\begin{table}[H]
+\centering
+\caption{GPU memory breakdown for training (per GPU, no sharding)}
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+\textbf{Component} & \textbf{What It Stores} & \textbf{Bytes per Param} \\
+\midrule
+Parameters & Model weights & 2 (BF16) or 4 (FP32) \\
+Gradients & $\nabla_\theta \loss$ for each param & 2 (BF16) or 4 (FP32) \\
+Optimizer states (Adam) & First moment $m$ + second moment $v$ & 8 (FP32 for both) \\
+Master weights & FP32 copy for mixed precision & 4 (FP32) \\
+\midrule
+\textbf{Total (mixed precision + Adam)} & & \textbf{$\sim$18 per param} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Rule of thumb:} For a model with $P$ billion parameters trained with AdamW in mixed precision, the parameter-related memory is approximately $18P$ GB. A 7B model needs $\sim$126 GB just for parameters, gradients, and optimizer states---before activations.
+
+\subsection{Activation Memory}
+
+Activation memory scales with batch size, sequence length, hidden dimension, and number of layers. For a Transformer with $L$ layers, hidden dimension $d$, sequence length $s$, and batch size $b$:
+
+\begin{equation}
+\text{Activation memory} \approx 2 \cdot b \cdot s \cdot d \cdot L \cdot \text{bytes\_per\_element}
+\end{equation}
+
+The factor of 2 accounts for both forward activations and intermediate values needed for backward. Gradient checkpointing reduces this from $O(L)$ to $O(\sqrt{L})$ at the cost of $\sim$33\% recomputation.
+
+\subsection{LoRA Memory Savings}
+
+LoRA (Low-Rank Adaptation) freezes the base model and trains only low-rank update matrices $\Delta \mW = \mathbf{A}\mathbf{B}$ where $\mathbf{A} \in \R^{d \times r}$ and $\mathbf{B} \in \R^{r \times d}$ with rank $r \ll d$. The memory savings are dramatic:
+
+\begin{itemize}
+    \item \textbf{Trainable parameters:} Only $2 \times d \times r$ per adapted layer (vs.\ $d^2$ for full fine-tuning)
+    \item \textbf{Optimizer states:} Only for LoRA parameters (8 bytes each), not the frozen base
+    \item \textbf{Gradients:} Only for LoRA parameters
+    \item \textbf{Base model:} Loaded in reduced precision (e.g., INT4 with QLoRA) since no gradient needed
+\end{itemize}
+
+\subsection{Distributed Training Throughput}
+
+Training throughput (tokens/sec or samples/sec) is limited by either compute or communication:
+
+\begin{table}[H]
+\centering
+\caption{Common distributed training bottlenecks}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Bottleneck} & \textbf{Symptom} & \textbf{Diagnosis} \\
+\midrule
+All-reduce communication & GPU utilization $<$ 80\%; GPUs idle between steps & Profile with \texttt{torch.profiler}; check interconnect bandwidth \\
+Pipeline bubble & Low utilization in pipeline parallelism & Increase micro-batches; rebalance stage sizes \\
+Data loading & GPU utilization drops periodically & Use \texttt{num\_workers $>$ 0}; prefetch; use SSD/RAM cache \\
+Memory-bound (swapping) & OOM or slow due to CPU offloading & Reduce batch size; use gradient checkpointing; add GPUs \\
+Kernel launch overhead & Many small ops; low GPU utilization & Use \texttt{torch.compile}; fuse operations; increase batch \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Throughput Estimation}
+
+For a dense Transformer model with $P$ parameters, the compute per token during training is approximately $6P$ FLOPs (2$P$ for forward, 4$P$ for backward including gradient computation). The theoretical peak throughput on hardware with $C$ FLOP/s is:
+
+\begin{equation}
+\text{Tokens/sec (theoretical)} = \frac{C}{6P}
+\end{equation}
+
+In practice, you achieve 30--50\% of this theoretical peak (called Model FLOPs Utilization, or MFU). An A100 delivers $\sim$312 TFLOP/s in BF16, so a single A100 training a 7B model achieves roughly $\frac{312 \times 10^{12}}{6 \times 7 \times 10^9} \times 0.4 \approx 3{,}000$ tokens/sec.
+
+%==============================================================================
 \section{Interview Questions}
 \label{sec:training_interview}
 %==============================================================================
 
+%--- Rewritten Question 1 (originally Q1) ---
 \begin{interviewq}
-\textbf{Q1: Your model's loss plateaus after initial descent. Walk through your debugging process.}
+\textbf{Q: Your model's loss plateaus after initial descent. Walk through your debugging process.}
 
-\textbf{What the interviewer is testing:} Systematic thinking, practical experience with training failures, ability to prioritize hypotheses from most to least likely.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
 
 \textbf{Strong answer:}
 
-I would investigate in this order:
+I follow a structured diagnostic hierarchy, ordered from most common to least common cause:
 
 \begin{enumerate}
-    \item \textbf{Check the learning rate schedule.} Is the LR already too small? Try increasing it or switching to cosine annealing with warm restarts. A plateau often means the current LR is too low to escape the current basin.
+    \item \textbf{Learning rate schedule.} Is the LR already too small? A plateau often means the current LR cannot escape the current basin. I check the schedule---if using step decay, the LR may have dropped too aggressively. I try cosine annealing with warm restarts, or simply multiply the current LR by 3--10$\times$ as a probe.
 
-    \item \textbf{Check validation loss.} If validation loss is also plateaued (and still high), the model is underfitting---increase capacity or train longer. If validation loss is increasing while training loss plateaus, the model is at the edge of overfitting.
+    \item \textbf{Train vs.\ validation loss.} If both are plateaued and high, the model is underfitting---I increase capacity (wider or deeper). If training loss is low but validation is plateaued, the model is overfitting and I need regularization or more data. If both plateau at a reasonable level, I may be near the Bayes-optimal error for this data quality.
 
-    \item \textbf{Examine gradient norms per layer.} Are early layers receiving gradients? Vanishing gradients cause effective early-layer freezing, which manifests as a plateau.
+    \item \textbf{Gradient norms per layer.} I log $\|\nabla_\theta \loss\|$ per layer. If early layers show norms $10^{-6}$ while later layers show $10^{-2}$, vanishing gradients are freezing the early layers. Fix: add residual connections, switch to pre-norm, or check initialization.
 
-    \item \textbf{Check data.} Is the model seeing diverse batches, or is the data loader repeating patterns? Are there label noise issues capping achievable loss?
+    \item \textbf{Data pipeline audit.} Is the data loader repeating batches or not shuffling properly? Are there label noise issues capping achievable loss? I check by training on a small subset---if the model can overfit a single batch to near-zero loss, the model and loss are correct and the issue is optimization or data scale.
 
-    \item \textbf{Try a larger model.} The current architecture may not have enough capacity for the task. Try doubling width or depth as a diagnostic.
+    \item \textbf{Model capacity.} Double the width or depth as a diagnostic. If loss improves, the original model was too small.
 
-    \item \textbf{Inspect the loss landscape.} Is the model stuck in a sharp local minimum? Increasing batch size or learning rate (or using SWA) can help escape sharp minima.
+    \item \textbf{Loss landscape.} The model may be stuck in a sharp local minimum. I try increasing batch size (smoother gradients), SWA (averages across minima), or SAM (penalizes sharpness explicitly).
 \end{enumerate}
 
-\textbf{Common follow-ups:} ``How do you distinguish underfitting from a data quality ceiling?'' ``What if increasing LR causes divergence?'' ``How does batch size affect this?''
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``I would just train longer''---plateaus rarely resolve by training longer without changing something.
+    \item ``I would try a different architecture''---this is premature without diagnosing the root cause first.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systematic debugging methodology---can you prioritize hypotheses by likelihood and cost to test? Do you check cheap diagnostics (LR, loss curves) before expensive ones (architecture change)?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Covers the top 3--4 hypotheses in a logical order; mentions LR, overfitting vs.\ underfitting, and gradient norms.
+    \item \textbf{L6:} Adds the ``overfit one batch'' diagnostic, discusses loss landscape geometry (sharp vs.\ flat minima), and mentions label noise as an irreducible error floor.
+    \item \textbf{L7:} Discusses Bayes-optimal error, proposes interventions with estimated cost-benefit (e.g., ``doubling width costs $2\times$ memory but will confirm capacity is the bottleneck in one experiment''), and connects to learning rate warmup theory.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you distinguish underfitting from a data quality ceiling?'' ``What if increasing LR causes divergence?'' ``How does batch size affect the loss landscape?''
 \end{interviewq}
 
+%--- Rewritten Question 2 (originally Q2) ---
 \begin{interviewq}
-\textbf{Q2: How would you scale training of a 70B parameter model across 256 GPUs?}
+\textbf{Q: How would you scale training of a 70B parameter model across 256 GPUs?}
 
-\textbf{What the interviewer is testing:} Understanding of distributed training strategies, ability to do back-of-the-envelope memory calculations, knowledge of modern training infrastructure.
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
 
 \textbf{Strong answer:}
 
-First, I would estimate memory requirements. A 70B model needs:
+First, memory estimation. A 70B model with AdamW in mixed precision needs approximately:
 \begin{itemize}
     \item Parameters in BF16: $70\text{B} \times 2 = 140$ GB
-    \item Optimizer states (AdamW, FP32): $70\text{B} \times 8 = 560$ GB (first + second moments)
     \item Gradients in BF16: $70\text{B} \times 2 = 140$ GB
-    \item Total: $\sim 840$ GB, before activations
+    \item Optimizer states (AdamW, FP32 $m$ + $v$): $70\text{B} \times 8 = 560$ GB
+    \item FP32 master weights: $70\text{B} \times 4 = 280$ GB
+    \item \textbf{Total:} $\sim$1,120 GB before activations
 \end{itemize}
 
-This does not fit on a single 80 GB A100. I would use a \textbf{3D parallelism} strategy:
+This does not fit on a single 80 GB A100. I would use \textbf{3D parallelism}:
 
 \begin{enumerate}
-    \item \textbf{Tensor parallelism (TP = 8):} Split each layer across 8 GPUs within a single node (connected via NVLink). This divides per-layer memory and compute by 8.
+    \item \textbf{Tensor parallelism (TP = 8):} Split each layer's weight matrices across 8 GPUs within a single NVLink-connected node. This divides per-layer memory and compute by 8. TP requires high-bandwidth interconnect because it communicates activations within every forward and backward pass.
 
-    \item \textbf{Pipeline parallelism (PP = 4):} Split the 80 Transformer layers into 4 stages of 20 layers each. Each stage runs on a different group of 8 GPUs. Use micro-batching to reduce the pipeline bubble.
+    \item \textbf{Pipeline parallelism (PP = 4):} Assign the $\sim$80 Transformer layers to 4 pipeline stages of 20 layers each. Each stage runs on a node of 8 GPUs (using TP within the node). Use interleaved scheduling with many micro-batches to minimize the pipeline bubble (bubble fraction $\approx (PP-1)/(M + PP - 1)$ where $M$ is micro-batches).
 
-    \item \textbf{Data parallelism (DP = 8):} The remaining $256 / (8 \times 4) = 8$ groups each run a data-parallel replica. Use ZeRO-1 to shard optimizer states across the 8 replicas.
+    \item \textbf{Data parallelism (DP = 8):} The remaining $256 / (8 \times 4) = 8$ groups each run a data-parallel replica. Use ZeRO-1 to shard optimizer states across the 8 DP replicas, reducing per-GPU optimizer memory by $8\times$.
 \end{enumerate}
 
-Additional optimizations: BF16 mixed precision, gradient checkpointing (to fit activations in memory), gradient accumulation if effective batch size needs to be larger than what the DP degree provides.
+Additional optimizations: BF16 mixed precision throughout, gradient checkpointing (recompute activations to reduce memory from $O(L)$ to $O(\sqrt{L})$), sequence parallelism for LayerNorm and dropout (splits the sequence dimension across TP ranks).
 
-\textbf{Common follow-ups:} ``What is the pipeline bubble and how do you minimize it?'' ``How would you handle a node failure?'' ``What communication patterns does tensor parallelism require?''
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just use FSDP/ZeRO-3 on all 256 GPUs''---pure ZeRO-3 at this scale has excessive communication overhead from all-gathering parameters across 256 GPUs. 3D parallelism keeps the expensive communication (TP) within fast NVLink nodes.
+    \item Confusing tensor parallelism and pipeline parallelism, or not knowing which requires high-bandwidth interconnect.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you do memory math on the spot? Do you understand why different parallelism strategies suit different communication topologies? Can you compose them into a coherent system?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows DDP, ZeRO, and that you need to split the model. Can estimate memory roughly.
+    \item \textbf{L6:} Proposes a specific 3D parallelism configuration with concrete numbers ($\text{TP} \times \text{PP} \times \text{DP} = 256$). Explains why TP is intra-node and PP is inter-node. Mentions activation checkpointing.
+    \item \textbf{L7:} Quantifies the pipeline bubble, discusses sequence parallelism, explains how to handle heterogeneous interconnect (NVLink vs.\ InfiniBand), and addresses fault tolerance (checkpoint frequency, elastic training).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What is the pipeline bubble and how do you minimize it?'' ``How would you handle a node failure mid-training?'' ``What communication primitives does tensor parallelism use (all-reduce vs.\ all-gather)?''
 \end{interviewq}
 
+%--- Rewritten Question 3 (originally Q3) ---
 \begin{interviewq}
-\textbf{Q3: Adam vs SGD with momentum---when would you pick each?}
+\textbf{Q: Adam vs SGD with momentum---when would you pick each?}
 
-\textbf{What the interviewer is testing:} Nuanced understanding of optimizer properties, not just memorized definitions. Ability to connect optimizer choice to task characteristics.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
 
 \textbf{Strong answer:}
 
-\textbf{SGD with momentum} when: I am training a CNN on a well-studied task (ImageNet, object detection), have a known good training recipe, and care most about final generalization. SGD with a well-tuned cosine schedule consistently achieves better test accuracy on vision tasks, likely because the gradient noise from non-adaptive steps helps escape sharp minima and find flatter solutions.
+\textbf{SGD with momentum} when: Training a CNN on a well-studied task (ImageNet, detection) with a known recipe, and generalization matters most. SGD with a tuned cosine schedule consistently finds flatter minima on vision tasks. The uniform step size across parameters acts as implicit regularization---the gradient noise from non-adaptive updates helps escape sharp minima.
 
-\textbf{Adam(W)} when: I am training a Transformer, LLM, or any model where the loss landscape has highly variable curvature across parameters. Adam's per-parameter adaptive rate handles the heterogeneous gradient scales in attention layers (Q/K/V projections, embeddings, layer norms all have very different gradient magnitudes). Also better for: fast prototyping, GANs (where training is unstable), and any setting where I cannot afford extensive LR tuning.
+\textbf{Adam(W)} when: Training Transformers, LLMs, or any model with highly heterogeneous gradient scales across parameters. Attention layers have Q/K/V projections, embeddings, and layer norms all at different gradient magnitudes---Adam's per-parameter adaptive rate handles this naturally. Also preferred for: fast prototyping (less LR sensitivity), GANs (unstable landscapes), and any setting where extensive LR tuning is infeasible.
 
-\textbf{The nuanced point:} The performance gap between Adam and SGD has narrowed. AdamW with proper weight decay and cosine schedule now matches or beats SGD on many vision tasks (see ConvNeXt). The ``SGD generalizes better'' claim is mostly about Adam without proper decoupled weight decay.
+\textbf{The nuanced point:} The gap has narrowed. AdamW with proper decoupled weight decay and cosine schedule now matches SGD on many vision benchmarks (see ConvNeXt). The older ``SGD generalizes better'' result was mostly comparing SGD against Adam \textit{without} decoupled weight decay---the L2 regularization gets attenuated by Adam's adaptive scaling, leading to effectively under-regularized models.
 
-\textbf{Common follow-ups:} ``Why does Adam sometimes generalize worse?'' ``What is the connection between adaptive learning rates and sharp minima?'' ``How does weight decay interact differently with each?''
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Adam is always better because it converges faster''---ignores the generalization gap on vision tasks and the importance of the loss landscape geometry.
+    \item ``SGD is obsolete''---SGD remains the gold standard in well-tuned vision pipelines and has theoretical advantages for generalization.
+    \item Confusing L2 regularization with decoupled weight decay in the context of Adam.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Do you understand \textit{why} these optimizers behave differently, not just \textit{when} to use them? Can you connect optimizer properties to loss landscape geometry?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly identifies the domain split (SGD for vision, Adam for NLP/Transformers) and knows adaptive LR is the key difference.
+    \item \textbf{L6:} Explains the L2 vs.\ decoupled weight decay distinction, the flat/sharp minima connection, and why the gap has narrowed with AdamW.
+    \item \textbf{L7:} Discusses the edge-of-stability phenomenon, how SGD's gradient noise scales with learning rate (providing implicit regularization that Adam lacks), and references the Sharpness-Aware Minimization (SAM) line of work that attempts to give Adam the generalization benefits of SGD.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Why does Adam sometimes generalize worse?'' ``What is the connection between adaptive learning rates and sharp minima?'' ``How does weight decay interact differently with SGD vs.\ Adam?''
 \end{interviewq}
 
+%--- Rewritten Question 4 (originally Q4) ---
 \begin{interviewq}
-\textbf{Q4: Explain gradient accumulation and when you would use it.}
+\textbf{Q: Explain gradient accumulation and when you would use it.}
 
-\textbf{What the interviewer is testing:} Understanding of the relationship between batch size, memory, and optimization; practical training knowledge.
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqmed{}
 
 \textbf{Strong answer:}
 
-Gradient accumulation simulates a larger batch size without increasing GPU memory. Instead of updating parameters after every mini-batch, you:
+Gradient accumulation simulates a larger effective batch size without increasing GPU memory. The procedure:
 \begin{enumerate}
-    \item Forward and backward pass on mini-batch $i$, accumulate the gradient (add to running sum)
-    \item Repeat for $k$ mini-batches (without zeroing gradients)
-    \item After $k$ accumulations, divide by $k$ (average the gradients), then run the optimizer step
-    \item Zero the gradients and repeat
+    \item Forward and backward pass on mini-batch $i$, accumulate the gradient (add to running sum).
+    \item Repeat for $k$ mini-batches without zeroing gradients.
+    \item After $k$ accumulations, divide by $k$ (average the gradients), run the optimizer step.
+    \item Zero the gradients and repeat.
 \end{enumerate}
 
-The effective batch size is $k \times B$ where $B$ is the per-step mini-batch size. Mathematically, this is equivalent to training with batch size $kB$ (the averaged gradient is identical), except that:
+The effective batch size is $k \times B$ where $B$ is the per-step mini-batch size. Mathematically, the averaged gradient is identical to computing the gradient over the full $kB$ batch---but with two important caveats:
 \begin{itemize}
-    \item Batch normalization statistics are computed per mini-batch, not per effective batch (use LayerNorm/GroupNorm to avoid this issue)
-    \item You get $k$ times fewer optimizer steps per epoch, so training is $k$ times slower in wall-clock time per update
+    \item \textbf{Batch normalization:} Statistics are computed per mini-batch of size $B$, not the effective batch of size $kB$. This can cause a train/eval mismatch. Fix: use LayerNorm or GroupNorm.
+    \item \textbf{In-batch negatives:} For contrastive losses like InfoNCE, accumulation does \textit{not} increase the effective number of negatives---each mini-batch still only contrasts $B$ samples. You need true larger batches or gradient caching techniques.
 \end{itemize}
 
-\textbf{When I would use it:}
+\textbf{When to use it:}
 \begin{itemize}
-    \item My GPU cannot fit the batch size required by a training recipe (e.g., a paper uses batch 2048 but I can only fit 256)
-    \item Contrastive learning where larger batches improve performance (though note: for in-batch negatives like InfoNCE, accumulation does \textit{not} increase the effective negative count---you need true larger batches or techniques like gradient caching)
-    \item Fine-tuning large models where even batch size 1 barely fits
+    \item GPU memory limits batch size below what a training recipe requires (e.g., recipe uses batch 2048, but only 256 fits).
+    \item Fine-tuning large models where even batch size 1 barely fits.
+    \item Matching a paper's training setup exactly on fewer GPUs.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``Does gradient accumulation affect learning rate?'' (Yes---apply linear scaling to the effective batch size, not the mini-batch size.) ``How does it interact with mixed precision?'' (Accumulate in FP32 to avoid precision loss from many additions.)
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``It is always equivalent to a larger batch''---misses the BatchNorm and contrastive learning exceptions.
+    \item ``You should also scale the learning rate by $k$''---the LR should match the \textit{effective} batch size. If the recipe already specifies LR for batch $kB$, no additional scaling is needed. Only scale if you are changing from the recipe's intended batch size.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of the relationship between batch size, memory, gradient noise, and optimization. Do you know the edge cases where accumulation is \textit{not} equivalent to a larger batch?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly explains the mechanism and when to use it. Knows to average gradients (not just sum).
+    \item \textbf{L6:} Identifies the BatchNorm caveat and the contrastive learning limitation. Discusses interaction with mixed precision (accumulate in FP32 to avoid precision loss from many small additions).
+    \item \textbf{L7:} Discusses the gradient noise implications---$k$ accumulation steps with batch $B$ have the same expected gradient but different noise characteristics than 1 step with batch $kB$ when using stochastic regularization (dropout produces different masks per mini-batch). Connects to the linear scaling rule and warmup requirements.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Does gradient accumulation affect the learning rate?'' ``How does it interact with mixed precision training?'' ``What happens to dropout noise across accumulation steps?''
+\end{interviewq}
+
+%--- New Question 5: Debugging - Loss spikes ---
+\begin{interviewq}
+\textbf{Q: Your model's loss spikes every N steps then recovers. Diagnose.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Symptom:} Periodic loss spikes at regular intervals of $N$ steps, followed by recovery to the pre-spike trajectory.
+
+\textbf{Hypothesis 1 --- Learning rate schedule step (most likely for periodic spikes).} If $N$ aligns with a schedule milestone (warmup end, step decay boundary, epoch boundary), the LR change is too abrupt. \textit{Experiment:} Log the LR at each spike. \textit{Fix:} Switch to cosine decay for smoother transitions, or reduce the step decay factor.
+
+\textbf{Hypothesis 2 --- Data loader cycling.} If $N$ equals the dataset size divided by batch size (i.e., one epoch), the spike occurs at epoch boundaries due to a data ordering artifact---perhaps the last batch of each epoch is very different (e.g., remainder batch with unusual class distribution, or the shuffle seed resets). \textit{Experiment:} Check if $N = \lceil|\text{dataset}|/B\rceil$. Log the loss per batch around the spike. \textit{Fix:} Drop the last incomplete batch, or use a different shuffling strategy.
+
+\textbf{Hypothesis 3 --- Gradient explosion from specific data patterns.} Certain batches contain outliers (very long sequences, corrupted samples, extreme label values) that cause gradient spikes. \textit{Experiment:} Log gradient norms per step---does the gradient norm spike at the same steps? Inspect the specific batches at those steps. \textit{Fix:} Add gradient clipping ($c = 1.0$), filter outliers from the dataset, or cap sequence length.
+
+\textbf{Hypothesis 4 --- Numerical instability in FP16.} If using FP16 mixed precision, the loss scaler may be periodically detecting overflow and halving the scale factor, causing a transient disruption. \textit{Experiment:} Log the loss scale value---is it oscillating? \textit{Fix:} Switch to BF16 (which rarely overflows), or tune the loss scaler's growth/backoff parameters.
+
+\textbf{Hypothesis 5 --- Evaluation or checkpoint interference.} If $N$ matches the evaluation or checkpoint interval, the spike may be a logging artifact: the model switches to eval mode (affecting dropout/BatchNorm), or the I/O from checkpointing causes a stale data prefetch. \textit{Experiment:} Disable evaluation and checkpointing---does the spike disappear?
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just add gradient clipping and move on''---this treats the symptom without diagnosing the root cause. Clipping is a valid mitigation but you should still understand \textit{why} the spikes occur.
+    \item ``It is normal for loss to spike occasionally''---periodic spikes at a fixed interval $N$ are never normal; they always indicate a systematic issue.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you generate multiple hypotheses for the same symptom and design targeted experiments to distinguish between them? Do you notice that ``periodic'' is the key diagnostic clue?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies LR schedule and gradient explosion as causes. Suggests gradient clipping.
+    \item \textbf{L6:} Notices the periodicity and connects $N$ to data loader epoch length or schedule milestones. Proposes logging gradient norms and LR to differentiate. Mentions the FP16 loss scaler.
+    \item \textbf{L7:} Considers second-order effects like evaluation-mode interference, discusses how the spike pattern differs between causes (LR spikes recover slowly as the optimizer re-adapts; data outlier spikes recover in 1--2 steps), and proposes an ablation plan to isolate the cause.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you distinguish a data-caused spike from an LR-caused spike?'' ``What if the spikes are not periodic but random?'' ``How do loss spikes in LLM pretraining (e.g., PaLM, OPT) get handled in practice?''
+\end{interviewq}
+
+%--- New Question 6: Debugging - NaN loss ---
+\begin{interviewq}
+\textbf{Q: Training loss is NaN after 1000 steps. Walk through your debugging process.}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+NaN loss means a numerical infinity or invalid value has propagated through the computation graph. I debug systematically from most common to least common cause:
+
+\textbf{Step 1 --- Check gradients before the NaN.} Insert \texttt{torch.autograd.detect\_anomaly()} or log gradient norms every step. If gradient norms are growing exponentially in the steps before the NaN (e.g., $10^2 \to 10^5 \to 10^{12} \to \text{NaN}$), the cause is exploding gradients. \textit{Fix:} Add gradient norm clipping with $c = 1.0$; reduce learning rate.
+
+\textbf{Step 2 --- Check data for NaN/Inf.} Add assertions on input batches: \texttt{assert not torch.isnan(x).any()}. Corrupted data (missing values, encoding errors) can inject NaN at the source. \textit{Fix:} Clean the data pipeline; add input validation.
+
+\textbf{Step 3 --- Check for numerically unstable operations.} Common culprits:
+\begin{itemize}
+    \item $\log(0)$ --- if a softmax output reaches exactly 0 and you compute cross-entropy as $-\log(p)$. \textit{Fix:} Use \texttt{F.cross\_entropy} (numerically stable log-softmax), or add $\epsilon = 10^{-8}$ inside the log.
+    \item Division by zero --- LayerNorm with zero variance, or custom normalization. \textit{Fix:} Ensure $\epsilon$ is present in denominators.
+    \item $\exp(\text{large value})$ overflow --- in attention logits or loss computation. \textit{Fix:} Subtract the max before exponentiation (log-sum-exp trick).
+\end{itemize}
+
+\textbf{Step 4 --- Check FP16 overflow.} FP16 overflows at $\sim 65{,}504$. If activations or gradients exceed this, they become Inf, then NaN on the next operation. \textit{Experiment:} Switch to BF16 (range $\sim 3.4 \times 10^{38}$) or FP32 and see if the NaN disappears. \textit{Fix:} Use BF16; tune the dynamic loss scaler; or identify which layer produces large activations.
+
+\textbf{Step 5 --- Check learning rate.} A learning rate that is too high causes parameter values to blow up. \textit{Experiment:} Reduce LR by $10\times$. If training stabilizes, the original LR was too high for this architecture. \textit{Fix:} Add warmup (especially critical for Transformers); reduce LR; ensure weight initialization is appropriate.
+
+\textbf{Step 6 --- Binary search for the guilty layer.} If the above steps do not isolate the cause, register forward hooks on each layer to check for NaN outputs. Run training until the NaN appears and find the first layer to produce it.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Set LR to $10^{-6}$ and hope it works''---this is not debugging, it is guessing. A very low LR may mask the problem while making training useless.
+    \item ``NaN is usually a data problem''---while data can cause NaN, numerical instability and exploding gradients are more common in practice.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systematic numerical debugging skills. Do you know the common sources of NaN in deep learning? Can you write targeted experiments to isolate the cause?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies exploding gradients, LR too high, and FP16 overflow. Knows to add gradient clipping and check data.
+    \item \textbf{L6:} Lists specific unstable operations ($\log(0)$, division by zero, exp overflow) and their fixes. Knows the FP16 vs.\ BF16 range difference. Mentions \texttt{detect\_anomaly()}.
+    \item \textbf{L7:} Proposes the binary-search-by-layer approach for hard cases. Discusses how NaN can be \textit{intermittent} due to stochastic data ordering (the bug only triggers on specific batches). Mentions that gradient clipping can mask the root cause and should be used alongside a proper fix.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What if NaN appears only with mixed precision but not FP32?'' ``How do you debug NaN in a distributed training setting where only some ranks see it?'' ``What is the difference between NaN and Inf in terms of root cause?''
+\end{interviewq}
+
+%--- New Question 7: Debugging - Distributed training slowdown ---
+\begin{interviewq}
+\textbf{Q: Your distributed training job is 60\% as fast as expected with 8 GPUs. What is wrong?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+Linear scaling from 1 to 8 GPUs is the theoretical ideal. Getting only 60\% means 40\% of potential throughput is lost to overhead. I would profile and investigate these causes in order:
+
+\textbf{Hypothesis 1 --- Communication bottleneck (most common).} In DDP, gradients are synchronized via all-reduce after every backward pass. If the all-reduce takes a significant fraction of the step time, scaling efficiency drops. \textit{Diagnosis:} Use \texttt{torch.profiler} or NCCL logging to measure the fraction of time spent in all-reduce. For a model with $P$ parameters in BF16, each all-reduce sends $2P$ bytes per GPU. On 8 GPUs with PCIe Gen4 ($\sim$25 GB/s bidirectional), a 7B model sends $\sim$14 GB---this takes $\sim$560 ms, which can dominate a 200 ms compute step. \textit{Fix:} Use NVLink interconnect ($\sim$600 GB/s); overlap communication with computation (\texttt{gradient\_as\_bucket\_view=True} in PyTorch DDP); reduce model size or use gradient compression.
+
+\textbf{Hypothesis 2 --- Data loading starvation.} If the data pipeline cannot feed 8 GPUs fast enough, GPUs idle between steps. \textit{Diagnosis:} Check GPU utilization with \texttt{nvidia-smi}---if it oscillates between 0\% and 100\%, data loading is the bottleneck. \textit{Fix:} Increase \texttt{num\_workers}; use memory-mapped datasets; add prefetching; move data to local SSD.
+
+\textbf{Hypothesis 3 --- Unbalanced workload.} If samples have variable length (NLP), some GPUs finish their batch faster and wait for the slowest GPU (the ``straggler'' problem). \textit{Diagnosis:} Log per-GPU step time---high variance indicates imbalance. \textit{Fix:} Sort samples by length and create balanced batches; pad to the same length within each batch; use dynamic batching.
+
+\textbf{Hypothesis 4 --- Python GIL or CPU bottleneck.} Data preprocessing, tokenization, or augmentation running on CPU can bottleneck the pipeline. With 8 GPUs, the CPU demand is $8\times$ higher. \textit{Diagnosis:} Profile CPU utilization. \textit{Fix:} Move preprocessing to GPU (e.g., DALI); precompute features offline; use more CPU cores per GPU.
+
+\textbf{Hypothesis 5 --- Small batch size per GPU.} If the per-GPU batch is too small, GPU compute is underutilized and the communication-to-computation ratio is unfavorable. \textit{Diagnosis:} Check GPU compute utilization (should be $>$80\%). \textit{Fix:} Increase per-GPU batch size or use gradient accumulation to amortize communication.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``60\% scaling is normal''---while perfect linear scaling is rare, 60\% on only 8 GPUs indicates a real problem. Typical DDP on 8 NVLink-connected GPUs should achieve $>$90\% scaling.
+    \item ``Use model parallelism instead''---this treats the symptom and would likely make scaling \textit{worse} if the root cause is communication or data loading.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systems-level thinking. Can you reason quantitatively about communication costs, identify bottlenecks, and propose targeted fixes? Do you know how to profile distributed training?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies communication overhead and data loading as possible causes. Knows about all-reduce.
+    \item \textbf{L6:} Quantifies the communication cost (bytes transferred, bandwidth, time). Proposes specific profiling tools. Discusses computation-communication overlap. Identifies the straggler problem.
+    \item \textbf{L7:} Calculates the expected communication-to-compute ratio for the given model and hardware. Discusses Amdahl's law applied to the non-parallelizable fraction. Proposes architectural solutions (gradient compression, async all-reduce, bucketed communication) and knows when to switch from DDP to FSDP for memory-bound scenarios.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you calculate the theoretical maximum scaling efficiency for this setup?'' ``What changes if you go from 8 GPUs on one node to 8 GPUs across two nodes?'' ``How does FSDP change the communication pattern?''
+\end{interviewq}
+
+%--- New Question 8: Estimation - LoRA vs full fine-tuning memory ---
+\begin{interviewq}
+\textbf{Q: How much GPU memory is needed to fine-tune a 13B parameter model with LoRA vs.\ full fine-tuning?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+\textbf{Full fine-tuning (BF16 mixed precision with AdamW):}
+
+Per-parameter costs:
+\begin{itemize}
+    \item BF16 parameters: $13\text{B} \times 2 = 26$ GB
+    \item FP32 master weights: $13\text{B} \times 4 = 52$ GB
+    \item FP32 optimizer states ($m$ + $v$): $13\text{B} \times 8 = 104$ GB
+    \item BF16 gradients: $13\text{B} \times 2 = 26$ GB
+    \item \textbf{Subtotal (parameters):} $\sim$208 GB
+\end{itemize}
+
+Activation memory depends on batch size and sequence length. For a typical setup ($b=4$, $s=2048$, $d=5120$, 40 layers): roughly 30--60 GB with gradient checkpointing. \textbf{Total: $\sim$240--270 GB.} This requires at minimum 4$\times$ A100-80GB with FSDP/ZeRO-3.
+
+\textbf{LoRA fine-tuning (rank $r = 16$, adapting Q/V projections):}
+
+Trainable parameters: Each adapted layer adds $2 \times d \times r = 2 \times 5120 \times 16 = 163{,}840$ parameters. With $\sim$80 adapted weight matrices (Q and V in 40 layers), total trainable params $\approx 80 \times 163{,}840 \approx 13\text{M}$ (0.1\% of the model).
+\begin{itemize}
+    \item Base model (frozen, BF16): $13\text{B} \times 2 = 26$ GB (no gradients, no optimizer states)
+    \item LoRA parameters (BF16): $13\text{M} \times 2 \approx 0.03$ GB
+    \item LoRA optimizer states (FP32 $m$ + $v$): $13\text{M} \times 8 \approx 0.10$ GB
+    \item LoRA gradients (BF16): $13\text{M} \times 2 \approx 0.03$ GB
+    \item \textbf{Subtotal (parameters):} $\sim$26.2 GB
+\end{itemize}
+
+Activation memory is similar (you still run forward through all layers), so $\sim$30--60 GB with checkpointing. \textbf{Total: $\sim$56--86 GB.} This fits on a \textit{single} A100-80GB.
+
+\textbf{QLoRA (4-bit quantized base + LoRA):}
+
+Base model in INT4: $13\text{B} \times 0.5 = 6.5$ GB. Plus LoRA overhead ($\sim$0.2 GB) plus activations ($\sim$30 GB with checkpointing). \textbf{Total: $\sim$37 GB.} Fits on a single A100-40GB or even a consumer GPU with 48 GB VRAM.
+
+\begin{table}[H]
+\centering
+\caption{Memory comparison: full fine-tuning vs.\ LoRA vs.\ QLoRA for 13B model}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Component} & \textbf{Full FT} & \textbf{LoRA ($r=16$)} & \textbf{QLoRA (INT4)} \\
+\midrule
+Base model weights & 26 GB (BF16) & 26 GB (BF16, frozen) & 6.5 GB (INT4) \\
+Master weights & 52 GB & 0 GB & 0 GB \\
+Optimizer states & 104 GB & 0.1 GB & 0.1 GB \\
+Gradients & 26 GB & 0.03 GB & 0.03 GB \\
+Activations (w/ ckpt) & $\sim$40 GB & $\sim$40 GB & $\sim$30 GB \\
+\midrule
+\textbf{Total} & \textbf{$\sim$248 GB} & \textbf{$\sim$66 GB} & \textbf{$\sim$37 GB} \\
+Min hardware & 4$\times$ A100-80GB & 1$\times$ A100-80GB & 1$\times$ A100-40GB \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``LoRA uses less memory because it has fewer parameters''---this is true but incomplete. The dominant saving is that the frozen base model needs \textit{no gradients, no optimizer states, and no master weights}. The parameter count reduction alone would only save $\sim$0.2 GB.
+    \item Forgetting activation memory---it is often the second-largest component and is nearly the same for LoRA and full fine-tuning.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you do structured back-of-envelope memory calculations? Do you understand where memory goes during training (parameters vs.\ optimizer states vs.\ activations)?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows LoRA is more memory-efficient and can state the general reason (fewer trainable parameters, frozen base). Rough memory estimate within $2\times$.
+    \item \textbf{L6:} Provides itemized memory breakdown with concrete numbers. Identifies that optimizer states dominate full fine-tuning memory. Includes the QLoRA option. Mentions activation memory.
+    \item \textbf{L7:} Discusses how LoRA rank $r$ affects both memory and quality. Knows that activation memory is the same and explains gradient checkpointing trade-offs. Compares FSDP-sharded full fine-tuning on 4 GPUs vs.\ LoRA on 1 GPU in terms of total cost and training speed, not just memory.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What LoRA rank would you start with for a 13B model?'' ``When would full fine-tuning be worth the extra cost over LoRA?'' ``How does LoRA interact with quantization during inference?''
+\end{interviewq}
+
+%--- New Question 9: Estimation - Training throughput ---
+\begin{interviewq}
+\textbf{Q: Calculate the training throughput (tokens/sec) for a 7B model on 8$\times$A100s.}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+\textbf{Step 1 --- FLOPs per token.} For a dense Transformer with $P$ parameters, the compute per token during training is approximately $6P$ FLOPs: $2P$ for forward (each parameter participates in one multiply-add) and $4P$ for backward (gradient w.r.t.\ activations + gradient w.r.t.\ weights, each $\sim 2P$). For 7B parameters: $6 \times 7 \times 10^9 = 4.2 \times 10^{10}$ FLOPs/token.
+
+\textbf{Step 2 --- Hardware peak FLOP/s.} A single A100-80GB achieves 312 TFLOP/s peak in BF16 (tensor core operations). With 8 GPUs: $8 \times 312 = 2{,}496$ TFLOP/s aggregate.
+
+\textbf{Step 3 --- Model FLOPs Utilization (MFU).} MFU measures what fraction of peak hardware FLOP/s is used for model computation (excluding communication overhead, memory-bound ops, etc.). Typical MFU for well-optimized LLM training: 40--55\%. Using 45\% as a reasonable estimate: effective FLOP/s = $2{,}496 \times 0.45 = 1{,}123$ TFLOP/s.
+
+\textbf{Step 4 --- Throughput calculation.}
+\begin{equation}
+\text{Tokens/sec} = \frac{\text{Effective FLOP/s}}{\text{FLOPs/token}} = \frac{1{,}123 \times 10^{12}}{4.2 \times 10^{10}} \approx 26{,}700 \text{ tokens/sec}
+\end{equation}
+
+\textbf{Step 5 --- Sanity check.} At $\sim$26.7K tokens/sec, training on 1T tokens takes $1 \times 10^{12} / 26{,}700 \approx 3.7 \times 10^7$ seconds $\approx$ 434 days. This is plausible for a 7B model on a small cluster---LLaMA-2 7B used 184K GPU-hours on A100s for 2T tokens, which implies $\sim$3K tokens/sec/GPU, closely matching our $26.7\text{K}/8 \approx 3.3\text{K}$ per GPU.
+
+\textbf{Key factors that affect throughput:}
+\begin{itemize}
+    \item \textbf{Batch size:} Larger batches improve GPU utilization (more arithmetic intensity).
+    \item \textbf{Sequence length:} Longer sequences amortize per-step overhead but increase activation memory.
+    \item \textbf{Parallelism strategy:} DDP (8 GPUs, single node, NVLink) for a 7B model---communication overhead is minimal.
+    \item \textbf{Software stack:} Flash attention, torch.compile, optimized kernels can improve MFU from 40\% to 55\%+.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Using $2P$ FLOPs/token instead of $6P$---a common mistake that forgets the backward pass costs $\sim$2$\times$ the forward pass.
+    \item Assuming 100\% hardware utilization---real MFU is never above 60\% for LLM training; the memory-bound operations (LayerNorm, softmax, etc.) and communication overhead reduce it significantly.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you reason from first principles about compute requirements? Do you know the $6P$ rule, hardware specs, and MFU concept? Can you sanity-check your answer against known training runs?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows that training FLOPs scale with parameter count and can give a rough order-of-magnitude estimate.
+    \item \textbf{L6:} Produces the $6P$ calculation, knows A100 peak FLOP/s, and applies a realistic MFU. Gets the right order of magnitude.
+    \item \textbf{L7:} Includes the sanity check against published training runs. Discusses what determines MFU (arithmetic intensity, memory bandwidth, communication overlap). Can reason about whether the workload is compute-bound or memory-bound using the roofline model.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would throughput change if you switched to H100s?'' ``What if you increase the model to 70B---does 8$\times$A100 still work?'' ``How does sequence length affect MFU?''
+\end{interviewq}
+
+%--- New Question 10: Trade-off - Cosine decay vs constant LR ---
+\begin{interviewq}
+\textbf{Q: Cosine decay vs.\ constant LR with warmup---when would you use each?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Cosine decay with warmup} (warmup $\to$ cosine from $\eta_{\max}$ to $\eta_{\min}$):
+\begin{itemize}
+    \item \textbf{When:} You know the total training budget in advance (fixed number of steps/tokens). This is the standard for LLM pretraining (GPT-3, LLaMA, Mistral) and most Transformer training.
+    \item \textbf{Why it works:} The gradual decay spends most of the training at a moderate LR (the productive range), then slowly reduces to let the model settle into a good minimum. Avoids the shock of step decay.
+    \item \textbf{Limitation:} You must commit to a total step count upfront. If you want to continue training beyond $T$, the LR is already near zero---you need to ``rewind'' with warm restarts or start a new cosine cycle.
+\end{itemize}
+
+\textbf{Constant LR with warmup} (warmup $\to$ constant $\eta$):
+\begin{itemize}
+    \item \textbf{When:} The training budget is open-ended or you want to continue training / fine-tune later from a checkpoint. Also useful for continual learning, or when you are uncertain about the right total step count.
+    \item \textbf{Why:} The model never enters a low-LR ``settling'' phase, so checkpoints at any point during training are equally viable for downstream use. Recent work (Chinchilla, MiniCPM) has shown that constant LR followed by a short cooldown phase can match cosine decay in final performance.
+    \item \textbf{Limitation:} Without decay, the constant gradient noise can prevent convergence to a sharp minimum. A short ``cooldown'' (rapid LR decay over the final 5--10\% of training) is usually necessary to close the gap with cosine.
+\end{itemize}
+
+\textbf{Practical recommendation:} Use cosine for fixed-budget training (most common). Use constant + cooldown when you want checkpoint flexibility or are unsure of the training duration.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Cosine is always better''---constant + cooldown matches cosine in practice and offers more flexibility. The choice depends on the use case, not absolute quality.
+    \item ``The LR schedule does not matter much with Adam''---while Adam is less sensitive than SGD, schedule choice still affects final model quality by 1--3\% on downstream benchmarks.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Do you understand \textit{why} LR decay helps (noise reduction near convergence)? Can you reason about trade-offs between training flexibility and final performance?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows cosine is the default for Transformers and can explain the basic schedule shape. Knows warmup is needed.
+    \item \textbf{L6:} Identifies the fixed-budget limitation of cosine and proposes constant + cooldown as the alternative. References Chinchilla or similar work on schedule flexibility.
+    \item \textbf{L7:} Discusses how the schedule interacts with the loss landscape (high LR explores, low LR exploits). Knows about WSD (warmup-stable-decay) schedules and their advantages for continual pretraining. Can connect LR schedule to learning rate rewinding for lottery ticket hypothesis or model soups.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What is the WSD (warmup-stable-decay) schedule?'' ``How do you resume training after cosine has decayed to zero?'' ``Does batch size interact with schedule choice?''
+\end{interviewq}
+
+%--- New Question 11: Trade-off - Parallelism strategies ---
+\begin{interviewq}
+\textbf{Q: Data parallelism vs.\ tensor parallelism vs.\ pipeline parallelism---what is your decision framework?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+The choice depends on three factors: \textbf{model size} (does it fit on one GPU?), \textbf{interconnect bandwidth} (NVLink vs.\ InfiniBand vs.\ Ethernet), and \textbf{number of GPUs}.
+
+\textbf{Data Parallelism (DDP / FSDP / ZeRO):}
+\begin{itemize}
+    \item \textbf{What it splits:} Data across GPUs. Each GPU processes different batches; gradients are synchronized.
+    \item \textbf{Communication:} All-reduce of gradients once per step. Volume = $O(P)$ bytes, independent of GPU count (ring all-reduce).
+    \item \textbf{When:} Model fits on one GPU (DDP), or fits with sharded optimizer/gradients (FSDP/ZeRO). \textit{Always the first choice}---simplest and most efficient.
+    \item \textbf{Scales to:} Hundreds of GPUs, limited by batch size (diminishing returns beyond critical batch size) and all-reduce latency.
+\end{itemize}
+
+\textbf{Tensor Parallelism (TP):}
+\begin{itemize}
+    \item \textbf{What it splits:} Individual weight matrices across GPUs ($\mW$ split column-wise or row-wise).
+    \item \textbf{Communication:} All-reduce of activations \textit{within every forward and backward pass} (multiple times per layer). Very communication-intensive.
+    \item \textbf{When:} A single layer is too large for one GPU, or you need to reduce per-GPU memory for large models. \textit{Requires NVLink} (600+ GB/s)---never use across nodes on InfiniBand ($\sim$50 GB/s).
+    \item \textbf{Scales to:} 4--8 GPUs within a single node. Beyond 8, the communication overhead dominates.
+\end{itemize}
+
+\textbf{Pipeline Parallelism (PP):}
+\begin{itemize}
+    \item \textbf{What it splits:} Layers across GPUs (GPU 0 gets layers 1--20, GPU 1 gets layers 21--40, etc.).
+    \item \textbf{Communication:} Point-to-point activation transfer between stages---only at stage boundaries, so lower bandwidth requirement than TP.
+    \item \textbf{When:} Model is too large for one node even with TP. PP works across nodes because inter-stage communication is point-to-point and relatively low-bandwidth.
+    \item \textbf{Limitation:} Pipeline bubble---GPUs idle while waiting for micro-batches. Bubble fraction $\approx (P-1)/(M+P-1)$ where $M$ is micro-batches and $P$ is pipeline stages. Mitigate by increasing $M$ or using interleaved schedules (1F1B).
+\end{itemize}
+
+\textbf{Decision framework:}
+\begin{enumerate}
+    \item Model fits on 1 GPU $\to$ \textbf{DDP only}
+    \item Model fits on 1 node (8 GPUs) with sharding $\to$ \textbf{FSDP/ZeRO + optional TP within node}
+    \item Model needs multiple nodes $\to$ \textbf{TP within node + PP across nodes + DP across PP replicas} (3D parallelism)
+    \item $>$100B parameters $\to$ Full 3D parallelism with expert-level tuning of TP/PP/DP degrees
+\end{enumerate}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Use tensor parallelism across nodes''---TP requires NVLink bandwidth. Cross-node TP on InfiniBand is $10\times$ slower and will destroy throughput.
+    \item Treating FSDP/ZeRO-3 and model parallelism as interchangeable---FSDP shards parameters but gathers them in full for each layer's computation. Model parallelism actually splits the computation itself.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you reason about the communication-computation trade-off for each strategy? Do you understand which parallelism maps to which hardware topology?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows all three types and their basic definitions. Knows DDP is the starting point.
+    \item \textbf{L6:} Maps each parallelism type to hardware topology (TP $\to$ intra-node, PP $\to$ inter-node, DP $\to$ everywhere). Quantifies the pipeline bubble. Provides a concrete decision framework based on model size.
+    \item \textbf{L7:} Discusses sequence parallelism (splitting the sequence dimension for LayerNorm/dropout across TP ranks), expert parallelism for MoE models, and context parallelism for very long sequences. Knows the specific communication primitives (all-reduce for DDP/TP, point-to-point send/recv for PP) and their bandwidth requirements.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you choose the TP/PP/DP degrees for a given cluster?'' ``What is the pipeline bubble and how do you minimize it?'' ``How does FSDP differ from ZeRO-3 in practice?''
+\end{interviewq}
+
+%--- New Question 12: Trade-off - FP16 vs BF16 vs FP8 ---
+\begin{interviewq}
+\textbf{Q: FP16 vs.\ BF16 vs.\ FP8 for training---when would you use each?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+The three formats trade off between dynamic range, precision, compute speed, and hardware support:
+
+\begin{table}[H]
+\centering
+\caption{Numerical format comparison for training}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Property} & \textbf{FP16} & \textbf{BF16} & \textbf{FP8 (E4M3/E5M2)} \\
+\midrule
+Exponent / Mantissa bits & 5 / 10 & 8 / 7 & 4/3 or 5/2 \\
+Dynamic range & $6.5 \times 10^4$ & $3.4 \times 10^{38}$ & $448$ (E4M3) / $57344$ (E5M2) \\
+Precision & High & Medium & Low \\
+Loss scaling required & Yes & Rarely & Yes (per-tensor) \\
+Tensor core speedup (vs.\ FP32) & $\sim$2$\times$ & $\sim$2$\times$ & $\sim$4$\times$ (H100) \\
+Hardware & V100+ & A100+ / TPU & H100 / H200 / B200 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{FP16:}
+\begin{itemize}
+    \item \textbf{When:} Inference on older GPUs (V100, T4, consumer GPUs). Fine-tuning small models where loss scaling is manageable.
+    \item \textbf{Why not for LLM training:} FP16 max value is $\sim$65K. In deep networks with 80+ layers, activations and gradients regularly exceed this, causing overflow $\to$ Inf $\to$ NaN. Dynamic loss scaling mitigates this but adds complexity and occasional training instability.
+\end{itemize}
+
+\textbf{BF16:}
+\begin{itemize}
+    \item \textbf{When:} LLM pretraining and fine-tuning on A100+ or TPU. This is the \textit{de facto standard} for modern LLM training.
+    \item \textbf{Why:} Same dynamic range as FP32 ($3.4 \times 10^{38}$), so overflow is essentially impossible during training. Loss scaling is rarely needed. The reduced precision (7 mantissa bits vs.\ 10 for FP16) is acceptable because the stochastic gradient noise dominates precision errors.
+    \item \textbf{Limitation:} Lower precision than FP16 for tasks requiring fine-grained numerical accuracy (some scientific computing). Not available on older GPUs.
+\end{itemize}
+
+\textbf{FP8 (E4M3 + E5M2):}
+\begin{itemize}
+    \item \textbf{When:} H100/H200/B200 training where you want maximum throughput. Cutting-edge and requires careful per-tensor scaling.
+    \item \textbf{How:} Forward pass uses E4M3 (4 exponent, 3 mantissa---higher precision, lower range) for weights and activations. Backward pass uses E5M2 (5 exponent, 2 mantissa---higher range for gradients). Per-tensor dynamic scaling calibrates the range for each tensor.
+    \item \textbf{Status:} Successfully used for LLM pretraining (DeepSeek-V3, Nemotron), but requires framework support (\texttt{torch.float8}) and careful implementation. Not yet ``just works'' like BF16.
+\end{itemize}
+
+\textbf{Decision rule:} Use BF16 by default. Use FP8 if on H100+ and throughput is critical and you have the engineering bandwidth to handle per-tensor scaling. Use FP16 only for inference on older hardware.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``FP16 and BF16 are basically the same''---they have fundamentally different dynamic ranges. FP16 overflows at 65K; BF16 shares FP32's range of $10^{38}$. This distinction is critical for LLM training stability.
+    \item ``FP8 halves memory compared to FP16''---FP8 halves memory for weights and activations but optimizer states and master weights are still in FP32/BF16. The actual memory saving depends on the component mix.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Do you understand the bit-level differences (exponent vs.\ mantissa trade-off) and their practical implications? Can you reason about numerical stability in the context of training?
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows BF16 is preferred over FP16 for training and can explain the dynamic range difference. Knows FP8 exists.
+    \item \textbf{L6:} Explains the exponent/mantissa trade-off, knows loss scaling is needed for FP16 but not BF16, and can discuss the E4M3/E5M2 split in FP8 training. Mentions per-tensor scaling for FP8.
+    \item \textbf{L7:} Discusses the interaction between numerical precision and gradient noise (why 7 mantissa bits in BF16 is ``good enough'' for stochastic optimization). Knows about the stochastic rounding technique for low-precision training. Can reason about when FP8 training diverges and how to debug it (activation histogram analysis, per-layer scale monitoring).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``Why does BF16 not need loss scaling but FP16 does?'' ``What is per-tensor scaling in FP8 and why is it necessary?'' ``How would you debug a model that trains fine in BF16 but diverges in FP8?''
 \end{interviewq}
