@@ -1,0 +1,1820 @@
+% ============================================================================
+% CHAPTER 10: EVALUATION, METRICS, AND DECODING
+% Where theory meets reality: measuring what matters in NLP.
+% ============================================================================
+
+\chapter{Evaluation, Metrics, and Decoding}
+\label{chap:evaluation}
+
+\begin{tldr}
+Evaluation is where theory meets reality.  This chapter covers the complete landscape of
+NLP evaluation: language modeling metrics (perplexity and its connection to cross-entropy),
+generation metrics (BLEU, ROUGE, METEOR, BERTScore, COMET), classification metrics
+(precision, recall, F1, entity-level scoring for NER), human evaluation protocols,
+LLM-as-judge paradigms, the modern benchmark landscape, and decoding strategies
+(greedy, beam search, temperature sampling, top-$k$, nucleus sampling, constrained
+decoding).  Understanding evaluation deeply signals maturity---interviewers test whether
+candidates know not just \emph{what} to measure, but \emph{why} certain metrics fail and
+\emph{when} to distrust them.  A candidate who can derive BLEU, explain why ROUGE
+favors extractive summaries, and articulate the biases of LLM-as-judge evaluation
+demonstrates the kind of critical thinking that earns ``strong hire'' signals.
+\end{tldr}
+
+\bigskip
+
+% ============================================================================
+% SECTION 1: LANGUAGE MODELING METRICS
+% ============================================================================
+\section{Language Modeling Metrics}
+\label{sec:lm_metrics}
+
+The most fundamental evaluation question in NLP is: \emph{how well does the model
+predict the next token?}  Language modeling metrics quantify this directly.
+
+\subsection{Cross-Entropy Loss}
+
+Given a sequence of $N$ tokens $w_1, w_2, \ldots, w_N$ and a model that assigns
+probability $P_\theta(w_i \mid w_{<i})$ to each token conditioned on its left
+context, the \textbf{cross-entropy loss} is:
+\[
+    H(\theta) = -\frac{1}{N} \sum_{i=1}^{N} \log_2 P_\theta(w_i \mid w_{<i})
+\]
+
+This measures the average number of \emph{bits} the model needs to encode each
+token.  A perfect model that assigns probability 1 to every correct next token
+achieves $H = 0$.  In practice, training minimizes cross-entropy using natural
+logarithms ($\ln$), which differs from the information-theoretic convention
+($\log_2$) by a constant factor: $H_{\text{nats}} = H_{\text{bits}} \times \ln 2$.
+
+\subsection{Perplexity}
+
+Perplexity exponentiates the cross-entropy to give a more interpretable number:
+
+\begin{mathresult}{Perplexity}
+\[
+    \text{PP}(W) = \exp\!\left(-\frac{1}{N}\sum_{i=1}^{N}\ln P_\theta(w_i \mid w_{<i})\right)
+    = 2^{H(\theta)}
+\]
+where $H(\theta)$ is the cross-entropy in bits.  Equivalently, using the chain rule
+of probability:
+\[
+    \text{PP}(W) = P_\theta(w_1, w_2, \ldots, w_N)^{-1/N}
+    = \left(\prod_{i=1}^{N} P_\theta(w_i \mid w_{<i})\right)^{-1/N}
+\]
+\end{mathresult}
+
+\paragraph{Intuition: weighted average branching factor.}
+Perplexity represents the effective number of equally likely choices the model
+considers at each step.  A perplexity of 50 means the model is, on average, as
+uncertain as if choosing uniformly among 50 options per token.  For English text:
+\begin{itemize}
+    \item A uniform distribution over a 50,000-token vocabulary gives
+          $\text{PP} = 50{,}000$.
+    \item A good n-gram model achieves $\text{PP} \approx 80\text{--}200$.
+    \item GPT-2 (1.5B) achieved $\text{PP} \approx 18$ on WikiText-103.
+    \item Modern LLMs achieve $\text{PP} < 10$ on standard benchmarks.
+\end{itemize}
+Lower is better, but the absolute number is only meaningful when comparing models
+on the \emph{same} data with the \emph{same} tokenizer.
+
+\subsection{Bits-Per-Character and Bits-Per-Byte}
+\label{sec:bpc}
+
+Because different tokenizers produce different numbers of tokens for the same
+text, perplexity is not directly comparable across models with different
+vocabularies.  \textbf{Bits-per-character} (BPC) and \textbf{bits-per-byte}
+(BPB) solve this by normalizing to a tokenizer-independent unit:
+\[
+    \text{BPC} = \frac{-\sum_{i=1}^{N}\log_2 P_\theta(w_i \mid w_{<i})}{\text{total characters in text}}, \qquad
+    \text{BPB} = \frac{-\sum_{i=1}^{N}\log_2 P_\theta(w_i \mid w_{<i})}{\text{total bytes (UTF-8)}}
+\]
+This enables fair comparison: a character-level model and a subword-level model
+can be compared on the same BPC/BPB scale.
+
+\begin{keyinsight}[Perplexity: Necessary but Not Sufficient]
+Perplexity measures a model's ability to \emph{predict} text---not to
+\emph{generate} useful, faithful, safe, or coherent text.  A model with
+excellent perplexity might still hallucinate facts, produce toxic content, or
+fail at instruction following.  This is precisely why the field moved to
+downstream benchmarks (MMLU, HumanEval, GSM8K) and human evaluation as the
+primary assessment tools for LLMs, while perplexity remains the dominant metric
+for \emph{pretraining} optimization and scaling law research.
+\end{keyinsight}
+
+\subsection{Limitations of Perplexity}
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Vocabulary dependence.}  Models with different tokenizers
+          produce incomparable perplexities.  A BPE tokenizer with 32K vocabulary
+          and one with 100K vocabulary will report different perplexities on
+          identical text because they predict different token sequences.
+
+    \item \textbf{No quality signal.}  Perplexity does not measure fluency,
+          coherence, factuality, helpfulness, or safety.  Two models with
+          identical perplexity can differ drastically in generation quality.
+
+    \item \textbf{Domain sensitivity.}  Perplexity on Wikipedia does not predict
+          performance on clinical notes, legal documents, or code.  Always report
+          perplexity on a domain-matched held-out set.
+
+    \item \textbf{Equal token weighting.}  Every token contributes equally, but
+          predicting ``the'' is trivially easy while predicting a rare entity
+          name is what matters for downstream tasks.
+
+    \item \textbf{Not calibrated to utility.}  Improvements from $\text{PP}=15$ to
+          $\text{PP}=14$ may matter more or less than from $\text{PP}=50$ to
+          $\text{PP}=40$, depending on the downstream task.
+\end{enumerate}
+
+% ============================================================================
+% SECTION 2: MACHINE TRANSLATION METRICS
+% ============================================================================
+\section{Machine Translation Metrics}
+\label{sec:mt_metrics}
+
+Machine translation evaluation has driven some of the most rigorous metric
+development in NLP, because translation quality is multidimensional (adequacy,
+fluency, terminology) and purely human evaluation is prohibitively expensive at
+scale.
+
+\subsection{BLEU: Bilingual Evaluation Understudy}
+\label{sec:bleu}
+
+BLEU (Papineni et al., ACL 2002) remains the most widely reported MT metric,
+despite well-known limitations.  Every NLP interview candidate must be able to
+derive it from scratch.
+
+\paragraph{Step 1: Modified n-gram precision.}
+For each n-gram order $n \in \{1,2,3,4\}$, compute the \emph{modified precision}
+$p_n$, which clips the count of each n-gram in the candidate by its maximum count
+in any reference translation:
+\[
+    p_n = \frac{\sum_{\text{n-gram} \in C}\min\!\bigl(\text{Count}_C(\text{n-gram}),\;\max_{R}\text{Count}_R(\text{n-gram})\bigr)}{\sum_{\text{n-gram} \in C}\text{Count}_C(\text{n-gram})}
+\]
+where $C$ is the candidate and $R$ iterates over reference translations.  The
+clipping prevents a degenerate candidate like ``the the the the'' from achieving
+perfect unigram precision against a reference containing ``the.''
+
+\paragraph{Step 2: Geometric mean of n-gram precisions.}
+BLEU combines precisions across n-gram orders using a weighted geometric mean:
+\[
+    \text{geo} = \exp\!\left(\sum_{n=1}^{4} w_n \ln p_n\right)
+\]
+where typically $w_n = \frac{1}{4}$ for all $n$ (uniform weighting).  Using the
+geometric mean ensures that a zero precision at \emph{any} order drives the
+entire score to zero, which penalizes candidates that match individual words but
+fail to capture any longer phrases.
+
+\paragraph{Step 3: Brevity penalty.}
+Short candidates can trivially achieve high precision by generating only
+high-confidence words.  The \textbf{brevity penalty} (BP) penalizes candidates
+shorter than the reference:
+\[
+    \text{BP} = \begin{cases}
+        1 & \text{if } |C| \geq |R| \\[4pt]
+        \exp\!\left(1 - \frac{|R|}{|C|}\right) & \text{if } |C| < |R|
+    \end{cases}
+\]
+where $|C|$ and $|R|$ are the candidate and (closest) reference lengths.
+
+\begin{mathresult}{BLEU Score}
+\[
+    \text{BLEU} = \text{BP} \times \exp\!\left(\sum_{n=1}^{4} w_n \ln p_n\right)
+\]
+where $p_n$ is the modified $n$-gram precision, $w_n = \tfrac{1}{4}$ by default,
+and $\text{BP} = \exp\!\bigl(\min(0,\; 1 - |R|/|C|)\bigr)$.  BLEU ranges from
+0 to 1, though scores above 0.40 are considered very good for MT.
+\end{mathresult}
+
+\paragraph{Corpus-level vs.\ sentence-level.}
+BLEU is designed as a \emph{corpus-level} metric: $p_n$ is computed by summing
+counts across all sentence pairs before dividing.  Sentence-level BLEU is
+problematic because short sentences often have $p_n = 0$ for higher $n$, which
+drives the geometric mean to zero.  Smoothed variants (BLEU+1, SacreBLEU) add
+small epsilon counts to handle this.
+
+\subsection{Limitations of BLEU}
+
+\begin{warningbox}
+BLEU has serious known limitations that interviewers frequently test:
+\begin{enumerate}[label=(\arabic*)]
+    \item \textbf{Precision-only.}  BLEU measures precision (how many candidate
+          n-grams appear in the reference) but not recall (how many reference
+          n-grams appear in the candidate).  The brevity penalty is a crude
+          recall proxy.
+    \item \textbf{No semantic awareness.}  ``The cat sat on the mat'' and
+          ``A feline rested upon the rug'' share few n-grams despite being
+          near-paraphrases.  BLEU penalizes valid lexical variation.
+    \item \textbf{Word-order insensitivity.}  BLEU-1 treats bags of words; even
+          BLEU-4 only captures local 4-gram order, not global sentence structure.
+    \item \textbf{Reference dependence.}  Quality depends heavily on reference
+          count and quality.  A single reference captures only one valid
+          translation among many.
+    \item \textbf{Poor correlation at segment level.}  Individual sentence-level
+          BLEU scores correlate poorly with human judgments.
+    \item \textbf{Language bias.}  BLEU was designed for English and works poorly
+          for agglutinative or morphologically rich languages where surface form
+          variation is high.
+\end{enumerate}
+\end{warningbox}
+
+\subsection{Beyond BLEU: Better MT Metrics}
+
+\paragraph{METEOR} (Banerjee \& Lavie, 2005) addresses several BLEU limitations
+by computing an alignment between candidate and reference tokens using exact
+match, stemming, synonyms (via WordNet), and paraphrase tables.  It computes
+both precision and recall, combines them with a weighted harmonic mean (favoring
+recall), and applies a fragmentation penalty for non-contiguous matches.  METEOR
+correlates better with human judgments than BLEU, particularly at the sentence
+level.
+
+\paragraph{chrF and chrF++} (Popovi\'{c}, 2015) compute character n-gram F-score
+rather than word n-grams.  Because character n-grams are language-agnostic and
+naturally capture morphological similarity, chrF works well across typologically
+diverse languages without requiring stemming or synonym resources.  chrF++ adds
+word unigram and bigram precision to the character-level metric.
+
+\paragraph{COMET} (Rei et al., 2020) is a \emph{neural metric} that encodes the
+source, candidate, and reference using a pretrained multilingual encoder (XLM-R)
+and predicts a quality score using a regression head trained on human judgment
+data (Direct Assessment scores from WMT).  COMET achieves substantially higher
+correlation with human judgments than BLEU or METEOR and has become the de facto
+standard in MT research since 2020.
+
+\begin{keyinsight}[The Metric Evolution in MT]
+The progression from BLEU to COMET mirrors the broader NLP evolution: from
+surface-form heuristics (n-gram overlap) to learned, neural representations
+trained on human judgments.  In interviews, demonstrating awareness of this
+progression shows that you understand both the classical metrics (which you must
+know) and the state of the art (which you should prefer in practice).
+\end{keyinsight}
+
+\subsection{MT Metric Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of machine translation metrics.}
+\label{tab:mt_metrics}
+\begin{tabularx}{\textwidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Metric} & \textbf{Type} & \textbf{Human Corr.} & \textbf{Lang.\ Agnostic} & \textbf{Key Mechanism} \\
+\midrule
+BLEU       & Surface    & Moderate  & No  & Modified n-gram precision + brevity penalty \\
+METEOR     & Surface+   & Good      & No  & Alignment with stems/synonyms, F-score \\
+chrF       & Surface    & Good      & Yes & Character n-gram F-score \\
+TER        & Surface    & Moderate  & Yes & Edit distance (insert/delete/substitute/shift) \\
+BERTScore  & Neural     & High      & Yes & Token-level cosine similarity with BERT \\
+COMET      & Neural     & Very High & Yes & Regression on source + candidate + reference embeddings \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% ============================================================================
+% SECTION 3: SUMMARIZATION METRICS
+% ============================================================================
+\section{Summarization Metrics}
+\label{sec:summarization_metrics}
+
+Summarization evaluation is notoriously difficult because a good summary must be
+simultaneously fluent, coherent, relevant, concise, and---most critically---\emph{faithful} to the source document.
+
+\subsection{ROUGE: Recall-Oriented Understudy for Gisting Evaluation}
+
+ROUGE (Lin, 2004) is the dominant automatic metric for summarization.  Unlike
+BLEU (which is precision-oriented), ROUGE is \emph{recall-oriented}: it measures
+how much of the \emph{reference} summary is captured by the candidate.
+
+\begin{mathresult}{ROUGE Variants}
+\textbf{ROUGE-N} (unigram $N{=}1$, bigram $N{=}2$):
+\[
+    \text{ROUGE-N} = \frac{\sum_{\text{n-gram} \in \text{Ref}} \min\!\bigl(\text{Count}_{\text{Cand}}(\text{n-gram}),\;\text{Count}_{\text{Ref}}(\text{n-gram})\bigr)}{\sum_{\text{n-gram} \in \text{Ref}} \text{Count}_{\text{Ref}}(\text{n-gram})}
+\]
+\textbf{ROUGE-L} (longest common subsequence):
+\[
+    R_{\text{lcs}} = \frac{\text{LCS}(\text{Ref}, \text{Cand})}{|\text{Ref}|}, \quad
+    P_{\text{lcs}} = \frac{\text{LCS}(\text{Ref}, \text{Cand})}{|\text{Cand}|}, \quad
+    \text{ROUGE-L} = \frac{(1+\beta^2) R_{\text{lcs}} P_{\text{lcs}}}{R_{\text{lcs}} + \beta^2 P_{\text{lcs}}}
+\]
+where $\beta$ is typically set large (e.g., 1.2) to weight recall more heavily.
+LCS captures the longest in-order (not necessarily contiguous) subsequence match.
+\end{mathresult}
+
+\paragraph{ROUGE-1 vs.\ ROUGE-2 vs.\ ROUGE-L.}
+\begin{itemize}
+    \item \textbf{ROUGE-1} measures unigram recall---content coverage at the word
+          level.  It is the most commonly reported variant for summarization.
+    \item \textbf{ROUGE-2} measures bigram recall---captures some local fluency
+          and phrase-level overlap.
+    \item \textbf{ROUGE-L} uses the longest common subsequence, which captures
+          sentence-level structure without requiring contiguous n-gram matches.
+\end{itemize}
+
+\paragraph{Why ROUGE is recall-oriented (and why this matters).}
+Summarization references are typically \emph{short}.  A system that copies the
+entire source document would have perfect recall but produce a useless summary.
+ROUGE counters this partly by using F-score variants that balance precision and
+recall, but the canonical metric emphasizes recall.  The critical insight:
+\emph{BLEU and ROUGE are complementary}---BLEU penalizes candidates that add
+extraneous content (precision), while ROUGE penalizes candidates that miss
+reference content (recall).
+
+\subsection{BERTScore}
+
+BERTScore (Zhang et al., ICLR 2020) moves beyond surface n-gram overlap by
+computing similarity in \emph{embedding space}:
+
+\begin{enumerate}
+    \item Encode both candidate and reference tokens using a pretrained model
+          (typically RoBERTa or DeBERTa), producing contextual embeddings.
+    \item For each candidate token, find the maximum cosine similarity with any
+          reference token (greedy matching):
+          \[
+              P_{\text{BERT}} = \frac{1}{|C|}\sum_{c_i \in C}\max_{r_j \in R}\cos(\vx_{c_i}, \vx_{r_j}), \quad
+              R_{\text{BERT}} = \frac{1}{|R|}\sum_{r_j \in R}\max_{c_i \in C}\cos(\vx_{r_j}, \vx_{c_i})
+          \]
+    \item Compute the F1 score: $F_{\text{BERT}} = 2 P_{\text{BERT}} R_{\text{BERT}} / (P_{\text{BERT}} + R_{\text{BERT}})$.
+\end{enumerate}
+
+BERTScore captures paraphrases (``purchase'' $\leftrightarrow$ ``buy'') and
+semantic equivalence that surface metrics miss.  It correlates better with human
+judgments than ROUGE for abstractive summarization.
+
+\subsection{Faithfulness Metrics}
+\label{sec:faithfulness}
+
+The most critical problem in summarization evaluation is \textbf{faithfulness}:
+does the summary contain only information that is supported by the source
+document?  Neither ROUGE nor BERTScore measure this---a summary that adds
+plausible but fabricated facts can score well on both.
+
+\begin{itemize}
+    \item \textbf{FactCC} (Kr\'{y}sci\'{n}ski et al., 2020): A BERT-based binary
+          classifier trained on synthetic claim-document pairs.  Classifies
+          each summary sentence as consistent or inconsistent with the source.
+
+    \item \textbf{SummaC} (Laban et al., 2022): Splits summaries into sentences
+          and computes NLI (natural language inference) scores between each
+          summary sentence and source sentences, aggregating into a consistency
+          score.
+
+    \item \textbf{QuestEval / QAFactEval}: Generates questions from the summary,
+          answers them from the source, and checks agreement.  If the source
+          cannot answer a question implied by the summary, that content is
+          likely hallucinated.
+
+    \item \textbf{LLM-based checking}: Prompt an LLM to verify whether each
+          claim in the summary is supported by the source.  Scalable but
+          inherits LLM biases and errors.
+\end{itemize}
+
+\subsection{Limitations of Summarization Metrics}
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{ROUGE favors extractive output.}  Because ROUGE measures
+          n-gram overlap, systems that copy phrases verbatim from the source
+          tend to score higher than abstractive systems that paraphrase.  This
+          creates a perverse incentive toward less fluent but higher-overlap
+          summaries.
+
+    \item \textbf{No faithfulness signal.}  ROUGE and BERTScore reward overlap
+          with the reference---not consistency with the source.  A hallucinated
+          sentence that happens to overlap with the reference will be rewarded.
+
+    \item \textbf{Reference quality bottleneck.}  Summarization references are
+          often written by a single annotator.  Different valid summaries of the
+          same document may have low ROUGE overlap with each other.
+
+    \item \textbf{Length gaming.}  Longer summaries tend to have higher ROUGE
+          recall.  Without length normalization, systems are incentivized to
+          produce longer output.
+\end{enumerate}
+
+% ============================================================================
+% SECTION 4: CLASSIFICATION METRICS FOR NLP
+% ============================================================================
+\section{Classification Metrics for NLP}
+\label{sec:classification_metrics}
+
+Classification is the backbone of many production NLP systems: spam detection,
+sentiment analysis, intent classification, content moderation, and named entity
+recognition all reduce to classification at some level.  The choice of metric
+must match the task structure and business objective.
+
+\subsection{Fundamental Metrics}
+
+For a binary classifier with true positives (TP), false positives (FP), false
+negatives (FN), and true negatives (TN):
+
+\[
+    \text{Precision} = \frac{\text{TP}}{\text{TP} + \text{FP}}, \qquad
+    \text{Recall} = \frac{\text{TP}}{\text{TP} + \text{FN}}, \qquad
+    F_1 = \frac{2 \cdot \text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}}
+\]
+
+\paragraph{Precision vs.\ recall tradeoff.}
+The key question is: \emph{what is more costly---a false positive or a false
+negative?}  In spam filtering, a false positive (legitimate email in spam) is
+worse than a false negative (spam in inbox), so precision matters more.  In
+medical screening, a false negative (missed disease) is worse, so recall matters
+more.  F1 balances both but treats them as equally important.
+
+\subsection{Multi-class Averaging}
+
+For $K$ classes, there are three standard averaging schemes:
+
+\begin{itemize}
+    \item \textbf{Macro F1:} Compute F1 per class, then average.  Treats all
+          classes equally regardless of frequency.
+          \[
+              F_1^{\text{macro}} = \frac{1}{K}\sum_{k=1}^{K} F_1^{(k)}
+          \]
+    \item \textbf{Micro F1:} Aggregate TP, FP, FN across all classes, then
+          compute F1 on the totals.  Equivalent to accuracy for single-label
+          classification.
+          \[
+              F_1^{\text{micro}} = \frac{2\sum_k\text{TP}_k}{2\sum_k\text{TP}_k + \sum_k\text{FP}_k + \sum_k\text{FN}_k}
+          \]
+    \item \textbf{Weighted F1:} Compute F1 per class, average weighted by class
+          frequency (support).  Accounts for class imbalance while still
+          reflecting per-class performance.
+\end{itemize}
+
+\begin{warningbox}
+\textbf{Micro vs.\ macro F1 in imbalanced NER datasets:}
+In NER, entity types are highly imbalanced (e.g., ``O'' tags dominate).  Micro
+F1 is dominated by the majority class and can be misleadingly high.  Macro F1
+gives equal weight to rare entity types, revealing poor performance on minority
+classes that micro F1 hides.  \textbf{Always report both}, and understand which
+one the business objective aligns with.  If identifying rare entities (e.g.,
+adverse drug reactions in medical text) is the primary goal, macro F1 is the
+right metric.  If overall system throughput matters, micro F1 is appropriate.
+\end{warningbox}
+
+\subsection{Entity-Level F1 for NER}
+\label{sec:ner_eval}
+
+NER evaluation has a subtle but critical distinction: \textbf{token-level} vs.\
+\textbf{entity-level} evaluation.
+
+\paragraph{Token-level F1.}
+Evaluate each token's predicted BIO tag independently.  A prediction of B-PER
+followed by I-PER for ``Barack Obama'' scores two correct tokens.  Problem:
+partial matches inflate scores.  If the model predicts ``Barack'' as B-PER but
+misses ``Obama,'' token-level scoring gives 50\% recall for that entity, which
+is misleading---the entity was \emph{not} correctly extracted.
+
+\paragraph{Entity-level F1 (strict matching).}
+An entity is counted as a true positive only if \textbf{both the boundary and
+the type are exactly correct}:
+\begin{itemize}
+    \item Predicted span must match the gold span exactly (same start and end
+          token).
+    \item Predicted entity type must match the gold entity type.
+    \item Any mismatch in boundary or type counts as both a false positive
+          (for the predicted entity) and a false negative (for the gold entity).
+\end{itemize}
+
+This is the standard evaluation in CoNLL-2003 and most NER benchmarks.  Entity-level
+F1 is always lower than token-level F1 and gives a more honest picture of system
+quality.
+
+\paragraph{Partial matching (SemEval scheme).}
+For tasks where partial credit is reasonable (e.g., extracting product names
+where ``iPhone 15 Pro'' partially matching ``iPhone 15 Pro Max'' has value), the
+SemEval evaluation scheme defines:
+\begin{itemize}
+    \item \textbf{Exact}: boundary and type both correct.
+    \item \textbf{Partial}: overlapping boundary, correct type (half credit).
+    \item \textbf{Type only}: correct type regardless of boundary.
+    \item \textbf{Strict}: same as exact (no partial credit).
+\end{itemize}
+
+\subsection{Multi-Label Classification Metrics}
+
+When each instance can have multiple labels (e.g., topic tagging, multi-label
+sentiment), standard metrics extend as follows:
+\begin{itemize}
+    \item \textbf{Hamming loss:} Fraction of labels that are incorrectly
+          predicted (either false positive or false negative), averaged over all
+          instances and labels.
+    \item \textbf{Subset accuracy (exact match ratio):} Fraction of instances
+          where the \emph{entire} predicted label set exactly matches the gold
+          label set.  Very strict---a single missed or extra label counts as
+          wrong.
+    \item \textbf{Label-wise F1:} Compute F1 per label, then macro/micro
+          average.
+\end{itemize}
+
+% ============================================================================
+% SECTION 5: HUMAN EVALUATION
+% ============================================================================
+\section{Human Evaluation}
+\label{sec:human_eval}
+
+Automatic metrics are proxies.  Human evaluation is the gold standard---and also
+the most expensive, slowest, and hardest-to-reproduce evaluation method.
+Understanding when and how to deploy it is a mark of evaluation maturity.
+
+\subsection{Evaluation Dimensions}
+
+Human evaluators typically rate generated text along multiple orthogonal
+dimensions:
+
+\begin{itemize}
+    \item \textbf{Fluency:} Is the text grammatically correct and natural?
+    \item \textbf{Coherence:} Does the text flow logically from sentence to
+          sentence?
+    \item \textbf{Relevance:} Does the output address the input query/task?
+    \item \textbf{Faithfulness / Factuality:} Is the content consistent with the
+          source material (summarization, RAG) or factually correct (open-ended
+          generation)?
+    \item \textbf{Harmlessness:} Does the output avoid toxic, biased, or
+          dangerous content?
+    \item \textbf{Helpfulness:} Does the output actually help the user accomplish
+          their goal?
+\end{itemize}
+
+\subsection{Evaluation Protocols}
+
+\paragraph{Likert Scale Rating.}
+Evaluators rate each output on a numerical scale (e.g., 1--5).  Simple but
+suffers from annotator calibration differences: one annotator's ``3'' may be
+another's ``4.''  Anchoring the scale with examples (``1 = incomprehensible,
+5 = publication quality'') helps but does not eliminate subjectivity.
+
+\paragraph{Pairwise Comparison.}
+Evaluators are shown two outputs (from different systems) for the same input and
+choose which is better (or ``tie'').  More reliable than absolute ratings because
+it removes calibration differences---humans are better at relative judgments than
+absolute scores.  This is the protocol used by Chatbot Arena.
+
+\paragraph{Ranking.}
+Evaluators rank $k$ outputs from best to worst.  More informative than pairwise
+but quadratically more comparisons to obtain a full ranking.  Best-worst scaling
+(BWS) is a popular compromise: evaluators select only the best and worst from
+each group.
+
+\subsection{Inter-Annotator Agreement}
+
+Because human evaluation is subjective, measuring agreement between annotators
+is critical:
+\begin{itemize}
+    \item \textbf{Cohen's kappa} (for 2 annotators): $\kappa = (p_o - p_e) / (1 - p_e)$,
+          where $p_o$ is observed agreement and $p_e$ is chance agreement.
+          $\kappa > 0.8$ is excellent; $\kappa < 0.4$ is poor.
+    \item \textbf{Krippendorff's alpha}: Generalizes to multiple annotators,
+          multiple categories, and handles missing data.  The recommended
+          standard for NLP annotation studies.
+    \item \textbf{Fleiss' kappa}: Extends Cohen's kappa to more than 2
+          annotators when each item is rated by the same number of annotators.
+\end{itemize}
+
+Low agreement does not necessarily mean the annotations are bad---it may mean
+the task is genuinely ambiguous or the guidelines are underspecified.
+
+\subsection{Crowdsourced Evaluation at Scale}
+
+\paragraph{LMSYS Chatbot Arena.}
+The most influential LLM evaluation platform (since 2023).  Users submit
+prompts, receive anonymous responses from two models, and vote for the better
+one.  Votes are aggregated into an Elo rating system (adapted from chess).  Key
+strengths: real user prompts, massive scale (millions of votes), no prompt
+engineering by model creators.  Key limitations: population bias (tech-savvy
+English speakers), prompt distribution does not match all use cases, Elo
+sensitivity to prompt difficulty distribution.
+
+\paragraph{MT-Bench.}
+A curated set of 80 multi-turn questions spanning 8 categories (writing,
+reasoning, math, coding, extraction, STEM, humanities, roleplay).  Responses are
+scored 1--10 by GPT-4 as judge.  Useful for rapid evaluation during development
+but limited by prompt set size and GPT-4 judge biases.
+
+% ============================================================================
+% SECTION 6: LLM-AS-JUDGE
+% ============================================================================
+\section{LLM-as-Judge}
+\label{sec:llm_judge}
+
+Using a powerful LLM (GPT-4, Claude) to evaluate the outputs of other models has
+become a dominant evaluation paradigm because it scales better than human
+evaluation while correlating reasonably well with human preferences.
+
+\subsection{Evaluation Modes}
+
+\begin{itemize}
+    \item \textbf{Pointwise scoring:} The judge LLM rates a single response on a
+          scale (e.g., 1--10) given a rubric.  Simple but suffers from
+          calibration drift and positional sensitivity within the prompt.
+    \item \textbf{Pairwise comparison:} The judge compares two responses and
+          selects the better one.  More robust than pointwise because relative
+          judgments are easier.  This is the protocol used in AlpacaEval.
+    \item \textbf{Listwise ranking:} The judge ranks multiple responses.  Most
+          informative but most prone to position bias (the judge may favor
+          responses presented first or last).
+    \item \textbf{Reference-guided:} The judge is given a reference answer and
+          evaluates how well the candidate matches it.  Useful for factual tasks.
+\end{itemize}
+
+\subsection{Known Biases}
+
+\begin{warningbox}
+LLM-as-judge evaluation has systematic biases that can silently corrupt evaluation
+results:
+\begin{enumerate}[label=(\arabic*)]
+    \item \textbf{Verbosity bias:} LLM judges tend to prefer longer, more detailed
+          responses, even when brevity is more appropriate.  Models that pad
+          responses with unnecessary elaboration are systematically overrated.
+    \item \textbf{Position bias:} When comparing two responses, LLM judges may
+          prefer the response presented first (primacy) or second (recency),
+          regardless of quality.  Mitigation: evaluate both orderings and average.
+    \item \textbf{Self-preference bias:} GPT-4 as judge tends to prefer
+          GPT-4-generated responses over other models' outputs, even when human
+          evaluators disagree.  Similarly for other model families.
+    \item \textbf{Style over substance:} LLM judges may reward well-formatted,
+          confident-sounding responses over factually correct but less polished
+          ones.
+    \item \textbf{Sycophancy in evaluation:} Some judges agree too readily with
+          the prompt framing, inflating scores when the prompt implies the
+          response should be good.
+\end{enumerate}
+\end{warningbox}
+
+\subsection{Calibration and Best Practices}
+
+\begin{itemize}
+    \item \textbf{Ground against human preferences:} Always validate that the
+          LLM judge agrees with human annotators on a calibration set before
+          trusting it on new data.  Report the agreement rate.
+    \item \textbf{Swap position:} For pairwise evaluation, run each comparison
+          in both orders (A-B and B-A) and flag disagreements.
+    \item \textbf{Use rubrics:} Detailed scoring rubrics reduce variance.
+          ``Rate helpfulness 1--10'' is worse than a rubric with examples for
+          each score level.
+    \item \textbf{Multiple judges:} Use multiple LLM judges (e.g., GPT-4 +
+          Claude + Gemini) and check agreement, analogous to inter-annotator
+          agreement for human evaluation.
+    \item \textbf{Report the judge:} Always state which LLM and version was used
+          as judge---evaluation results are not reproducible without this.
+\end{itemize}
+
+\begin{keyinsight}[LLM-as-Judge: Useful but Not Authoritative]
+LLM-as-judge is best understood as a \emph{noisy, scalable proxy} for human
+evaluation.  It is invaluable during development for rapid iteration (catching
+major regressions, A/B testing prompt variants) but should not be the sole
+basis for high-stakes decisions like model deployment or benchmark claims.  For
+any result you plan to publish or deploy, validate with human evaluation on
+a representative sample.
+\end{keyinsight}
+
+% ============================================================================
+% SECTION 7: BENCHMARK LANDSCAPE
+% ============================================================================
+\section{The Benchmark Landscape}
+\label{sec:benchmarks}
+
+Benchmarks serve as standardized tests for comparing models, but they are
+imperfect proxies for real-world utility.  A mature candidate knows what each
+benchmark tests, why it exists, and where it fails.
+
+\subsection{Major LLM Benchmarks}
+
+\begin{table}[H]
+\centering
+\caption{Major benchmarks for LLM evaluation.}
+\label{tab:benchmarks}
+\begin{tabularx}{\textwidth}{@{}l l l X@{}}
+\toprule
+\textbf{Benchmark} & \textbf{Format} & \textbf{Size} & \textbf{What It Tests} \\
+\midrule
+MMLU         & 4-way MC   & 15K Qs, 57 subjects & Broad knowledge (STEM, humanities, social science) \\
+HumanEval    & Code gen.  & 164 problems         & Python function completion, test-case passing \\
+MBPP         & Code gen.  & 974 problems          & Basic Python programming \\
+GSM8K        & Free-form  & 8.5K problems         & Grade-school math reasoning (multi-step) \\
+MATH         & Free-form  & 12.5K problems        & Competition-level mathematics \\
+ARC          & 4-way MC   & 7.7K questions        & Grade-school / challenge science reasoning \\
+HellaSwag    & 4-way MC   & 10K questions         & Commonsense sentence completion \\
+WinoGrande   & Binary     & 44K problems          & Commonsense coreference resolution \\
+TruthfulQA   & MC / gen.  & 817 questions         & Resistance to common misconceptions \\
+BigBench     & Various    & 200+ tasks            & Diverse capabilities (reasoning, translation, QA) \\
+MT-Bench     & Open-ended & 80 multi-turn Qs      & Multi-turn conversation quality (LLM-judged) \\
+Chatbot Arena & Pairwise  & Millions of votes     & Real-user preference (Elo rating) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Benchmark Pitfalls}
+
+\paragraph{Data contamination.}
+LLMs are trained on vast web corpora that may contain benchmark questions and
+answers.  A model that has ``seen'' GSM8K problems during pretraining will
+overfit to them, inflating its reported score.  Contamination is difficult to
+detect---even deduplication against known benchmarks cannot catch paraphrased
+versions.  Mitigation strategies include: held-out test sets never published
+online, dynamic benchmarks with new questions per evaluation round (LiveBench),
+and contamination analysis (n-gram overlap between training data and benchmarks).
+
+\paragraph{Benchmark saturation.}
+As models improve, older benchmarks lose discriminative power.  HellaSwag and
+WinoGrande are near ceiling for frontier models.  Even MMLU has become less
+informative as top models exceed 90\%.  The field must continuously develop
+harder benchmarks---MMLU-Pro, GPQA (PhD-level questions), and FrontierMath
+represent this trend.
+
+\paragraph{Gaming and Goodhart's law.}
+``When a measure becomes a target, it ceases to be a good measure.''  Models can
+be optimized specifically for benchmark performance (training on similar
+distributions, prompt engineering) without corresponding real-world improvement.
+Chatbot Arena partially mitigates this by using real, unpredictable user prompts.
+
+\paragraph{Narrow coverage.}
+No single benchmark captures the full range of capabilities that matter:
+safety, instruction following, long-context reasoning, multilingual performance,
+tool use, agentic planning, and domain-specific knowledge all require specialized
+evaluation.
+
+\begin{keyinsight}[Benchmarks Are Necessary but Unreliable]
+Interviewers are not testing whether you memorized benchmark scores---they are
+testing whether you understand the \emph{limitations} of benchmarks.  The
+strongest answer to ``how would you evaluate your model?'' is never ``we scored
+X on MMLU'' but rather a multi-layered evaluation strategy: automatic metrics
+for development iteration, targeted benchmarks for capability assessment, human
+evaluation for quality validation, and production metrics (engagement, task
+completion rate) for real-world impact.
+\end{keyinsight}
+
+% ============================================================================
+% SECTION 8: DECODING STRATEGIES
+% ============================================================================
+\section{Decoding Strategies}
+\label{sec:decoding}
+
+A language model defines a probability distribution over next tokens.
+\emph{Decoding} is the process of selecting tokens from this distribution to
+generate output text.  The choice of decoding strategy profoundly affects output
+quality, diversity, and computational cost.
+
+\subsection{Greedy Decoding}
+
+At each step, select the token with the highest probability:
+\[
+    w_t = \argmax_{w} P_\theta(w \mid w_{<t})
+\]
+\textbf{Advantages:} Simplest possible strategy; fast (no branching).
+\textbf{Disadvantages:} Produces repetitive, dull text because it always takes
+the locally optimal choice, which often leads to loops (``the the the...'' or
+repeating sentence patterns).  It also misses globally optimal sequences---the
+best overall sentence may start with a less-probable first word.
+
+\subsection{Beam Search}
+
+Maintain $B$ candidate sequences (beams) at each step, expanding each by the
+top-$k$ tokens and keeping the top $B$ overall:
+
+\begin{enumerate}
+    \item Initialize with the $B$ most probable first tokens.
+    \item At each subsequent step, expand each beam by its top-$V$ continuations
+          (often $V = B$), yielding up to $B \times V$ candidates.
+    \item Score each candidate by cumulative log-probability and keep the top $B$.
+    \item Terminate beams that produce an end-of-sequence token.
+    \item Return the highest-scoring complete sequence.
+\end{enumerate}
+
+\paragraph{Length normalization.}
+Raw log-probability is biased toward shorter sequences (fewer terms summed).
+Length normalization divides by $|y|^\alpha$ where $\alpha \in [0.6, 1.0]$:
+\[
+    \text{score}(y) = \frac{\log P(y)}{|y|^\alpha}
+\]
+Setting $\alpha = 0$ ignores length; $\alpha = 1$ gives per-token
+log-probability.  In practice, $\alpha = 0.6\text{--}0.8$ works well for
+machine translation.
+
+\paragraph{When to use beam search.}
+Beam search excels for tasks with a clear ``correct'' answer---machine
+translation, speech recognition, structured output generation.  It produces
+reliable, high-likelihood output but lacks diversity.  For open-ended generation
+(chatbots, creative writing), beam search produces bland, repetitive text.
+
+\subsection{Temperature Sampling}
+
+\emph{Sampling} introduces randomness by drawing from the distribution rather
+than taking the argmax.  \textbf{Temperature} controls the sharpness of this
+distribution:
+
+\begin{mathresult}{Temperature Scaling}
+Given logits $z_i$ for token $i$, temperature-scaled sampling draws from:
+\[
+    P(w_i) = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}
+\]
+\begin{itemize}
+    \item $T = 1$: the model's original distribution (no modification).
+    \item $T < 1$: sharper distribution (more confident, less diverse).
+          As $T \to 0$, sampling becomes greedy decoding.
+    \item $T > 1$: flatter distribution (more random, more diverse).
+          As $T \to \infty$, sampling becomes uniform random over the vocabulary.
+\end{itemize}
+\end{mathresult}
+
+\paragraph{Why temperature works.}
+Consider logits $[2.0, 1.0, 0.5]$.  At $T{=}1$, probabilities are approximately
+$[0.50, 0.27, 0.13]$.  At $T{=}0.5$, they become $[0.71, 0.21, 0.08]$---the
+winner dominates more.  At $T{=}2.0$, they become $[0.39, 0.33, 0.28]$---nearly
+uniform.  Temperature does not change the \emph{ranking} of tokens, only the
+\emph{magnitude of differences} between their probabilities.
+
+\subsection{Top-$k$ Sampling}
+
+At each step, restrict sampling to the $k$ most probable tokens, redistributing
+probability mass among them:
+
+\[
+    P'(w_i) = \begin{cases}
+        P(w_i) \;/\; \sum_{j \in \text{top-}k} P(w_j) & \text{if } w_i \in \text{top-}k \\[4pt]
+        0 & \text{otherwise}
+    \end{cases}
+\]
+
+\textbf{Problem:}  A fixed $k$ is not adaptive.  When the model is confident
+(one token has 95\% probability), $k{=}40$ still includes 39 unlikely tokens.
+When the model is uncertain (flat distribution), $k{=}40$ may exclude plausible
+tokens.
+
+\subsection{Top-$p$ (Nucleus) Sampling}
+
+Top-$p$ sampling (Holtzman et al., ICLR 2020) addresses the fixed-$k$ problem by
+dynamically selecting the smallest set of tokens whose cumulative probability
+exceeds a threshold $p$:
+
+\[
+    V_p = \min \{V' \subseteq \mathcal{V} : \sum_{w \in V'} P(w) \geq p\}
+\]
+where tokens are sorted by descending probability and added until the cumulative
+sum reaches $p$.  Then sample from $V_p$ with renormalized probabilities.
+
+\textbf{Why this is better than top-$k$:}  The size of $V_p$ adapts to the
+model's uncertainty.  When the model is confident, $V_p$ might contain only
+1--3 tokens.  When uncertain, $V_p$ might contain hundreds.  Typical values:
+$p \in [0.9, 0.95]$.
+
+\subsection{Repetition Penalties}
+
+LLMs tend to repeat themselves, especially with greedy or low-temperature
+decoding.  Several mechanisms combat this:
+
+\begin{itemize}
+    \item \textbf{Repetition penalty} (Keskar et al., 2019): Divide the logit
+          of any previously generated token by a penalty factor $\theta > 1$:
+          $z'_i = z_i / \theta$ if token $i$ has appeared before.  Simple and
+          effective.
+    \item \textbf{Frequency penalty:} Subtract a term proportional to how many
+          times a token has appeared: $z'_i = z_i - \alpha \cdot \text{count}(i)$.
+          Used in OpenAI's API.
+    \item \textbf{Presence penalty:} Subtract a fixed amount if the token has
+          appeared \emph{at all}: $z'_i = z_i - \beta \cdot \mathbbm{1}[\text{count}(i) > 0]$.
+          Encourages topic diversity without penalizing appropriate repetition.
+\end{itemize}
+
+\subsection{Constrained Decoding}
+
+For tasks requiring structured output (JSON, SQL, code, XML), \textbf{constrained
+decoding} restricts the token selection to only valid continuations:
+
+\begin{itemize}
+    \item \textbf{Grammar-based (GBNF):} Define a formal grammar for the target
+          format.  At each step, mask out tokens that would violate the grammar.
+          Guarantees syntactically valid output.
+    \item \textbf{Regex-based:} Similar idea using regular expressions to define
+          valid token sequences.
+    \item \textbf{JSON mode:} Many inference frameworks (vLLM, Outlines, llama.cpp)
+          implement JSON schema-constrained decoding, ensuring every generated
+          token is a valid continuation of a JSON document matching the schema.
+    \item \textbf{Logit bias:} Manually boost or suppress specific tokens.
+          Coarser than grammar-based methods but simpler to implement.
+\end{itemize}
+
+\subsection{Speculative Decoding}
+\label{sec:speculative}
+
+Standard autoregressive decoding is memory-bandwidth bound: generating one token
+requires loading the entire model's weights from memory.
+\textbf{Speculative decoding} (Leviathan et al., 2023; Chen et al., 2023)
+addresses this with a draft-and-verify approach:
+
+\begin{enumerate}
+    \item A small, fast \emph{draft model} generates $k$ candidate tokens
+          autoregressively.
+    \item The large \emph{target model} evaluates all $k$ tokens in parallel
+          (a single forward pass).
+    \item Accept draft tokens from left to right as long as the target model
+          agrees (using a rejection sampling scheme).
+    \item On the first disagreement, resample from the target model's adjusted
+          distribution.
+\end{enumerate}
+
+The critical property: speculative decoding produces \textbf{exactly the same
+distribution} as standard decoding from the target model.  The speedup comes from
+amortizing the target model's forward pass across multiple tokens.  Typical
+speedups: 2--3$\times$ when draft acceptance rate is high.
+
+\subsection{Decoding Strategy Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of decoding strategies.}
+\label{tab:decoding}
+\begin{tabularx}{\textwidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Strategy} & \textbf{Quality} & \textbf{Diversity} & \textbf{Latency} & \textbf{Best Use Case} \\
+\midrule
+Greedy          & Moderate & None   & Lowest  & Debugging, deterministic tasks \\
+Beam search     & High     & Low    & High    & Translation, speech recognition \\
+Temperature     & Tunable  & Tunable & Low    & General generation (tune $T$) \\
+Top-$k$         & Good     & Moderate & Low   & Creative writing (fixed cutoff) \\
+Top-$p$ (nucleus) & Good   & Good   & Low    & Open-ended generation (adaptive) \\
+Constrained     & Task-dep.& None   & Moderate & JSON, SQL, structured output \\
+Speculative     & Same*    & Same*  & Lower  & Production serving (*matches target model) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[Choosing the Right Decoding Strategy]
+The choice of decoding strategy should match the task:
+\begin{itemize}
+    \item \textbf{Deterministic tasks} (classification, extraction, factual QA):
+          greedy or low temperature ($T \leq 0.3$).
+    \item \textbf{Constrained generation} (translation, summarization): beam
+          search with length normalization.
+    \item \textbf{Open-ended generation} (chatbots, creative writing): nucleus
+          sampling ($p = 0.9\text{--}0.95$) with moderate temperature
+          ($T = 0.7\text{--}1.0$).
+    \item \textbf{Structured output} (JSON, code): constrained decoding with
+          grammar enforcement.
+    \item \textbf{Production serving at scale}: add speculative decoding for
+          throughput improvement.
+\end{itemize}
+A candidate who can articulate these distinctions---rather than defaulting to
+``just set temperature to 0.7''---demonstrates production awareness.
+\end{keyinsight}
+
+% ============================================================================
+% SECTION 9: INTERVIEW QUESTIONS
+% ============================================================================
+\section{Interview Questions}
+\label{sec:eval_interview_questions}
+
+\vspace{0.5em}
+
+%% QUESTION 1 %%
+\begin{interviewq}
+\textbf{Q: What is BLEU? Derive it step by step. What are its limitations?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+BLEU (Bilingual Evaluation Understudy) is an automatic metric for evaluating
+machine translation quality by measuring n-gram precision between a candidate
+translation and one or more reference translations.
+
+\textbf{Derivation:}
+\begin{enumerate}
+    \item \textbf{Modified n-gram precision $p_n$:} For each n-gram in the
+          candidate, count how many times it appears, but clip this count by
+          the maximum number of times it appears in any single reference.
+          This prevents gaming (e.g., repeating ``the'' 20 times).
+          \[
+              p_n = \frac{\sum_{\text{n-gram} \in C}\min(\text{Count}_C,\;\max_R \text{Count}_R)}{\sum_{\text{n-gram} \in C}\text{Count}_C}
+          \]
+
+    \item \textbf{Geometric mean:} Combine $p_1$ through $p_4$ using a weighted
+          geometric mean with uniform weights $w_n = 1/4$:
+          $\exp\!\bigl(\sum_{n=1}^{4}\frac{1}{4}\ln p_n\bigr)$.
+          This ensures that failure at any n-gram order zeroes the entire score.
+
+    \item \textbf{Brevity penalty:}
+          $\text{BP} = \exp\!\bigl(\min(0, 1 - |R|/|C|)\bigr)$.
+          Penalizes candidates shorter than the reference to prevent trivially
+          high precision from short outputs.
+
+    \item \textbf{Final score:}
+          $\text{BLEU} = \text{BP} \times \exp\!\bigl(\sum_{n=1}^{4}w_n \ln p_n\bigr)$.
+\end{enumerate}
+
+\textbf{Limitations:}
+(1)~Precision-only: no recall component beyond the crude brevity penalty.
+(2)~No semantic awareness: valid paraphrases are penalized.
+(3)~Poor segment-level correlation with human judgments.
+(4)~Language-biased: works poorly for morphologically rich languages.
+(5)~Insensitive to word order beyond short n-gram windows.
+(6)~Reference-dependent: quality limited by reference count and quality.
+
+Modern alternatives like COMET (neural, trained on human judgments) achieve
+much higher correlation with human evaluation and should be preferred in
+practice, but BLEU remains the lingua franca of MT reporting.
+
+\redflags
+\begin{itemize}
+    \item Cannot derive the formula---just says ``it's n-gram overlap.''
+    \item Does not mention the brevity penalty or explain why it exists.
+    \item Does not mention the clipping in modified precision.
+    \item Claims BLEU measures recall (it measures precision).
+    \item Cannot name any limitation.
+\end{itemize}
+
+\interviewtest{Mathematical rigor, ability to derive metrics from scratch, and
+critical awareness of metric limitations.  This question tests whether the
+candidate understands metrics deeply enough to know when to trust them.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Derives all four components correctly, gives at least
+          three limitations.
+    \item \badgeLsix{L6}: Contrasts with ROUGE (recall-oriented), explains
+          why BLEU is a corpus-level metric (sentence-level problems), discusses
+          SacreBLEU for reproducibility, and mentions COMET as a superior
+          alternative.
+    \item \badgeLseven{L7}: Discusses the history of MT evaluation (BLEU's
+          impact on driving MT progress despite its flaws), connects to the
+          broader theme of Goodhart's law in metrics, and explains how WMT
+          shared tasks transitioned from BLEU to neural metrics.
+\end{itemize}
+
+\followups{What is SacreBLEU and why was it created?  How does BLEU compare to
+ROUGE?  What is COMET and why is it better?  How would you evaluate MT for a
+morphologically rich language like Finnish?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 2 %%
+\begin{interviewq}
+\textbf{Q: What is perplexity? How does it relate to cross-entropy? What are its
+limitations?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Perplexity is the standard evaluation metric for language models.  Given a
+sequence $w_1, \ldots, w_N$ and a model assigning probability
+$P_\theta(w_i \mid w_{<i})$, perplexity is:
+\[
+    \text{PP} = \exp\!\Bigl(-\frac{1}{N}\sum_{i=1}^{N}\ln P_\theta(w_i \mid w_{<i})\Bigr)
+\]
+
+\textbf{Connection to cross-entropy:}  The term inside the exponential is the
+\emph{cross-entropy} $H$ (in nats).  Perplexity is simply $\text{PP} = e^H$
+(or $2^{H_{\text{bits}}}$ in the information-theoretic convention using
+$\log_2$).  Cross-entropy measures the average negative log-likelihood per
+token; perplexity exponentiates it to give the ``effective vocabulary size'' the
+model is choosing from at each step.  A perplexity of 20 means the model is, on
+average, as uncertain as if choosing uniformly among 20 options.
+
+\textbf{Connection to bits-per-character:}  To compare models with different
+tokenizers, normalize by the number of characters or bytes rather than tokens.
+This gives bits-per-character (BPC) or bits-per-byte (BPB), which are
+tokenizer-independent.
+
+\textbf{Limitations:}
+\begin{enumerate}
+    \item Not comparable across tokenizers (different vocabularies $\Rightarrow$
+          different number of prediction events).
+    \item Does not measure generation quality---a low-perplexity model can still
+          hallucinate, produce toxic content, or fail at instruction following.
+    \item Domain-sensitive: perplexity measured on one domain does not predict
+          performance on another.
+    \item All tokens weighted equally, but content words matter more than
+          function words for most applications.
+\end{enumerate}
+
+For LLM evaluation, perplexity is useful for pretraining monitoring and scaling
+law research, but downstream benchmarks and human evaluation are needed to assess
+actual model utility.
+
+\redflags
+\begin{itemize}
+    \item Cannot state the formula or the connection to cross-entropy.
+    \item Says ``lower perplexity means better generation'' without qualification.
+    \item Does not mention the vocabulary dependence issue.
+    \item Confuses perplexity with accuracy.
+\end{itemize}
+
+\interviewtest{Mathematical understanding of language model evaluation, ability
+to connect related concepts (cross-entropy, bits, information theory), and
+awareness of metric limitations.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: States the formula, gives the branching factor
+          intuition, names two limitations.
+    \item \badgeLsix{L6}: Derives the cross-entropy connection, discusses
+          bits-per-byte as a tokenizer-independent alternative, and connects
+          to downstream evaluation.
+    \item \badgeLseven{L7}: Discusses how perplexity relates to scaling laws
+          ($L = aC^{-\alpha}$ where $L$ is cross-entropy loss), whether
+          low perplexity implies calibrated probabilities (not necessarily),
+          and when perplexity improvements stop translating to downstream gains.
+\end{itemize}
+
+\followups{How would you compare perplexity between GPT-2 (BPE, 50K vocab) and
+a character-level model?  What is bits-per-byte?  How does perplexity relate to
+scaling laws?  At what point do perplexity improvements stop mattering for
+downstream tasks?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 3 %%
+\begin{interviewq}
+\textbf{Q: How would you evaluate a summarization system? Specifically, how would
+you measure faithfulness?}
+
+\badgeLfive{L5} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Summarization evaluation requires a \emph{multi-metric} approach because no
+single metric captures all quality dimensions:
+
+\textbf{1.\ Content coverage (automatic):}
+ROUGE-1 (unigram recall), ROUGE-2 (bigram recall), and ROUGE-L (longest common
+subsequence) measure how much reference content the summary captures.  BERTScore
+adds semantic matching.  But these only measure overlap with a reference, not
+consistency with the source.
+
+\textbf{2.\ Faithfulness (the critical dimension):}
+This is the most important and hardest dimension.  A summary that sounds fluent
+but contains hallucinated facts is worse than useless.  I would measure
+faithfulness with:
+\begin{itemize}
+    \item \textbf{NLI-based checking (SummaC):} Decompose the summary into
+          sentences, run NLI between each summary sentence and the source.
+          Sentences classified as ``contradiction'' flag hallucinations.
+    \item \textbf{QA-based checking (QuestEval):} Generate questions from the
+          summary, answer them using only the source, and verify agreement.
+          Unanswerable questions indicate hallucinated content.
+    \item \textbf{LLM-based verification:} Prompt a strong LLM to identify
+          claims in the summary that are not supported by the source.  Scalable
+          but imperfect.
+\end{itemize}
+
+\textbf{3.\ Fluency and coherence (human evaluation):}
+Automatic metrics cannot reliably assess whether the summary reads naturally and
+flows logically.  Human evaluation with Likert scales on fluency (1--5) and
+coherence (1--5) is necessary for final quality assessment.
+
+\textbf{4.\ Production metrics:}
+In deployment, track user engagement (click-through rate on summaries), task
+completion rate (did the summary help the user decide?), and flagged errors
+(user reports of incorrect summaries).
+
+The key architectural insight is that ROUGE measures overlap with a
+\emph{reference} while faithfulness measures consistency with the \emph{source}
+---these are different signals and both must be evaluated.
+
+\redflags
+\begin{itemize}
+    \item Only mentions ROUGE with no discussion of faithfulness.
+    \item Proposes BLEU for summarization (BLEU is precision-oriented; ROUGE's
+          recall focus is more appropriate).
+    \item Treats ``it looks good to me'' as a valid evaluation strategy.
+    \item Cannot distinguish between reference overlap and source faithfulness.
+\end{itemize}
+
+\interviewtest{Multi-dimensional evaluation thinking, awareness of the
+faithfulness problem, practical evaluation pipeline design.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Proposes ROUGE + human evaluation + at least one
+          faithfulness method.
+    \item \badgeLsix{L6}: Describes the full NLI/QA-based faithfulness pipeline,
+          explains why ROUGE cannot detect hallucination, and proposes production
+          monitoring metrics.
+    \item \badgeLseven{L7}: Designs a complete evaluation framework including
+          automated regression testing (ROUGE threshold gates), faithfulness
+          auditing (sampled human annotation), production monitoring (error
+          rates, user feedback loops), and discusses the cost-quality tradeoff
+          in evaluation.
+\end{itemize}
+
+\followups{What is the difference between \emph{extrinsic} and \emph{intrinsic}
+hallucination?  How would you build a faithfulness classifier?  What are the
+limitations of NLI-based faithfulness checking?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 4 %%
+\begin{interviewq}
+\textbf{Q: What are the problems with LLM-as-judge evaluation? When would you
+use it and when would you not?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+LLM-as-judge (using a powerful LLM like GPT-4 to evaluate other models' outputs)
+has become popular because it scales much better than human evaluation while
+maintaining reasonable correlation with human preferences.  However, it has
+systematic biases:
+
+\textbf{Known biases:}
+\begin{enumerate}
+    \item \textbf{Verbosity bias:} LLM judges prefer longer, more detailed
+          responses even when conciseness is appropriate.  This systematically
+          inflates scores for verbose models.
+    \item \textbf{Position bias:} In pairwise comparison, the judge may prefer
+          whichever response appears first (or second), regardless of quality.
+    \item \textbf{Self-preference:} GPT-4 tends to prefer GPT-4-generated text;
+          Claude prefers Claude-generated text.  The judge's family bias
+          contaminates the evaluation.
+    \item \textbf{Style over substance:} Well-formatted, confident responses are
+          favored over correct but less polished ones.
+\end{enumerate}
+
+\textbf{When to use it:}  Rapid development iteration (comparing prompt
+variants, catching regressions), evaluating subjective dimensions (helpfulness,
+tone) where automated metrics are poor, and as a first-pass filter before
+expensive human evaluation.
+
+\textbf{When NOT to use it:}  Final deployment decisions, published benchmark
+claims, evaluating factual accuracy (the judge may share the same factual errors
+as the candidate), safety-critical applications, and any evaluation where the
+stakes warrant human annotation.
+
+\textbf{Mitigation:}  Swap response positions and check consistency, use
+multiple judge models, validate against human annotations on a calibration set,
+and always report which judge model was used.
+
+\redflags
+\begin{itemize}
+    \item Treats LLM-as-judge as equivalent to human evaluation.
+    \item Cannot name any specific bias.
+    \item Proposes using the same model as both generator and judge.
+    \item No awareness of position bias or how to mitigate it.
+\end{itemize}
+
+\interviewtest{Critical evaluation thinking, awareness of method limitations,
+ability to reason about when a technique is and is not appropriate.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Names at least two biases, gives clear guidance on
+          when to use vs.\ not.
+    \item \badgeLsix{L6}: Describes mitigation strategies (position swapping,
+          multi-judge ensemble, calibration), discusses the cost-quality tradeoff
+          vs.\ human evaluation, and mentions specific tools (AlpacaEval,
+          MT-Bench).
+    \item \badgeLseven{L7}: Proposes a hierarchical evaluation pipeline
+          (LLM-judge for development, human evaluation for deployment gates,
+          production metrics for monitoring), discusses the meta-evaluation
+          question (how do you evaluate the evaluator?), and connects to the
+          broader philosophical issue of evaluation being the hardest unsolved
+          problem in NLP.
+\end{itemize}
+
+\followups{How would you validate that your LLM judge agrees with humans?  What
+is the inter-annotator agreement between GPT-4 and human evaluators?  How would
+you handle a case where two LLM judges disagree?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 5 %%
+\begin{interviewq}
+\textbf{Q: Explain ROUGE. How is it different from BLEU?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+ROUGE (Recall-Oriented Understudy for Gisting Evaluation) is the standard
+automatic metric for summarization evaluation.  The key difference from BLEU
+is the orientation:
+
+\textbf{BLEU is precision-oriented:} ``Of the n-grams in the \emph{candidate},
+how many appear in the reference?''  It penalizes candidates that add content
+not in the reference.
+
+\textbf{ROUGE is recall-oriented:} ``Of the n-grams in the \emph{reference},
+how many appear in the candidate?''  It penalizes candidates that miss content
+from the reference.
+
+This difference is not arbitrary---it reflects the different failure modes of
+each task.  In \textbf{translation}, the main risk is producing fluent but
+unfaithful output (adding information not in the source), so
+precision matters.  In \textbf{summarization}, the main risk is missing
+important content, so recall matters.
+
+\textbf{ROUGE variants:}
+ROUGE-1 (unigram recall), ROUGE-2 (bigram recall), and ROUGE-L (longest common
+subsequence, which captures in-order matching without requiring contiguity).
+
+\textbf{Additional differences:}
+(1)~BLEU uses a geometric mean across n-gram orders; ROUGE reports each variant
+separately.
+(2)~BLEU has a brevity penalty; ROUGE typically uses F-score variants.
+(3)~BLEU is computed at corpus level; ROUGE is typically computed per-example
+and averaged.
+
+\textbf{Shared limitation:} Both are surface-form metrics that cannot capture
+semantic equivalence or faithfulness.
+
+\redflags
+\begin{itemize}
+    \item Confuses precision and recall orientation.
+    \item Cannot explain why ROUGE is recall-oriented and BLEU is
+          precision-oriented.
+    \item Does not know the ROUGE variants (1, 2, L).
+    \item Treats BLEU and ROUGE as interchangeable.
+\end{itemize}
+
+\interviewtest{Understanding of the design principles behind metrics and the
+connection between metric design and task requirements.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Correctly states the precision vs.\ recall
+          distinction, explains the three ROUGE variants, and gives the
+          task-based rationale.
+    \item \badgeLsix{L6}: Discusses ROUGE-LSum for multi-sentence evaluation,
+          the faithfulness gap (ROUGE cannot detect hallucination), and
+          BERTScore as a semantic improvement.
+    \item \badgeLseven{L7}: Connects to the broader evaluation landscape
+          (surface metrics $\to$ learned metrics $\to$ LLM-based evaluation),
+          discusses ROUGE's bias toward extractive summaries, and explains
+          why summarization evaluation remains an unsolved problem.
+\end{itemize}
+
+\followups{Why does ROUGE favor extractive summaries?  What is ROUGE-LSum?
+How would you evaluate an abstractive summarizer where valid summaries may have
+low ROUGE overlap with the reference?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 6 %%
+\begin{interviewq}
+\textbf{Q: Compare greedy decoding, beam search, and nucleus sampling. When
+would you use each?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+These three decoding strategies represent fundamentally different tradeoffs
+between quality, diversity, and computation:
+
+\textbf{Greedy decoding} selects the highest-probability token at each step:
+$w_t = \argmax P(w \mid w_{<t})$.  It is fast and deterministic but produces
+repetitive, bland text because it always takes the locally optimal choice,
+missing globally better sequences.  Use for: debugging, deterministic extraction
+tasks, when diversity is harmful.
+
+\textbf{Beam search} maintains $B$ candidate sequences and selects the
+highest-scoring complete sequence.  It explores a wider space than greedy and is
+excellent for tasks with a clear ``correct'' output, but it tends to produce
+generic, safe text for open-ended tasks because high-likelihood sequences are
+often repetitive or dull.  Use for: machine translation, speech recognition,
+structured generation---tasks where there is a well-defined correct answer and
+diversity is undesirable.
+
+\textbf{Nucleus (top-$p$) sampling} draws from the smallest set of tokens whose
+cumulative probability exceeds $p$ (e.g., 0.9).  Unlike top-$k$, the candidate
+set size adapts to the model's confidence: few tokens when confident, many when
+uncertain.  This produces diverse, natural-sounding text.  Use for: chatbots,
+creative writing, any open-ended generation where diversity and naturalness
+matter.
+
+\textbf{The key design principle:}  Deterministic tasks (factual QA,
+classification, extraction) benefit from low or no randomness.  Creative and
+conversational tasks benefit from controlled randomness.  The decoding strategy
+should match the task's tolerance for variation.
+
+\redflags
+\begin{itemize}
+    \item Cannot explain the mechanism of any of the three strategies.
+    \item Recommends beam search for open-ended chatbot generation.
+    \item Does not explain why nucleus sampling is adaptive (unlike top-$k$).
+    \item Says ``just use temperature 0.7'' without understanding the
+          underlying strategy.
+\end{itemize}
+
+\interviewtest{Understanding of the generation process in autoregressive models,
+the tradeoff between quality and diversity, and practical system design judgment.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Correctly describes all three mechanisms, gives the
+          right use case for each, and explains the quality-diversity tradeoff.
+    \item \badgeLsix{L6}: Discusses length normalization for beam search,
+          temperature's interaction with nucleus sampling, repetition penalties,
+          and how these strategies are combined in practice (e.g., top-$p$ +
+          temperature + repetition penalty).
+    \item \badgeLseven{L7}: Discusses speculative decoding for production
+          serving, constrained decoding for structured output, the theoretical
+          connection between beam search and MAP estimation, and why the
+          highest-probability sequence is often not the best sequence for
+          open-ended generation (the ``neural text degeneration'' finding).
+\end{itemize}
+
+\followups{What is the ``neural text degeneration'' problem?  How does
+speculative decoding preserve the original distribution?  How would you choose
+decoding parameters for a production chatbot?  What is constrained decoding?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 7 %%
+\begin{interviewq}
+\textbf{Q: How do you handle benchmark contamination? How would you design
+an evaluation pipeline that is robust to it?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Benchmark contamination occurs when benchmark questions or answers appear in
+the model's pretraining data, inflating reported performance.  It is one of the
+most significant threats to trustworthy LLM evaluation.
+
+\textbf{Why it happens:}  LLMs are trained on massive web crawls (CommonCrawl,
+etc.) that index pages containing benchmark datasets, their solutions, and
+discussions about them.  Deduplication against known benchmarks helps but cannot
+catch paraphrases, reformulations, or discussions that convey the answer
+indirectly.
+
+\textbf{Detection methods:}
+\begin{enumerate}
+    \item \textbf{N-gram overlap analysis:} Check for verbatim or near-verbatim
+          overlap between training data and benchmark questions.  Limited by
+          the availability of the training data (many models do not disclose it).
+    \item \textbf{Canary strings:} Include unique identifier strings in benchmark
+          data and check if the model can reproduce them.
+    \item \textbf{Performance discontinuity:} Compare performance on contaminated
+          vs.\ uncontaminated subsets.  Unexpectedly high performance on specific
+          questions may indicate memorization.
+    \item \textbf{Membership inference:} Test whether the model assigns
+          suspiciously high likelihood to exact benchmark phrasings.
+\end{enumerate}
+
+\textbf{Robust evaluation design:}
+\begin{enumerate}
+    \item \textbf{Private held-out sets:} Create evaluation sets that are never
+          published online.  This is the gold standard (used by Anthropic, Google
+          internally).
+    \item \textbf{Dynamic benchmarks:} Generate new questions regularly
+          (LiveBench, SEAL).  Old questions are retired as contamination risk
+          increases.
+    \item \textbf{Multi-benchmark aggregation:} Report performance across
+          many diverse benchmarks---contamination on one is diluted.
+    \item \textbf{Human evaluation on novel prompts:} Chatbot Arena's approach
+          of using real user prompts that did not exist during training.
+    \item \textbf{Functional testing:} Instead of fixed question sets, test
+          capabilities with procedurally generated problems (e.g., random
+          arithmetic, novel code problems, shuffled answer options).
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item Not aware that contamination is a real and significant problem.
+    \item Proposes only n-gram deduplication (which is necessary but insufficient).
+    \item Cannot suggest any design principle for robust evaluation.
+    \item Trusts reported benchmark numbers without questioning contamination.
+\end{itemize}
+
+\interviewtest{Evaluation maturity, awareness of the systemic challenges in LLM
+evaluation, and ability to design robust evaluation systems.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Explains what contamination is and why it matters,
+          suggests at least one detection method.
+    \item \badgeLsix{L6}: Describes multiple detection methods and design
+          principles (private held-out, dynamic benchmarks), discusses the
+          tradeoff between benchmark standardization and contamination risk.
+    \item \badgeLseven{L7}: Proposes a complete evaluation philosophy---static
+          benchmarks for tracking, dynamic benchmarks for validation, private
+          sets for deployment decisions, and production metrics for real-world
+          assessment.  Connects to Goodhart's law and the broader challenge of
+          measuring intelligence.
+\end{itemize}
+
+\followups{How does LiveBench address contamination?  What is the evidence that
+contamination significantly inflates benchmark scores?  How would you build a
+private evaluation set?  What is the role of functional testing?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 8 %%
+\begin{interviewq}
+\textbf{Q: Design an evaluation pipeline for a production chatbot that handles
+customer support for an e-commerce company.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+I would design a three-tier evaluation pipeline: offline evaluation during
+development, online evaluation at deployment, and continuous monitoring in
+production.
+
+\textbf{Tier 1: Offline evaluation (pre-deployment).}
+\begin{itemize}
+    \item \textbf{Regression test suite:} A curated set of 500+ representative
+          customer queries with gold-standard responses, covering common intents
+          (order status, returns, product questions) and edge cases (angry
+          customers, ambiguous requests, out-of-scope questions).
+    \item \textbf{Automated metrics:} BERTScore against gold responses for
+          content quality, intent classification accuracy (does the chatbot
+          identify the correct intent?), faithfulness checking (does the response
+          contradict product/policy information?).
+    \item \textbf{Safety testing:} Red-team prompts to test for prompt injection,
+          information leakage (PII, internal policies), and harmful outputs.
+    \item \textbf{LLM-as-judge:} GPT-4 evaluation on helpfulness, tone, and
+          completeness for rapid iteration during development.
+\end{itemize}
+
+\textbf{Tier 2: Pre-launch human evaluation.}
+\begin{itemize}
+    \item \textbf{Expert evaluation:} Domain experts (customer support agents)
+          evaluate 200+ conversations on accuracy, helpfulness, tone, and
+          policy compliance.
+    \item \textbf{Pairwise comparison:} Compare new model vs.\ current production
+          model on the same queries.  Statistical test (Bradley-Terry or binomial)
+          to confirm significance.
+    \item \textbf{A/B test design:} Define primary metric (task completion rate),
+          guardrail metrics (escalation rate, customer satisfaction score), and
+          sample size calculation.
+\end{itemize}
+
+\textbf{Tier 3: Production monitoring.}
+\begin{itemize}
+    \item \textbf{Business metrics:} Task completion rate (did the customer's
+          issue get resolved without human escalation?), average handling time,
+          customer satisfaction (CSAT) score from post-chat survey.
+    \item \textbf{Safety monitors:} Toxicity classifier on all outputs, PII
+          detection in inputs and outputs, prompt injection detection.
+    \item \textbf{Quality sampling:} Daily random sample of 50 conversations
+          reviewed by QA team.  Track quality trends over time.
+    \item \textbf{Drift detection:} Monitor query distribution changes, response
+          latency, and failure rate.  Alert on anomalies.
+    \item \textbf{User feedback:} Thumbs up/down on responses, escalation to
+          human agent as implicit negative signal.
+\end{itemize}
+
+\textbf{Key design principles:}  Automated metrics catch regressions fast.
+Human evaluation validates quality at deployment gates.  Production metrics
+measure real-world impact.  No single tier is sufficient---all three are
+necessary.
+
+\redflags
+\begin{itemize}
+    \item Proposes only automated metrics with no human evaluation.
+    \item No safety or guardrail testing.
+    \item No production monitoring plan.
+    \item Suggests a single metric (e.g., ``BLEU score'') as sufficient.
+    \item Does not consider the business objective (task completion, not BLEU).
+\end{itemize}
+
+\interviewtest{End-to-end system design thinking, understanding of the
+evaluation lifecycle (development $\to$ deployment $\to$ production), and
+ability to connect technical metrics to business outcomes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Proposes at least two tiers (automated + human),
+          mentions safety testing and production monitoring.
+    \item \badgeLsix{L6}: Designs all three tiers with specific metrics,
+          includes A/B testing methodology, and connects to business KPIs
+          (CSAT, escalation rate).
+    \item \badgeLseven{L7}: Adds a continuous improvement loop (production
+          failures feed back into the regression suite), discusses
+          statistical rigor for A/B testing (power analysis, multiple
+          comparisons correction), proposes a ``quality gate'' framework where
+          deployment requires passing all tiers, and discusses the
+          organizational challenges of evaluation (who owns the evaluation
+          pipeline, how to handle disagreements between metrics and human
+          judgment).
+\end{itemize}
+
+\followups{How would you handle a case where automated metrics pass but human
+evaluators flag quality issues?  How do you set the sample size for A/B testing?
+How would you detect if the chatbot is giving correct but unhelpful responses?
+How do you evaluate multi-turn conversations where early errors compound?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 9 %%
+\begin{interviewq}
+\textbf{Q: You are building a code generation system. BLEU is commonly reported
+for code generation---is it a good metric? What alternatives would you propose?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+BLEU is a \textbf{poor metric for code generation} despite being commonly
+reported.  The fundamental problem: in code, surface form (tokens, formatting,
+variable names) and \emph{functional correctness} are only loosely correlated.
+Two programs can be functionally identical but share zero n-grams (different
+variable names, different algorithms, different control flow).  Conversely, code
+that is textually similar to the reference but has a single-character bug
+(off-by-one, wrong operator) will have high BLEU but be completely wrong.
+
+\textbf{Better alternatives:}
+
+\begin{enumerate}
+    \item \textbf{pass@k (HumanEval):} Generate $k$ candidate solutions, check
+          how many pass all unit tests.  This directly measures functional
+          correctness.  $\text{pass@}1$ is the most commonly reported.  The
+          unbiased estimator (Chen et al., 2021) generates $n \geq k$ samples
+          and computes: $\text{pass@}k = 1 - \binom{n-c}{k}/\binom{n}{k}$
+          where $c$ is the number of correct samples.
+
+    \item \textbf{Execution-based testing:} Run the generated code against a
+          test suite and measure the fraction of tests that pass.  More general
+          than pass@k (handles partial correctness).
+
+    \item \textbf{CodeBERTScore:} Semantic similarity using CodeBERT embeddings.
+          Better than BLEU for capturing semantic equivalence of code, but still
+          does not guarantee functional correctness.
+
+    \item \textbf{Edit similarity:} Tree-edit distance on the AST (abstract
+          syntax tree).  Captures structural similarity while ignoring surface
+          formatting.  Useful for measuring ``how close'' a wrong solution is.
+\end{enumerate}
+
+\textbf{The key insight:}  For code, the only ground truth is whether it
+\emph{works}.  Execution-based metrics are strictly necessary.  Surface-form
+metrics (BLEU, CodeBLEU, ROUGE) are useful auxiliary signals for measuring
+diversity and similarity but should never be the primary metric.
+
+\redflags
+\begin{itemize}
+    \item Accepts BLEU as appropriate for code generation without questioning it.
+    \item Cannot articulate why surface-form metrics fail for code.
+    \item Does not mention execution-based evaluation.
+    \item Proposes ROUGE as a better alternative (it has the same fundamental
+          problem).
+\end{itemize}
+
+\interviewtest{Critical evaluation thinking---can the candidate reason about
+\emph{why} a metric is or is not appropriate for a given task, rather than
+reflexively applying standard metrics?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Identifies that BLEU fails for code and proposes
+          execution-based metrics.
+    \item \badgeLsix{L6}: Explains pass@k with the unbiased estimator, discusses
+          the limitations of execution-based metrics (test coverage,
+          specification quality), and proposes a multi-metric approach.
+    \item \badgeLseven{L7}: Discusses the broader challenge of evaluating
+          generated code in production (security, efficiency, maintainability---
+          not just correctness), formal verification approaches, and the
+          connection to the program synthesis literature.
+\end{itemize}
+
+\followups{How do you handle the case where the test suite is incomplete?  What
+is CodeBLEU and how does it differ from BLEU?  How would you evaluate code
+generation for languages without good test infrastructure?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+%% QUESTION 10 %%
+\begin{interviewq}
+\textbf{Q: A model achieves state-of-the-art on MMLU but users report it gives
+poor answers in practice. What could explain this gap?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Several factors can cause a disconnect between benchmark performance and
+real-world utility:
+
+\textbf{1.\ Benchmark contamination:}  The model may have seen MMLU questions
+(or very similar ones) during training, inflating its score without genuine
+knowledge improvement.  This is the first thing I would investigate.
+
+\textbf{2.\ Format mismatch:}  MMLU is multiple-choice (select from A/B/C/D).
+Real users ask open-ended questions.  A model can be excellent at selecting
+the correct option from a given set but poor at generating a correct, coherent
+answer from scratch.  Multiple-choice benchmarks test recognition, not
+generation.
+
+\textbf{3.\ Distribution mismatch:}  MMLU covers 57 academic subjects.  Users
+may be asking about topics not well represented (personal advice, domain-specific
+jargon, current events).  High MMLU does not imply broad real-world knowledge.
+
+\textbf{4.\ Missing evaluation dimensions:}  MMLU tests knowledge accuracy but
+not helpfulness, instruction following, conversational ability, appropriate
+hedging, tone, or safety.  A model can know the right answer but communicate it
+poorly, refuse to answer unnecessarily, or give correct but unhelpful responses.
+
+\textbf{5.\ Calibration and hedging:}  In multiple-choice, the model picks the
+best option.  In open-ended generation, users want the model to express
+uncertainty appropriately.  A model might be overconfident or underconfident in
+ways that MMLU cannot measure.
+
+\textbf{6.\ Alignment quality:}  MMLU measures pretrained knowledge.
+Post-training alignment (SFT, RLHF) determines how that knowledge is surfaced
+to users.  A model with excellent pretraining but poor alignment will score well
+on MMLU but frustrate users.
+
+\textbf{Lesson:}  No single benchmark captures real-world utility.  Production
+evaluation must include diverse automatic benchmarks, human evaluation,
+and real user feedback.
+
+\redflags
+\begin{itemize}
+    \item Cannot hypothesize any explanation beyond ``the benchmark must be wrong.''
+    \item Does not mention contamination.
+    \item Treats high MMLU as proof of overall model quality.
+    \item No awareness of the benchmark-to-deployment gap.
+\end{itemize}
+
+\interviewtest{Evaluation maturity, critical reasoning about metrics, and
+understanding of the gap between benchmarks and real-world performance.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Identifies at least two plausible explanations
+          (contamination, format mismatch).
+    \item \badgeLsix{L6}: Provides a systematic analysis covering contamination,
+          distribution mismatch, missing evaluation dimensions, and alignment
+          quality.  Proposes concrete investigation steps.
+    \item \badgeLseven{L7}: Connects to Goodhart's law, discusses how this
+          phenomenon has played out historically in NLP (models gaming benchmarks
+          from SQuAD to SuperGLUE to MMLU), proposes an evaluation philosophy
+          that treats benchmarks as necessary but insufficient signals, and
+          discusses the organizational implications (do not set MMLU as a team
+          OKR).
+\end{itemize}
+
+\followups{How would you detect benchmark contamination in a model you did not
+train?  What benchmarks would you add to MMLU to better predict user
+satisfaction?  How would you design an evaluation framework that captures
+real-world utility?}
+\end{interviewq}
+
+\bigskip
+
+% ============================================================================
+% CHAPTER SUMMARY
+% ============================================================================
+\section*{Chapter Summary}
+
+\begin{enumerate}
+    \item \textbf{Perplexity} ($\text{PP} = e^{H}$) is the standard language
+          modeling metric, representing the weighted average branching factor.
+          It measures prediction quality but not generation quality, faithfulness,
+          or safety.  Use bits-per-byte for cross-tokenizer comparison.
+
+    \item \textbf{BLEU} measures modified n-gram precision with a brevity penalty
+          for machine translation.  It is precision-oriented, corpus-level, and
+          has poor human correlation at the sentence level.  Neural metrics like
+          COMET are superior but BLEU remains the reporting standard.
+
+    \item \textbf{ROUGE} measures n-gram recall for summarization.  It is
+          complementary to BLEU (recall vs.\ precision) but shares the same
+          fundamental limitation: surface-form overlap does not capture semantic
+          equivalence or faithfulness.
+
+    \item \textbf{BERTScore} and \textbf{COMET} use learned embeddings to
+          capture semantic similarity, achieving higher human correlation than
+          surface-form metrics.
+
+    \item \textbf{Classification metrics} (precision, recall, F1) must be
+          chosen to match the task's error cost structure.  For NER, entity-level
+          strict matching is the standard; token-level metrics overestimate
+          performance.
+
+    \item \textbf{Human evaluation} is the gold standard but is expensive, slow,
+          and hard to reproduce.  Pairwise comparison is more reliable than
+          Likert scales.  Chatbot Arena provides crowd-sourced evaluation at
+          scale.
+
+    \item \textbf{LLM-as-judge} scales better than human evaluation but has
+          systematic biases (verbosity, position, self-preference).  It is
+          a useful development tool but should not be the sole basis for
+          deployment decisions.
+
+    \item \textbf{Benchmarks} (MMLU, HumanEval, GSM8K) provide standardized
+          comparison but suffer from contamination, saturation, and narrow
+          coverage.  No single benchmark captures real-world utility.
+
+    \item \textbf{Decoding strategies} trade off quality, diversity, and latency.
+          Greedy and beam search for deterministic tasks; nucleus sampling for
+          open-ended generation; constrained decoding for structured output;
+          speculative decoding for production throughput.
+\end{enumerate}
+
+\begin{keyinsight}[Chapter 10 Summary: What Interviewers Are Really Testing]
+When interviewers ask about evaluation, they are testing three things:
+(1)~\emph{Do you know the math?}---Can you derive BLEU, define perplexity,
+and explain why ROUGE is recall-oriented?
+(2)~\emph{Do you know the limitations?}---Can you explain why BLEU fails for
+paraphrases, why ROUGE favors extractive summaries, and why benchmark scores
+do not guarantee real-world quality?
+(3)~\emph{Can you design an evaluation pipeline?}---Can you propose a
+multi-layered evaluation strategy that combines automatic metrics for speed,
+human evaluation for quality validation, and production metrics for real-world
+impact?  Candidates who demonstrate all three signal that they treat evaluation
+as a first-class engineering problem, not an afterthought.
+\end{keyinsight}

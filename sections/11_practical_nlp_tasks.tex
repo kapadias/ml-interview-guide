@@ -1,0 +1,1795 @@
+% ============================================================================
+% CHAPTER 11: PRACTICAL NLP TASKS AND APPLICATIONS
+% Bridges architecture knowledge to real-world NLP problem solving.
+% ============================================================================
+
+\chapter{Practical NLP Tasks and Applications}
+\label{chap:practical_tasks}
+
+\begin{tldr}
+Knowing architectures is necessary but not sufficient---interviewers want to see that you can
+\emph{apply} them to real tasks.  This chapter covers the major NLP application areas: text
+classification, sentiment analysis, named entity recognition, relation extraction, question
+answering, summarization, machine translation, and dialogue systems.  For each task, we cover
+classical approaches, modern neural approaches, and LLM-based approaches, creating a
+\textbf{decision framework} for when to use each.  The ability to select the right approach for a
+given constraint set---data availability, latency budget, accuracy requirements, and
+interpretability needs---is what separates a strong hire from a textbook reciter.
+\end{tldr}
+
+% ============================================================================
+\section{Text Classification}
+\label{sec:text_classification}
+% ============================================================================
+
+Text classification---assigning a label from a predefined set to a text input---is the most
+common NLP task in production.  Spam filtering, content moderation, intent detection, topic
+routing, and language identification are all text classification problems.  Despite its apparent
+simplicity, the design space is rich and the ``right'' approach depends critically on
+constraints.
+
+\subsection{The Classical Pipeline}
+\label{sec:classical_text_clf}
+
+The classical text classification pipeline remains the right starting point for many production
+systems:
+
+\begin{enumerate}[label=\textbf{Step \arabic*.}]
+    \item \textbf{Preprocessing:} Tokenize, lowercase, remove stopwords (optional),
+          apply stemming or lemmatization (optional).
+    \item \textbf{Feature extraction:} Convert text to a fixed-dimensional vector.
+          TF-IDF over unigrams and bigrams is the workhorse.  Character n-grams
+          help with misspellings and morphological variation.
+    \item \textbf{Classification:} Train a supervised classifier on the feature vectors.
+\end{enumerate}
+
+\paragraph{Naive Bayes.}
+Multinomial Naive Bayes models the likelihood of each word given the class using word
+frequencies, then applies Bayes' theorem.  Despite the naive independence assumption
+($P(x_1, \ldots, x_n \given y) = \prod_i P(x_i \given y)$), it works remarkably well for
+text because:
+\begin{itemize}
+    \item High-dimensional sparse features are approximately conditionally independent given
+          the class (the independence assumption is ``less wrong'' in high dimensions).
+    \item The decision boundary depends only on the \emph{ratio} of class-conditional
+          probabilities, so systematic errors in probability estimation often cancel.
+    \item It requires very few parameters ($|V| \times |C|$), making it robust with small
+          training sets.
+\end{itemize}
+
+\paragraph{Linear SVM.}
+Support Vector Machines with a linear kernel are the classical SOTA for text classification.
+Linear SVMs work exceptionally well on text because TF-IDF features are high-dimensional and
+sparse---in this regime, data is often linearly separable, and the max-margin objective
+generalizes well.  SVMs with TF-IDF bigrams remained competitive with early neural methods
+on many benchmarks well into the deep learning era.
+
+\paragraph{Logistic Regression.}
+The probabilistic counterpart of linear SVMs.  Produces calibrated probabilities (useful when
+you need a confidence score, not just a label), supports regularization (L1 for sparsity, L2
+for generalization), and is trivially interpretable via feature weights.
+
+\subsection{Deep Learning Approaches}
+\label{sec:deep_text_clf}
+
+\paragraph{TextCNN (Kim, 2014).}
+Applies convolutional filters of varying widths (e.g., 3, 4, 5 tokens) over word embeddings,
+followed by max-over-time pooling and a fully connected classifier.  Each filter width captures
+n-gram patterns at a different scale.  TextCNN is fast, parallelizable, and surprisingly
+effective---it was the first neural model to consistently beat SVMs on sentiment and topic
+classification.
+
+\paragraph{BiLSTM + Attention.}
+A bidirectional LSTM encodes the sequence, and an attention mechanism computes a weighted sum
+over hidden states to form a document representation.  The attention weights provide a form of
+interpretability (which tokens mattered), though attention weights should not be over-interpreted
+as explanations.
+
+\paragraph{Fine-tuned BERT/RoBERTa.}
+The modern default for text classification.  Add a linear classification head on the
+\texttt{[CLS]} token and fine-tune the entire model (or use a frozen encoder with a trained
+head for efficiency).  Advantages: captures deep contextual understanding, handles polysemy
+and complex syntax, benefits from massive pretraining.  With as few as 1,000 labeled examples,
+fine-tuned BERT typically outperforms all classical methods by a significant margin.
+
+\paragraph{Few-Shot with LLMs.}
+For prototyping or when labeled data is extremely scarce, prompting an LLM with a task
+description and 2--8 examples can achieve competitive performance.  The tradeoff: much higher
+latency and cost per prediction, no gradient-based learning from your data, and sensitivity
+to prompt formatting.  Production systems typically use LLMs for labeling data to train a
+smaller classifier, not for serving predictions directly.
+
+\subsection{Multi-Label and Hierarchical Classification}
+
+\paragraph{Multi-label classification.}
+When each input can have multiple labels (e.g., a news article is both ``politics'' and
+``economy''), the standard approaches are:
+\begin{itemize}
+    \item \textbf{Binary relevance:} Train an independent binary classifier per label.  Simple
+          but ignores label correlations.
+    \item \textbf{Classifier chains:} Train classifiers sequentially, with each model's input
+          augmented by previous predictions.  Captures label dependencies at the cost of order
+          sensitivity and error propagation.
+    \item \textbf{Threshold tuning:} Use a single model with sigmoid outputs (not softmax) and
+          tune the decision threshold per label on a validation set.  This is the practical
+          default for BERT-based multi-label classifiers.
+\end{itemize}
+
+\paragraph{Hierarchical classification.}
+When labels form a taxonomy (e.g., ``Sports $\to$ Football $\to$ Premier League''), flat
+classification ignores the structure.  Taxonomy-aware approaches include: top-down classifiers
+(predict coarse category first, then refine), hierarchical loss functions (penalize less for
+predicting a sibling category than a distant one), and label embedding methods that encode the
+taxonomy structure.
+
+\subsection{Decision Framework: When Simple Models Win}
+
+\begin{table}[H]
+\centering
+\caption{Text classification model selection guide.}
+\label{tab:text_clf_selection}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\textbf{Scenario} & \textbf{NB/SVM} & \textbf{TextCNN} & \textbf{BERT} & \textbf{LLM} \\
+\midrule
+$<$ 100 labeled examples       & Best     & Poor   & Poor   & Good   \\
+100--1K labeled examples       & Good     & Good   & Good   & Good   \\
+$>$ 1K labeled examples        & Good     & Good   & Best   & Overkill \\
+Latency $<$ 1 ms               & Best     & Good   & Poor   & Poor   \\
+Latency $<$ 10 ms              & Best     & Best   & Good   & Poor   \\
+Interpretability required      & Best     & Fair   & Poor   & Poor   \\
+No GPU available               & Best     & Fair   & Poor   & Poor   \\
+Rapidly changing label space   & Poor     & Poor   & Poor   & Best   \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{keyinsight}[Always Start Simple]
+The single most common mistake in NLP system design interviews is jumping straight to the most
+complex model.  The correct answer almost always begins with: ``I would start with TF-IDF +
+logistic regression as a baseline, establish performance, then only move to BERT or LLMs if the
+baseline is insufficient and the latency/cost budget allows it.''  This signals engineering
+maturity.  A Naive Bayes classifier trained in seconds can be serving traffic in an hour;
+a fine-tuned BERT model requires GPU infrastructure, evaluation pipelines, and deployment
+engineering.  The business value of shipping faster often outweighs the marginal accuracy gain.
+\end{keyinsight}
+
+% ============================================================================
+\section{Sentiment Analysis}
+\label{sec:sentiment_analysis}
+% ============================================================================
+
+Sentiment analysis determines the emotional polarity (positive, negative, neutral) of text.
+While often framed as a simple classification task, production sentiment analysis requires
+nuanced treatment of multiple levels of granularity.
+
+\subsection{Levels of Sentiment Analysis}
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Document-level:} Assign an overall sentiment to an entire review or article.
+          This is standard text classification---TF-IDF + SVM or fine-tuned BERT work well.
+    \item \textbf{Sentence-level:} Classify each sentence independently.  Useful when a
+          document contains mixed sentiment (a positive review with one complaint).
+    \item \textbf{Aspect-level:} Identify specific aspects (targets) and the sentiment toward
+          each.  This is the most useful and most challenging level.
+\end{enumerate}
+
+\subsection{Aspect-Based Sentiment Analysis (ABSA)}
+
+ABSA decomposes sentiment into structured triples: \textbf{(aspect, opinion, sentiment)}.
+Consider the review:
+
+\begin{quote}
+\emph{``The food was excellent but the service was painfully slow.''}
+\end{quote}
+
+The desired output is:
+\begin{itemize}
+    \item (food, excellent, \textsc{positive})
+    \item (service, painfully slow, \textsc{negative})
+\end{itemize}
+
+\paragraph{Subtasks of ABSA.}
+\begin{itemize}
+    \item \textbf{Aspect term extraction:} Identify the aspect phrases (``food,'' ``service'').
+          This is a sequence labeling problem (BIO tagging).
+    \item \textbf{Aspect category detection:} Map extracted aspects to predefined categories
+          (e.g., ``food quality,'' ``service speed'').  This is classification.
+    \item \textbf{Opinion term extraction:} Identify the opinion phrases (``excellent,''
+          ``painfully slow'').  Also sequence labeling.
+    \item \textbf{Sentiment classification:} Given an aspect-opinion pair, classify sentiment.
+\end{itemize}
+
+\paragraph{Modern approaches.}
+Recent work frames ABSA as a generative task: given the review text, generate structured
+triples directly using a seq2seq model (T5, BART) or an LLM with structured output.  This
+avoids the error propagation of pipeline approaches and handles implicit aspects (where the
+aspect is not explicitly mentioned but implied by the opinion).
+
+\subsection{Challenges in Sentiment Analysis}
+
+\begin{itemize}
+    \item \textbf{Sarcasm:} ``Oh great, another meeting that could have been an email.''
+          The words are positive but the sentiment is negative.  Sarcasm detection requires
+          understanding pragmatic context, speaker intent, and often world knowledge.
+    \item \textbf{Implicit sentiment:} ``The restaurant closed after two months'' conveys
+          negative sentiment without any explicit opinion words.
+    \item \textbf{Negation:} ``Not bad'' is positive; ``not particularly good'' is negative.
+          Simple bag-of-words approaches fail on negation scope.
+    \item \textbf{Domain shift:} A sentiment model trained on movie reviews performs poorly on
+          product reviews because the vocabulary, style, and aspect space differ.
+    \item \textbf{Comparative sentiment:} ``The camera is better than the iPhone but worse
+          than the Pixel''---requires understanding comparison targets and relative polarity.
+\end{itemize}
+
+\begin{warningbox}
+Sarcasm detection remains largely unsolved by NLP systems, including LLMs.  In interviews,
+resist the urge to claim that ``a large enough model will handle sarcasm.''  The strongest
+answer acknowledges that sarcasm often requires shared cultural context, knowledge of the
+speaker, and situational awareness that is not present in text alone.  Multimodal cues
+(tone of voice, facial expression) are often essential, which is why text-only sarcasm
+detection has a natural accuracy ceiling.
+\end{warningbox}
+
+% ============================================================================
+\section{Named Entity Recognition}
+\label{sec:ner}
+% ============================================================================
+
+Named Entity Recognition (NER) identifies and classifies spans of text into predefined entity
+types.  Standard entity types include Person (PER), Organization (ORG), Location (LOC), and
+Miscellaneous (MISC) from the CoNLL-2003 shared task.  Domain-specific NER extends to medical
+entities (diseases, drugs, dosages), financial entities (companies, monetary amounts, dates),
+legal entities (laws, courts, parties), and many others.
+
+\subsection{Tag Schemes}
+
+NER is formulated as a sequence labeling problem where each token receives a tag.
+
+\paragraph{BIO scheme.}
+The most common scheme uses three tag types:
+\begin{itemize}
+    \item \textbf{B-\textit{type}}: Beginning of an entity of the given type.
+    \item \textbf{I-\textit{type}}: Inside (continuation of) an entity.
+    \item \textbf{O}: Outside any entity.
+\end{itemize}
+
+\paragraph{BIOES scheme.}
+Extends BIO with two additional tags:
+\begin{itemize}
+    \item \textbf{E-\textit{type}}: End of a multi-token entity.
+    \item \textbf{S-\textit{type}}: Single-token entity (both beginning and end).
+\end{itemize}
+BIOES is slightly more expressive than BIO and handles adjacent entities of the same type
+more cleanly (e.g., ``[New York] [Times]'' as ORG-LOC vs.\ a single ORG).
+
+\subsection{Approach Evolution}
+\label{sec:ner_evolution}
+
+\paragraph{Classical: CRF with hand-crafted features.}
+The pre-neural standard used Conditional Random Fields with features including: word identity,
+word shape (capitalization patterns, digit patterns), prefix/suffix n-grams, POS tags,
+gazetteer membership (lists of known entity names), and window features (context words).  CRFs
+model the \emph{joint} probability of the entire label sequence $P(\vy \given \vx)$, capturing
+label-label transition dependencies that per-token classifiers miss.
+
+\paragraph{Neural: BiLSTM-CRF (Lample et al., 2016).}
+The breakthrough that eliminated manual feature engineering.  A bidirectional LSTM encodes
+contextual token representations, and a CRF layer on top models label transitions.  The
+BiLSTM captures input dependencies (context); the CRF captures output dependencies (valid
+label sequences).
+
+\paragraph{Modern: BERT + token classification.}
+Fine-tune BERT with a linear layer (or CRF layer) on top of token representations.  Each
+subword token receives a label, and predictions are aggregated to the word level (typically
+using the first subword's prediction).  This is the current production standard for NER when
+labeled data is available.
+
+\paragraph{LLM-based: few-shot NER via prompting.}
+Prompt an LLM with examples and ask it to extract entities.  Effective for prototyping and
+low-resource scenarios, but unreliable for strict schema adherence and inconsistent on entity
+boundary detection.  Best used to generate training data for a dedicated NER model.
+
+\begin{keyinsight}[Why Add a CRF Layer?]
+A per-token softmax classifier makes \emph{independent} predictions for each token---it can
+produce invalid sequences like \texttt{O I-PER I-LOC} (an inside tag without a corresponding
+beginning tag).  A CRF layer models transition probabilities between labels, learning that
+\texttt{I-PER} can only follow \texttt{B-PER} or \texttt{I-PER}, never \texttt{B-LOC}.  The
+Viterbi algorithm then finds the globally optimal label sequence in $O(T \times K^2)$ time,
+where $T$ is the sequence length and $K$ is the number of labels.  Adding a CRF on top of
+BERT typically improves NER F1 by 0.5--1.5 points, with the largest gains on entities with
+strict structural constraints (nested types, multi-token entities).
+\end{keyinsight}
+
+\subsection{Entity Linking}
+\label{sec:entity_linking}
+
+NER alone identifies mentions (``Apple''); entity linking resolves them to knowledge base
+entries (Apple~Inc.\ Q312 in Wikidata vs.\ the fruit).  The pipeline is:
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Mention detection:} Identify entity spans (from NER or coreference).
+    \item \textbf{Candidate generation:} Retrieve a candidate set of KB entities for each
+          mention using alias tables, string matching, or dense retrieval.
+    \item \textbf{Candidate ranking:} Score each candidate using context---a cross-encoder
+          over (mention context, entity description) is the modern standard.
+    \item \textbf{NIL detection:} Determine if the mention refers to an entity not in the KB
+          (the ``NIL'' case).
+\end{enumerate}
+
+\subsection{NER Challenges}
+
+\begin{itemize}
+    \item \textbf{Nested entities:} ``[The [University of California] Berkeley]'' contains an
+          ORG inside an ORG.  Flat sequence labeling cannot represent this.  Solutions include
+          span-based models that enumerate and classify candidate spans, or layered/stacked
+          NER.
+    \item \textbf{Cross-domain transfer:} A NER model trained on news text performs poorly on
+          biomedical text because entity types, naming conventions, and context patterns differ.
+          Domain adaptation techniques include continued pretraining on domain text, few-shot
+          fine-tuning, and gazetteer augmentation.
+    \item \textbf{Noisy text:} Social media, OCR output, and speech transcriptions contain
+          misspellings, non-standard capitalization, and abbreviations that break features
+          dependent on surface form.
+\end{itemize}
+
+\subsection{NER Pipeline: From Text to Knowledge}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm and 1.0cm,
+    box/.style={rectangle, draw=deepblue, fill=lightblue, minimum width=2.4cm,
+                minimum height=0.8cm, font=\small\sffamily, rounded corners=2pt,
+                thick, align=center},
+    databox/.style={rectangle, draw=gray!60, fill=white, minimum width=2.4cm,
+                    minimum height=0.6cm, font=\scriptsize\sffamily, rounded corners=2pt,
+                    align=center},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!80},
+    lbl/.style={font=\scriptsize\sffamily, text=gray!70!black}
+]
+
+% Pipeline stages
+\node[box] (text) {Raw Text};
+\node[box, right=1.2cm of text] (ner) {NER Model};
+\node[box, right=1.2cm of ner] (link) {Entity Linker};
+\node[box, right=1.2cm of link] (kg) {Knowledge\\Graph};
+
+% Data flow
+\node[databox, below=0.4cm of text] (d1) {``Tim Cook led\\Apple's keynote''};
+\node[databox, below=0.4cm of ner] (d2) {[Tim Cook]\textsubscript{PER}\\{}[Apple]\textsubscript{ORG}};
+\node[databox, below=0.4cm of link] (d3) {Tim Cook $\to$ Q484876\\Apple $\to$ Q312};
+\node[databox, below=0.4cm of kg] (d4) {(Tim Cook, CEO\_of,\\Apple Inc.)};
+
+% Arrows
+\draw[arr] (text) -- (ner);
+\draw[arr] (ner) -- (link);
+\draw[arr] (link) -- (kg);
+
+% Labels
+\node[lbl, above=0.15cm of ner] {Sequence\\labeling};
+\node[lbl, above=0.15cm of link] {Candidate\\ranking};
+\node[lbl, above=0.15cm of kg] {Triple\\extraction};
+\end{tikzpicture}
+\caption{End-to-end NER pipeline from raw text to a populated knowledge graph.  Each stage
+feeds into the next: NER identifies mentions, entity linking resolves them to KB entries, and
+relation extraction populates the graph.}
+\label{fig:ner_pipeline}
+\end{figure}
+
+% ============================================================================
+\section{Relation Extraction}
+\label{sec:relation_extraction}
+% ============================================================================
+
+Relation extraction identifies semantic relationships between entities in text.  Given a
+sentence and two marked entities, the task is to classify the relationship (or determine that
+no relation holds).  For example:
+
+\begin{quote}
+\emph{``\textbf{[Tim Cook]}\textsubscript{PER} is the CEO of
+\textbf{[Apple]}\textsubscript{ORG}.''}
+$\to$ (\textit{Tim Cook}, \textsc{ceo\_of}, \textit{Apple})
+\end{quote}
+
+\subsection{Supervised Relation Extraction}
+
+\paragraph{Entity marker approach.}
+The modern standard is to insert special tokens around entities in the input, then classify
+using the \texttt{[CLS]} representation or the pooled entity representations.  For BERT:
+
+\begin{lstlisting}[language=Python, caption={Entity marker input format for relation extraction.}]
+# Input format with typed entity markers
+input = "[CLS] <e1:PER> Tim Cook </e1:PER> is the CEO of "
+        "<e2:ORG> Apple </e2:ORG> . [SEP]"
+# Classify: [CLS] embedding -> linear -> relation labels
+\end{lstlisting}
+
+Variants include entity start markers (use the hidden state at the entity start token) and
+typed markers (include the entity type in the marker).  Entity start markers typically
+outperform \texttt{[CLS]}-based classification because they carry entity-specific information.
+
+\subsection{Distant Supervision}
+\label{sec:distant_supervision}
+
+When labeled relation data is scarce, \textbf{distant supervision} (Mintz et al., 2009)
+generates noisy training data by aligning a knowledge base with text:
+
+\begin{quote}
+\emph{If a knowledge base contains the triple (Tim Cook, CEO\_of, Apple), then every
+sentence mentioning both ``Tim Cook'' and ``Apple'' is labeled as expressing the
+\textsc{ceo\_of} relation.}
+\end{quote}
+
+The fundamental problem is that this assumption is wrong.  The sentence ``Tim Cook bought an
+Apple product'' mentions both entities but does not express the CEO\_of relation.  This
+creates \textbf{noisy labels} that degrade classifier performance.
+
+\paragraph{Noise mitigation strategies.}
+\begin{itemize}
+    \item \textbf{Multi-instance learning:} Group all sentences mentioning the same entity
+          pair into a ``bag'' and predict at the bag level, allowing the model to select
+          informative instances and ignore noisy ones.
+    \item \textbf{Denoising with attention:} Use attention over instances in a bag to
+          downweight noisy sentences (Lin et al., 2016).
+    \item \textbf{Human-in-the-loop:} Use distant supervision for initial labels, then
+          refine with a small amount of human annotation on the noisiest examples.
+\end{itemize}
+
+\subsection{Open Information Extraction}
+
+Unlike supervised RE, which classifies into a fixed relation schema, \textbf{Open IE} extracts
+arbitrary (subject, predicate, object) triples from text without predefined relation types.
+For example, from ``Einstein was born in Ulm in 1879,'' Open IE extracts:
+
+\begin{itemize}
+    \item (Einstein, was born in, Ulm)
+    \item (Einstein, was born in, 1879)
+\end{itemize}
+
+Classical Open IE systems (ReVerb, OpenIE~5) use syntactic patterns.  Modern approaches use
+LLMs with structured output to extract triples, achieving broader coverage but requiring
+careful post-processing to normalize predicates and resolve entity references.
+
+\subsection{Modern: LLM-Based Extraction}
+
+LLMs can perform relation extraction through prompting with structured output requirements
+(JSON, XML).  This approach excels when:
+\begin{itemize}
+    \item The relation schema is complex or evolving (no need to retrain).
+    \item Few-shot examples are available but full training data is not.
+    \item The extraction requires reasoning (implicit relations, multi-sentence evidence).
+\end{itemize}
+
+The tradeoff is cost and latency: an LLM call per sentence is orders of magnitude slower and
+more expensive than a fine-tuned BERT classifier.  Production systems often use LLMs to
+generate training data, then distill into a smaller model for serving.
+
+% ============================================================================
+\section{Question Answering}
+\label{sec:question_answering}
+% ============================================================================
+
+Question answering (QA) systems return precise answers to natural language questions.  The
+task taxonomy is rich, and the right architecture depends heavily on the QA type.
+
+\subsection{Extractive QA}
+\label{sec:extractive_qa}
+
+In extractive QA, the answer is a contiguous span within a given context passage.  The model
+predicts the start and end positions of the answer span.
+
+\paragraph{BERT for extractive QA.}
+The standard approach concatenates the question and context:
+
+\[
+\text{Input:} \quad \texttt{[CLS]}\; \underbrace{q_1 \ldots q_m}_{\text{question}}\;
+\texttt{[SEP]}\; \underbrace{c_1 \ldots c_n}_{\text{context}}\; \texttt{[SEP]}
+\]
+
+Two linear layers project each token's hidden state to start and end logits:
+\[
+    P_{\text{start}}(i) = \softmax(\mW_s \vh_i + b_s), \qquad
+    P_{\text{end}}(j) = \softmax(\mW_e \vh_j + b_e)
+\]
+The predicted answer span is $\argmax_{i \leq j} P_{\text{start}}(i) \times P_{\text{end}}(j)$,
+typically with a constraint that $j - i < L_{\max}$ (maximum answer length).
+
+\begin{mathresult}{Extractive QA Loss}
+\[
+    \loss = -\frac{1}{N}\sum_{k=1}^{N}\left[
+        \log P_{\text{start}}(s^{(k)}) + \log P_{\text{end}}(e^{(k)})
+    \right]
+\]
+where $s^{(k)}$ and $e^{(k)}$ are the ground-truth start and end positions for example $k$.
+The loss decomposes into two independent cross-entropy terms, one for start position and one
+for end position.
+\end{mathresult}
+
+\paragraph{Handling unanswerable questions.}
+SQuAD~2.0 introduced questions that have no answer in the context.  The model must decide
+whether to extract a span or output ``no answer.''  The standard approach treats the
+\texttt{[CLS]} token as a ``null span'' candidate: if the \texttt{[CLS]} score exceeds all
+span scores by a threshold $\tau$ (tuned on the validation set), the model predicts ``no
+answer.''
+
+\subsection{Extractive QA: Architecture}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm,
+    box/.style={rectangle, draw=deepblue, fill=lightblue, minimum width=1.6cm,
+                minimum height=0.6cm, font=\scriptsize\sffamily, rounded corners=2pt,
+                thick, align=center},
+    tok/.style={rectangle, draw=gray!50, fill=white, minimum width=0.9cm,
+                minimum height=0.5cm, font=\scriptsize\ttfamily, align=center},
+    logit/.style={rectangle, draw=deepgreen!70, fill=lightgreen, minimum width=0.9cm,
+                  minimum height=0.5cm, font=\scriptsize\sffamily, align=center},
+    arr/.style={-{Stealth[length=4pt]}, thick, deepblue!70},
+    brace/.style={decorate, decoration={brace, amplitude=5pt, mirror}, thick, gray!60}
+]
+
+% Token row
+\node[tok] (cls) {\texttt{[CLS]}};
+\node[tok, right=0.15cm of cls] (q1) {When};
+\node[tok, right=0.15cm of q1] (q2) {was};
+\node[tok, right=0.15cm of q2] (q3) {BERT};
+\node[tok, right=0.15cm of q3] (sep1) {\texttt{[SEP]}};
+\node[tok, right=0.15cm of sep1] (c1) {BERT};
+\node[tok, right=0.15cm of c1] (c2) {was};
+\node[tok, right=0.15cm of c2] (c3) {released};
+\node[tok, right=0.15cm of c3] (c4) {in};
+\node[tok, right=0.15cm of c4] (c5) {2018};
+\node[tok, right=0.15cm of c5] (sep2) {\texttt{[SEP]}};
+
+% BERT encoder
+\node[box, above=0.8cm of q3, minimum width=10.8cm] (bert) {BERT Encoder (12/24 layers)};
+
+% Hidden states
+\node[logit, above=0.6cm of bert.west, anchor=west, xshift=0.5cm] (hcls) {$\vh_{\text{CLS}}$};
+\node[logit, above=0.6cm of bert.east, anchor=east, xshift=-3.0cm] (h5) {$\vh_{\text{2018}}$};
+
+% Arrows from tokens to BERT
+\draw[arr] (cls.north) -- ++(0,0.35);
+\draw[arr] (q3.north) -- ++(0,0.35);
+\draw[arr] (c1.north) -- ++(0,0.35);
+\draw[arr] (c5.north) -- ++(0,0.35);
+\draw[arr] (sep2.north) -- ++(0,0.35);
+
+% Linear layers
+\node[box, above=0.7cm of hcls, fill=lightyellow, draw=orange!60] (null) {Null\\score};
+\node[box, above=0.7cm of h5, fill=lightyellow, draw=orange!60] (span) {Start/End\\logits};
+
+\draw[arr] (hcls) -- (null);
+\draw[arr] (h5) -- (span);
+
+% Braces
+\draw[brace] (q1.south west) -- (q3.south east)
+    node[midway, below=6pt, font=\scriptsize\sffamily, text=gray!70!black] {Question};
+\draw[brace] (c1.south west) -- (c5.south east)
+    node[midway, below=6pt, font=\scriptsize\sffamily, text=gray!70!black] {Context};
+\end{tikzpicture}
+\caption{BERT-based extractive QA.  The question and context are concatenated with separator
+tokens.  Two linear layers predict start and end logits over context tokens.  The
+\texttt{[CLS]} token's score serves as the ``no answer'' signal.}
+\label{fig:extractive_qa}
+\end{figure}
+
+\subsection{Abstractive QA}
+
+In abstractive QA, the model generates a free-form answer rather than extracting a span.
+This is necessary when:
+\begin{itemize}
+    \item The answer requires synthesizing information from multiple parts of the context.
+    \item The answer requires rephrasing or summarizing (``yes/no'' questions, aggregation).
+    \item No single span contains the full answer.
+\end{itemize}
+
+Architectures include encoder-decoder models (T5, BART) and decoder-only LLMs.  Abstractive
+QA is the natural formulation for RAG-based systems, where the generator must synthesize
+information from multiple retrieved passages.
+
+\subsection{Open-Domain QA}
+\label{sec:open_domain_qa}
+
+Open-domain QA answers questions without a pre-specified context.  The system must
+\emph{retrieve} relevant passages from a large corpus, then \emph{read} them to extract or
+generate an answer.
+
+\paragraph{The retriever-reader pipeline.}
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Retriever:} Given the question, retrieve the top-$k$ passages from a corpus.
+          DPR (Dense Passage Retrieval) uses a dual-encoder BERT model trained on
+          question-passage pairs with in-batch negatives.
+    \item \textbf{Reader:} Given the question and retrieved passages, extract or generate the
+          answer.  The reader can be extractive (select a span from the best passage) or
+          abstractive (generate an answer conditioned on all passages).
+\end{enumerate}
+
+Modern open-domain QA systems are essentially RAG systems (Chapter~\ref{chap:practical_tasks}
+refers to Chapter~9 for RAG details).  The key design decisions are: retrieval method (sparse
+vs.\ dense vs.\ hybrid), number of passages to retrieve, how to present multiple passages to
+the reader, and how to handle conflicting information across passages.
+
+\subsection{Multi-Hop QA}
+
+Multi-hop QA requires reasoning over multiple documents or passages to arrive at an answer.
+For example:
+
+\begin{quote}
+\emph{``What is the capital of the country where the Eiffel Tower is located?''} \\
+Hop 1: Eiffel Tower $\to$ located in France \\
+Hop 2: France $\to$ capital is Paris
+\end{quote}
+
+Approaches include iterative retrieval (retrieve, read, generate a follow-up query, retrieve
+again), graph-based reasoning (construct an entity graph across documents and reason over
+paths), and chain-of-thought prompting with LLMs (which naturally decompose multi-hop
+questions into reasoning steps).
+
+\subsection{Table QA}
+
+Answering questions from structured tables introduces unique challenges: understanding table
+structure, aggregation operations (count, sum, average), and compositional queries.
+
+\begin{itemize}
+    \item \textbf{TAPAS (Google):} Extends BERT with additional embeddings for row/column
+          position and trains on table-question pairs.  Predicts cell selection and aggregation
+          operator.
+    \item \textbf{Text-to-SQL:} Convert the natural language question to a SQL query, execute
+          against a database.  Modern approaches use LLMs with schema-aware prompting.
+          Spider and WikiSQL are standard benchmarks.
+\end{itemize}
+
+% ============================================================================
+\section{Text Summarization}
+\label{sec:summarization}
+% ============================================================================
+
+Text summarization condenses a source document into a shorter representation that preserves
+the key information.  The two fundamental approaches---extractive and abstractive---have
+different strengths, limitations, and failure modes.
+
+\subsection{Extractive Summarization}
+
+Extractive summarization selects a subset of sentences from the source document and presents
+them as the summary.  No new text is generated.
+
+\paragraph{TextRank.}
+A graph-based unsupervised method inspired by PageRank.  Build a graph where sentences are
+nodes and edge weights are sentence similarity (cosine similarity of TF-IDF or embedding
+vectors).  Run PageRank to score sentence importance.  Select the top-$k$ sentences, ordered
+by their position in the original document.  No training data required.
+
+\paragraph{BertSumExt (Liu and Lapata, 2019).}
+Fine-tune BERT for sentence-level binary classification: each sentence receives a score
+indicating whether it should be included in the summary.  Inter-sentence attention (using
+segment embeddings alternated per sentence) captures document-level context.
+
+\paragraph{Advantages and limitations.}
+Extractive methods are inherently faithful---every sentence in the summary is a verbatim copy
+from the source, so hallucination is structurally impossible.  However, extractive summaries
+are often choppy (sentences lack coherent flow), contain irrelevant details (an entire sentence
+is selected even if only one clause is relevant), and cannot paraphrase or abstract.
+
+\subsection{Abstractive Summarization}
+
+Abstractive summarization generates new text that may paraphrase, compress, or fuse
+information from the source.
+
+\paragraph{Key models.}
+\begin{itemize}
+    \item \textbf{BART (Lewis et al., 2019):} Pretrained as a denoising autoencoder (corrupt
+          text, reconstruct).  Strong at generation tasks including summarization.
+    \item \textbf{Pegasus (Zhang et al., 2020):} Gap-sentence generation pretraining---mask
+          entire sentences and predict them.  This pretraining objective directly mirrors
+          extractive summarization, leading to excellent performance with few fine-tuning
+          examples.
+    \item \textbf{LLMs with prompting:} Provide the document and ask for a summary.  Highly
+          flexible (can control length, style, focus), but expensive and prone to hallucination
+          without careful grounding.
+\end{itemize}
+
+\subsection{Long Document Summarization}
+
+When the source document exceeds the model's context window, strategies include:
+
+\begin{itemize}
+    \item \textbf{Truncation:} Simply truncate the input.  Surprisingly effective for news
+          (the lead paragraph often contains the key information) but catastrophic for long
+          reports or legal documents.
+    \item \textbf{Chunking + map-reduce:} Summarize each chunk independently, then summarize
+          the summaries.  Simple to implement but loses cross-chunk dependencies.
+    \item \textbf{Hierarchical:} Encode chunks at a local level, then attend over chunk
+          representations at a global level.  Architectures like Longformer and LED
+          (Long-document Encoder-Decoder) support inputs of 4K--16K tokens.
+    \item \textbf{Iterative refinement:} Generate an initial summary, then refine it by
+          re-reading the source and correcting errors.
+\end{itemize}
+
+\subsection{The Faithfulness Problem}
+
+Faithfulness---the degree to which the summary accurately represents the source---is the
+central challenge of abstractive summarization.
+
+\begin{itemize}
+    \item \textbf{Intrinsic hallucination:} The summary contradicts information in the source.
+          ``The company's revenue increased by 15\%'' when the source says 10\%.
+    \item \textbf{Extrinsic hallucination:} The summary adds information not present in or
+          inferable from the source.  ``The CEO expressed optimism'' when the source does not
+          mention the CEO's sentiment.
+\end{itemize}
+
+\paragraph{Detection methods.}
+\begin{itemize}
+    \item \textbf{NLI-based:} Use a natural language inference model to check if the summary
+          is entailed by the source.  If the NLI model predicts ``contradiction,'' the summary
+          likely contains an intrinsic hallucination.
+    \item \textbf{Question-based (QuestEval):} Generate questions from the summary, answer
+          them using the source, and compare.  Mismatches indicate hallucination.
+    \item \textbf{Factual consistency models:} Dedicated classifiers trained on hallucination
+          annotations (FactCC, DAE).
+\end{itemize}
+
+\begin{keyinsight}[Faithfulness Over Fluency]
+In production summarization, faithfulness is more important than fluency.  A choppy but
+accurate extractive summary is preferable to a fluent but hallucinated abstractive one.
+Interviewers test this because it reveals practical judgment: candidates who optimize for
+ROUGE scores without discussing faithfulness are missing the metric that actually matters
+for deployment.  ROUGE measures n-gram overlap, which correlates with fluency but is
+\emph{completely blind to factual correctness}.
+\end{keyinsight}
+
+% ============================================================================
+\section{Machine Translation}
+\label{sec:machine_translation}
+% ============================================================================
+
+Machine translation (MT) converts text from a source language to a target language.  It is one
+of the oldest NLP tasks (dating to the 1950s) and has been the driving application behind
+several NLP breakthroughs, including the attention mechanism and the Transformer itself.
+
+\subsection{Neural Machine Translation}
+
+The standard NMT architecture is the Transformer encoder-decoder.  The encoder processes the
+source sentence with bidirectional self-attention; the decoder generates the target sentence
+autoregressively with causal self-attention and cross-attention to the encoder outputs.
+
+\paragraph{Training.}
+NMT models are trained on parallel corpora (aligned source-target sentence pairs) using
+teacher forcing: at each decoding step, the ground-truth previous token is provided as input
+(not the model's own prediction).  The loss is cross-entropy over the target vocabulary at
+each position:
+
+\[
+    \loss = -\sum_{t=1}^{T} \log P(y_t \given y_{<t}, \vx)
+\]
+
+\paragraph{Label smoothing.}
+Standard practice in NMT applies label smoothing ($\epsilon = 0.1$): instead of training
+against hard one-hot targets, the target distribution places $1 - \epsilon$ on the correct
+token and distributes $\epsilon$ uniformly across the vocabulary.  This reduces overconfidence
+and improves BLEU by 0.5--1.0 points.
+
+\subsection{Multilingual Translation}
+
+\paragraph{Multilingual models.}
+Rather than training separate models for each language pair, multilingual models handle
+many languages in a single model:
+\begin{itemize}
+    \item \textbf{mBART (Liu et al., 2020):} Denoising autoencoder pretrained on monolingual
+          data in 25 languages, then fine-tuned on parallel data.  Enables zero-shot
+          translation between language pairs not seen during fine-tuning.
+    \item \textbf{NLLB-200 (Costa-juss\`{a} et al., 2022):} ``No Language Left Behind.''
+          Covers 200 languages with a single model, including many low-resource languages.
+          Uses language-specific routing and data augmentation strategies.
+\end{itemize}
+
+\subsection{Low-Resource Translation Strategies}
+
+When parallel data is scarce for a language pair, several strategies help:
+
+\begin{itemize}
+    \item \textbf{Back-translation (Sennrich et al., 2016):} Train a reverse model
+          (target $\to$ source), use it to translate monolingual target data into synthetic
+          source data, then add the synthetic pairs to training.  This is the single most
+          effective data augmentation technique for NMT.
+    \item \textbf{Pivot translation:} Translate through a high-resource intermediate language
+          (e.g., translate Swahili $\to$ English $\to$ French instead of Swahili $\to$
+          French directly).
+    \item \textbf{Transfer from related languages:} Initialize a low-resource model from a
+          high-resource related language (e.g., Portuguese $\to$ Galician).
+    \item \textbf{Multilingual training:} Include the low-resource pair in a multilingual
+          model that also trains on high-resource pairs.  Cross-lingual transfer improves
+          low-resource performance.
+\end{itemize}
+
+\subsection{LLMs as Translators}
+
+Large language models achieve competitive translation quality through few-shot prompting,
+especially for high-resource language pairs.  They excel at:
+\begin{itemize}
+    \item Handling domain-specific or informal text (where NMT models trained on formal
+          parallel data struggle).
+    \item Providing explanations of translation choices (useful for language learning).
+    \item Adapting to user preferences (formality level, regional variants) via instructions.
+\end{itemize}
+
+However, for high-volume production translation, dedicated NMT models remain preferred due to
+their lower latency, lower cost per token, and more predictable quality.  LLMs also
+underperform dedicated NMT for low-resource languages where the LLM's pretraining data
+is limited.
+
+\subsection{MT Evaluation}
+
+Evaluation is covered in depth in Chapter~10.  The key metrics in brief:
+
+\begin{itemize}
+    \item \textbf{BLEU:} N-gram precision with brevity penalty.  The traditional standard but
+          increasingly recognized as inadequate---it penalizes valid paraphrases and correlates
+          poorly with human judgment for high-quality systems.
+    \item \textbf{COMET:} A learned neural metric that uses reference translations and source
+          text.  Correlates much better with human judgment than BLEU.
+    \item \textbf{Human evaluation:} The gold standard.  MQM (Multidimensional Quality Metrics)
+          provides a structured framework for annotating translation errors by type and severity.
+\end{itemize}
+
+% ============================================================================
+\section{Dialogue Systems}
+\label{sec:dialogue_systems}
+% ============================================================================
+
+Dialogue systems engage in multi-turn conversation with users.  The two primary categories
+---task-oriented and open-domain---have fundamentally different architectures, evaluation
+criteria, and deployment challenges.
+
+\subsection{Task-Oriented Dialogue}
+\label{sec:task_oriented_dialogue}
+
+Task-oriented dialogue systems help users accomplish specific goals (booking a restaurant,
+checking flight status, troubleshooting a device).  The classical architecture is a pipeline
+of specialized components.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.4cm and 0.8cm,
+    box/.style={rectangle, draw=deepblue, fill=lightblue, minimum width=2.6cm,
+                minimum height=1.0cm, font=\small\sffamily, rounded corners=3pt,
+                thick, align=center},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!80},
+    lbl/.style={font=\scriptsize\sffamily, text=gray!70!black, align=center},
+    databox/.style={rectangle, draw=gray!50, fill=white, minimum width=2.6cm,
+                    minimum height=0.5cm, font=\scriptsize\sffamily, rounded corners=2pt,
+                    align=center}
+]
+
+% Pipeline boxes
+\node[box] (nlu) {NLU\\{\scriptsize Intent +\\Slot Filling}};
+\node[box, right=1.0cm of nlu] (dst) {Dialogue State\\Tracker};
+\node[box, right=1.0cm of dst] (policy) {Dialogue\\Policy};
+\node[box, right=1.0cm of policy] (nlg) {NLG\\{\scriptsize Response\\Generation}};
+
+% User input/output
+\node[databox, left=0.8cm of nlu] (user) {User utterance};
+\node[databox, right=0.8cm of nlg] (resp) {System response};
+
+% Arrows
+\draw[arr] (user) -- (nlu);
+\draw[arr] (nlu) -- (dst);
+\draw[arr] (dst) -- (policy);
+\draw[arr] (policy) -- (nlg);
+\draw[arr] (nlg) -- (resp);
+
+% Example data below
+\node[lbl, below=0.3cm of nlu] {Intent: \texttt{book\_table}\\Slots: \{time: 7pm,\\party\_size: 4\}};
+\node[lbl, below=0.3cm of dst] {Belief state:\\cuisine=Italian\\time=7pm\\party\_size=4};
+\node[lbl, below=0.3cm of policy] {Action:\\\texttt{confirm}\\+ \texttt{ask\_location}};
+\node[lbl, below=0.3cm of nlg] {``A table for 4 at\\7pm. Which area\\do you prefer?''};
+
+% DB arrow
+\node[box, below=1.8cm of policy, fill=lightyellow, draw=orange!60, minimum width=2.0cm] (db) {Backend/DB};
+\draw[arr, orange!60] (policy) -- (db);
+\draw[arr, orange!60] (db) -- (policy);
+\end{tikzpicture}
+\caption{Classical task-oriented dialogue pipeline.  Each component is a specialized module:
+NLU parses user intent and slots, the dialogue state tracker maintains the belief state
+across turns, the policy decides the next system action (potentially querying a backend), and
+NLG generates the response.}
+\label{fig:tod_pipeline}
+\end{figure}
+
+\paragraph{Natural Language Understanding (NLU).}
+The NLU module performs two tasks jointly:
+\begin{itemize}
+    \item \textbf{Intent classification:} Determine the user's goal (e.g., \texttt{book\_table},
+          \texttt{cancel\_reservation}, \texttt{check\_hours}).  Standard text classification.
+    \item \textbf{Slot filling:} Extract relevant parameters as named slots (e.g.,
+          \texttt{time=7pm}, \texttt{party\_size=4}).  Sequence labeling with BIO tags.
+\end{itemize}
+Joint intent-slot models (where the intent classifier and slot tagger share a BERT encoder)
+outperform separate models because intent and slots are mutually informative.
+
+\paragraph{Dialogue State Tracking (DST).}
+The DST module maintains a structured representation of the user's goals across turns.  The
+\textbf{belief state} is a set of slot-value pairs accumulated from conversation history.
+Key challenge: the user may correct, update, or partially specify values across turns.
+
+\begin{quote}
+\emph{Turn 1: ``I'd like Italian food.''} $\to$ \{cuisine: Italian\} \\
+\emph{Turn 2: ``Actually, make it Chinese.''} $\to$ \{cuisine: Chinese\} \\
+\emph{Turn 3: ``For 4 people at 7pm.''} $\to$ \{cuisine: Chinese, party\_size: 4, time: 7pm\}
+\end{quote}
+
+Modern DST models use BERT-based classifiers over the full dialogue history or generative
+models that produce the belief state as text.
+
+\paragraph{Dialogue Policy.}
+Decides what action the system should take given the current belief state: ask for a missing
+slot, confirm a value, query the database, or provide information.  Classical approaches use
+handcrafted rules; modern approaches use reinforcement learning or supervised learning from
+human demonstrations.
+
+\paragraph{Natural Language Generation (NLG).}
+Converts the system action into natural language.  Template-based NLG (``A table for
+\{\texttt{party\_size}\} at \{\texttt{time}\}'') is reliable and predictable.  Neural NLG
+(fine-tuned LMs) is more fluent but risks generating incorrect slot values.
+
+\subsection{Open-Domain Dialogue}
+
+Open-domain (chitchat) systems aim to engage users in free-form conversation without a
+specific task goal.  Quality is measured by engagement, coherence, personality consistency,
+and safety.
+
+\paragraph{Challenges.}
+\begin{itemize}
+    \item \textbf{Consistency:} The system should not contradict itself across turns (``I'm
+          from New York'' in turn 3, ``I grew up in London'' in turn 7).
+    \item \textbf{Engagement:} Avoiding generic responses (``That's interesting.'') while
+          maintaining relevance.
+    \item \textbf{Grounding:} Connecting responses to verifiable facts (reducing hallucination).
+    \item \textbf{Safety:} Avoiding harmful, biased, or inappropriate responses.
+\end{itemize}
+
+\subsection{Modern LLM-Based Dialogue}
+
+Modern dialogue systems are increasingly built on LLMs with the following components:
+
+\begin{itemize}
+    \item \textbf{System prompt:} Defines persona, constraints, capabilities, and safety rules.
+    \item \textbf{Conversation memory:} The full conversation history (or a summarized version
+          for long conversations) is included in the prompt.
+    \item \textbf{Tool integration:} The LLM can call external tools (search, calculator,
+          APIs) using function calling or ReAct-style prompting.
+    \item \textbf{Safety guardrails:} Input classifiers (detect prompt injection, harmful
+          requests) and output classifiers (detect harmful, off-topic, or policy-violating
+          responses).
+    \item \textbf{Retrieval augmentation:} Ground responses in retrieved documents or
+          knowledge base entries to reduce hallucination.
+\end{itemize}
+
+This architecture collapses the classical pipeline into a single LLM that handles NLU, DST,
+policy, and NLG jointly.  The tradeoff is reduced controllability: when the LLM makes an
+error in any stage, it is harder to diagnose and fix than in a modular pipeline.
+
+% ============================================================================
+\section{Information Extraction Pipeline}
+\label{sec:ie_pipeline}
+% ============================================================================
+
+Information extraction (IE) is the umbrella task of converting unstructured text into
+structured representations.  In practice, IE systems chain multiple NLP components into an
+end-to-end pipeline.
+
+\subsection{From Text to Knowledge Graph}
+
+The canonical IE pipeline proceeds in stages:
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Entity extraction:} NER identifies entity mentions in text.
+    \item \textbf{Coreference resolution:} Cluster mentions that refer to the same entity
+          (``Tim Cook,'' ``he,'' ``the Apple CEO'' $\to$ same person).
+    \item \textbf{Relation extraction:} For each pair of (co-referenced) entities, classify
+          the relationship.
+    \item \textbf{Entity linking:} Resolve each entity cluster to a canonical knowledge base
+          entry.
+    \item \textbf{Knowledge graph population:} Insert the extracted triples
+          (subject, relation, object) into a knowledge graph.
+\end{enumerate}
+
+Each stage has error rates that compound: if NER has 90\% recall and RE has 85\% accuracy,
+the end-to-end pipeline's effective accuracy is at most $0.9 \times 0.85 = 76.5\%$.  This
+error compounding is the fundamental challenge of pipeline IE systems.
+
+\subsection{Event Extraction}
+
+Event extraction goes beyond entity-relation triples to extract structured event
+representations:
+
+\begin{quote}
+\emph{``Apple acquired Beats Electronics for \$3 billion in May 2014.''}\\
+Event type: \textsc{Acquisition}\\
+Trigger: ``acquired''\\
+Arguments: \{buyer: Apple, target: Beats Electronics, price: \$3B, date: May 2014\}
+\end{quote}
+
+The task decomposes into: (1) trigger identification (which word/phrase triggers the event),
+(2) event type classification, and (3) argument extraction and role labeling.
+
+\subsection{Coreference Resolution}
+
+Coreference resolution groups mentions in a document that refer to the same real-world entity.
+This is essential for IE because relations often span sentences:
+
+\begin{quote}
+\emph{``Tim Cook joined Apple in 1998.  He became CEO in 2011.''}
+\end{quote}
+
+Without resolving ``He'' $\to$ ``Tim Cook,'' the relation (\textit{Tim Cook},
+\textsc{became\_ceo}, \textit{Apple}) cannot be extracted from the second sentence alone.
+
+Modern coreference systems use mention-pair scoring: for each pair of spans, a model (typically
+BERT-based) predicts whether they are coreferent.  The scores are used to build clusters via
+agglomerative clustering or a span-ranking approach (Lee et al., 2017).
+
+\subsection{End-to-End IE with LLMs}
+
+LLMs can perform the entire IE pipeline in a single pass via structured prompting:
+
+\begin{lstlisting}[language=Python, caption={LLM-based end-to-end information extraction.}]
+prompt = """Extract all entities, relationships, and events
+from the following text. Return as JSON.
+
+Text: "Apple acquired Beats Electronics for $3B in May 2014.
+Tim Cook announced the deal at WWDC."
+
+Output format:
+{"entities": [...], "relations": [...], "events": [...]}"""
+\end{lstlisting}
+
+The advantages are: no pipeline error compounding, handles implicit relations and events, and
+adapts to new schemas via prompt modification.  The disadvantages are: inconsistent output
+structure, higher latency, and difficulty in controlling precision/recall tradeoffs.  For
+production systems, a hybrid approach---LLM for complex or ambiguous cases, dedicated models
+for high-volume extraction---typically offers the best balance.
+
+% ============================================================================
+\section{Task Selection Decision Framework}
+\label{sec:task_decision_framework}
+% ============================================================================
+
+The following table summarizes when to use each approach tier across the tasks covered in
+this chapter.  The right choice depends on the constraint set, not on which approach is
+``newest.''
+
+\begin{table}[H]
+\centering
+\caption{Approach selection by task and constraint.  ``Classical'' = feature-based ML,
+``Neural'' = fine-tuned BERT/RoBERTa, ``LLM'' = prompted large language model.}
+\label{tab:task_approach_selection}
+\small
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Constraint} & \textbf{Classical} & \textbf{Neural (FT)} & \textbf{LLM (Prompt)} \\
+\midrule
+Labeled data $<$ 100          & Good      & Poor     & Best     \\
+Labeled data $>$ 1K           & Good      & Best     & Overkill \\
+Latency $<$ 5 ms              & Best      & Fair     & Poor     \\
+Schema changes frequently     & Poor      & Poor     & Best     \\
+Strict output structure       & Best      & Good     & Fair     \\
+Interpretability required     & Best      & Fair     & Poor     \\
+Multilingual (50+ languages)  & Poor      & Good     & Best     \\
+Cost per prediction matters   & Best      & Good     & Poor     \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{warningbox}
+The strongest interview signal on applied NLP questions is \textbf{not} knowing the most
+advanced approach---it is knowing \emph{which} approach to use and \emph{why}.  Proposing an
+LLM for a spam filter processing 10 million emails per day shows lack of engineering judgment.
+Proposing Naive Bayes for a nuanced legal document analysis task shows lack of awareness of
+model capabilities.  The right answer starts with constraints (data, latency, cost, accuracy
+requirements) and derives the approach from them.
+\end{warningbox}
+
+% ============================================================================
+\section{Interview Questions}
+\label{sec:practical_tasks_interview}
+% ============================================================================
+
+\begin{interviewq}
+\textbf{Q: How would you build a text classification system? Walk through the full pipeline
+from data to deployment.}
+
+\badgeLfive{L5} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+I would follow a structured pipeline with increasing complexity, stopping when the accuracy
+meets requirements:
+
+\textbf{1. Problem definition:} Clarify the label taxonomy (how many classes, single-label vs.
+multi-label, hierarchical?), data availability, latency requirements, and accuracy targets.
+
+\textbf{2. Data pipeline:} Collect and clean training data.  Perform label quality audit (what
+is the inter-annotator agreement?).  Split into train/validation/test with stratification.
+Ensure the test set is representative of production distribution.
+
+\textbf{3. Baseline (day 1):} TF-IDF (unigrams + bigrams) + logistic regression.  This
+trains in seconds, establishes a performance floor, and reveals whether the task is easy
+(baseline $>$ 90\%) or hard (baseline $<$ 70\%).
+
+\textbf{4. Stronger model:} Fine-tune BERT or DistilBERT on the training set.  Compare
+against the baseline.  If the improvement is marginal, the baseline may be sufficient.
+
+\textbf{5. Error analysis:} Examine misclassified examples.  Are errors due to ambiguous
+labels, insufficient data for rare classes, domain mismatch, or model limitations?  Fix data
+issues before model issues.
+
+\textbf{6. Deployment:} Choose the model that meets the accuracy-latency-cost Pareto
+frontier.  Implement monitoring: track prediction distribution shifts, confidence score
+distributions, and flagged low-confidence predictions for human review.
+
+\redflags
+\begin{itemize}
+    \item Jumping straight to BERT or LLMs without establishing a baseline.
+    \item Not discussing data quality, label definitions, or evaluation methodology.
+    \item Ignoring latency and cost constraints.
+    \item Not mentioning error analysis or monitoring.
+\end{itemize}
+
+\interviewtest{End-to-end system design thinking, engineering maturity, understanding that
+data quality often matters more than model choice.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes the baseline-then-upgrade approach, includes data
+    preprocessing, and mentions evaluation with train/val/test split.
+    \item \badgeLsix{L6}: Adds active learning for labeling, discusses the full Pareto
+    frontier of model choices (NB $\to$ SVM $\to$ DistilBERT $\to$ BERT $\to$ LLM),
+    includes deployment monitoring and A/B testing against rule-based fallbacks.
+    \item \badgeLseven{L7}: Discusses how to handle evolving label taxonomies, multi-model
+    architectures (fast model for easy cases, expensive model for hard cases), data flywheel
+    (model predictions $\to$ human review $\to$ training data), and when to use LLM-based
+    labeling to bootstrap the training set.
+\end{itemize}
+
+\followups{How would you handle class imbalance? What if the label taxonomy changes quarterly?
+How would you decide between DistilBERT and full BERT for production? How would you monitor
+for data drift?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 2 ---
+\begin{interviewq}
+\textbf{Q: How would you build a production NER system for a new domain (e.g., biomedical)
+with limited labeled data?}
+
+\badgeLfive{L5} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+This is a cold-start problem with a well-known playbook:
+
+\textbf{Step 1: Define the entity schema.}  Work with domain experts to define entity types,
+annotation guidelines, and ambiguous cases.  For biomedical NER: diseases, drugs, genes,
+dosages, procedures.  Clear guidelines are essential---inconsistent annotations waste
+everything downstream.
+
+\textbf{Step 2: Bootstrap with existing resources.}  Use transfer learning from general NER
+(fine-tune a model pretrained on CoNLL-2003) or, better, from a domain-pretrained model
+(BioBERT, PubMedBERT for biomedical text).  Domain-specific pretraining captures vocabulary
+and distributional patterns that general models miss.
+
+\textbf{Step 3: Leverage gazetteers.}  Compile lists of known entities from domain knowledge
+bases (UMLS for medical, SEC filings for financial).  Use these for: (a) weak labeling
+(dictionary matching provides noisy labels for training), (b) feature augmentation (binary
+feature indicating gazetteer membership), and (c) evaluation (check if the model finds
+entities not in the gazetteer).
+
+\textbf{Step 4: Active learning.}  Train an initial model on weakly labeled + any available
+labeled data.  Score unlabeled sentences by model uncertainty (entropy of per-token
+predictions).  Prioritize the most uncertain sentences for expert annotation.  This
+maximizes the value of each annotation dollar.
+
+\textbf{Step 5: Iterate.}  Retrain with new annotations, evaluate on a held-out test set,
+perform error analysis, and repeat.  50--200 carefully annotated documents often suffice to
+reach production quality when combined with transfer learning and gazetteers.
+
+\redflags
+\begin{itemize}
+    \item Proposing to ``just train BERT on a few examples'' without transfer learning or
+    data augmentation strategy.
+    \item Not mentioning domain-specific pretrained models.
+    \item Ignoring the importance of annotation guidelines and inter-annotator agreement.
+    \item Not discussing gazetteers or weak supervision.
+\end{itemize}
+
+\interviewtest{Ability to design a practical system under data constraints, knowledge of
+transfer learning and active learning, domain adaptation awareness.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes transfer learning from domain-pretrained models, mentions
+    gazetteers, and outlines an iterative annotation-training loop.
+    \item \badgeLsix{L6}: Adds weak supervision frameworks (Snorkel-style labeling functions),
+    discusses the CRF layer decision, and mentions evaluation at the entity level (exact match
+    F1 vs.\ partial match vs.\ type-specific F1).
+    \item \badgeLseven{L7}: Discusses continued pretraining on domain corpus before
+    fine-tuning (two-stage adaptation), few-shot NER with LLMs for initial labeling, and
+    how to handle nested entities and entity linking in the domain.
+\end{itemize}
+
+\followups{How do you handle nested entities? What is the difference between exact and partial
+match F1 for NER evaluation? How would you use an LLM to accelerate annotation?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 3 ---
+\begin{interviewq}
+\textbf{Q: Compare extractive vs.\ abstractive summarization. What are the tradeoffs and when
+would you use each?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+The core tradeoff is \textbf{faithfulness vs.\ fluency}.
+
+\textbf{Extractive summarization} selects sentences verbatim from the source.  Advantages:
+zero hallucination risk (every sentence is a direct quote), computationally cheaper,
+interpretable (can trace every sentence to its source).  Disadvantages: summaries are often
+choppy and redundant, cannot paraphrase or compress, and include irrelevant details from
+selected sentences.
+
+\textbf{Abstractive summarization} generates new text that may paraphrase or fuse information.
+Advantages: more natural and concise, can synthesize across multiple passages, produces
+coherent narratives.  Disadvantages: prone to hallucination (both intrinsic and extrinsic),
+harder to verify, and requires more compute.
+
+\textbf{Decision framework:}
+\begin{itemize}
+    \item High-stakes domains (medical, legal, financial): prefer extractive or
+    extractive-then-polish (extract key sentences, then use an LLM to smooth the language
+    while grounding each claim in a source sentence).
+    \item User-facing summaries where readability matters: abstractive with faithfulness
+    checks (NLI-based verification, citation generation).
+    \item Long documents: extractive first (sentence ranking to identify key content), then
+    abstractive on the selected sentences.
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item Saying abstractive is ``always better because it generates more natural text.''
+    \item Not mentioning hallucination as the central risk of abstractive summarization.
+    \item Not discussing faithfulness evaluation.
+    \item Treating this as a binary choice rather than a spectrum.
+\end{itemize}
+
+\interviewtest{Understanding of practical tradeoffs in generation tasks, awareness of
+hallucination risk, ability to match approach to constraints.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Clearly states the faithfulness-fluency tradeoff and gives
+    concrete scenarios for each approach.
+    \item \badgeLsix{L6}: Discusses hybrid approaches (extract-then-abstract), faithfulness
+    evaluation methods (NLI, QuestEval, FactCC), and ROUGE's blindness to factual accuracy.
+    \item \badgeLseven{L7}: Discusses the production pipeline with guardrails (faithfulness
+    classifier as a post-generation filter), how to handle long documents that exceed context
+    windows, and the role of retrieval-augmented generation for grounded summarization.
+\end{itemize}
+
+\followups{How would you detect hallucinations in a generated summary? What is ROUGE measuring
+and what does it miss? How would you summarize a 100-page legal document?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 4 ---
+\begin{interviewq}
+\textbf{Q: Design a question answering system for a company's internal documentation
+(Confluence, Notion, internal wikis).}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+This is a RAG (Retrieval-Augmented Generation) system design problem with specific constraints:
+the corpus is private (cannot use external search), documents update frequently, and accuracy
+is critical (employees act on the answers).
+
+\textbf{Ingestion pipeline:}
+\begin{enumerate}
+    \item \textbf{Document processing:} Parse documents from various formats (Confluence
+    Markdown, Notion blocks, PDF, HTML).  Extract text, tables, code blocks, and metadata
+    (author, last updated, access permissions).
+    \item \textbf{Chunking:} Split documents into retrievable units.  Use semantic chunking
+    (split at section boundaries, paragraphs) rather than fixed-size chunks.  Overlap of
+    50--100 tokens between chunks preserves context at boundaries.  Typical chunk size:
+    256--512 tokens.
+    \item \textbf{Embedding:} Encode chunks using a bi-encoder (e.g., E5, BGE, or a
+    domain-fine-tuned model).  Store embeddings in a vector database (Pinecone, Weaviate,
+    Qdrant).
+    \item \textbf{Metadata indexing:} Also build a BM25 index over chunk text for hybrid
+    retrieval.  Index metadata (document title, author, date) for filtering.
+\end{enumerate}
+
+\textbf{Query pipeline:}
+\begin{enumerate}
+    \item \textbf{Retrieval:} Hybrid retrieval (dense + BM25) with reciprocal rank fusion.
+    Retrieve top-20 candidates.
+    \item \textbf{Re-ranking:} Cross-encoder re-ranker scores each (query, chunk) pair.
+    Select top-5.
+    \item \textbf{Generation:} Feed the query and top-5 chunks to an LLM with a prompt that
+    instructs it to answer based only on the provided context and cite sources.
+    \item \textbf{Citation:} The response includes inline citations linking each claim to the
+    source document.  This enables verification and builds trust.
+\end{enumerate}
+
+\textbf{Key design decisions:} Access control (only retrieve documents the user has permission
+to see), freshness (re-index on document updates), handling ``I don't know'' (when the
+retrieved context doesn't contain the answer, the system should say so), and feedback loop
+(users can upvote/downvote answers to improve retrieval and generation over time).
+
+\redflags
+\begin{itemize}
+    \item Designing a system that ignores document access permissions.
+    \item Not including a ``no answer'' / ``I don't know'' pathway.
+    \item Using only dense retrieval without BM25 (misses exact keyword matches).
+    \item Not discussing chunking strategy or its impact on retrieval quality.
+\end{itemize}
+
+\interviewtest{End-to-end RAG system design, practical awareness of enterprise constraints
+(permissions, freshness, trust), and understanding of the full retrieval-generation pipeline.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes the basic RAG pipeline with retrieval and generation,
+    mentions chunking and embedding.
+    \item \badgeLsix{L6}: Adds hybrid retrieval, re-ranking, citation, access control,
+    incremental indexing, and evaluation strategy (retrieval recall, answer quality, user
+    satisfaction).
+    \item \badgeLseven{L7}: Discusses query routing (simple factoid queries to lightweight
+    extraction, complex queries to full RAG), fine-tuning the embedding model on internal
+    query logs, handling tables and structured data in documents, and a feedback-driven
+    continuous improvement loop.
+\end{itemize}
+
+\followups{How would you handle tables in the documentation? What chunk size would you start
+with and how would you tune it? How would you evaluate this system before and after launch?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 5 ---
+\begin{interviewq}
+\textbf{Q: How would you handle aspect-based sentiment analysis at scale?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Aspect-based sentiment analysis (ABSA) extracts structured (aspect, opinion, sentiment)
+triples from text.  At scale, the key challenge is balancing extraction quality with
+throughput.
+
+\textbf{Approach selection:}
+For high-throughput production (millions of reviews per day), I would use a fine-tuned BERT
+model that jointly performs aspect extraction and sentiment classification.  The model takes
+the review as input and either: (a) performs sequence labeling to extract aspect and opinion
+spans with BIO tags, then classifies sentiment per extracted pair, or (b) frames the task
+generatively---fine-tune a T5 model to output structured triples directly (e.g.,
+``(food, excellent, positive); (service, slow, negative)'').
+
+\textbf{For cold-start or prototyping:} Use an LLM with a structured output prompt.  This
+handles implicit aspects (``The wait was worth it'' implies positive sentiment about food
+quality) better than extraction-based methods, but costs 100--1000x more per prediction.
+
+\textbf{Handling implicit aspects:}  A review like ``overpriced for what you get'' expresses
+negative sentiment about value, but ``value'' is never explicitly mentioned.  This requires
+aspect category detection (mapping to predefined categories) rather than just span extraction.
+
+\textbf{Domain adaptation:}  ABSA models trained on restaurant reviews fail on electronics
+reviews because the aspect vocabulary is entirely different.  Solutions: domain-specific
+fine-tuning, aspect category ontology per domain, and shared sentiment layers with
+domain-specific aspect layers.
+
+\redflags
+\begin{itemize}
+    \item Treating ABSA as simple sentence-level sentiment classification.
+    \item Not distinguishing explicit from implicit aspects.
+    \item Proposing only an LLM solution without discussing cost at scale.
+\end{itemize}
+
+\interviewtest{Understanding of structured prediction tasks, ability to decompose a complex
+NLP task into subtasks, and awareness of the explicit vs.\ implicit aspect distinction.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Correctly decomposes ABSA into subtasks, mentions both
+    extraction-based and generative approaches.
+    \item \badgeLsix{L6}: Discusses implicit aspects, domain adaptation, and the
+    throughput-quality tradeoff between fine-tuned models and LLMs.
+    \item \badgeLseven{L7}: Discusses multi-task learning (joint aspect-sentiment models),
+    cross-lingual ABSA for global products, aggregation of aspect-level sentiment into
+    product-level insights, and using ABSA output to drive business actions (e.g., routing
+    complaints by aspect category to the relevant team).
+\end{itemize}
+
+\followups{How would you aggregate aspect-level sentiment across thousands of reviews into
+actionable product insights? How would you handle aspects that are mentioned with abbreviations
+or slang?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 6 ---
+\begin{interviewq}
+\textbf{Q: Compare Naive Bayes vs.\ fine-tuned BERT for text classification. When might Naive
+Bayes win?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Naive Bayes wins in specific, well-defined scenarios:
+
+\textbf{1. Extremely small training data ($<$ 100 examples):}  Naive Bayes has
+$O(|V| \times |C|)$ parameters---far fewer than BERT's 110M.  With 50 examples, BERT's
+classification head overfits, while Naive Bayes's strong inductive bias (conditional
+independence) acts as regularization.  The independence assumption is a ``useful wrong
+assumption'' that prevents overfitting in small-data regimes.
+
+\textbf{2. Hard latency constraints ($<$ 1 ms):}  Naive Bayes inference is a sparse dot
+product---microseconds.  BERT requires a full forward pass through 12 transformer layers---
+10--50 ms on GPU, hundreds of ms on CPU.  For high-QPS systems (email spam filtering at
+100K+ requests per second), this difference is decisive.
+
+\textbf{3. Interpretability:}  Naive Bayes feature log-ratios directly explain predictions.
+``This email was flagged as spam because `free,' `winner,' and `click' have high spam
+likelihood ratios.''  BERT is opaque without additional interpretability infrastructure.
+
+\textbf{4. No GPU infrastructure:}  Naive Bayes trains in seconds on a laptop CPU and
+requires no GPU for inference.  BERT fine-tuning and inference are impractical without GPU
+access.
+
+\textbf{When BERT wins:}  When data is sufficient ($>$ 1K examples), when the task requires
+understanding context, negation, or compositional semantics, and when latency budgets
+permit.  For most classification tasks with adequate data, BERT outperforms Naive Bayes by
+5--15\% absolute accuracy.
+
+\redflags
+\begin{itemize}
+    \item Saying ``always use BERT'' or ``Naive Bayes is obsolete.''
+    \item Not mentioning latency or resource constraints.
+    \item Not quantifying the data threshold where BERT overtakes Naive Bayes.
+\end{itemize}
+
+\interviewtest{Engineering judgment, practical awareness of the simplicity-performance
+tradeoff, ability to reason about constraints rather than defaulting to the most powerful
+model.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Gives at least two concrete scenarios where Naive Bayes wins, with
+    clear reasoning.
+    \item \badgeLsix{L6}: Discusses the full model hierarchy
+    (NB $\to$ SVM $\to$ DistilBERT $\to$ BERT $\to$ LLM), mentions Pareto frontier of
+    accuracy vs.\ latency, and proposes DistilBERT as a middle ground.
+    \item \badgeLseven{L7}: Discusses cascade architectures (fast model for easy cases,
+    expensive model for hard cases), cost-benefit analysis for choosing models, and how
+    LLM-generated labels can bootstrap training data for Naive Bayes when no labeled data
+    exists.
+\end{itemize}
+
+\followups{What about DistilBERT as a middle ground? How would you quantify the business
+value of the accuracy gain from BERT? What about few-shot LLM classification as an
+alternative when no training data exists?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 7 ---
+\begin{interviewq}
+\textbf{Q: How would you detect sarcasm in text? Why is this hard?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqlow}
+
+\stronganswer
+Sarcasm detection is hard because it requires understanding what the speaker \emph{means}
+versus what they \emph{say}---a form of pragmatic inference that goes beyond surface
+semantics.
+
+\textbf{Why it is fundamentally hard:}
+\begin{itemize}
+    \item \textbf{Surface-meaning inversion:} ``Great, another Monday'' uses positive words
+    to express negative sentiment.  Models that rely on lexical sentiment are systematically
+    wrong on sarcasm.
+    \item \textbf{Context dependence:} ``Nice weather'' is literal on a sunny day, sarcastic
+    during a hurricane.  The text alone is insufficient---the model needs situational context.
+    \item \textbf{Cultural and personal variation:} Sarcasm conventions vary across cultures,
+    age groups, and individuals.  What is sarcastic in British English may be literal in
+    another context.
+    \item \textbf{Absence of prosodic cues:} In speech, sarcasm is often conveyed through
+    tone, emphasis, and pacing.  Text strips these signals away.
+\end{itemize}
+
+\textbf{Approaches:}
+\begin{itemize}
+    \item \textbf{Feature-based:} Incongruity features (positive words + negative context),
+    punctuation patterns (excessive exclamation marks, ellipsis), capitalization (``SURE''),
+    and discourse features (contrast between sentences).
+    \item \textbf{Contextual models:} Fine-tuned BERT on sarcasm-annotated datasets (Twitter
+    sarcasm corpus, Reddit \texttt{/s} tag data).  Achieves 70--80\% F1, well below human
+    performance.
+    \item \textbf{Multimodal:} Incorporating images (sarcastic memes), audio (tone of voice),
+    or video.  Multimodal approaches show significant improvements but are limited to
+    settings where these modalities are available.
+    \item \textbf{LLMs:} Better at sarcasm than previous models due to broader world knowledge,
+    but still unreliable, especially on subtle or culture-specific sarcasm.
+\end{itemize}
+
+\textbf{Practical implication:} In production sentiment analysis, explicitly model an
+``uncertain/mixed'' category rather than forcing every sarcastic text into positive or
+negative.  Flag potentially sarcastic texts (high positive-word count + negative context
+signals) for human review.
+
+\redflags
+\begin{itemize}
+    \item Claiming that a large enough model ``solves'' sarcasm.
+    \item Not acknowledging the fundamental role of non-textual context.
+    \item Proposing a purely lexical approach (keyword lists for sarcasm detection).
+\end{itemize}
+
+\interviewtest{Understanding of pragmatic language phenomena, intellectual honesty about
+the limits of current NLP systems, and ability to design systems that gracefully handle
+unsolvable subproblems.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Explains why sarcasm is hard (surface inversion, context
+    dependence) and names at least one approach.
+    \item \badgeLsix{L6}: Discusses the role of multimodal cues, the limits of text-only
+    detection, and practical strategies for handling sarcasm in production pipelines
+    (uncertainty, flagging, human-in-the-loop).
+    \item \badgeLseven{L7}: Connects to pragmatics research (Grice's maxims, conversational
+    implicature), discusses how sarcasm detection could benefit from user modeling
+    (individual sarcasm tendency), and acknowledges the natural ceiling on text-only sarcasm
+    detection accuracy.
+\end{itemize}
+
+\followups{How would you collect sarcasm training data? What is the inter-annotator agreement
+for sarcasm labeling? How does sarcasm detection differ across languages?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 8 ---
+\begin{interviewq}
+\textbf{Q: Design a task-oriented dialogue system for restaurant booking.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+I would design this as a modular system with clear interfaces between components, allowing
+independent iteration on each.
+
+\textbf{1. NLU Module:}
+\begin{itemize}
+    \item \textbf{Intent classification:} Intents include \texttt{book\_table},
+    \texttt{cancel\_reservation}, \texttt{modify\_reservation}, \texttt{check\_hours},
+    \texttt{ask\_menu}, \texttt{general\_inquiry}.  Fine-tuned BERT or DistilBERT on
+    intent-labeled utterances.
+    \item \textbf{Slot filling:} Slots include \texttt{cuisine}, \texttt{location},
+    \texttt{date}, \texttt{time}, \texttt{party\_size}, \texttt{restaurant\_name},
+    \texttt{price\_range}.  Joint intent-slot model using BERT with a sequence labeling
+    head for slots and a classification head for intent on \texttt{[CLS]}.
+\end{itemize}
+
+\textbf{2. Dialogue State Tracker:}
+Maintains a belief state (slot-value pairs) accumulated across turns.  Must handle slot
+updates (``Actually, make that 6 people''), slot confirmation (``Yes, 7pm is correct''), and
+slot negation (``Not Italian, I want Thai'').  Implementation: rule-based tracker on top of
+NLU output for reliability, or a BERT-based generative DST model for flexibility.
+
+\textbf{3. Dialogue Policy:}
+Given the belief state and available API results, determine the next system action:
+\begin{itemize}
+    \item If required slots are missing: ask for the missing slot.
+    \item If all required slots are filled: query the restaurant database.
+    \item If results are available: present options and ask for confirmation.
+    \item If confirmed: make the reservation and confirm to the user.
+\end{itemize}
+Start with a rule-based policy (deterministic and predictable), evolve to a learned policy if
+the conversation flows become too complex for rules.
+
+\textbf{4. NLG Module:}
+Template-based for reliability: ``I found \{\texttt{n}\} \{\texttt{cuisine}\} restaurants near
+\{\texttt{location}\}.  Would you like to book at \{\texttt{restaurant\_name}\} for
+\{\texttt{party\_size}\} at \{\texttt{time}\}?''  Optionally backed by an LLM for more
+natural phrasing, with template fallback if the LLM output fails validation.
+
+\textbf{5. Error recovery:}
+Handle NLU failures gracefully: ``I didn't catch the time.  When would you like to dine?''
+Implement maximum retry limits and escalation to human agent.
+
+\redflags
+\begin{itemize}
+    \item Proposing ``just use ChatGPT'' without discussing controllability, reliability,
+    or the structured nature of the task.
+    \item Not defining the slot schema or intent taxonomy.
+    \item Ignoring error recovery and edge cases.
+    \item Not discussing how the system interacts with the restaurant database/API.
+\end{itemize}
+
+\interviewtest{Ability to design a structured, multi-component system with clear interfaces,
+understanding of task-oriented dialogue architecture, and practical awareness of reliability
+requirements.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes the NLU $\to$ DST $\to$ Policy $\to$ NLG pipeline with
+    correct terminology and a concrete slot schema.
+    \item \badgeLsix{L6}: Discusses hybrid approaches (rule-based policy for reliability,
+    learned NLU for flexibility), error recovery, evaluation metrics (task completion rate,
+    average turns to completion, slot accuracy), and the database interaction.
+    \item \badgeLseven{L7}: Discusses when to transition from a pipeline to an end-to-end LLM
+    approach (and the controllability tradeoffs), multi-language support, personalization
+    (remembering user preferences across sessions), and A/B testing the dialogue policy.
+\end{itemize}
+
+\followups{How would you evaluate this system? What metrics matter? How would you handle
+ambiguous user inputs? When would you switch from a pipeline to an end-to-end LLM-based
+system?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 9 ---
+\begin{interviewq}
+\textbf{Q: You need to build an information extraction system that populates a knowledge graph
+from news articles. Walk through your approach.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+I would build a pipeline IE system with four stages, with careful attention to error
+compounding across stages.
+
+\textbf{Stage 1: Entity Extraction.}
+Fine-tune a BERT-CRF model for NER on news text (CoNLL-2003 or a custom-annotated dataset).
+Entity types: Person, Organization, Location, Date, Event, Product.  Use BIOES tagging for
+better boundary detection.  Expected F1: 88--93\% depending on domain.
+
+\textbf{Stage 2: Coreference Resolution.}
+Cluster entity mentions that refer to the same entity.  Use a span-based coreference model
+(e.g., based on Lee et al., 2017, fine-tuned on OntoNotes).  This is critical: without
+coreference, the system misses relations expressed across sentences (``Tim Cook...He became
+CEO...'').
+
+\textbf{Stage 3: Relation Extraction.}
+For each pair of entities within a document (or within a window), classify the relation.
+Use BERT with typed entity markers.  Define a relation schema aligned with the target KG
+ontology (e.g., Wikidata properties: CEO\_of, headquartered\_in, founded\_in, acquired).
+Include a ``no relation'' class---most entity pairs have no meaningful relation.
+
+\textbf{Stage 4: Entity Linking + KG Population.}
+Link extracted entities to canonical KB entries using candidate generation (string matching
++ dense retrieval) and candidate ranking (cross-encoder).  Insert validated triples into
+the knowledge graph.
+
+\textbf{Error mitigation:}  Since errors compound across stages ($0.9^4 = 65.6\%$ for four
+stages at 90\% each), I would: (a) use confidence thresholds at each stage and only pass
+high-confidence outputs forward, (b) implement a human-in-the-loop verification for
+low-confidence triples, and (c) consider an end-to-end LLM approach for complex or ambiguous
+cases that the pipeline handles poorly.
+
+\redflags
+\begin{itemize}
+    \item Not mentioning coreference resolution (a critical and often-forgotten stage).
+    \item Ignoring error compounding across pipeline stages.
+    \item Not defining a relation schema or entity types.
+    \item Proposing only an LLM solution without discussing throughput or cost for large
+    document volumes.
+\end{itemize}
+
+\interviewtest{Understanding of the full IE pipeline, awareness of error compounding,
+practical system design under real-world constraints.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes NER $\to$ RE $\to$ entity linking as the core pipeline
+    and mentions evaluation per stage.
+    \item \badgeLsix{L6}: Adds coreference resolution, discusses error compounding with
+    quantitative analysis, and proposes confidence-based filtering and human-in-the-loop
+    verification.
+    \item \badgeLseven{L7}: Discusses incremental KG updates (handling entity merges, relation
+    updates, temporal validity), combines pipeline with LLM-based extraction for long-tail
+    relations, and designs a feedback loop where KG consumers report errors that improve
+    extraction models.
+\end{itemize}
+
+\followups{How would you handle contradictory information from different sources? How would
+you evaluate the quality of the populated knowledge graph? How would you handle temporal
+relations (``was CEO from 2011 to 2023'')?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 10 ---
+\begin{interviewq}
+\textbf{Q: When is an LLM overkill for an NLP task? Give concrete examples.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+An LLM is overkill whenever a simpler approach achieves acceptable accuracy within the system's
+constraints.  Concrete examples:
+
+\textbf{1. Language detection:} Identifying whether text is English, French, or Chinese
+requires no semantic understanding.  A character n-gram model (fastText's language ID, or
+even simple Unicode script detection) achieves $>$99\% accuracy in microseconds.  An LLM
+would be 10,000x slower and no more accurate.
+
+\textbf{2. High-volume spam filtering:} Email spam filters process billions of messages daily.
+TF-IDF + logistic regression achieves 95--98\% accuracy with sub-millisecond latency and
+trivial infrastructure cost.  An LLM at \$0.01 per 1K tokens would cost millions of dollars
+per day with no meaningful accuracy improvement on this well-defined binary task.
+
+\textbf{3. Keyword-based routing:} Routing customer support tickets by category (billing,
+technical, shipping) based on keyword presence.  A simple rule-based system or TF-IDF
+classifier handles this perfectly; the categories are well-defined and the signal is in
+obvious keywords.
+
+\textbf{4. Regex-solvable extraction:} Extracting phone numbers, email addresses, dates, or
+URLs from text.  Regular expressions are exact, fast, and have zero false positives when
+correctly written.  An LLM would be slower, more expensive, and less reliable.
+
+\textbf{5. Deduplication:} Near-duplicate document detection using MinHash or SimHash.  This
+is a similarity computation problem, not a language understanding problem.
+
+\textbf{The general principle:} Use the simplest model that meets accuracy requirements within
+the latency and cost budget.  LLMs are appropriate when the task requires genuine language
+understanding, reasoning, or generation---and when simpler approaches have been tried and found
+insufficient.
+
+\redflags
+\begin{itemize}
+    \item Unable to name concrete examples---gives only vague statements about ``simple tasks.''
+    \item Saying ``always start with an LLM and optimize later.''
+    \item Not considering cost or latency in the analysis.
+\end{itemize}
+
+\interviewtest{Engineering judgment, cost awareness, ability to resist hype and select
+appropriate tools for the problem.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Names 3+ concrete examples with clear reasoning about why simpler
+    approaches suffice.
+    \item \badgeLsix{L6}: Quantifies the cost and latency differences, discusses the model
+    selection hierarchy (rules $\to$ classical ML $\to$ fine-tuned BERT $\to$ LLM), and
+    frames this as a Pareto optimization problem.
+    \item \badgeLseven{L7}: Discusses when LLMs are the right starting point
+    (rapid prototyping, undefined label spaces, tasks requiring world knowledge or reasoning),
+    and how to decide when to ``graduate'' from LLM to dedicated model (when volume and cost
+    justify the engineering investment in training and deploying a task-specific model).
+\end{itemize}
+
+\followups{When IS an LLM the right choice? How would you decide when to switch from an LLM
+prototype to a dedicated model? How would you estimate the cost of an LLM-based solution vs.\
+a classical one?}
+\end{interviewq}
+
+\bigskip
+
+\begin{keyinsight}[Chapter Summary: What Interviewers Are Really Testing]
+When interviewers ask about practical NLP tasks, they are testing three things beyond technical
+knowledge: (1) \emph{Can you decompose a complex problem into well-defined subtasks?}  The
+best candidates break down ``build a dialogue system'' into NLU, DST, policy, and NLG with
+clear interfaces.  (2) \emph{Do you have engineering judgment about approach selection?}  The
+answer is never ``use the best model''---it is ``use the right model given the constraints.''
+(3) \emph{Do you think about the full system, not just the model?}  Data collection, annotation
+guidelines, evaluation metrics, monitoring, error analysis, and deployment are as important as
+model architecture.  Candidates who discuss all of these dimensions signal that they have
+actually built and shipped NLP systems, not just trained models on benchmarks.
+\end{keyinsight}
