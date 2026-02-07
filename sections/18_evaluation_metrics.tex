@@ -1,0 +1,662 @@
+\chapter{Evaluation Metrics}
+\label{chap:evaluation_metrics}
+
+\begin{tldr}
+Evaluation metrics determine whether your model actually solves the problem. This chapter covers classification metrics (precision, recall, F1, ROC-AUC, PR-AUC, calibration), ranking metrics (NDCG, MRR, MAP), regression metrics, NLP/generation metrics (BLEU, ROUGE, BERTScore, perplexity), and the often-fatal gap between offline and online metrics. A Staff-level engineer must know which metric to use, why the obvious choice fails, and how to prove a model improvement is real rather than noise.
+\end{tldr}
+
+%==============================================================================
+\section{Classification Metrics}
+\label{sec:classification_metrics}
+%==============================================================================
+
+\subsection{The Confusion Matrix}
+
+Every classification metric is a function of four counts. Know them cold:
+
+\begin{table}[H]
+\centering
+\caption{Confusion matrix for binary classification}
+\begin{tabular}{ll|cc}
+\toprule
+& & \multicolumn{2}{c}{\textbf{Predicted}} \\
+& & Positive & Negative \\
+\midrule
+\multirow{2}{*}{\textbf{Actual}} & Positive & TP (correct hit) & FN (missed) \\
+& Negative & FP (false alarm) & TN (correct reject) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{One-line mnemonics:}
+\begin{itemize}
+    \item \textbf{TP}: Model said yes, and it was right.
+    \item \textbf{FP}: Model said yes, but it was wrong. (Type I error.)
+    \item \textbf{FN}: Model said no, but it was wrong. (Type II error.)
+    \item \textbf{TN}: Model said no, and it was right.
+\end{itemize}
+
+\subsection{Precision, Recall, and F1}
+
+\begin{mathresult}{Core Classification Metrics}
+\begin{align}
+\text{Precision} &= \frac{TP}{TP + FP} \quad \text{(Of those predicted positive, how many are correct?)} \\[6pt]
+\text{Recall} &= \frac{TP}{TP + FN} \quad \text{(Of all actual positives, how many did we find?)} \\[6pt]
+F_1 &= \frac{2 \cdot \text{Precision} \cdot \text{Recall}}{\text{Precision} + \text{Recall}} = \frac{2\,TP}{2\,TP + FP + FN}
+\end{align}
+\end{mathresult}
+
+\textbf{When each metric matters---the one-sentence rule:}
+
+\begin{table}[H]
+\centering
+\caption{When to prioritize which metric}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Metric} & \textbf{Prioritize When} & \textbf{Example} \\
+\midrule
+Precision & Cost of false positives is high & Spam filter (don't send real email to junk) \\
+Recall & Cost of false negatives is high & Cancer screening (don't miss a tumor) \\
+F1 & Both errors roughly equally costly & General-purpose classifier \\
+$F_\beta$ & Need explicit precision--recall weighting & $F_2$ for search (recall $>$ precision) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The generalized $F_\beta$ score weights recall $\beta^2$ times as much as precision:
+\[
+F_\beta = (1 + \beta^2) \cdot \frac{\text{Precision} \cdot \text{Recall}}{\beta^2 \cdot \text{Precision} + \text{Recall}}
+\]
+
+\textbf{Multi-class averaging strategies:}
+
+\begin{table}[H]
+\centering
+\caption{Averaging strategies for multi-class metrics}
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+\textbf{Strategy} & \textbf{Description} & \textbf{Best For} \\
+\midrule
+Macro & Compute per-class, average equally & All classes equally important \\
+Micro & Aggregate TP/FP/FN globally, then compute & Overall performance \\
+Weighted & Per-class, weighted by support & Imbalanced classes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}
+\textbf{Accuracy is misleading for imbalanced data.} A model that always predicts the majority class gets 99\% accuracy on a 99:1 dataset. In an interview, never propose accuracy as the primary metric without first asking about class balance. This is a filter question---getting it wrong signals junior-level thinking. Always reach for precision/recall/F1 or PR-AUC on imbalanced problems.
+\end{warningbox}
+
+\subsection{ROC-AUC vs. PR-AUC}
+
+Both metrics evaluate a classifier across \textit{all} thresholds rather than at a single operating point.
+
+\textbf{ROC curve:} Plots True Positive Rate (recall) vs. False Positive Rate ($\frac{FP}{FP+TN}$) as the decision threshold varies from 0 to 1. AUC = area under this curve.
+
+\textbf{PR curve:} Plots Precision vs. Recall as the threshold varies. AUC = area under this curve.
+
+\begin{table}[H]
+\centering
+\caption{ROC-AUC vs. PR-AUC: when to use each}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Property} & \textbf{ROC-AUC} & \textbf{PR-AUC} \\
+\midrule
+Threshold-free & Yes & Yes \\
+Range & 0.5 (random) to 1.0 (perfect) & Depends on class prevalence \\
+Class imbalance & Misleadingly optimistic (inflated by TNR) & Faithfully reflects performance \\
+Interpretation & Prob. correct ranking of random +/- pair & Avg. precision across recall levels \\
+Best for & Balanced datasets, comparing models & Imbalanced datasets, rare events \\
+Invariant to & Class balance changes & Nothing (sensitive to prevalence) \\
+Typical domain & Medical diagnostics, general ML & Fraud, anomaly detection, retrieval \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}{ROC-AUC Hides Poor Performance on Imbalanced Data}
+On a 1000:1 negative-to-positive dataset, a model with 90\% recall and just 10\% precision still achieves a ROC-AUC above 0.95. Why? Because FPR = $\frac{FP}{FP+TN}$ stays tiny when TN is enormous. The ROC curve looks great while the model floods users with false positives. PR-AUC reveals this immediately because precision drops to 10\%. The interview rule: if the positive class is below 5\% prevalence, default to PR-AUC.
+\end{keyinsight}
+
+\subsection{Calibration}
+
+A model is \textit{calibrated} if its predicted probability matches the empirical frequency. If the model says ``80\% chance of rain,'' it should actually rain 80\% of the time across all such predictions.
+
+\textbf{Why calibration matters:} Ranking only requires correct \textit{ordering} of predictions. But downstream decisions that depend on \textit{magnitude}---bidding in ad auctions, clinical risk thresholds, insurance pricing---require calibrated probabilities.
+
+\begin{mathresult}{Expected Calibration Error (ECE)}
+\[
+\text{ECE} = \sum_{b=1}^{B} \frac{|B_b|}{N} \left| \text{acc}(B_b) - \text{conf}(B_b) \right|
+\]
+where $B_b$ is the set of predictions in bin $b$, $\text{acc}$ is the fraction correct in that bin, and $\text{conf}$ is the mean predicted probability.
+\end{mathresult}
+
+\textbf{Reliability diagrams:} Plot average confidence (x-axis) vs. actual accuracy (y-axis) per bin. A perfectly calibrated model lies on the diagonal. Points above the diagonal = under-confident; points below = over-confident.
+
+\textbf{Brier score:} The MSE of probability predictions: $\frac{1}{N}\sum_i (p_i - y_i)^2$. Captures both calibration and discrimination in a single number. Lower is better.
+
+\textbf{Fixing miscalibration:}
+\begin{itemize}
+    \item \textbf{Temperature scaling}: Post-hoc, learn a single scalar $T$ to divide logits by. Simple, effective, does not change rankings. This is the right default.
+    \item \textbf{Platt scaling}: Fit logistic regression on logits using a held-out set. More flexible than temperature scaling.
+    \item \textbf{Isotonic regression}: Non-parametric, most flexible, but requires more calibration data and can overfit with small held-out sets.
+\end{itemize}
+
+\textbf{Pitfall:} Modern deep networks are systematically \textit{over-confident} after training---they assign high probabilities even to incorrect predictions. This was shown by Guo et al.\ (2017, ICML). Temperature scaling with $T > 1$ fixes this almost for free.
+
+%==============================================================================
+\section{Ranking Metrics}
+\label{sec:ranking_metrics}
+%==============================================================================
+
+Ranking metrics evaluate \textit{ordered lists}, not individual predictions. They are the primary offline metrics for search, recommendation, and retrieval systems.
+
+\subsection{NDCG (Normalized Discounted Cumulative Gain)}
+
+\textbf{What it is:} Measures the quality of a ranked list by giving more credit for relevant items appearing higher. Supports graded relevance (not just binary).
+
+\begin{mathresult}{NDCG}
+\begin{align}
+\text{DCG}@K &= \sum_{i=1}^{K} \frac{2^{rel_i} - 1}{\log_2(i + 1)} \\[6pt]
+\text{NDCG}@K &= \frac{\text{DCG}@K}{\text{IDCG}@K}
+\end{align}
+where $rel_i$ is the relevance of the item at position $i$, and $\text{IDCG}@K$ is the DCG of the ideal (best possible) ranking.
+\end{mathresult}
+
+\textbf{Worked example.} Five results with relevance scores---model's ranking vs. ideal:
+
+\begin{table}[H]
+\centering
+\caption{NDCG worked example}
+\begin{tabular}{cccccc}
+\toprule
+\textbf{Position} & \textbf{Model $rel_i$} & \textbf{Gain} & \textbf{Discount} & \textbf{Ideal $rel_i$} & \textbf{Ideal Gain/Disc.} \\
+\midrule
+1 & 3 & $\frac{7}{1.00} = 7.00$ & $\log_2 2 = 1.00$ & 3 & 7.00 \\
+2 & 1 & $\frac{1}{1.58} = 0.63$ & $\log_2 3 = 1.58$ & 2 & 1.89 \\
+3 & 2 & $\frac{3}{2.00} = 1.50$ & $\log_2 4 = 2.00$ & 1 & 0.50 \\
+4 & 0 & $\frac{0}{2.32} = 0.00$ & $\log_2 5 = 2.32$ & 0 & 0.00 \\
+5 & 0 & $\frac{0}{2.58} = 0.00$ & $\log_2 6 = 2.58$ & 0 & 0.00 \\
+\midrule
+\multicolumn{2}{c}{DCG@5} & \multicolumn{2}{c}{$= 9.13$} & IDCG@5 & $= 9.39$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+$\text{NDCG}@5 = 9.13 / 9.39 = 0.972$ --- good ranking but not perfect (items 2 and 3 are swapped relative to the ideal order).
+
+\textbf{When to use:} Web search, recommendations, any task with graded relevance labels.
+
+\textbf{Pitfalls:} (1) NDCG is undefined when there are no relevant documents (IDCG = 0); convention is to set it to 1.0 or exclude the query. (2) The exponential gain $2^{rel} - 1$ heavily rewards top-grade items; this may or may not match your business value.
+
+\subsection{MRR, MAP, and Recall@K}
+
+\textbf{MRR (Mean Reciprocal Rank):} How quickly does the user find the first correct answer?
+
+\[
+\text{MRR} = \frac{1}{|Q|}\sum_{q=1}^{|Q|} \frac{1}{\text{rank}_q}
+\]
+
+\textbf{Best for:} QA, navigational search, any task where one correct answer suffices. \textbf{Limitation:} Ignores all relevant items after the first.
+
+\textbf{MAP (Mean Average Precision):} Average precision across recall levels, then averaged over queries. Requires binary relevance.
+
+\[
+\text{AP}(q) = \frac{1}{|\text{relevant}|}\sum_{k=1}^{n} \text{Precision}@k \cdot \mathbbm{1}[\text{item}_k \text{ is relevant}]
+\]
+
+\textbf{Best for:} Information retrieval with binary relevance. \textbf{Limitation:} No graded relevance---a ``somewhat relevant'' result is treated identically to irrelevant.
+
+\subsection{Ranking Metrics Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Choosing the right ranking metric}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Metric} & \textbf{What It Measures} & \textbf{Best For} & \textbf{Key Limitation} \\
+\midrule
+NDCG@K & Graded relevance with position discount & Web search, recommendations & Requires relevance labels \\
+MRR & Position of first correct result & QA, navigational search & Only first relevant item \\
+MAP & Binary relevance across full list & Document retrieval & Binary only, no graded \\
+Recall@K & Coverage of relevant items in top $K$ & Candidate retrieval stage & Ignores ranking within $K$ \\
+Precision@K & Quality of top $K$ results & Result page quality & Ignores items beyond $K$ \\
+Hit Rate@K & Any relevant item in top $K$? & Recommendation (implicit) & Binary, coarse \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}{Match the Metric to the Pipeline Stage}
+In a two-stage retrieval system, use \textbf{Recall@K} for the retrieval (candidate generation) stage---its job is to not miss relevant items, regardless of order. Use \textbf{NDCG@K} for the ranking (re-ranking) stage---its job is to put the best items first. Mixing these up is a common interview mistake: optimizing NDCG for retrieval or Recall for ranking both miss the point.
+\end{keyinsight}
+
+%==============================================================================
+\section{Regression Metrics}
+\label{sec:regression_metrics}
+%==============================================================================
+
+\begin{mathresult}{Regression Metrics}
+\begin{align}
+\text{MSE} &= \frac{1}{N}\sum_{i=1}^{N}(y_i - \hat{y}_i)^2 & &\text{(penalizes large errors quadratically)} \\[4pt]
+\text{MAE} &= \frac{1}{N}\sum_{i=1}^{N}|y_i - \hat{y}_i| & &\text{(robust to outliers)} \\[4pt]
+\text{MAPE} &= \frac{100}{N}\sum_{i=1}^{N}\left|\frac{y_i - \hat{y}_i}{y_i}\right| & &\text{(percentage error)} \\[4pt]
+R^2 &= 1 - \frac{\sum(y_i - \hat{y}_i)^2}{\sum(y_i - \bar{y})^2} & &\text{(fraction of variance explained)}
+\end{align}
+\end{mathresult}
+
+\begin{table}[H]
+\centering
+\caption{Regression metric comparison}
+\begin{tabularx}{\textwidth}{lccX}
+\toprule
+\textbf{Metric} & \textbf{Outlier Sensitivity} & \textbf{Interpretability} & \textbf{Use Case} \\
+\midrule
+MSE & High (squared) & Low (units$^2$) & Optimization target, gradient-friendly \\
+RMSE & High & High (same units) & Reporting, interpretable scale \\
+MAE & Low (linear) & High (same units) & Robust evaluation, median-focused \\
+MAPE & Medium & High (percentage) & Business reporting, relative errors \\
+$R^2$ & High & High (0--1 scale) & Explaining variance, quick sanity check \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{$R^2$ gotchas:}
+\begin{itemize}
+    \item $R^2 = 1$ is perfect, $R^2 = 0$ means no better than predicting the mean.
+    \item $R^2$ can be \textit{negative} on test data---the model is worse than always predicting $\bar{y}$.
+    \item Adding features never decreases training $R^2$; use adjusted $R^2$ to penalize complexity.
+    \item $R^2$ does not tell you if the model is ``good enough''---it is relative to the variance in your data. An $R^2$ of 0.3 might be excellent for stock prediction but terrible for physics simulation.
+\end{itemize}
+
+\begin{warningbox}
+\textbf{MAPE has two critical flaws:} (1) It is undefined when $y_i = 0$, which crashes your evaluation pipeline or returns infinity. (2) It is asymmetric---it penalizes over-prediction less than under-prediction. Use Symmetric MAPE (sMAPE) or MAE for data with zeros or near-zero values.
+\end{warningbox}
+
+%==============================================================================
+\section{NLP and Generation Metrics}
+\label{sec:nlp_metrics}
+%==============================================================================
+
+\subsection{N-gram Overlap Metrics}
+
+\textbf{BLEU} (Bilingual Evaluation Understudy): Measures n-gram precision between generated and reference text with a brevity penalty. Computes modified n-gram precision for $n = 1, 2, 3, 4$, takes the geometric mean, and multiplies by a penalty for short outputs. Corpus-level metric; unreliable on single sentences. Scores above 30 are ``understandable''; above 50 is ``high quality.''
+
+\textbf{Key limitation:} Precision-only. Does not penalize the model for missing content. ``The cat'' scores well if those words appear in the reference, even though the model produced almost nothing.
+
+\textbf{ROUGE} (Recall-Oriented Understudy for Gisting Evaluation): The recall counterpart to BLEU. Measures how much of the reference is captured.
+
+\begin{table}[H]
+\centering
+\caption{ROUGE variants}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Variant} & \textbf{What It Measures} & \textbf{Best For} \\
+\midrule
+ROUGE-1 & Unigram overlap (individual words) & Content coverage \\
+ROUGE-2 & Bigram overlap (word pairs) & Fluency and phrasing \\
+ROUGE-L & Longest common subsequence (LCS) & Sentence-level structure \\
+ROUGE-Lsum & LCS across summary sentences & Multi-sentence summaries \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{BERTScore:} Uses contextual embeddings (BERT or similar) to compute semantic similarity between generated and reference tokens. Matches tokens greedily by cosine similarity, then computes precision, recall, and F1 over these soft matches. Captures paraphrases that n-gram metrics miss entirely. ``The automobile departed'' and ``The car left'' score high on BERTScore but near-zero on BLEU.
+
+\textbf{Weakness:} Computationally expensive, harder to interpret, and dependent on the underlying embedding model version.
+
+\subsection{NLP Metrics Comparison}
+
+\begin{table}[H]
+\centering
+\caption{NLP and generation metrics at a glance}
+\begin{tabularx}{\textwidth}{lXXXl}
+\toprule
+\textbf{Metric} & \textbf{Measures} & \textbf{Strength} & \textbf{Weakness} & \textbf{Domain} \\
+\midrule
+BLEU & N-gram precision & Fast, standard & Misses meaning & Translation \\
+ROUGE & N-gram recall & Captures coverage & Misses meaning & Summarization \\
+BERTScore & Semantic similarity & Handles paraphrases & Expensive, opaque & Any generation \\
+METEOR & Precision + recall + synonyms & Better than BLEU alone & Less widely used & Translation \\
+ChrF & Character n-gram F-score & Language-agnostic & Coarse & Morphologically rich langs \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Perplexity}
+
+\textbf{What it is:} ``How surprised is the model by the text?'' Lower perplexity means the model assigns higher probability to the observed sequence. It is the exponential of the average per-token cross-entropy loss.
+
+\begin{mathresult}{Perplexity}
+\[
+\text{PPL} = \exp\left(-\frac{1}{T}\sum_{t=1}^{T}\log p(x_t \mid x_{<t})\right)
+\]
+where $T$ is the sequence length and $p(x_t \mid x_{<t})$ is the model's predicted probability of token $t$.
+\end{mathresult}
+
+\textbf{Interpretation:}
+\begin{itemize}
+    \item Perplexity of 1 = perfect prediction (model is never surprised).
+    \item Perplexity of $V$ = random guessing over vocabulary of size $V$.
+    \item A model with perplexity 30 is roughly choosing among 30 equally likely next tokens.
+    \item Modern frontier LLMs achieve perplexity below 10 on standard benchmarks.
+\end{itemize}
+
+\textbf{Caveats:} Perplexity is only comparable across models using the \textit{same tokenizer}. A model with a larger vocabulary has higher per-token perplexity because each prediction is harder. Byte-level or bits-per-character normalization removes this confound but is less commonly reported.
+
+\subsection{Human Evaluation}
+
+When automated metrics fail---and they frequently do for open-ended generation---human evaluation is the gold standard.
+
+\textbf{Common protocols:}
+\begin{itemize}
+    \item \textbf{Likert scales}: Rate outputs 1--5 for fluency, relevance, factuality. Simple but suffers from annotator scale bias.
+    \item \textbf{A/B preferences}: Show two outputs, ask which is better. More reliable than absolute ratings because it eliminates scale calibration issues.
+    \item \textbf{Elo ratings}: Run pairwise comparisons at scale, compute Elo scores. Used by Chatbot Arena for LLM ranking. Requires large sample sizes to converge.
+    \item \textbf{Best-of-$N$ ranking}: Rank $N$ outputs. More informative but more expensive per annotation.
+\end{itemize}
+
+\textbf{Inter-annotator agreement:} Always measure (Cohen's kappa, Krippendorff's alpha). Low agreement means your task definition is ambiguous, not that your annotators are bad.
+
+\textbf{LLM-as-judge:} Using strong LLMs (GPT-4, Claude) as evaluators is increasingly common. Cheap and scalable, but introduces biases: verbosity bias (longer answers rated higher), position bias (first answer preferred), and self-enhancement bias (models prefer their own outputs). Mitigate by: swapping presentation order, using structured rubrics, and calibrating against human judgments.
+
+%==============================================================================
+\section{Metric Selection Framework}
+\label{sec:metric_selection}
+%==============================================================================
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.7cm,
+    every node/.style={font=\small},
+    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, align=center, font=\small},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=1.8cm, minimum height=0.6cm, align=center, font=\footnotesize},
+    arrow/.style={->, thick, >=stealth}
+]
+    % Root
+    \node[decision] (start) {What is your\\task?};
+
+    % Level 1 branches
+    \node[decision, below left=1.8cm and 4.5cm of start] (clf) {Classes\\balanced?};
+    \node[decision, below left=1.8cm and 0.5cm of start] (rank) {Graded\\relevance?};
+    \node[decision, below right=1.8cm and 0.5cm of start] (reg) {Outliers\\present?};
+    \node[decision, below right=1.8cm and 4.5cm of start] (gen) {Reference\\text available?};
+
+    % Classification results
+    \node[result, below left=1.5cm and 0.8cm of clf] (rocauc) {ROC-AUC\\+ F1};
+    \node[result, below right=1.5cm and 0.8cm of clf] (prauc) {PR-AUC\\+ Recall};
+
+    % Ranking results
+    \node[result, below left=1.5cm and 0.5cm of rank] (ndcg) {NDCG};
+    \node[result, below right=1.5cm and 0.5cm of rank] (map) {MAP / MRR};
+
+    % Regression results
+    \node[result, below left=1.5cm and 0.5cm of reg] (rmse) {RMSE\\+ $R^2$};
+    \node[result, below right=1.5cm and 0.5cm of reg] (mae) {MAE\\/ Huber};
+
+    % Generation results
+    \node[result, below left=1.5cm and 0.5cm of gen] (auto) {BLEU /\\ROUGE};
+    \node[result, below right=1.5cm and 0.5cm of gen] (ppl) {Perplexity\\/ Human};
+
+    % Edges from root
+    \draw[arrow] (start) -- node[above left] {Classification} (clf);
+    \draw[arrow] (start) -- node[left] {Ranking} (rank);
+    \draw[arrow] (start) -- node[right] {Regression} (reg);
+    \draw[arrow] (start) -- node[above right] {Generation} (gen);
+
+    % Classification edges
+    \draw[arrow] (clf) -- node[left, font=\footnotesize] {Yes} (rocauc);
+    \draw[arrow] (clf) -- node[right, font=\footnotesize] {No} (prauc);
+
+    % Ranking edges
+    \draw[arrow] (rank) -- node[left, font=\footnotesize] {Yes} (ndcg);
+    \draw[arrow] (rank) -- node[right, font=\footnotesize] {No} (map);
+
+    % Regression edges
+    \draw[arrow] (reg) -- node[left, font=\footnotesize] {No} (rmse);
+    \draw[arrow] (reg) -- node[right, font=\footnotesize] {Yes} (mae);
+
+    % Generation edges
+    \draw[arrow] (gen) -- node[left, font=\footnotesize] {Yes} (auto);
+    \draw[arrow] (gen) -- node[right, font=\footnotesize] {No} (ppl);
+\end{tikzpicture}
+\caption{Decision tree for evaluation metric selection. Start with your task type, then refine based on data characteristics.}
+\label{fig:metric_decision_tree}
+\end{figure}
+
+\subsection{Multi-Objective Evaluation}
+
+Real production systems never optimize a single metric. A recommendation system might simultaneously track:
+\begin{itemize}
+    \item \textbf{Primary metric}: CTR or conversion rate (what you optimize for).
+    \item \textbf{Guardrail metrics}: Diversity, freshness, fairness (must not degrade).
+    \item \textbf{Counter-metrics}: Time on site, session length (detect engagement hacking).
+\end{itemize}
+
+\textbf{The guardrail pattern:} Ship a model only if the primary metric improves AND all guardrails stay within tolerance. A model that increases CTR by 3\% but decreases content diversity by 20\% is probably showing the same popular items repeatedly.
+
+\begin{table}[H]
+\centering
+\caption{Multi-objective evaluation example for a news feed}
+\begin{tabularx}{\textwidth}{lXcc}
+\toprule
+\textbf{Metric} & \textbf{Role} & \textbf{Direction} & \textbf{Threshold} \\
+\midrule
+CTR & Primary optimization target & Maximize & $> +0.5\%$ \\
+User retention (7-day) & Business guardrail & Maximize & $> -0.1\%$ \\
+Content diversity & Quality guardrail & Maximize & $> -2\%$ \\
+Misinformation rate & Safety guardrail & Minimize & $< +0.01\%$ \\
+Latency (p95) & System guardrail & Minimize & $< +10$ms \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{The Offline--Online Gap}
+
+The most important lesson in production ML: \textbf{offline metric improvements do not reliably predict online metric improvements.}
+
+\textbf{Why the gap exists:}
+\begin{enumerate}
+    \item \textbf{Position bias}: Users click higher-ranked results regardless of quality. Historical click data is biased toward the current model, and your offline eval inherits this bias.
+    \item \textbf{Presentation bias}: UI layout, snippet quality, and visual features affect clicks but are not captured by offline ranking metrics.
+    \item \textbf{Exploration-exploitation tension}: Offline evaluation rewards exploitation. Online value often comes from exploration (discovering new user preferences).
+    \item \textbf{Feedback loops}: The model affects the data that evaluates it. A model that never shows certain items will never get engagement data for them.
+    \item \textbf{Metric mismatch}: Optimizing NDCG offline but measuring revenue online measures different things.
+\end{enumerate}
+
+\begin{keyinsight}{Offline Gains Do Not Transfer Linearly to Online Gains}
+A 1\% improvement in offline NDCG might translate to 0.1\% or 5\% online improvement depending on where in the funnel the improvement occurs. Gains at positions 1--3 translate much more directly to clicks and conversions than gains at positions 20--50. Always segment your offline analysis by position and query frequency. In interviews, mentioning this segmented analysis is a strong positive signal.
+\end{keyinsight}
+
+%==============================================================================
+\section{Statistical Significance}
+\label{sec:statistical_significance}
+%==============================================================================
+
+\textbf{Why it matters:} Without significance testing, you cannot distinguish a real 0.3\% CTR improvement from noise. Shipping noise degrades trust in the ML team over time.
+
+\subsection{Practical Guidance}
+
+\begin{enumerate}
+    \item \textbf{Bootstrap confidence intervals are your best friend.} Resample your test set with replacement 1000+ times, compute the metric each time, and report the 95\% CI. If the CI for the difference excludes zero, the improvement is significant. No distributional assumptions needed.
+
+    \item \textbf{Use paired tests when possible.} Paired tests (paired t-test, Wilcoxon signed-rank) are more powerful than unpaired tests because they control for per-sample variance. If both models scored the same test set, use a paired test.
+
+    \item \textbf{Choose the right test:}
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\caption{Choosing a significance test}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Test} & \textbf{When to Use} & \textbf{Assumptions} \\
+\midrule
+Paired t-test & Two models on same data, normal diffs & Normal distribution of differences \\
+Wilcoxon signed-rank & Same as above, non-normal data & No distributional assumption \\
+McNemar's test & Comparing classifiers (correct/incorrect) & Paired binary outcomes \\
+Bootstrap CI & Any metric, any distribution & Large enough sample \\
+Permutation test & Any metric, exact test & Exchangeability under null \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Multiple Comparisons}
+
+\textbf{The problem:} If you run 20 experiments and pick the best result, there is a $1 - 0.95^{20} = 64\%$ chance that at least one ``significant'' result is a false positive.
+
+\textbf{Bonferroni correction:} Divide $\alpha$ by the number of comparisons. Testing $k$ hypotheses? Use threshold $\alpha / k$. Simple but conservative.
+
+\textbf{Benjamini-Hochberg (FDR control):} Less conservative alternative. Controls the expected false discovery rate rather than the probability of any false positive. Preferred when testing many hypotheses (feature importance, hyperparameter sweeps).
+
+\begin{warningbox}
+\textbf{Cherry-picking results inflates significance.} Running multiple experiments and only reporting the best one---or sweeping hyperparameters and evaluating on the test set each time---is p-hacking. Always pre-register your primary metric and evaluation plan before running experiments. In interviews, mentioning pre-registration shows awareness of rigorous experimental design.
+\end{warningbox}
+
+\subsection{Sample Size Planning}
+
+\textbf{Power analysis} tells you how many samples you need to detect a given effect size:
+\begin{itemize}
+    \item Larger effect sizes need fewer samples.
+    \item Higher power (typically 0.8) needs more samples.
+    \item Smaller $\alpha$ (stricter significance) needs more samples.
+    \item Higher variance in the metric needs more samples.
+\end{itemize}
+
+\textbf{Rule of thumb for A/B tests:} To detect a relative change of $\delta$ in a metric with variance $\sigma^2$, you need roughly $n \approx 16\sigma^2 / \delta^2$ samples per group (for 80\% power at $\alpha = 0.05$). For conversion rates, $\sigma^2 \approx p(1-p)$.
+
+\textbf{Why this matters in interviews:} If a candidate proposes an A/B test without discussing sample size, it signals they have not run experiments in production. Always estimate whether you have enough traffic \textit{before} running the test.
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:eval_interview_questions}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q1: ``Your model has 95\% accuracy but stakeholders are unhappy. What's going on?''}
+
+\textbf{Strong answer:}
+
+Several possibilities, in order of likelihood:
+
+\begin{enumerate}
+    \item \textbf{Class imbalance}: If 95\% of samples are negative, a trivial ``always predict negative'' classifier achieves 95\% accuracy while being completely useless. I would check the confusion matrix immediately and switch to precision/recall/F1 or PR-AUC.
+
+    \item \textbf{Wrong metric for the business}: Stakeholders care about recall (``we're missing fraud cases'') while the model was optimized for accuracy. I would meet with stakeholders to map their actual business objective to the right metric.
+
+    \item \textbf{Distribution shift}: 95\% accuracy on a hold-out test set but poor real-world performance suggests the test set does not represent production traffic. Check for temporal drift, demographic skew, or data leakage in the evaluation setup.
+
+    \item \textbf{Calibration}: The model ranks correctly but assigns wrong probabilities. Downstream systems that depend on calibrated scores (ad bidding, risk thresholds) fail silently.
+
+    \item \textbf{Per-segment failure}: 95\% overall accuracy can hide 40\% accuracy on a critical minority segment. Always slice metrics by user segment, geography, and time.
+\end{enumerate}
+
+\textbf{What the interviewer is testing:} Whether you immediately question the metric itself before debugging the model. This is a screening question---jumping straight to ``let me tune hyperparameters'' is a strong negative signal.
+
+\textbf{Common follow-ups:} ``How would you choose between precision and recall?'' ``What metric would you propose instead?'' ``How do you handle conflicting metric requirements from different stakeholders?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q2: ``How do you evaluate a search ranking system?''}
+
+\textbf{Strong answer:}
+
+\textbf{Offline evaluation:}
+\begin{itemize}
+    \item \textbf{Primary metric}: NDCG@10 using human-judged relevance labels with graded relevance (0--4 scale), because it distinguishes ``somewhat relevant'' from ``highly relevant.''
+    \item \textbf{Secondary metrics}: MRR (for navigational queries), Recall@100 (for the retrieval stage---ensure we do not lose relevant candidates before re-ranking).
+    \item \textbf{Sliced evaluation}: Break down by query frequency (head vs. tail), query type (navigational vs. informational), and user segment. A model might improve on head queries but degrade on the long tail.
+\end{itemize}
+
+\textbf{Online evaluation:}
+\begin{itemize}
+    \item \textbf{A/B test}: Primary metric is session success rate, measured by CTR on top results and low query reformulation rate.
+    \item \textbf{Guardrails}: Latency (p95), abandonment rate, diversity of results.
+    \item \textbf{Long-term metrics}: User retention at 7 and 30 days. Short-term engagement hacking (clickbait) increases CTR while reducing retention.
+\end{itemize}
+
+\textbf{Bridging the gap}: I would not trust offline NDCG improvements alone. Position bias in click data means offline labels are biased toward the current model. I would use interleaving experiments (mixing results from old and new models in the same result page) as a faster bridge between offline and online evaluation.
+
+\textbf{What the interviewer is testing:} End-to-end systems thinking. Do you understand the full pipeline from offline experiments to online A/B tests? Do you know why offline gains do not always translate to online gains?
+
+\textbf{Common follow-ups:} ``How do you handle position bias in click data?'' ``What is an interleaving experiment?'' ``How long do you run the A/B test?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q3: ``Precision is 0.95 but recall is 0.30. What do you do?''}
+
+\textbf{Strong answer:}
+
+First, determine whether this is actually a problem:
+\begin{itemize}
+    \item \textbf{If precision matters most} (content moderation where false positives cause user outrage), 0.95/0.30 might be the right operating point. The model is conservative---when it flags something, it is almost always correct.
+    \item \textbf{If recall matters most} (fraud detection, medical screening), this is a serious problem---we are missing 70\% of positive cases.
+\end{itemize}
+
+To improve recall without destroying precision:
+\begin{enumerate}
+    \item \textbf{Lower the decision threshold}: Move from 0.5 to 0.3. Plot the full PR curve to find the optimal operating point for the business cost function.
+    \item \textbf{Improve the model}: High precision / low recall often means the model has learned only the ``easy'' positives. Try hard negative mining, focal loss, oversampling rare positives, or adding features that distinguish hard positives from negatives.
+    \item \textbf{Cascade approach}: Use the high-precision model as stage one. Add a second, higher-recall model to catch what the first misses. Route disagreements to human review.
+    \item \textbf{Audit the labels}: Low recall sometimes means many positives are mislabeled as negative. Sample 100 false negatives and verify the ground truth.
+\end{enumerate}
+
+\textbf{What the interviewer is testing:} Whether you reason about the precision--recall tradeoff structurally (business context first, then threshold tuning, then model improvements) rather than mechanically (``just lower the threshold'').
+
+\textbf{Common follow-ups:} ``How do you choose the optimal threshold?'' ``What if stakeholders demand both precision and recall above 0.90?'' ``How does this change for a real-time system?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q4: ``How do you know if a model improvement is statistically significant?''}
+
+\textbf{Strong answer:}
+
+\textbf{For offline evaluation (fixed test set):}
+\begin{enumerate}
+    \item Compute the metric difference between the new and baseline model on the same test set.
+    \item Run a bootstrap: resample the test set with replacement 10,000 times, compute the metric difference each time, and construct a 95\% confidence interval for the difference.
+    \item If the CI excludes zero, the improvement is statistically significant at $p < 0.05$.
+    \item For classification, McNemar's test is an alternative: it compares the disagreement counts between two classifiers and is more powerful than comparing aggregate metrics.
+\end{enumerate}
+
+\textbf{For online evaluation (A/B test):}
+\begin{enumerate}
+    \item Before the test: run a power analysis to determine sample size. For a 0.5\% relative lift in CTR with baseline 3\%, we typically need millions of user-sessions.
+    \item Randomize by user (not request) to avoid inconsistent experiences.
+    \item Run for at least 1--2 full weeks to capture day-of-week effects.
+    \item Use a two-sample t-test or Mann-Whitney U-test on the per-user metric aggregates.
+    \item Apply Bonferroni or Benjamini-Hochberg correction if testing multiple metrics.
+\end{enumerate}
+
+\textbf{Key nuance}: statistical significance is not practical significance. A $p = 0.01$ result with a 0.01\% lift might not be worth the engineering cost of deployment. Always pair statistical significance with a minimum detectable effect that matters to the business.
+
+\textbf{What the interviewer is testing:} Production experimentation maturity. Do you know the difference between offline and online significance testing? Do you think about sample size before running experiments? Do you understand multiple comparisons?
+
+\textbf{Common follow-ups:} ``What is the difference between statistical and practical significance?'' ``How do you handle novelty effects in A/B tests?'' ``What do you do if the test is inconclusive after 4 weeks?''
+\end{interviewq}
+
+%==============================================================================
+\section{Quick Reference}
+\label{sec:metrics_cheatsheet}
+%==============================================================================
+
+\begin{table}[H]
+\centering
+\caption{Evaluation metrics cheat sheet---what to reach for first}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Problem} & \textbf{First Choice} & \textbf{Watch Out For} & \textbf{Also Report} \\
+\midrule
+Binary classif. (balanced) & ROC-AUC + F1 & Threshold sensitivity & Calibration (ECE) \\
+Binary classif. (imbalanced) & PR-AUC + Recall & Accuracy inflation & Per-class breakdown \\
+Multi-class & Macro F1 & Ignoring rare classes & Confusion matrix \\
+Ranking / Search & NDCG@K & Offline--online gap & MRR, Recall@K \\
+Retrieval stage & Recall@K & K too small & Precision@K \\
+Regression & RMSE & Outlier sensitivity & MAE, $R^2$ \\
+Translation & BLEU & Does not capture meaning & Human eval \\
+Summarization & ROUGE-L & Surface overlap only & BERTScore \\
+Language model & Perplexity & Tokenizer-dependent & Downstream task perf \\
+Production system & Online CTR / conversion & Novelty effects & Guardrail metrics \\
+\bottomrule
+\end{tabularx}
+\end{table}

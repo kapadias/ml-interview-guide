@@ -1,0 +1,613 @@
+\chapter{Production ML Systems}
+\label{chap:production_systems}
+
+\begin{tldr}
+Production ML is where models meet reality. This chapter covers end-to-end ML system design (the pipeline from data to monitoring), model serving (batch vs.\ real-time, dynamic batching, latency optimization), feature engineering and feature stores (online/offline consistency, training-serving skew), A/B testing (power analysis, bandits, interleaving), drift detection and monitoring (concept drift, data drift, retraining triggers), and ML infrastructure patterns (CI/CD for ML, experiment tracking, model registry). At Staff+ interviews, you are expected to design complete production ML systems---not just pick a model architecture. If your system design answer ends at ``train the model,'' you will not pass.
+\end{tldr}
+
+%==============================================================================
+\section{ML System Design Overview}
+\label{sec:ml_system_overview}
+%==============================================================================
+
+Most ML interview candidates focus on model architecture. Most production ML failures have nothing to do with the model. They come from bad data, stale features, silent drift, and broken pipelines. A Staff-level engineer designs the \textit{system}, not just the model.
+
+\subsection{End-to-End ML Pipeline}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.4cm,
+    stage/.style={rectangle, draw, rounded corners=4pt, minimum width=2.2cm, minimum height=1.4cm, align=center, font=\small\bfseries},
+    substage/.style={font=\tiny, align=center, text width=2cm},
+    arrow/.style={->, thick, >=stealth}
+]
+    % Main pipeline stages
+    \node[stage, fill=lightblue] (data) {Data};
+    \node[stage, fill=lightblue, right=0.8cm of data] (features) {Features};
+    \node[stage, fill=lightgreen, right=0.8cm of features] (training) {Training};
+    \node[stage, fill=lightyellow, right=0.8cm of training] (validation) {Validation};
+    \node[stage, fill=orange!25, right=0.8cm of validation] (serving) {Serving};
+    \node[stage, fill=red!15, right=0.8cm of serving] (monitoring) {Monitoring};
+
+    % Sub-labels
+    \node[substage, below=0.15cm of data] {Collection\\Cleaning\\Labeling};
+    \node[substage, below=0.15cm of features] {Engineering\\Store\\Pipelines};
+    \node[substage, below=0.15cm of training] {Model\\Optimizer\\Distributed};
+    \node[substage, below=0.15cm of validation] {Offline Eval\\A/B Testing\\Shadow Mode};
+    \node[substage, below=0.15cm of serving] {Real-time\\Batch\\Caching};
+    \node[substage, below=0.15cm of monitoring] {Drift\\Latency\\Alerts};
+
+    % Forward arrows
+    \draw[arrow] (data) -- (features);
+    \draw[arrow] (features) -- (training);
+    \draw[arrow] (training) -- (validation);
+    \draw[arrow] (validation) -- (serving);
+    \draw[arrow] (serving) -- (monitoring);
+
+    % Feedback loop
+    \draw[arrow, dashed, deepred, thick] (monitoring.south) -- ++(0, -1.2) -| (data.south)
+        node[pos=0.25, below, font=\small\itshape] {Feedback loop: retrain on new data};
+\end{tikzpicture}
+\caption{End-to-end ML pipeline. The feedback loop from monitoring back to data is what separates production systems from one-off experiments. Every stage is a potential failure point.}
+\label{fig:ml_pipeline}
+\end{figure}
+
+\subsection{Training vs.\ Serving: Two Different Worlds}
+
+The training environment and the serving environment have fundamentally different constraints. Confusing them is one of the most common sources of production bugs.
+
+\begin{table}[H]
+\centering
+\caption{Training vs.\ serving environment differences}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Training} & \textbf{Serving} \\
+\midrule
+Primary constraint & Throughput (samples/sec) & Latency (ms per request) \\
+Batch size & Large (hundreds to thousands) & Small (often 1, or dynamic batch) \\
+Data access & Full dataset, random access & Single request, real-time features \\
+Compute budget & Hours to weeks, amortized & Milliseconds, per request \\
+Failure mode & Slow convergence, wasted compute & User-facing latency, stale predictions \\
+Feature computation & Offline, full history available & Online, must be precomputed or fast \\
+Hardware & GPU clusters, high bandwidth & GPU/CPU mix, cost-per-query matters \\
+Acceptable error & Small accuracy loss from noise is fine & Determinism and reproducibility matter \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{The practical consequence.} You cannot copy-paste training code into a serving system. The model artifact is only one piece; the feature computation, preprocessing, and postprocessing logic must be replicated exactly---or you get training-serving skew (Section~\ref{sec:feature_stores}).
+
+%==============================================================================
+\section{Model Serving}
+\label{sec:model_serving}
+%==============================================================================
+
+\begin{keyinsight}{Model Serving Is a Systems Problem, Not an ML Problem}
+Once the model is trained, the challenge shifts entirely to systems engineering: how to serve predictions at low latency, high throughput, and acceptable cost. The best model in the world is useless if it cannot serve results within the latency budget. At FAANG scale, shaving 10ms off p99 latency or reducing serving cost by 20\% can be worth millions of dollars annually.
+\end{keyinsight}
+
+\subsection{Batch vs.\ Real-Time Inference}
+
+\begin{table}[H]
+\centering
+\caption{Batch vs.\ real-time inference comparison}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Batch Inference} & \textbf{Real-Time Inference} \\
+\midrule
+When & Periodically (hourly, daily) & On each user request \\
+Latency & Minutes to hours & Milliseconds (p50 $<$ 50ms typical) \\
+Throughput & Optimized for bulk processing & Optimized for per-request cost \\
+Freshness & Stale (computed hours ago) & Fresh (uses latest context) \\
+Complexity & Simpler (MapReduce-style) & Harder (load balancing, autoscaling) \\
+Cost model & Compute per batch run & Compute per request \\
+Use cases & Email campaigns, pre-computed recs & Search ranking, ad serving, chatbots \\
+Failure handling & Retry entire batch & Fallback to cache or default \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{When to use batch.} The prediction does not depend on real-time context, and staleness is acceptable. Examples: daily recommendation lists, spam classification of stored content, offline feature enrichment.
+
+\textbf{When to use real-time.} The prediction depends on the current request (query, session, context). Examples: search ranking, ad click prediction, fraud detection, LLM inference.
+
+\textbf{Hybrid pattern.} Pre-compute candidate scores in batch, then re-rank in real-time using session context. This is the standard architecture for recommendation systems at scale (see Chapter~\ref{chap:recommendation}).
+
+\subsection{Dynamic Batching}
+
+\textbf{What it is.} Accumulate individual inference requests into a batch before sending to the GPU. GPUs are highly parallel---processing 1 request or 32 requests takes nearly the same time. Dynamic batching amortizes GPU kernel launch overhead and fills the compute units.
+
+\textbf{How it works:}
+\begin{enumerate}
+    \item Requests arrive asynchronously at the serving layer
+    \item A batcher accumulates requests for up to $t_{\text{max}}$ milliseconds (e.g., 5--10ms)
+    \item Once the batch is full (size $B_{\max}$) or the timeout expires, send to GPU
+    \item Results are de-multiplexed back to individual callers
+\end{enumerate}
+
+\textbf{Trade-off.} Larger batches improve throughput but add latency (each request waits up to $t_{\text{max}}$). The optimal settings depend on the traffic pattern and latency SLA.
+
+\subsection{Continuous Batching for LLMs}
+
+\textbf{What it is.} Standard batching for autoregressive LLMs is wasteful because sequences finish at different times. In naive static batching, the entire batch waits for the longest sequence. Continuous batching (also called in-flight batching) allows new requests to enter the batch as soon as a sequence finishes, keeping the GPU fully utilized.
+
+\textbf{How it differs from dynamic batching:}
+\begin{itemize}
+    \item Dynamic batching: form a batch, process it completely, return results
+    \item Continuous batching: sequences enter and leave the batch at each decode step
+\end{itemize}
+
+\textbf{Key enabler: paged attention (vLLM).} KV-cache memory is allocated in non-contiguous pages (like OS virtual memory), eliminating fragmentation and enabling efficient batch management. Without paged attention, continuous batching wastes memory on pre-allocated but unused KV-cache slots.
+
+\textbf{Impact.} Continuous batching with paged attention (vLLM) can increase LLM serving throughput by 2--4$\times$ compared to naive static batching, with no accuracy loss.
+
+\subsection{Latency Optimization Techniques}
+
+\begin{table}[H]
+\centering
+\caption{Latency optimization techniques by impact and complexity}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Technique} & \textbf{How It Works} & \textbf{Typical Impact} & \textbf{Effort} \\
+\midrule
+Result caching & Cache predictions for repeated inputs & 10--100$\times$ for cache hits & Low \\
+Feature precomputation & Compute expensive features offline & 2--10$\times$ per feature & Low \\
+Model quantization & INT8/INT4 weights, FP16 activations & 2--4$\times$ latency reduction & Medium \\
+Model distillation & Train a smaller model to mimic the large one & 5--20$\times$ speedup & High \\
+Model cascading & Simple model first; complex model only if needed & 2--5$\times$ average latency & Medium \\
+Speculative decoding & Small draft model + large verifier (LLMs) & 2--3$\times$ for autoregressive & Medium \\
+Graph optimization & Operator fusion, kernel optimization (TensorRT) & 1.5--3$\times$ & Medium \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Model Cascading}
+
+\textbf{What it is.} A system of models ordered from cheap to expensive. Route easy requests to the cheap model; only escalate to the expensive model when confidence is low. This reduces average serving cost while maintaining accuracy on hard examples.
+
+\textbf{Example (content moderation):}
+\begin{enumerate}
+    \item \textbf{Level 1:} Rule-based filter (keyword match) --- 0.01ms, catches 60\% of violations
+    \item \textbf{Level 2:} Small BERT classifier --- 5ms, catches 35\% of remaining violations
+    \item \textbf{Level 3:} Large multimodal model --- 100ms, handles the remaining 5\%
+\end{enumerate}
+
+\textbf{The key design decision:} Setting the confidence threshold for escalation. Too aggressive (escalate too often) wastes the expensive model's capacity. Too conservative (escalate too rarely) misses hard cases. Tune this threshold on a held-out set, optimizing for your latency budget.
+
+%==============================================================================
+\section{Feature Engineering and Feature Stores}
+\label{sec:feature_stores}
+%==============================================================================
+
+\begin{warningbox}
+Training-serving skew is the \#1 production ML bug. It happens when the features used during training differ from those available at serving time---due to different computation logic, different data sources, or different timing. The model was trained on feature X computed offline with full history; at serving time, feature X is computed online with partial data. The result: silent accuracy degradation that is extremely hard to debug.
+\end{warningbox}
+
+\subsection{Batch vs.\ Streaming Features}
+
+\begin{table}[H]
+\centering
+\caption{Batch vs.\ streaming feature computation}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Batch Features} & \textbf{Streaming Features} \\
+\midrule
+Computation & Scheduled jobs (Spark, SQL) & Event-driven (Flink, Kafka) \\
+Freshness & Hours to days old & Seconds to minutes old \\
+Examples & User lifetime stats, item popularity & Session click count, recent query \\
+Complexity & Simple aggregations, joins & Windowed aggregations, state mgmt \\
+Cost & Cheaper (bulk compute) & More expensive (always running) \\
+Failure mode & Stale features after job failure & Feature delays, out-of-order events \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Feature Store Architecture}
+
+A feature store provides a single source of truth for feature computation, serving both training and inference with identical logic. The two critical interfaces are:
+
+\begin{itemize}
+    \item \textbf{Offline store} (for training): Serves historical feature values via batch reads. Backed by a data warehouse (BigQuery, Hive). Supports point-in-time joins to avoid label leakage.
+    \item \textbf{Online store} (for serving): Serves the latest feature values with low latency ($<$ 5ms). Backed by a key-value store (Redis, DynamoDB). Updated by batch or streaming pipelines.
+\end{itemize}
+
+\textbf{Point-in-time correctness.} When constructing training data, you must join features as of the timestamp when the label was generated---not the current values. Otherwise, you leak future information into training. A feature store enforces this through point-in-time joins.
+
+\subsection{Sources of Training-Serving Skew}
+
+\begin{table}[H]
+\centering
+\caption{Common sources of training-serving skew and mitigations}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Source} & \textbf{What Goes Wrong} & \textbf{Mitigation} \\
+\midrule
+Dual implementation & Training uses Spark, serving uses Java --- logic diverges & Single feature definition (feature store) \\
+Data freshness & Training uses daily snapshots, serving uses real-time & Log served features, train on logged values \\
+Preprocessing & Different tokenization, normalization at train vs.\ serve & Package preprocessing with the model artifact \\
+Missing features & Feature unavailable at serving time, replaced with default & Validate feature availability before training \\
+Time leakage & Training accidentally uses future data & Enforce point-in-time joins \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{The gold standard mitigation:} Log the exact features served to each request, then train on those logged features. This guarantees training and serving see identical inputs. Companies like Meta and Google use this ``log-and-train'' pattern extensively.
+
+%==============================================================================
+\section{A/B Testing for ML Models}
+\label{sec:ab_testing}
+%==============================================================================
+
+Offline metrics (AUC, NDCG, perplexity) are necessary but not sufficient. The only reliable way to know if a model improves business outcomes is to test it on live traffic.
+
+\subsection{A/B Testing Basics}
+
+\textbf{What it is.} Split traffic randomly between control (existing model) and treatment (new model). Measure a business metric (e.g., CTR, revenue, retention). Use a statistical test to determine if the difference is real.
+
+\textbf{Practical rules of thumb (no derivations needed):}
+\begin{itemize}
+    \item \textbf{Sample size:} For detecting a 1\% relative lift in a metric with baseline rate $p$, you need roughly $n \approx 16 p(1-p) / \delta^2$ samples per group, where $\delta$ is the absolute change. For a 2\% CTR with 1\% relative lift ($\delta = 0.0002$), that is $\sim$1.6M samples per group.
+    \item \textbf{Duration:} Run for at least 1--2 full weekly cycles to capture day-of-week effects.
+    \item \textbf{Significance:} Standard threshold is $p < 0.05$ (5\% false positive rate). For high-stakes changes, use $p < 0.01$.
+    \item \textbf{Power:} Aim for 80\% power (80\% chance of detecting a true effect). Increase sample size or run longer to increase power.
+\end{itemize}
+
+\begin{warningbox}
+Peeking at results inflates the false positive rate. If you check your A/B test daily and stop as soon as you see $p < 0.05$, your actual false positive rate can be 20--30\%, not 5\%. Either commit to a fixed sample size before starting, or use sequential testing methods (e.g., always-valid p-values, group sequential designs) that are designed for continuous monitoring.
+\end{warningbox}
+
+\subsection{Alternatives to Classical A/B Testing}
+
+\begin{table}[H]
+\centering
+\caption{A/B testing alternatives: when to use each}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Method} & \textbf{How It Works} & \textbf{When to Use} & \textbf{Limitation} \\
+\midrule
+Classical A/B & Fixed split, fixed duration & Standard model comparison & Slow; wastes traffic on worse variant \\
+Multi-armed bandit & Dynamically shift traffic to the better variant & Many variants, want to minimize regret & Harder to get clean statistical estimates \\
+Interleaving & Mix results from both models in the same list & Ranking systems (search, recs) & Only works for list-based outputs \\
+Switchback & Alternate treatment/control over time periods & Marketplace effects (supply/demand) & Sensitive to time-of-day confounds \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Interleaving} deserves special attention for ranking interviews. Instead of showing user A the control ranking and user B the treatment ranking, you interleave results from both rankers into a single list. When user clicks item at position 3, you credit the model that ranked it higher. Interleaving is 10--100$\times$ more sensitive than A/B testing because it eliminates user-level variance---the same user evaluates both models simultaneously.
+
+\textbf{Multi-armed bandits} are useful when you have many model variants (e.g., testing 10 different recommendation strategies). Thompson sampling or UCB algorithms dynamically allocate more traffic to better-performing variants, reducing cumulative regret. The trade-off: you get faster convergence to the best variant, but the non-stationarity of traffic allocation makes statistical significance harder to establish.
+
+%==============================================================================
+\section{Drift Detection and Monitoring}
+\label{sec:drift_monitoring}
+%==============================================================================
+
+ML models degrade over time because the world changes. Unlike software bugs that crash loudly, model degradation is silent---predictions get worse, but the system keeps running. Proactive monitoring is the only defense.
+
+\subsection{Types of Drift}
+
+\begin{table}[H]
+\centering
+\caption{Concept drift vs.\ data drift}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Data Drift (Covariate Shift)} & \textbf{Concept Drift} \\
+\midrule
+Definition & Input distribution $P(\vx)$ changes & Relationship $P(y|\vx)$ changes \\
+Example & User demographics shift over time & What users consider ``relevant'' changes \\
+Detection & Compare input feature distributions & Monitor prediction accuracy over time \\
+Cause & New user segments, seasonal patterns & Market shifts, cultural changes, competition \\
+Fix & Retrain on recent data & Retrain with new labels; may need new features \\
+Speed & Usually gradual & Can be sudden (e.g., pandemic, policy change) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Detection Methods}
+
+\textbf{For data drift:}
+\begin{itemize}
+    \item \textbf{Population Stability Index (PSI):} Compare binned distributions of features between training and serving. PSI $< 0.1$: no significant shift. PSI $> 0.25$: major shift, investigate immediately.
+    \item \textbf{KL divergence / JS divergence:} Measure divergence between reference and current feature distributions. More principled than PSI but requires density estimation.
+    \item \textbf{Kolmogorov-Smirnov test:} Non-parametric test for whether two samples come from the same distribution. Works well for univariate features.
+\end{itemize}
+
+\textbf{For concept drift:}
+\begin{itemize}
+    \item \textbf{Monitor prediction quality:} Track AUC, calibration, precision/recall over time windows. Requires delayed ground truth labels.
+    \item \textbf{Prediction distribution shift:} If the model's output distribution changes (e.g., average predicted CTR drops by 10\%), the relationship may have shifted---even before labels arrive.
+    \item \textbf{Residual analysis:} When labels arrive, compute error residuals in recent time windows. Increasing residuals signal concept drift.
+\end{itemize}
+
+\subsection{What to Monitor in Production}
+
+\begin{table}[H]
+\centering
+\caption{Production ML monitoring checklist}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Category} & \textbf{Metric} & \textbf{Alert If} \\
+\midrule
+\multirow{3}{*}{Model quality} & Prediction distribution & Mean/variance shifts $> 2\sigma$ from baseline \\
+ & Calibration & Predicted probabilities diverge from observed rates \\
+ & Accuracy (when labels available) & AUC drops $> 1\%$ from baseline \\
+\midrule
+\multirow{2}{*}{Feature health} & Feature distributions (per feature) & PSI $> 0.1$ for any top feature \\
+ & Missing value rate & Increases $> 2\times$ from baseline \\
+\midrule
+\multirow{3}{*}{System health} & Inference latency (p50, p99) & p99 exceeds SLA \\
+ & Throughput (QPS) & Drops below expected traffic \\
+ & Error rate & Any serving errors $> 0.1\%$ \\
+\midrule
+\multirow{2}{*}{Data pipeline} & Data freshness & Feature staleness exceeds threshold \\
+ & Data volume & Row count anomaly (too few or too many) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Retraining Strategies}
+
+\begin{table}[H]
+\centering
+\caption{Model retraining strategies}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Strategy} & \textbf{How It Works} & \textbf{When to Use} \\
+\midrule
+Scheduled retraining & Retrain on a fixed cadence (daily, weekly) & Stable domains, predictable drift \\
+Triggered retraining & Retrain when monitoring detects drift & Unpredictable drift, cost-sensitive \\
+Online learning & Update model continuously on new data & High-velocity domains (ads, news) \\
+Warm-starting & Initialize new model from previous checkpoint & Large models, incremental data \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{The practical default:} Scheduled retraining (daily or weekly) with triggered retraining as a safety net. Pure online learning is appealing but operationally difficult---it is hard to debug, hard to roll back, and susceptible to data quality issues amplifying through the model over time.
+
+\begin{keyinsight}{ML Systems Fail Silently --- Your Monitoring Must Be Proactive}
+A software service that crashes gets paged. A model that silently degrades by 3\% per week does not. By the time someone notices, the cumulative business impact can be enormous. The monitoring system is not a nice-to-have---it is a core component of the ML system, equal in importance to the model itself. At Staff+ level, you are expected to design the monitoring alongside the model.
+\end{keyinsight}
+
+%==============================================================================
+\section{ML Infrastructure Patterns}
+\label{sec:ml_infra}
+%==============================================================================
+
+\subsection{The ML Infrastructure Stack}
+
+At scale, ML teams need standardized infrastructure for reproducibility, collaboration, and velocity. The three core components:
+
+\begin{enumerate}
+    \item \textbf{Feature store} (Section~\ref{sec:feature_stores}): Single source of truth for feature computation across training and serving.
+    \item \textbf{Experiment tracking:} Record hyperparameters, metrics, code versions, and artifacts for every training run. Tools: MLflow, Weights \& Biases, Neptune, internal equivalents at FAANG. A run that cannot be reproduced is a run that was wasted.
+    \item \textbf{Model registry:} Versioned storage for trained model artifacts with metadata (training data snapshot, metrics, lineage). The registry acts as the boundary between training and serving---only registered, validated models can be deployed.
+\end{enumerate}
+
+\subsection{CI/CD for ML}
+
+Standard software CI/CD tests code correctness. ML CI/CD must also test \textit{data correctness} and \textit{model quality}---which makes it fundamentally harder.
+
+\begin{table}[H]
+\centering
+\caption{Software CI/CD vs.\ ML CI/CD}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Software CI/CD} & \textbf{ML CI/CD} \\
+\midrule
+What is tested & Code logic & Code + data + model quality \\
+What is built & Binary / container & Model artifact + serving config \\
+Test types & Unit tests, integration tests & + Data validation, model validation \\
+Deployment gate & Tests pass & Tests pass + model beats baseline \\
+Rollback trigger & Error rate spike & Error rate spike + quality degradation \\
+Reproducibility & Deterministic (same code = same binary) & Non-deterministic (randomness, data order) \\
+Pipeline trigger & Code commit & Code commit + data change + schedule \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{ML-specific CI/CD stages:}
+\begin{enumerate}
+    \item \textbf{Data validation:} Check schema, distributions, volume, freshness. Catch data pipeline bugs before they corrupt a model. Tools: Great Expectations, TensorFlow Data Validation (TFDV).
+    \item \textbf{Training:} Run training pipeline end-to-end. For full retraining, this can take hours---use canary training (train on a small subset first) to catch obvious errors fast.
+    \item \textbf{Model validation:} Compare new model against the current production model on held-out data. Gate: new model must match or beat production on all key metrics.
+    \item \textbf{Shadow deployment:} Serve the new model alongside production, compare predictions without affecting users. Catches serving-time bugs (latency, memory, feature compatibility).
+    \item \textbf{Canary rollout:} Route a small fraction of traffic (1--5\%) to the new model. Monitor metrics closely. Gradually increase traffic if stable.
+\end{enumerate}
+
+\subsection{ML Deployment Patterns}
+
+\begin{table}[H]
+\centering
+\caption{ML deployment strategies}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Pattern} & \textbf{How It Works} & \textbf{Risk Level} & \textbf{When to Use} \\
+\midrule
+Shadow mode & New model runs in parallel, no user impact & Minimal & First deployment of new model \\
+Canary release & 1--5\% traffic to new model, monitor & Low & Standard model update \\
+Blue/green & Two full environments, instant switch & Low & Infrastructure changes \\
+Rolling update & Gradually replace old instances & Medium & Large serving fleet \\
+Full cutover & Replace all at once & High & Emergency fixes only \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Infrastructure Anti-Patterns}
+
+Common pitfalls that interviewers probe for at Staff+ level:
+
+\begin{itemize}
+    \item \textbf{Notebook-to-production pipeline:} Training in Jupyter, serving in Java, with manual artifact transfer in between. Breaks reproducibility and introduces skew.
+    \item \textbf{No model versioning:} ``Which model is in production?'' --- if nobody can answer this immediately, the system is broken.
+    \item \textbf{No data versioning:} Models are only reproducible if you can reproduce the exact training data. Version your datasets, not just your code.
+    \item \textbf{Monolithic training pipeline:} One giant script that does data loading, preprocessing, training, and evaluation. Impossible to debug, test, or reuse components.
+    \item \textbf{Alert fatigue:} Too many noisy alerts that get ignored. Tune alert thresholds carefully; every alert should be actionable.
+\end{itemize}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:production_interview}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q1: Design ML infrastructure for a search ranking system at 10K QPS.}
+
+\textbf{What the interviewer is testing:} End-to-end systems thinking. Can you design beyond the model? Do you reason about latency, throughput, feature freshness, and failure modes? Do you start with requirements and constraints?
+
+\textbf{Strong answer:}
+
+\textbf{Step 1: Requirements and constraints.}
+\begin{itemize}
+    \item 10K QPS means $\sim$100$\mu$s budget per query if single-threaded. Realistically, we have distributed serving, so target p99 latency of 200ms end-to-end, with model inference under 50ms.
+    \item Each query requires scoring $\sim$1000 candidate documents (retrieval stage returns candidates).
+\end{itemize}
+
+\textbf{Step 2: Architecture.}
+\begin{itemize}
+    \item \textbf{Two-stage system:} retrieval (ANN index for top-1000 candidates, $<$10ms) then ranking (neural ranker scores 1000 docs, $<$50ms).
+    \item \textbf{Feature serving:} Online feature store (Redis cluster) for user features and real-time query features. Document features are precomputed and stored alongside the index.
+    \item \textbf{Model serving:} Quantized ranking model (INT8) on GPU instances behind a load balancer. Dynamic batching with max batch size 64 and timeout 5ms.
+\end{itemize}
+
+\textbf{Step 3: Feature pipeline.}
+\begin{itemize}
+    \item Batch features (user history, document quality scores): computed daily in Spark, written to online store.
+    \item Streaming features (session context, recent clicks): computed in Flink from Kafka event stream, written to online store with $<$1min delay.
+    \item Feature logging: every served feature vector is logged to enable log-and-train.
+\end{itemize}
+
+\textbf{Step 4: Training pipeline.}
+\begin{itemize}
+    \item Daily retraining on logged impression data (features + clicks).
+    \item Automated validation: new model must beat production on NDCG@10 on a held-out set from the past 24 hours.
+    \item Canary deployment: 2\% traffic for 4 hours, monitoring CTR and NDCG.
+\end{itemize}
+
+\textbf{Step 5: Monitoring.}
+\begin{itemize}
+    \item \textbf{Quality:} CTR, NDCG@10, query-level satisfaction signals.
+    \item \textbf{Features:} PSI per feature, missing rate, freshness.
+    \item \textbf{System:} p50/p99 latency, QPS, error rate, GPU utilization.
+    \item Automated rollback if CTR drops $>$2\% relative or p99 latency exceeds 300ms.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you handle a cold-start query with no user history?'' ``What if the retrieval stage is the bottleneck?'' ``How do you handle position bias in the training data?'' ``What happens during a feature store outage?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q2: Your model's CTR dropped 5\% overnight. Walk through your diagnosis.}
+
+\textbf{What the interviewer is testing:} Structured debugging under pressure. Can you systematically narrow down root causes instead of guessing? Do you distinguish between model issues, data issues, and system issues?
+
+\textbf{Strong answer:}
+
+I would triage in this order, from most likely and fastest to check, to least likely:
+
+\textbf{1. Check if it is a system issue, not a model issue.}
+\begin{itemize}
+    \item Is the serving system healthy? Check error rates, latency, timeouts. A latency spike could cause timeouts that fall back to a default (non-personalized) experience, dropping CTR.
+    \item Was there a deployment? Check if a new model version was deployed overnight. If so, roll back immediately and investigate offline.
+    \item Was there an infrastructure change? New serving hosts, load balancer config change, feature store migration.
+\end{itemize}
+
+\textbf{2. Check the data pipeline.}
+\begin{itemize}
+    \item Did a feature pipeline fail or produce stale data? Check feature freshness in the online store. If the daily batch job failed, features are 24+ hours stale.
+    \item Did a feature distribution shift? Check PSI for top features. A bug in an upstream data source can silently change feature distributions.
+    \item Are there missing or null features? A schema change in an upstream table can cause joins to fail.
+\end{itemize}
+
+\textbf{3. Check for external changes.}
+\begin{itemize}
+    \item Did the product UI change? A frontend change can shift user behavior without any model change.
+    \item Did the user population shift? A marketing campaign or viral event can bring in users with different behavior patterns.
+    \item Seasonal or calendar effects? Holidays, weekdays vs.\ weekends.
+\end{itemize}
+
+\textbf{4. Check the model itself (least likely for overnight change).}
+\begin{itemize}
+    \item If the model was retrained overnight: compare the new model's offline metrics against the previous version. Check the training data for anomalies (label noise, data corruption).
+    \item Examine the model's prediction distribution. A shift in predicted CTR distribution without a corresponding shift in input features suggests a training bug.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you distinguish a real CTR drop from a measurement artifact?'' ``What if the drop is only in a specific user segment?'' ``How would you build alerting to catch this faster?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q3: How would you set up an A/B test for a new recommendation model?}
+
+\textbf{What the interviewer is testing:} Statistical literacy, practical experiment design, understanding of business metrics, and awareness of pitfalls.
+
+\textbf{Strong answer:}
+
+\textbf{Step 1: Define the metric.}
+\begin{itemize}
+    \item Primary metric (the decision metric): engagement rate (clicks per impression) or a composite metric like user-session-level satisfaction.
+    \item Guardrail metrics: revenue per user, retention rate, content diversity. The new model must not degrade these even if the primary metric improves.
+    \item Avoid proxy metrics that game easily (e.g., total clicks---users might click more because recommendations are confusing, not better).
+\end{itemize}
+
+\textbf{Step 2: Power analysis and sample size.}
+\begin{itemize}
+    \item Determine the minimum detectable effect (MDE). For a rec model, a 0.5\% absolute improvement in engagement is meaningful.
+    \item Compute required sample size: given baseline engagement rate, MDE, significance level ($\alpha = 0.05$), and power (80\%), use standard sample size formulas. For a 10\% baseline engagement with 0.5\% MDE, approximately 70K users per group.
+    \item Translate to duration: if we have 1M daily active users and split 50/50, we reach 70K per group in under a day---but run for at least 2 weeks to capture weekly patterns.
+\end{itemize}
+
+\textbf{Step 3: Experiment design.}
+\begin{itemize}
+    \item Randomization unit: user-level (not request-level, to avoid inconsistent user experience).
+    \item Stratification: stratify by platform (iOS/Android/web) and user activity level to reduce variance.
+    \item Holdout: maintain a 5\% long-term holdout group that never sees new models, to measure cumulative model improvement over time.
+\end{itemize}
+
+\textbf{Step 4: Launch and monitor.}
+\begin{itemize}
+    \item Pre-register the analysis plan: metric, MDE, duration, and decision criteria. Do not change these mid-experiment.
+    \item Monitor for sample ratio mismatch (SRM): if the control/treatment split deviates from 50/50 by more than expected, the randomization is broken.
+    \item Do not peek and stop early (or use sequential testing if early stopping is needed).
+\end{itemize}
+
+\textbf{Step 5: Analysis and decision.}
+\begin{itemize}
+    \item After the pre-specified duration, compute confidence intervals.
+    \item Ship if: primary metric is significantly positive AND no guardrail metric is significantly negative.
+    \item If results are inconclusive: either extend the test or accept that the effect is too small to detect (and likely too small to matter).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What if the primary metric is positive but a guardrail is negative?'' ``How do you handle network effects in a social platform?'' ``What is the novelty effect and how do you account for it?'' ``When would you use interleaving instead?''
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q4: How do you handle training-serving skew?}
+
+\textbf{What the interviewer is testing:} Production maturity. This question separates candidates who have shipped ML systems from those who have only trained models. The interviewer wants to hear specific mechanisms, not vague awareness.
+
+\textbf{Strong answer:}
+
+Training-serving skew occurs when the model sees different feature distributions at serving time than at training time. It is the most common cause of ``the model works offline but not in production.'' I handle it through prevention, detection, and mitigation.
+
+\textbf{Prevention:}
+\begin{itemize}
+    \item \textbf{Feature store with shared logic:} Define each feature once. The same transformation code generates features for both the offline store (training) and the online store (serving). This eliminates dual-implementation bugs.
+    \item \textbf{Log-and-train pattern:} Log the exact feature vector served to each request. Train the model on these logged features. This guarantees the model is trained on exactly what it will see at serving time.
+    \item \textbf{Package preprocessing with the model:} Embed all feature transformations (normalization, tokenization, bucketing) into the model artifact itself, rather than implementing them separately in the serving layer.
+\end{itemize}
+
+\textbf{Detection:}
+\begin{itemize}
+    \item \textbf{Feature distribution monitoring:} Compare the distribution of each feature at serving time against the training data distribution. Alert on PSI $> 0.1$.
+    \item \textbf{Prediction distribution monitoring:} Compare the distribution of model outputs at serving time against expected output distribution from offline evaluation.
+    \item \textbf{Integration tests:} In CI/CD, run the model on a fixed set of test inputs through both the training pipeline and the serving pipeline. Outputs must match within numerical tolerance.
+\end{itemize}
+
+\textbf{Mitigation (when skew is detected):}
+\begin{itemize}
+    \item Identify the specific features that drifted. Check the upstream data source and feature pipeline for bugs.
+    \item If the skew is caused by a data pipeline delay, add fallback logic (e.g., use last-known-good feature value, or use a feature default that was included in training data).
+    \item Retrain the model on data that reflects the new feature distribution. If the skew was a bug, fix the bug and retrain.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you detect skew in a feature that is an embedding vector?'' ``What if the skew is intentional (e.g., a product change upstream)?'' ``How does the log-and-train pattern handle delayed labels?'' ``What are the storage costs of logging all features?''
+\end{interviewq}

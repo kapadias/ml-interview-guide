@@ -1,1 +1,494 @@
+\chapter{Long Context and RAG Systems}
+\label{chap:long_context_rag}
 
+\begin{tldr}
+Modern LLMs face a fundamental tension: context windows are growing (128K--1M+ tokens), yet real-world knowledge bases far exceed any context window. This chapter covers both sides of the problem. Long-context techniques (RoPE scaling, NTK-aware interpolation, YaRN) extend what the model can process in a single forward pass. Retrieval-Augmented Generation (RAG) sidesteps context limits by fetching only the relevant information at query time. A Staff-level engineer must know when to stuff the context window, when to build a RAG pipeline, and when to combine both---because the wrong choice wastes either compute or accuracy.
+\end{tldr}
+
+%==============================================================================
+\section{Long Context Techniques}
+\label{sec:long_context}
+%==============================================================================
+
+\subsection{The Problem: Extending Trained Context Length}
+
+Most LLMs are trained with a fixed maximum sequence length (e.g., 4K or 8K tokens). Deploying them on longer inputs requires \textit{context extension}---modifying the model so it can generalize beyond its training length without full retraining.
+
+The bottleneck is almost always \textbf{positional encoding}. Absolute learned embeddings cannot extrapolate at all. Sinusoidal encodings degrade quickly. The modern approach is Rotary Position Embeddings (RoPE), which encodes relative position by rotating query and key vectors in 2D subspaces.
+
+\subsection{RoPE and Why It Enables Extension}
+
+\textbf{What it is.} RoPE applies a rotation matrix $\mR_{\theta, m}$ to query and key vectors at position $m$. The attention dot product between positions $m$ and $n$ depends only on the relative distance $m - n$, not on absolute position.
+
+\begin{mathresult}{RoPE Attention}
+\[
+\text{Attention}(m, n) = (\mR_{\theta, m}\,\vq)^\top (\mR_{\theta, n}\,\vk) = \vq^\top \mR_{\theta, n-m}\,\vk
+\]
+where $\mR_{\theta, m}$ rotates each pair of dimensions $(2i, 2i{+}1)$ by angle $m \cdot \theta_i$, with base frequencies $\theta_i = \text{base}^{-2i/d}$ and $\text{base} = 10{,}000$ by default.
+\end{mathresult}
+
+\textbf{Why extension is possible.} Because RoPE encodes position through rotation angles, you can manipulate the frequencies to ``compress'' longer sequences into the model's trained range. The key parameter is the \textbf{base frequency}---changing it changes the wavelength of each rotary dimension.
+
+\subsection{Context Extension Methods}
+
+\begin{table}[H]
+\centering
+\caption{RoPE-based context extension methods}
+\begin{tabularx}{\textwidth}{lXXc}
+\toprule
+\textbf{Method} & \textbf{Key Idea} & \textbf{Trade-off} & \textbf{Year} \\
+\midrule
+Position Interpolation & Linearly scale positions by $\frac{L_{\text{train}}}{L_{\text{target}}}$; all frequencies compressed equally & Degrades high-frequency (local) positional info; needs fine-tuning & 2023 \\
+NTK-aware Scaling & Increase RoPE base from 10K to a higher value; spreads compression across frequencies nonuniformly & Better preserves local position; minimal fine-tuning needed & 2023 \\
+YaRN & Combine NTK scaling with temperature correction and attention scaling factor & Best quality at high extension ratios (16--32$\times$); needs brief fine-tuning & 2023 \\
+Dynamic NTK & Adjust the base frequency dynamically at inference based on current sequence length & No fine-tuning needed; quality degrades at extreme lengths & 2023 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Position Interpolation} divides all position indices by a scaling factor $s = L_{\text{target}} / L_{\text{train}}$. A model trained on 4K, extended to 16K, maps position 16,000 to effective position 4,000. Simple but treats all RoPE frequency bands identically, which is suboptimal---low-frequency bands (capturing global position) need more compression than high-frequency bands (capturing local position).
+
+\textbf{NTK-aware scaling} modifies the RoPE base frequency: instead of $\text{base} = 10{,}000$, use $\text{base}' = 10{,}000 \cdot s^{d/(d-2)}$. This applies stronger compression to low-frequency bands and weaker compression to high-frequency bands, preserving local positional resolution. The name comes from the analogy to Neural Tangent Kernel theory, where high-frequency components require finer resolution.
+
+\textbf{YaRN} (Yet another RoPE extensioN) is the most complete approach. It combines NTK-aware base scaling with a per-dimension interpolation strategy (dimensions below a threshold are not scaled at all), plus a learned or computed attention scaling factor ($\sqrt{t}$) that corrects for the entropy increase caused by longer sequences.
+
+\begin{keyinsight}{Why Naive Extrapolation Fails}
+A model trained on 4K tokens has never seen RoPE angles corresponding to position 5,000+. These out-of-distribution angles produce attention patterns the model was never trained to interpret---attention scores become essentially random beyond the training length. Context extension methods work by ensuring all position encodings at the target length map back into the distribution of encodings the model saw during training. The choice of method determines how gracefully this mapping preserves local vs.\ global positional information.
+\end{keyinsight}
+
+\subsection{Non-RoPE Approaches}
+
+Not all long-context solutions modify position encodings:
+
+\begin{itemize}
+    \item \textbf{ALiBi} (Attention with Linear Biases): Adds a position-dependent penalty directly to attention logits. No learned positional parameters. Extrapolates naturally but cannot match RoPE quality at very long contexts.
+    \item \textbf{Ring Attention}: Distributes the long sequence across multiple devices, with each device computing attention for its local chunk and passing KV blocks in a ring topology. Enables context lengths limited only by the number of devices, not memory.
+    \item \textbf{Landmark / infini-attention}: Compress old context into fixed-size memory states, maintaining a ``compressive memory'' that the model can attend to. Trades exact retrieval for bounded memory.
+    \item \textbf{Training on long data}: The most reliable method. Models like Gemini 1.5 and GPT-4 Turbo are trained natively on long sequences (up to 1M--2M tokens). Requires significant compute but avoids all extension artifacts.
+\end{itemize}
+
+%==============================================================================
+\section{RAG Architecture}
+\label{sec:rag_architecture}
+%==============================================================================
+
+\subsection{Core Pipeline}
+
+\textbf{What it is.} Retrieval-Augmented Generation augments an LLM with an external knowledge base. Instead of relying solely on parametric knowledge (memorized during pretraining), the model retrieves relevant documents at query time and conditions its generation on them. This provides up-to-date, verifiable, and domain-specific knowledge without retraining.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    stage/.style={rectangle, draw, rounded corners=4pt, minimum width=2.0cm, minimum height=1.2cm, align=center, font=\small\bfseries},
+    substage/.style={font=\tiny, align=center, text width=1.8cm},
+    arrow/.style={->, thick, >=stealth},
+    data/.style={cylinder, draw, shape border rotate=90, aspect=0.25, minimum height=1.2cm, minimum width=1.4cm, align=center, font=\small}
+]
+    % Query path
+    \node[stage, fill=lightblue] (query) {User\\Query};
+    \node[stage, fill=lightyellow, right=0.7cm of query] (rewrite) {Query\\Processing};
+    \node[stage, fill=lightgreen, right=0.7cm of rewrite] (retriever) {Retriever};
+    \node[stage, fill=orange!25, right=0.7cm of retriever] (reranker) {Reranker};
+    \node[stage, fill=lightblue, right=0.7cm of reranker] (generator) {LLM\\Generator};
+    \node[stage, fill=lightgreen, right=0.7cm of generator] (answer) {Answer};
+
+    % Knowledge base
+    \node[data, fill=lightgray, below=1.2cm of retriever] (kb) {Vector\\Store};
+    \node[stage, fill=red!15, left=0.7cm of kb] (chunker) {Chunker +\\Embedder};
+    \node[data, fill=lightgray, left=0.7cm of chunker] (docs) {Document\\Corpus};
+
+    % Sub-labels
+    \node[substage, below=0.1cm of rewrite] {Rewriting\\HyDE\\Decomposition};
+    \node[substage, below=0.1cm of reranker] {Cross-encoder\\ColBERT\\Top-$k$ filter};
+
+    % Forward arrows
+    \draw[arrow] (query) -- (rewrite);
+    \draw[arrow] (rewrite) -- (retriever);
+    \draw[arrow] (retriever) -- (reranker);
+    \draw[arrow] (reranker) -- (generator);
+    \draw[arrow] (generator) -- (answer);
+
+    % Knowledge base arrows
+    \draw[arrow] (docs) -- (chunker);
+    \draw[arrow] (chunker) -- (kb);
+    \draw[arrow] (kb) -- (retriever);
+
+    % Context arrow
+    \draw[arrow, dashed, deepblue] (reranker.south) -- ++(0, -0.5) -| (generator.south)
+        node[pos=0.25, below, font=\small\itshape] {Top-$k$ chunks as context};
+\end{tikzpicture}
+\caption{Full RAG pipeline. Documents are chunked, embedded, and indexed offline. At query time, the query is processed, relevant chunks are retrieved and reranked, then the top-$k$ chunks are passed as context to the LLM for grounded generation.}
+\label{fig:rag_pipeline}
+\end{figure}
+
+\subsection{Indexing Pipeline (Offline)}
+
+The offline pipeline converts raw documents into a searchable index:
+
+\begin{enumerate}
+    \item \textbf{Document ingestion:} Parse PDFs, HTML, databases, APIs into clean text. Handle tables, images, and metadata extraction.
+    \item \textbf{Chunking:} Split documents into retrievable units (Section~\ref{sec:chunking}).
+    \item \textbf{Embedding:} Encode each chunk into a dense vector using an embedding model (e.g., OpenAI \texttt{text-embedding-3}, BGE, E5, GTE). Typical dimension: 768--1536.
+    \item \textbf{Indexing:} Store embeddings in a vector database (Pinecone, Weaviate, Qdrant, pgvector, FAISS) with approximate nearest neighbor (ANN) search support. Also store the raw text and metadata alongside each vector.
+\end{enumerate}
+
+\subsection{Retrieval Pipeline (Online)}
+
+At query time:
+\begin{enumerate}
+    \item \textbf{Query processing:} Rewrite, expand, or decompose the query (Section~\ref{sec:query_processing}).
+    \item \textbf{Retrieval:} Embed the processed query with the same model used for indexing. Perform ANN search to retrieve top-$N$ candidate chunks ($N = 20$--100).
+    \item \textbf{Reranking:} Score each candidate with a cross-encoder or late-interaction model (Section~\ref{sec:reranking}). Select top-$k$ ($k = 3$--10).
+    \item \textbf{Generation:} Concatenate the top-$k$ chunks into the LLM prompt with appropriate instructions. Generate the answer.
+\end{enumerate}
+
+\textbf{Why two-stage retrieval?} Embedding similarity (bi-encoder) is fast ($O(1)$ with ANN) but imprecise---it compresses all semantics into a single vector. Cross-encoder reranking is precise but slow ($O(N)$ forward passes). The two-stage design gives you both speed and quality.
+
+%==============================================================================
+\section{Chunking Strategies}
+\label{sec:chunking}
+%==============================================================================
+
+Chunking determines the granularity of retrieval. Chunks that are too large dilute relevant information with noise. Chunks that are too small lose context and coherence. This is one of the highest-leverage design decisions in a RAG system.
+
+\begin{table}[H]
+\centering
+\caption{Chunking strategy comparison}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Strategy} & \textbf{How It Works} & \textbf{Strengths} & \textbf{Weaknesses} \\
+\midrule
+Fixed-size & Split every $N$ tokens with $M$-token overlap & Simple, predictable chunk sizes & Splits mid-sentence, ignores document structure \\
+Recursive / structural & Split by headers, paragraphs, sentences; fall back to token splits for large sections & Preserves semantic boundaries & Variable chunk sizes; requires parsing structure \\
+Semantic & Embed sliding windows, split where embedding similarity drops & Chunks align with topic boundaries & Expensive (requires embedding at index time); sensitive to threshold \\
+Document-aware & Custom per-format: tables as units, code blocks intact, slide-per-chunk & Preserves format-specific semantics & Requires per-format logic; high engineering effort \\
+Parent-child & Index small chunks for retrieval precision; retrieve the parent (larger) chunk for context & Best of both: precise retrieval + rich context & More complex indexing; larger context passed to LLM \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Practical defaults:}
+\begin{itemize}
+    \item Chunk size: 256--512 tokens for most text. Smaller (128--256) for precise QA; larger (512--1024) for summarization.
+    \item Overlap: 10--20\% of chunk size. Prevents information loss at boundaries.
+    \item Always preserve sentence boundaries---mid-sentence splits degrade both retrieval quality and generation coherence.
+\end{itemize}
+
+\textbf{The parent-child pattern} deserves special attention. Index small chunks (e.g., individual paragraphs) for high retrieval precision---a tight paragraph about topic X will match query X better than a 2-page section. But when retrieved, return the parent chunk (the full section or page) to give the LLM sufficient context for coherent generation. This decouples retrieval granularity from generation context.
+
+%==============================================================================
+\section{Query Processing}
+\label{sec:query_processing}
+%==============================================================================
+
+Raw user queries are often vague, ambiguous, or poorly phrased for retrieval. Query processing transforms them into more effective retrieval queries.
+
+\subsection{Query Rewriting}
+
+\textbf{What it is.} Use an LLM to reformulate the user's query into one or more retrieval-optimized queries. A conversational question like ``What about the pricing?'' (referring to a previous topic) gets expanded to ``What is the pricing for the enterprise plan mentioned in the product documentation?''
+
+\textbf{When to use.} Multi-turn conversations (where context is implicit), ambiguous queries, or queries with pronouns that need resolution.
+
+\subsection{HyDE (Hypothetical Document Embeddings)}
+
+\textbf{What it is.} Instead of embedding the query directly, ask the LLM to generate a hypothetical answer to the query, then embed that hypothetical answer and use it for retrieval. The insight: a hypothetical answer is linguistically closer to the actual documents than the question is.
+
+\begin{mathresult}{HyDE Retrieval}
+\[
+\text{score}(d) = \text{sim}\!\Big(\text{embed}\big(\text{LLM}(q)\big),\; \text{embed}(d)\Big) \quad \text{vs.\ standard:}\quad \text{sim}\!\big(\text{embed}(q),\; \text{embed}(d)\big)
+\]
+where $q$ is the query, $d$ is a document chunk, and $\text{LLM}(q)$ is the hypothetical answer.
+\end{mathresult}
+
+\textbf{When it helps.} When queries and documents have very different linguistic styles---e.g., a user asks ``How do I fix OOM errors?'' but the documentation says ``Memory management: reduce batch size or enable gradient checkpointing.'' The hypothetical answer bridges this vocabulary gap.
+
+\textbf{Pitfalls.} Adds one LLM call per query (latency). If the LLM hallucinates a completely wrong hypothetical answer, retrieval quality degrades. Works best when the LLM has reasonable domain knowledge to generate plausible answers.
+
+\subsection{Query Decomposition}
+
+\textbf{What it is.} Break a complex multi-part query into simpler sub-queries, retrieve for each independently, then synthesize. ``Compare the pricing and security features of products A and B'' becomes three sub-queries: pricing of A, pricing of B, security features of A vs.\ B.
+
+\textbf{When to use.} Complex analytical questions, comparison queries, multi-hop reasoning where no single chunk contains the full answer.
+
+\begin{table}[H]
+\centering
+\caption{Query processing techniques comparison}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Technique} & \textbf{Best For} & \textbf{Latency Cost} & \textbf{Risk} \\
+\midrule
+Direct embedding & Simple factual queries & None (baseline) & Vocabulary mismatch \\
+Query rewriting & Conversational / ambiguous queries & 1 LLM call & Rewrite may lose intent \\
+HyDE & Style mismatch (query vs.\ docs) & 1 LLM call + 1 embedding & Hallucinated hypothesis \\
+Decomposition & Multi-hop / comparison queries & $N$ LLM calls + $N$ retrievals & Over-decomposition; synthesis errors \\
+Multi-query & Broad / exploratory queries & 1 LLM call + $N$ retrievals & Redundant results \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Reranking}
+\label{sec:reranking}
+%==============================================================================
+
+The retrieval stage casts a wide net using fast but imprecise bi-encoder similarity. Reranking applies a more powerful model to score just the top-$N$ candidates.
+
+\subsection{Cross-Encoder Reranking}
+
+\textbf{What it is.} A cross-encoder processes the query and each candidate chunk \textit{jointly} as a single input: \texttt{[CLS] query [SEP] chunk [SEP]}. Unlike bi-encoders (which embed query and chunk independently), cross-encoders can model fine-grained token-level interactions between query and chunk.
+
+\textbf{Why it is better.} Bi-encoders compress the query into a single vector and the chunk into another single vector, then measure cosine similarity. All the nuance of how specific query terms relate to specific chunk passages is lost. Cross-encoders see both simultaneously and can attend across them.
+
+\textbf{Why it is slower.} A bi-encoder computes one embedding per query. A cross-encoder requires $N$ forward passes (one per candidate). This is why cross-encoders are used for reranking (top 20--100 candidates) rather than full-corpus retrieval.
+
+\subsection{ColBERT: Late Interaction}
+
+\textbf{What it is.} ColBERT keeps query and document \textit{encoded independently} (like a bi-encoder) but computes similarity at the \textit{token level} rather than the vector level. Each query token's embedding is compared against all document token embeddings via MaxSim---the relevance score is the sum of maximum similarities across query tokens.
+
+\begin{mathresult}{ColBERT MaxSim Scoring}
+\[
+\text{score}(q, d) = \sum_{i=1}^{|q|} \max_{j=1}^{|d|} \; \vq_i^\top \vk_j
+\]
+where $\vq_i$ and $\vk_j$ are the contextualized embeddings of the $i$-th query token and $j$-th document token.
+\end{mathresult}
+
+\textbf{Why it matters.} ColBERT achieves near-cross-encoder quality with bi-encoder-like precomputation. Document token embeddings can be stored at index time. Only the lightweight MaxSim scoring happens at query time. This makes it 10--100$\times$ faster than cross-encoder reranking while retaining most of the quality gain.
+
+\textbf{Trade-off.} Storage cost is significant: each document stores one embedding per token, not one embedding per chunk. For a 512-token chunk with 128-dim embeddings, ColBERT stores 64KB vs.\ 512 bytes for a single-vector bi-encoder (125$\times$ more storage).
+
+\begin{table}[H]
+\centering
+\caption{Retrieval and reranking model comparison}
+\begin{tabularx}{\textwidth}{lXXXl}
+\toprule
+\textbf{Model Type} & \textbf{Quality} & \textbf{Speed} & \textbf{Storage} & \textbf{Stage} \\
+\midrule
+Sparse (BM25) & Baseline & Very fast & Low (inverted index) & Retrieval \\
+Bi-encoder & Good & Fast (ANN) & Low (1 vec/chunk) & Retrieval \\
+ColBERT (late interaction) & Very good & Medium & High (1 vec/token) & Retrieval or rerank \\
+Cross-encoder & Best & Slow ($N$ passes) & None (no precompute) & Rerank only \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Practical recommendation.} For most RAG systems: BM25 + bi-encoder hybrid retrieval (combine sparse and dense signals), followed by cross-encoder reranking of top 20--50 candidates. Add ColBERT when storage is not a constraint and you need faster reranking than cross-encoders.
+
+\begin{warningbox}
+\textbf{BM25 is still competitive and often complementary.} Many teams skip keyword-based retrieval entirely, assuming dense embeddings are strictly superior. In practice, BM25 catches exact-match queries (product IDs, error codes, proper nouns) that embedding models miss because they paraphrase rather than match literally. A hybrid of BM25 + dense retrieval with reciprocal rank fusion consistently outperforms either alone. In an interview, always mention this hybrid approach.
+\end{warningbox}
+
+%==============================================================================
+\section{RAG Evaluation}
+\label{sec:rag_eval}
+%==============================================================================
+
+RAG systems have more failure modes than standard generation---the retriever can fail, the generator can ignore the context, or the generator can hallucinate despite having the right context. Evaluation must test each component independently and end-to-end.
+
+\subsection{RAGAS Framework}
+
+RAGAS (Retrieval Augmented Generation Assessment) defines four core metrics that decompose RAG quality into independent dimensions:
+
+\begin{table}[H]
+\centering
+\caption{RAGAS evaluation metrics}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Metric} & \textbf{What It Measures} & \textbf{Failure It Catches} & \textbf{Needs} \\
+\midrule
+Faithfulness & Is the answer supported by the retrieved context? & Hallucination (making up facts not in context) & Answer + context \\
+Answer relevance & Does the answer address the question? & Off-topic or incomplete answers & Answer + question \\
+Context precision & Are the retrieved chunks relevant to the question? & Retriever returning irrelevant content & Context + question \\
+Context recall & Do the retrieved chunks contain the information needed? & Retriever missing key information & Context + ground truth \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{How metrics are computed.} RAGAS uses an LLM-as-judge approach: a strong LLM evaluates each dimension by analyzing the triplet (question, context, answer). For faithfulness, the judge extracts claims from the answer and checks whether each claim is supported by the retrieved context. For context precision, it checks whether each chunk contributes to answering the question.
+
+\subsection{Component-Level vs End-to-End Evaluation}
+
+\textbf{Component-level evaluation} isolates each stage:
+\begin{itemize}
+    \item \textbf{Retriever:} Recall@$k$, MRR, NDCG---standard information retrieval metrics. Use a labeled dataset of (query, relevant passages) pairs. Recall@10 above 0.9 is a typical target.
+    \item \textbf{Reranker:} NDCG@$k$ improvement over the retriever baseline. A good reranker lifts NDCG@5 by 5--15\% relative.
+    \item \textbf{Generator:} Given gold-standard context, does it produce correct answers? This isolates generation quality from retrieval quality.
+\end{itemize}
+
+\textbf{End-to-end evaluation:} Accuracy or F1 on a held-out QA dataset, human evaluation of answer quality, and the RAGAS metrics above. Always evaluate end-to-end because component improvements do not always translate---a better retriever might surface chunks that confuse the generator.
+
+\begin{keyinsight}{The Retriever Is Usually the Bottleneck}
+When a RAG system produces wrong answers, the root cause is retrieval failure roughly 70\% of the time. The generator is good at synthesizing an answer from relevant context; it is bad at working with irrelevant context. Debug the retriever first: check retrieval recall on a sample of failure cases. If the correct passage is not in the top $k$, no amount of prompt engineering or generator improvement will fix the problem. Invest in retrieval quality before tuning the generator.
+\end{keyinsight}
+
+%==============================================================================
+\section{Long Context vs RAG}
+\label{sec:long_context_vs_rag}
+%==============================================================================
+
+The availability of 128K--1M context windows raises a natural question: can we just stuff everything into the context and skip RAG entirely?
+
+\begin{table}[H]
+\centering
+\caption{Long context vs.\ RAG: when to choose each}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Dimension} & \textbf{Long Context (stuff everything)} & \textbf{RAG (retrieve then generate)} \\
+\midrule
+Knowledge base size & Up to context limit (128K--1M tokens) & Unlimited (millions of documents) \\
+Latency & Higher (process entire context) & Lower (process only retrieved chunks) \\
+Cost per query & High (billed per input token) & Lower (fewer input tokens) \\
+Accuracy (needle-in-haystack) & Degrades in middle of long contexts & Depends on retrieval quality \\
+Freshness & Must re-inject updated documents & Update index; no model change \\
+Setup complexity & Low (just concatenate) & High (chunking, embedding, indexing, reranking) \\
+Reasoning across documents & Strong (all docs visible simultaneously) & Weak (only sees retrieved subset) \\
+Failure mode & ``Lost in the middle'' attention degradation & Retrieval misses relevant documents \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{When to use long context:}
+\begin{itemize}
+    \item The corpus fits within the context window (a single long document, a codebase under 100K tokens).
+    \item The task requires cross-document reasoning (comparing clauses across a 50-page contract).
+    \item Latency tolerance is high (offline analysis, batch processing).
+    \item You want simplicity and can afford the inference cost.
+\end{itemize}
+
+\textbf{When to use RAG:}
+\begin{itemize}
+    \item The knowledge base is large (10K+ documents). No context window can hold it all.
+    \item Low-latency, low-cost per-query is required.
+    \item The knowledge base updates frequently and you need real-time freshness.
+    \item You need attribution---knowing exactly which source document supports each claim.
+\end{itemize}
+
+\textbf{When to combine both:} The most robust production pattern is RAG with a generous context window. Retrieve the top 20--30 chunks (filling 10K--30K tokens), then let the long-context model reason across all of them simultaneously. This avoids the ``lost in the middle'' problem of stuffing 100K tokens while retaining the cross-document reasoning strength of long context.
+
+\begin{warningbox}
+\textbf{``Lost in the middle'' is a real production risk.} Liu et al.\ (2024) showed that LLMs pay most attention to the beginning and end of their context window. Information placed in the middle of a 128K context is significantly more likely to be ignored. For long-context approaches, order your documents with the most relevant first and last. For RAG, this means the reranker's ordering directly impacts generation quality---do not treat the top-$k$ results as an unordered set.
+\end{warningbox}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:rag_interview}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q1: Design a RAG system for enterprise document Q\&A over 10 million internal documents.}
+
+\textbf{Strong answer:}
+
+\textbf{Step 1: Problem scoping.}
+\begin{itemize}
+    \item 10M documents $\times$ average 5 pages each = $\sim$50M pages. At $\sim$500 tokens/page, that is $\sim$25B tokens. This far exceeds any context window, so RAG is mandatory.
+    \item Latency target: under 3 seconds end-to-end for interactive Q\&A.
+    \item Must handle multiple formats: PDFs, Confluence pages, Slack threads, email, code repositories.
+\end{itemize}
+
+\textbf{Step 2: Indexing pipeline.}
+\begin{itemize}
+    \item \textbf{Ingestion:} Format-specific parsers (PDF with layout-aware extraction for tables/figures, HTML stripping for Confluence, thread-aware parsing for Slack). Store raw text + metadata (author, date, access permissions, document type).
+    \item \textbf{Chunking:} Recursive strategy---split by document section headers first, then by paragraphs, with 256-token target and 50-token overlap. Tables and code blocks kept as atomic chunks. Use parent-child indexing: retrieve on small chunks, return the parent section to the LLM.
+    \item \textbf{Embedding:} Fine-tuned embedding model on the company's domain (start with a strong base like BGE-large, fine-tune on internal query-document pairs using contrastive loss). 1024-dim embeddings.
+    \item \textbf{Vector store:} Qdrant or pgvector with HNSW indexing. Metadata filtering (date range, document type, access control) is critical for enterprise---users must only retrieve documents they are authorized to see.
+\end{itemize}
+
+\textbf{Step 3: Query pipeline.}
+\begin{itemize}
+    \item Query rewriting for multi-turn conversations (resolve pronouns, expand acronyms using company glossary).
+    \item Hybrid retrieval: BM25 (for exact-match terms, product names, error codes) + dense embedding search, fused with reciprocal rank fusion. Retrieve top 50 candidates.
+    \item Cross-encoder reranking to top 8 chunks.
+    \item Pass reranked chunks to the LLM with a system prompt enforcing grounded generation: ``Answer only based on the provided context. If the context does not contain the answer, say so.''
+    \item Include source citations in the output (chunk ID maps to document + page).
+\end{itemize}
+
+\textbf{Step 4: Evaluation and iteration.}
+\begin{itemize}
+    \item Curate a test set of 500+ question-answer pairs across document types. Measure: retrieval recall@10, RAGAS faithfulness, end-to-end answer accuracy.
+    \item Log all queries, retrieved chunks, and user feedback (thumbs up/down). Use negative feedback to identify retrieval failures and expand the test set.
+    \item A/B test changes to chunking, embedding model, and reranking before deploying.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Can you design an end-to-end system with attention to data ingestion, access control, evaluation, and iteration---not just ``embed and retrieve''? Do you handle the enterprise-specific concerns (permissions, multiple formats, domain adaptation)?
+
+\textbf{Common follow-ups:} ``How do you handle documents that update frequently?'' (Incremental re-indexing with document versioning; track document hashes, re-embed only changed documents.) ``How do you handle multi-modal content like diagrams?'' (Extract diagram captions and surrounding text; optionally use a vision-language model to describe diagrams and index the descriptions.) ``What if users ask questions that span multiple documents?'' (Query decomposition into sub-questions, retrieve for each, then synthesize. Or use an agentic approach with iterative retrieval.)
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q2: Long context window vs.\ RAG---when do you choose each?}
+
+\textbf{Strong answer:}
+
+This is not an either/or decision. The right choice depends on four factors: corpus size, task type, cost constraints, and freshness requirements.
+
+\textbf{Choose long context when:}
+\begin{itemize}
+    \item The corpus fits in the window. Analyzing a single 80-page legal contract (roughly 40K tokens) is a perfect long-context use case. No chunking boundary can split a cross-referenced clause.
+    \item The task requires holistic reasoning across the entire corpus---summarization, theme extraction, contradiction detection. RAG would miss connections between non-adjacent passages that happen to not match the query.
+    \item You are doing batch/offline analysis where cost per query is amortized and latency is not critical.
+\end{itemize}
+
+\textbf{Choose RAG when:}
+\begin{itemize}
+    \item The corpus is large (10K+ documents). No context window can hold it all.
+    \item Cost matters. Sending 128K tokens per query at \$10/M input tokens costs \$1.28 per query. RAG with 5K tokens of context costs \$0.05. At scale, this is the deciding factor.
+    \item The knowledge base changes frequently. Updating a vector index is cheap; re-ingesting a 128K context per query with updated documents is expensive.
+    \item You need source attribution. RAG naturally provides ``this answer came from Document X, page Y.'' Long context makes attribution harder (which part of 128K tokens supported the answer?).
+\end{itemize}
+
+\textbf{Combine both when:}
+\begin{itemize}
+    \item Use RAG to retrieve the top 20--30 relevant chunks, then use a long-context model to reason across all of them jointly. This is the strongest pattern for production systems---you get the precision of retrieval and the cross-chunk reasoning of long context without the cost of stuffing the full corpus.
+    \item For multi-hop questions: retrieve, generate an intermediate answer, retrieve again based on the intermediate answer, then generate the final answer. This ``retrieve-and-reason'' loop requires both capabilities.
+\end{itemize}
+
+\textbf{The cost argument wins most enterprise decisions:} a 128K-token query is 25$\times$ more expensive than a 5K-token RAG query. At 10K queries/day, that is the difference between \$500/day and \$12,800/day. Unless long context demonstrably improves quality enough to justify the cost, RAG is the production default.
+
+\textbf{What the interviewer is testing:} Nuanced engineering judgment. Can you reason about cost, latency, and quality simultaneously? Do you understand the ``lost in the middle'' problem? Do you recognize that the hybrid approach is usually optimal?
+
+\textbf{Common follow-ups:} ``What is the `lost in the middle' problem and how do you mitigate it?'' (Information in the middle of long contexts gets lower attention; mitigate by placing key documents at the start and end, or by using RAG to limit context to only relevant chunks.) ``How does the cost change with caching?'' (Prefix caching at the API level or KV-cache reuse can reduce cost for repeated prefixes, making long context cheaper for multi-turn conversations over the same document.) ``What about latency?'' (Long-context prefill is $O(n^2)$ for attention, so 128K is $\sim$256$\times$ slower to prefill than 8K. RAG queries with 5K context have fast prefill.)
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q3: How do you evaluate RAG quality and debug failures?}
+
+\textbf{Strong answer:}
+
+I evaluate RAG at three levels: component, end-to-end, and production monitoring.
+
+\textbf{Component evaluation:}
+\begin{itemize}
+    \item \textbf{Retriever:} Recall@$k$ on a labeled dataset of (query, relevant passage) pairs. If recall@10 is below 0.85, focus on improving retrieval before touching the generator. Also measure MRR for factoid questions where one passage is sufficient.
+    \item \textbf{Reranker:} NDCG@$k$ improvement over the retriever baseline. A good reranker improves NDCG@5 by 5--15\% relative.
+    \item \textbf{Generator (in isolation):} Given gold-standard context, what fraction of questions does it answer correctly? This establishes the upper bound---if the generator fails with perfect context, prompt engineering or model selection is needed.
+\end{itemize}
+
+\textbf{End-to-end evaluation (RAGAS):}
+\begin{itemize}
+    \item \textbf{Faithfulness:} Extract claims from the generated answer, check each against the retrieved context using an LLM judge. Target: above 0.9. Below 0.8 means the model is hallucinating despite having context.
+    \item \textbf{Answer relevance:} Does the answer address the question? Measured by generating questions from the answer and checking semantic similarity to the original question.
+    \item \textbf{Context precision / recall:} Is the right context being retrieved, and is it sufficient? Low context recall with high faithfulness means the model is correctly refusing to hallucinate but the retriever is failing.
+\end{itemize}
+
+\textbf{Debugging failures (the triage protocol):}
+\begin{enumerate}
+    \item \textbf{Check retrieval first.} Sample 50 failure cases. For each, inspect the retrieved chunks. In roughly 70\% of cases, the correct passage is not in the retrieved set at all. Fix: better chunking, embedding model fine-tuning, hybrid retrieval, query rewriting.
+    \item \textbf{Check reranking.} If the correct passage was retrieved but ranked low (below top-$k$ cutoff), the reranker is the bottleneck. Fix: better reranking model, increase $k$.
+    \item \textbf{Check generation.} If the correct passage is in the top-$k$ but the answer is wrong, the generator is failing---either ignoring the context, misinterpreting it, or over-indexing on its parametric knowledge. Fix: prompt engineering (``answer only from context''), few-shot examples, or switching to a model that is better at grounded generation.
+    \item \textbf{Check the question.} Some questions are genuinely unanswerable from the knowledge base. Build a classifier for ``answerable vs.\ not answerable'' and route unanswerable questions to a graceful fallback.
+\end{enumerate}
+
+\textbf{Production monitoring:}
+\begin{itemize}
+    \item Log every query, the retrieved chunks, and the generated answer.
+    \item Track user feedback (thumbs up/down, follow-up questions as a negative signal).
+    \item Monitor retrieval latency (p50, p99) and index freshness.
+    \item Run automated RAGAS evaluations nightly on a rolling sample of logged queries.
+    \item Alert on faithfulness score drops---this catches both retrieval degradation and model regressions.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systematic debugging methodology. Do you evaluate components independently before jumping to conclusions? Do you know that retrieval is usually the bottleneck? Do you have a monitoring strategy for production?
+
+\textbf{Common follow-ups:} ``How do you build the labeled dataset for retrieval evaluation?'' (Start with synthetic generation: use an LLM to generate questions from document chunks, then validate with humans. Supplement with logged user queries that received positive feedback.) ``What if faithfulness is high but users are still unhappy?'' (Check answer relevance and completeness. The model may be faithfully answering the wrong question, or providing technically correct but unhelpful responses.) ``How do you handle evaluation when there is no ground truth?'' (LLM-as-judge for faithfulness and relevance; human evaluation on a weekly sample; track implicit feedback signals like reformulation rate.)
+\end{interviewq}
