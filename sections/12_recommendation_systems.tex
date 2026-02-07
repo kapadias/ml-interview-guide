@@ -1,0 +1,556 @@
+\chapter{Recommendation Systems}
+\label{chap:recommendation}
+
+\begin{tldr}
+This chapter covers the complete landscape of recommendation systems: collaborative filtering (matrix factorization, neural CF), content-based methods, deep learning approaches (Two-Tower, Wide\&Deep, DCN), and sequential recommendations. We emphasize practical system design patterns including two-stage retrieval-ranking architecture, cold start solutions, and real-time vs. batch tradeoffs.
+\end{tldr}
+
+\section{Recommendation System Fundamentals}
+\label{sec:recsys_fundamentals}
+
+\subsection{Problem Formulation}
+
+\begin{definition}[Recommendation Problem]
+Given:
+\begin{itemize}
+    \item Users $\mathcal{U} = \{u_1, \ldots, u_M\}$
+    \item Items $\mathcal{I} = \{i_1, \ldots, i_N\}$
+    \item Interaction matrix $\mathbf{R} \in \mathbb{R}^{M \times N}$ (sparse)
+\end{itemize}
+Goal: Predict user preferences for unobserved items, or rank items for each user.
+\end{definition}
+
+\subsection{Types of Feedback}
+
+\begin{table}[H]
+\centering
+\caption{Explicit vs. implicit feedback}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Type} & \textbf{Examples} & \textbf{Characteristics} \\
+\midrule
+Explicit & Ratings (1-5 stars), reviews, likes/dislikes & Sparse, high signal, clear preference \\
+Implicit & Clicks, views, purchases, time spent & Dense, noisy, only positive signal \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}
+Most production systems use \textbf{implicit feedback} because:
+\begin{itemize}
+    \item Much more abundant (every interaction vs. rare ratings)
+    \item Less effort from users
+    \item More representative of actual behavior
+\end{itemize}
+Challenge: Non-interaction doesn't mean dislike—it might mean unawareness.
+\end{keyinsight}
+
+\subsection{Taxonomy of Approaches}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.7cm, fill=lightblue, font=\small, align=center},
+    leaf/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.5cm, fill=lightgreen, font=\footnotesize}
+]
+    \node[box] (root) {Recommendation};
+    
+    \node[box, below left=1cm and 1.5cm of root] (cf) {Collaborative\\Filtering};
+    \node[box, below=1cm of root] (cb) {Content-Based};
+    \node[box, below right=1cm and 1.5cm of root] (hybrid) {Hybrid};
+    
+    \node[leaf, below left=0.8cm and 0cm of cf] (mf) {Matrix Factorization};
+    \node[leaf, below right=0.8cm and 0cm of cf] (ncf) {Neural CF};
+    
+    \draw[-] (root) -- (cf);
+    \draw[-] (root) -- (cb);
+    \draw[-] (root) -- (hybrid);
+    \draw[-] (cf) -- (mf);
+    \draw[-] (cf) -- (ncf);
+\end{tikzpicture}
+\caption{Taxonomy of recommendation approaches.}
+\end{figure}
+
+%==============================================================================
+\section{Collaborative Filtering}
+\label{sec:collaborative_filtering}
+%==============================================================================
+
+\subsection{Matrix Factorization}
+
+\subsubsection{Basic Model}
+
+\begin{mathresult}{Matrix Factorization}
+Decompose interaction matrix into user and item embeddings:
+\begin{equation}
+\mathbf{R} \approx \mathbf{U}\mathbf{V}^T
+\end{equation}
+where $\mathbf{U} \in \mathbb{R}^{M \times k}$ and $\mathbf{V} \in \mathbb{R}^{N \times k}$.
+
+Predicted rating: $\hat{r}_{ui} = \mathbf{u}_u^T \mathbf{v}_i$
+\end{mathresult}
+
+\subsubsection{Loss Functions}
+
+\textbf{For explicit feedback (MSE)}:
+\begin{equation}
+\mathcal{L} = \sum_{(u,i) \in \mathcal{O}} (r_{ui} - \mathbf{u}_u^T \mathbf{v}_i)^2 + \lambda(\|\mathbf{U}\|_F^2 + \|\mathbf{V}\|_F^2)
+\end{equation}
+
+\textbf{For implicit feedback (BPR)}:
+\begin{equation}
+\mathcal{L}_{BPR} = -\sum_{(u,i,j) \in \mathcal{D}} \log \sigma(\hat{r}_{ui} - \hat{r}_{uj})
+\end{equation}
+where $i$ is a positive item (interacted) and $j$ is negative (not interacted).
+
+\subsubsection{Adding Biases}
+
+\begin{equation}
+\hat{r}_{ui} = \mu + b_u + b_i + \mathbf{u}_u^T \mathbf{v}_i
+\end{equation}
+
+\begin{itemize}
+    \item $\mu$: Global average
+    \item $b_u$: User bias (e.g., harsh vs. lenient rater)
+    \item $b_i$: Item bias (e.g., generally popular items)
+\end{itemize}
+
+\subsubsection{Optimization Methods}
+
+\begin{table}[H]
+\centering
+\caption{Matrix factorization optimization methods}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Method} & \textbf{Description} & \textbf{When to Use} \\
+\midrule
+SGD & Update on random samples & Large scale, online learning \\
+ALS & Alternating least squares & Parallelizable, explicit feedback \\
+Weighted ALS & Weight by confidence & Implicit feedback \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Neural Collaborative Filtering (NCF)}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    box/.style={rectangle, draw, minimum width=1.5cm, minimum height=0.6cm, rounded corners, font=\small},
+    emb/.style={box, fill=lightblue},
+    mlp/.style={box, fill=lightgreen},
+    concat/.style={box, fill=lightyellow}
+]
+    % Input
+    \node[emb] (user_emb) {User Emb};
+    \node[emb, right=2cm of user_emb] (item_emb) {Item Emb};
+    
+    % GMF path
+    \node[concat, below=1cm of $(user_emb)!0.5!(item_emb)$, xshift=-2cm] (gmf) {Element-wise $\odot$};
+    
+    % MLP path
+    \node[concat, below=1cm of $(user_emb)!0.5!(item_emb)$, xshift=2cm] (concat) {Concatenate};
+    \node[mlp, below=0.5cm of concat] (mlp1) {MLP Layer};
+    \node[mlp, below=0.5cm of mlp1] (mlp2) {MLP Layer};
+    
+    % Fusion
+    \node[concat, below=1.5cm of $(gmf)!0.5!(mlp2)$] (fusion) {Concatenate};
+    \node[box, fill=orange!30, below=0.5cm of fusion] (output) {Output Layer};
+    
+    % Edges
+    \draw[->] (user_emb) -- (gmf);
+    \draw[->] (item_emb) -- (gmf);
+    \draw[->] (user_emb) -- (concat);
+    \draw[->] (item_emb) -- (concat);
+    \draw[->] (concat) -- (mlp1);
+    \draw[->] (mlp1) -- (mlp2);
+    \draw[->] (gmf) -- (fusion);
+    \draw[->] (mlp2) -- (fusion);
+    \draw[->] (fusion) -- (output);
+    
+    % Labels
+    \node[left=0.5cm of gmf, font=\small\itshape] {GMF};
+    \node[right=0.5cm of mlp1, font=\small\itshape] {MLP};
+\end{tikzpicture}
+\caption{Neural Collaborative Filtering (NeuMF): combines GMF and MLP.}
+\label{fig:ncf}
+\end{figure}
+
+\subsubsection{Components}
+
+\textbf{Generalized Matrix Factorization (GMF)}:
+\begin{equation}
+\phi_{GMF}(\mathbf{u}, \mathbf{v}) = \mathbf{u} \odot \mathbf{v}
+\end{equation}
+
+\textbf{MLP Component}:
+\begin{equation}
+\phi_{MLP}(\mathbf{u}, \mathbf{v}) = \text{MLP}([\mathbf{u}; \mathbf{v}])
+\end{equation}
+
+\textbf{NeuMF Fusion}:
+\begin{equation}
+\hat{y}_{ui} = \sigma(\mathbf{w}^T[\phi_{GMF}; \phi_{MLP}])
+\end{equation}
+
+%==============================================================================
+\section{Deep Learning for Recommendations}
+\label{sec:deep_recsys}
+%==============================================================================
+
+\subsection{Two-Tower Architecture}
+
+\begin{mathresult}{Two-Tower Model}
+Separate encoders for users and items:
+\begin{align}
+\mathbf{u} &= f_{user}(\text{user features}; \theta_u) \\
+\mathbf{v} &= f_{item}(\text{item features}; \theta_v) \\
+\text{score} &= \mathbf{u}^T \mathbf{v}
+\end{align}
+\end{mathresult}
+
+\textbf{Key advantages}:
+\begin{itemize}
+    \item Item embeddings can be pre-computed
+    \item Enables ANN search for retrieval
+    \item Scales to billions of items
+\end{itemize}
+
+\textbf{Training}:
+\begin{itemize}
+    \item Softmax cross-entropy or InfoNCE with in-batch negatives
+    \item Additional hard negative sampling
+\end{itemize}
+
+\subsection{Wide \& Deep}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.6cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.6cm, rounded corners, font=\small},
+    wide/.style={box, fill=lightblue},
+    deep/.style={box, fill=lightgreen}
+]
+    % Wide
+    \node[wide] (wide_in) {Sparse Features};
+    \node[wide, below=0.5cm of wide_in] (cross) {Cross-Product};
+    
+    % Deep
+    \node[deep, right=2cm of wide_in] (deep_in) {Dense + Sparse};
+    \node[deep, below=0.5cm of deep_in] (emb) {Embeddings};
+    \node[deep, below=0.5cm of emb] (mlp1) {MLP};
+    \node[deep, below=0.5cm of mlp1] (mlp2) {MLP};
+    
+    % Output
+    \node[box, fill=orange!30, below=1cm of $(cross)!0.5!(mlp2)$] (output) {Output};
+    
+    % Edges
+    \draw[->] (wide_in) -- (cross);
+    \draw[->] (deep_in) -- (emb);
+    \draw[->] (emb) -- (mlp1);
+    \draw[->] (mlp1) -- (mlp2);
+    \draw[->] (cross) -- (output);
+    \draw[->] (mlp2) -- (output);
+    
+    % Labels
+    \node[left=0.3cm of cross, font=\small\itshape] {Memorization};
+    \node[right=0.3cm of mlp1, font=\small\itshape] {Generalization};
+\end{tikzpicture}
+\caption{Wide \& Deep: combines memorization (wide) with generalization (deep).}
+\end{figure}
+
+\textbf{Wide component}: Memorize specific feature combinations
+\begin{equation}
+y_{wide} = \mathbf{w}^T[\mathbf{x}, \phi(\mathbf{x})]
+\end{equation}
+where $\phi(\mathbf{x})$ is cross-product transformation.
+
+\textbf{Deep component}: Generalize from embeddings
+\begin{equation}
+y_{deep} = \text{MLP}(\text{Embed}(\mathbf{x}))
+\end{equation}
+
+\textbf{Combined}:
+\begin{equation}
+\hat{y} = \sigma(y_{wide} + y_{deep})
+\end{equation}
+
+\subsection{Deep Cross Network (DCN)}
+
+\textbf{Problem with Wide\&Deep}: Manual feature engineering for cross-products.
+
+\textbf{DCN solution}: Learn cross features automatically.
+
+\begin{mathresult}{Cross Network Layer}
+\begin{equation}
+\mathbf{x}_{l+1} = \mathbf{x}_0 \mathbf{x}_l^T \mathbf{w}_l + \mathbf{b}_l + \mathbf{x}_l
+\end{equation}
+\end{mathresult}
+
+Each layer adds one degree of feature interaction:
+\begin{itemize}
+    \item Layer 1: 2nd order interactions
+    \item Layer 2: 3rd order interactions
+    \item Layer $l$: $(l+1)$th order interactions
+\end{itemize}
+
+\subsection{Feature Interaction Models}
+
+\begin{table}[H]
+\centering
+\caption{Feature interaction model comparison}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Model} & \textbf{Interaction Type} & \textbf{Order} & \textbf{Complexity} \\
+\midrule
+FM & Factorized & 2nd order & $O(nk)$ \\
+DeepFM & FM + MLP & 2nd + implicit higher & Medium \\
+DCN & Cross network & Explicit up to $L$th & Low per layer \\
+AutoInt & Self-attention & Automatic & Higher \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Sequential Recommendations}
+\label{sec:sequential_recsys}
+%==============================================================================
+
+\subsection{Problem Setting}
+
+Given user's interaction sequence $S = (s_1, s_2, \ldots, s_t)$, predict next item $s_{t+1}$.
+
+\subsection{Self-Attention for Sequential Recommendation (SASRec)}
+
+\begin{mathresult}{SASRec}
+Apply Transformer decoder to item sequences:
+\begin{enumerate}
+    \item Embed items + positions
+    \item Stack self-attention layers (causal mask)
+    \item Predict next item from last position
+\end{enumerate}
+\end{mathresult}
+
+\textbf{Training}: Binary cross-entropy with negative sampling
+\begin{equation}
+\mathcal{L} = -\sum_{t=1}^{|S|} [\log \sigma(\hat{r}_{s_{t+1}}) + \sum_{j \in \text{neg}} \log(1 - \sigma(\hat{r}_j))]
+\end{equation}
+
+\subsection{BERT4Rec}
+
+Apply BERT-style masked prediction to sequences:
+\begin{itemize}
+    \item Mask random items in sequence
+    \item Predict masked items (not just next)
+    \item Bidirectional attention (unlike SASRec)
+\end{itemize}
+
+\textbf{Trade-off}: Better representation learning, but can't use future context at inference.
+
+%==============================================================================
+\section{System Design for Recommendations}
+\label{sec:recsys_system}
+%==============================================================================
+
+\subsection{Two-Stage Architecture}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    box/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.8cm, rounded corners, font=\small},
+    stage/.style={box, fill=lightblue, align=center}
+]
+    % Stages
+    \node[box, fill=lightgray] (corpus) {Item Corpus (millions)};
+    \node[stage, right=1cm of corpus] (retrieval) {Candidate\\Generation};
+    \node[stage, right=1cm of retrieval] (ranking) {Ranking};
+    \node[stage, right=1cm of ranking] (rerank) {Re-ranking /\\Business Logic};
+    \node[box, fill=lightgreen, right=1cm of rerank] (output) {Top K};
+    
+    % Numbers
+    \node[below=0.2cm of retrieval, font=\small] {$\rightarrow$ 1000s};
+    \node[below=0.2cm of ranking, font=\small] {$\rightarrow$ 100s};
+    \node[below=0.2cm of rerank, font=\small] {$\rightarrow$ 10s};
+    
+    % Edges
+    \draw[->] (corpus) -- (retrieval);
+    \draw[->] (retrieval) -- (ranking);
+    \draw[->] (ranking) -- (rerank);
+    \draw[->] (rerank) -- (output);
+\end{tikzpicture}
+\caption{Multi-stage recommendation pipeline.}
+\end{figure}
+
+\subsubsection{Stage 1: Candidate Generation}
+
+\textbf{Goal}: High recall, retrieve relevant candidates from millions.
+
+\textbf{Methods}:
+\begin{itemize}
+    \item Two-Tower model + ANN index
+    \item Multiple retrieval paths (collaborative, content, popularity)
+    \item Low latency critical (~10ms)
+\end{itemize}
+
+\subsubsection{Stage 2: Ranking}
+
+\textbf{Goal}: Precise scoring of candidates.
+
+\textbf{Methods}:
+\begin{itemize}
+    \item Feature-rich models (Wide\&Deep, DCN)
+    \item Cross-features between user and item
+    \item More compute per item (~50ms for 1000 items)
+\end{itemize}
+
+\subsubsection{Stage 3: Re-ranking}
+
+\textbf{Goals}: Business logic, diversity, freshness.
+
+\textbf{Considerations}:
+\begin{itemize}
+    \item Diversification (avoid showing similar items)
+    \item Promotion/boosting rules
+    \item Exploration for new items
+    \item Fairness constraints
+\end{itemize}
+
+\subsection{Cold Start Problem}
+
+\begin{definition}[Cold Start]
+The challenge of recommending for new users (no interaction history) or new items (no user interactions yet).
+\end{definition}
+
+\begin{table}[H]
+\centering
+\caption{Cold start solutions}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Problem} & \textbf{Solution} & \textbf{Details} \\
+\midrule
+New user & Popularity baseline & Most popular items \\
+New user & Content-based & Use demographic/context features \\
+New user & Onboarding & Ask preferences explicitly \\
+New item & Content-based & Use item attributes \\
+New item & Exploration & Deliberately show to collect feedback \\
+Both & Hybrid models & Combine CF + content \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Real-Time vs. Batch}
+
+\begin{table}[H]
+\centering
+\caption{Real-time vs. batch recommendations}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Batch} & \textbf{Real-Time} \\
+\midrule
+Freshness & Hours old & Up to seconds \\
+Compute & Offline, more complex & Online, latency constrained \\
+Personalization & Static user state & Dynamic (recent actions) \\
+Use case & Email campaigns & Homepage, in-session \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Hybrid approach}:
+\begin{itemize}
+    \item Pre-compute candidate lists (batch)
+    \item Real-time re-ranking based on session context
+    \item Streaming feature updates
+\end{itemize}
+
+%==============================================================================
+\section{Evaluation Metrics}
+\label{sec:recsys_metrics}
+%==============================================================================
+
+\subsection{Accuracy Metrics}
+
+\textbf{Recall@K}: Fraction of relevant items in top-K
+\begin{equation}
+\text{Recall@K} = \frac{|\text{Relevant} \cap \text{Top-K}|}{|\text{Relevant}|}
+\end{equation}
+
+\textbf{Precision@K}: Fraction of top-K that are relevant
+\begin{equation}
+\text{Precision@K} = \frac{|\text{Relevant} \cap \text{Top-K}|}{K}
+\end{equation}
+
+\textbf{NDCG@K}: Normalized discounted cumulative gain
+\begin{equation}
+\text{NDCG@K} = \frac{\text{DCG@K}}{\text{IDCG@K}}, \quad \text{DCG@K} = \sum_{i=1}^{K} \frac{2^{rel_i} - 1}{\log_2(i+1)}
+\end{equation}
+
+\textbf{MRR}: Mean reciprocal rank
+\begin{equation}
+\text{MRR} = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_i}
+\end{equation}
+
+\subsection{Beyond Accuracy}
+
+\begin{table}[H]
+\centering
+\caption{Beyond-accuracy metrics}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Metric} & \textbf{What It Measures} \\
+\midrule
+Coverage & Fraction of catalog recommended \\
+Diversity & Dissimilarity within recommendation list \\
+Novelty & How ``surprising'' recommendations are \\
+Serendipity & Relevant AND unexpected \\
+Fairness & Equal exposure across items/groups \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{interviewq}
+\textbf{Q: Design a recommendation system for a video streaming platform with 100M users and 1M videos.}
+
+\textbf{System Design:}
+
+\textbf{1. Data}:
+\begin{itemize}
+    \item User features: Demographics, watch history, preferences
+    \item Video features: Genre, cast, duration, thumbnail
+    \item Interactions: Watch time, completion rate, explicit ratings
+\end{itemize}
+
+\textbf{2. Candidate Generation (target: 10ms)}:
+\begin{itemize}
+    \item Two-Tower model: User encoder + Video encoder
+    \item Pre-compute video embeddings, store in HNSW index
+    \item Multiple sources: Collaborative, content-based, trending
+    \item Retrieve ~1000 candidates per source
+\end{itemize}
+
+\textbf{3. Ranking (target: 50ms)}:
+\begin{itemize}
+    \item DCN or DeepFM with rich features
+    \item User-video cross features
+    \item Context features (time, device, location)
+    \item Score ~3000 candidates, keep top 100
+\end{itemize}
+
+\textbf{4. Re-ranking}:
+\begin{itemize}
+    \item Diversify by genre/type
+    \item Freshness boosting for new releases
+    \item Continue watching prioritization
+    \item Business rules (promoted content)
+\end{itemize}
+
+\textbf{5. Online Learning}:
+\begin{itemize}
+    \item Stream watch events to update features
+    \item Periodic model retraining (daily/weekly)
+    \item A/B testing framework for model comparison
+\end{itemize}
+\end{interviewq}

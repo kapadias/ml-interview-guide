@@ -1,0 +1,1132 @@
+\chapter{Similarity and Metric Learning Architectures}
+\label{chap:similarity_architectures}
+
+\begin{tldr}
+This chapter covers architectures for learning similarity and embeddings: Siamese networks for verification, Triplet networks for ranking, Two-Tower (Dual Encoder) for large-scale retrieval, Cross-Encoder for high-precision reranking, and Poly-Encoder as a middle ground. Understanding when to use each architecture—and how to combine them in production systems—is critical for staff-level ML interviews.
+\end{tldr}
+
+\section{The Similarity Learning Problem}
+\label{sec:similarity_problem}
+
+\subsection{Problem Formulation}
+
+Given items from a space $\mathcal{X}$, we want to learn a function that measures semantic similarity. There are two main approaches:
+
+\begin{definition}[Metric Learning]
+Learn an embedding function $f: \mathcal{X} \to \R^d$ such that a simple distance metric in the embedding space reflects semantic similarity:
+\begin{equation}
+\text{sim}(x_i, x_j) \approx g(f(x_i), f(x_j))
+\end{equation}
+where $g$ is typically cosine similarity or negative Euclidean distance.
+\end{definition}
+
+\begin{definition}[Direct Similarity Learning]
+Learn a function $s: \mathcal{X} \times \mathcal{X} \to \R$ that directly outputs similarity scores:
+\begin{equation}
+\text{sim}(x_i, x_j) = s(x_i, x_j; \theta)
+\end{equation}
+\end{definition}
+
+\subsection{Why This Matters}
+
+Similarity learning underpins:
+\begin{itemize}
+    \item \textbf{Information retrieval}: Find documents similar to a query
+    \item \textbf{Recommendation systems}: Find items similar to user preferences
+    \item \textbf{Face recognition}: Verify if two faces are the same person
+    \item \textbf{Duplicate detection}: Find near-duplicate content
+    \item \textbf{Semantic search}: Find passages that answer a question
+    \item \textbf{Few-shot learning}: Classify by similarity to examples
+\end{itemize}
+
+\subsection{The Efficiency-Quality Trade-off}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.2]
+    % Axes
+    \draw[->] (0,0) -- (6,0) node[right] {Quality};
+    \draw[->] (0,0) -- (0,4) node[above] {Efficiency};
+    
+    % Points
+    \fill[blue] (1.5, 3.5) circle (3pt) node[above right] {Two-Tower};
+    \fill[green!70!black] (3, 2.5) circle (3pt) node[above right] {Poly-Encoder};
+    \fill[red] (5, 0.8) circle (3pt) node[above right] {Cross-Encoder};
+    \fill[orange] (2.5, 3) circle (3pt) node[below right] {Siamese};
+    
+    % Annotations
+    \node[font=\small, blue] at (1.5, 3) {O(n+m)};
+    \node[font=\small, green!70!black] at (3, 2) {O(n+mk)};
+    \node[font=\small, red] at (5, 0.3) {O(nm)};
+\end{tikzpicture}
+\caption{Trade-off between matching quality and computational efficiency for similarity architectures.}
+\label{fig:similarity_tradeoff}
+\end{figure}
+
+The fundamental trade-off:
+\begin{itemize}
+    \item \textbf{More interaction} between query and candidate = higher quality
+    \item \textbf{Less interaction} = items can be pre-computed = faster retrieval
+\end{itemize}
+
+%==============================================================================
+\section{Siamese Networks}
+\label{sec:siamese}
+%==============================================================================
+
+\subsection{Architecture Overview}
+
+Siamese networks process two inputs through identical (weight-shared) encoders and compute similarity in embedding space.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.8cm, rounded corners},
+    encoder/.style={box, fill=lightblue},
+    input/.style={box, fill=lightgray},
+    output/.style={box, fill=lightgreen}
+]
+    % Inputs
+    \node[input] (x1) {Input $x_1$};
+    \node[input, right=3cm of x1] (x2) {Input $x_2$};
+    
+    % Encoders
+    \node[encoder, below=1cm of x1] (enc1) {Encoder $f_\theta$};
+    \node[encoder, below=1cm of x2] (enc2) {Encoder $f_\theta$};
+    
+    % Weight sharing indicator
+    \draw[<->, thick, dashed, orange] (enc1.east) -- (enc2.west) node[midway, above] {Shared weights};
+    
+    % Embeddings
+    \node[below=1cm of enc1] (z1) {$\vz_1 = f_\theta(x_1)$};
+    \node[below=1cm of enc2] (z2) {$\vz_2 = f_\theta(x_2)$};
+    
+    % Similarity computation
+    \node[output, below=1.5cm of $(z1)!0.5!(z2)$] (sim) {$d(\vz_1, \vz_2)$ or $\cos(\vz_1, \vz_2)$};
+    
+    % Loss
+    \node[below=0.8cm of sim] (loss) {Contrastive / Triplet Loss};
+    
+    % Edges
+    \draw[->] (x1) -- (enc1);
+    \draw[->] (x2) -- (enc2);
+    \draw[->] (enc1) -- (z1);
+    \draw[->] (enc2) -- (z2);
+    \draw[->] (z1) -- (sim);
+    \draw[->] (z2) -- (sim);
+    \draw[->] (sim) -- (loss);
+\end{tikzpicture}
+\caption{Siamese network architecture with shared encoder weights.}
+\label{fig:siamese_arch}
+\end{figure}
+
+\subsection{Mathematical Formulation}
+
+Let $f_\theta: \mathcal{X} \to \R^d$ be the shared encoder with parameters $\theta$.
+
+For inputs $x_1, x_2$:
+\begin{align}
+\vz_1 &= f_\theta(x_1) \\
+\vz_2 &= f_\theta(x_2) \\
+\text{similarity} &= g(\vz_1, \vz_2)
+\end{align}
+
+Common similarity functions:
+\begin{align}
+\text{Cosine:} \quad g(\vz_1, \vz_2) &= \frac{\vz_1^T \vz_2}{\|\vz_1\| \|\vz_2\|} \\
+\text{Euclidean:} \quad g(\vz_1, \vz_2) &= -\|\vz_1 - \vz_2\|_2 \\
+\text{Learned:} \quad g(\vz_1, \vz_2) &= \text{MLP}([\vz_1; \vz_2; |\vz_1 - \vz_2|; \vz_1 \odot \vz_2])
+\end{align}
+
+\subsection{Why Weight Sharing?}
+
+\begin{proposition}[Embedding Space Consistency]
+Weight sharing ensures inputs of the same type are mapped to a consistent embedding space, enabling meaningful distance comparisons.
+\end{proposition}
+
+Without weight sharing:
+\begin{itemize}
+    \item Two encoders could learn completely different representations
+    \item Distance in ``combined'' space would be meaningless
+    \item Need paired training data for both encoders
+\end{itemize}
+
+With weight sharing:
+\begin{itemize}
+    \item Single, consistent embedding space
+    \item Any two items can be compared
+    \item More parameter-efficient
+    \item Acts as regularization
+\end{itemize}
+
+\subsection{Training Siamese Networks}
+
+\subsubsection{With Contrastive Loss}
+
+For pair $(x_1, x_2)$ with label $y \in \{0, 1\}$ (1 = similar):
+\begin{equation}
+\loss = y \cdot d(\vz_1, \vz_2)^2 + (1-y) \cdot \max(0, m - d(\vz_1, \vz_2))^2
+\end{equation}
+
+\subsubsection{With Binary Cross-Entropy}
+
+Transform distance to probability:
+\begin{equation}
+p = \sigma(-\alpha \cdot d(\vz_1, \vz_2) + \beta)
+\end{equation}
+Then use standard BCE loss.
+
+\subsubsection{Pair Sampling Strategies}
+
+\begin{table}[H]
+\centering
+\caption{Pair sampling strategies for Siamese networks}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Strategy} & \textbf{Description} & \textbf{Trade-off} \\
+\midrule
+Random & Random positive and negative pairs & Many easy negatives, slow learning \\
+Hard negative mining & Find most similar negative pairs & Can cause training instability \\
+Semi-hard mining & Negatives within margin of positives & Good balance \\
+Online mining & Mine within each batch & Efficient, commonly used \\
+Curriculum & Start easy, increase difficulty & Can improve convergence \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Applications}
+
+\subsubsection{Face Verification}
+
+\begin{itemize}
+    \item \textbf{Task}: Given two face images, determine if same person
+    \item \textbf{Architecture}: CNN encoder (ResNet, etc.)
+    \item \textbf{Training}: Pairs of same/different person images
+    \item \textbf{Inference}: Compute embedding distance, threshold
+\end{itemize}
+
+\subsubsection{Signature Verification}
+
+\begin{itemize}
+    \item \textbf{Task}: Verify if signature matches reference
+    \item \textbf{Challenge}: Few examples per person, many forgery types
+    \item \textbf{Advantage}: Siamese can work with single reference example
+\end{itemize}
+
+\subsubsection{One-Shot Learning}
+
+\begin{itemize}
+    \item \textbf{Task}: Classify with one example per class
+    \item \textbf{Method}: Compare query to each class example
+    \item \textbf{Prediction}: Class with highest similarity
+\end{itemize}
+
+\begin{keyinsight}
+Siamese networks excel when:
+\begin{enumerate}
+    \item You need to compare items of the \textbf{same type}
+    \item You have \textbf{limited examples} per class (few-shot)
+    \item The comparison is \textbf{symmetric} (order doesn't matter)
+    \item You need \textbf{interpretable} similarity scores
+\end{enumerate}
+\end{keyinsight}
+
+%==============================================================================
+\section{Triplet Networks}
+\label{sec:triplet}
+%==============================================================================
+
+\subsection{Architecture Overview}
+
+Triplet networks extend Siamese networks to process three inputs: anchor, positive, and negative.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    box/.style={rectangle, draw, minimum width=1.8cm, minimum height=0.7cm, rounded corners},
+    encoder/.style={box, fill=lightblue},
+    input/.style={box, fill=lightgray, minimum width=1.5cm}
+]
+    % Inputs
+    \node[input] (a) {Anchor};
+    \node[input, right=1.5cm of a] (p) {Positive};
+    \node[input, right=1.5cm of p] (n) {Negative};
+    
+    % Encoders
+    \node[encoder, below=0.8cm of a] (ea) {$f_\theta$};
+    \node[encoder, below=0.8cm of p] (ep) {$f_\theta$};
+    \node[encoder, below=0.8cm of n] (en) {$f_\theta$};
+    
+    % Embeddings
+    \node[below=0.8cm of ea] (za) {$\vz_a$};
+    \node[below=0.8cm of ep] (zp) {$\vz_p$};
+    \node[below=0.8cm of en] (zn) {$\vz_n$};
+    
+    % Distances
+    \node[below=1.2cm of $(za)!0.5!(zp)$, fill=lightgreen, draw, rounded corners] (dp) {$d_+ = d(\vz_a, \vz_p)$};
+    \node[below=1.2cm of $(za)!0.5!(zn)$, fill=red!20, draw, rounded corners] (dn) {$d_- = d(\vz_a, \vz_n)$};
+    
+    % Loss
+    \node[below=1cm of $(dp)!0.5!(dn)$] (loss) {$\loss = \max(0, d_+ - d_- + m)$};
+    
+    % Edges
+    \draw[->] (a) -- (ea);
+    \draw[->] (p) -- (ep);
+    \draw[->] (n) -- (en);
+    \draw[->] (ea) -- (za);
+    \draw[->] (ep) -- (zp);
+    \draw[->] (en) -- (zn);
+    \draw[->] (za) -- (dp);
+    \draw[->] (zp) -- (dp);
+    \draw[->] (za) -- (dn);
+    \draw[->] (zn) -- (dn);
+    \draw[->] (dp) -- (loss);
+    \draw[->] (dn) -- (loss);
+    
+    % Shared weights
+    \draw[<->, dashed, orange] (ea.north) to[bend left=30] (ep.north);
+    \draw[<->, dashed, orange] (ep.north) to[bend left=30] (en.north);
+\end{tikzpicture}
+\caption{Triplet network architecture with shared encoder.}
+\label{fig:triplet_arch}
+\end{figure}
+
+\subsection{Triplet Loss Analysis}
+
+\begin{mathresult}{Triplet Loss}
+\begin{equation}
+\loss = \max(0, d(\vz_a, \vz_p) - d(\vz_a, \vz_n) + m)
+\end{equation}
+where $m > 0$ is the margin.
+\end{mathresult}
+
+\subsubsection{Gradient Analysis}
+
+When the loss is active (i.e., $d_+ - d_- + m > 0$):
+\begin{align}
+\frac{\partial \loss}{\partial \vz_a} &= \frac{\partial d_+}{\partial \vz_a} - \frac{\partial d_-}{\partial \vz_a} \\
+\frac{\partial \loss}{\partial \vz_p} &= \frac{\partial d_+}{\partial \vz_p} \\
+\frac{\partial \loss}{\partial \vz_n} &= -\frac{\partial d_-}{\partial \vz_n}
+\end{align}
+
+For Euclidean distance:
+\begin{align}
+\frac{\partial \loss}{\partial \vz_a} &\propto (\vz_a - \vz_p) - (\vz_a - \vz_n) = \vz_n - \vz_p \\
+\frac{\partial \loss}{\partial \vz_p} &\propto \vz_p - \vz_a \quad \text{(move toward anchor)} \\
+\frac{\partial \loss}{\partial \vz_n} &\propto \vz_a - \vz_n \quad \text{(move away from anchor)}
+\end{align}
+
+\subsection{Triplet Mining: The Critical Component}
+
+\begin{definition}[Triplet Types]
+Given anchor $a$ with positive $p$ and negative $n$:
+\begin{itemize}
+    \item \textbf{Easy}: $d(a,n) > d(a,p) + m$ — Already satisfied, zero loss
+    \item \textbf{Semi-hard}: $d(a,p) < d(a,n) < d(a,p) + m$ — Negative farther but within margin
+    \item \textbf{Hard}: $d(a,n) < d(a,p)$ — Negative closer than positive!
+\end{itemize}
+\end{definition}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.5]
+    % Anchor
+    \fill[blue] (0,0) circle (3pt) node[above] {Anchor};
+    
+    % Circles
+    \draw[green!70!black, thick] (0,0) circle (0.8);
+    \draw[orange, thick, dashed] (0,0) circle (1.3);
+    \draw[red, thick] (0,0) circle (1.8);
+    
+    % Points
+    \fill[green!70!black] (0.6, 0.5) circle (2pt) node[right, font=\small] {Positive};
+    \fill[red!70!black] (1.0, -0.3) circle (2pt) node[right, font=\small] {Hard neg};
+    \fill[orange] (1.5, 0.2) circle (2pt) node[right, font=\small] {Semi-hard neg};
+    \fill[gray] (2.2, -0.5) circle (2pt) node[right, font=\small] {Easy neg};
+    
+    % Labels
+    \node[font=\small] at (0.5, -1.0) {$d(a,p)$};
+    \node[font=\small] at (1.0, -1.5) {$d(a,p)+m$};
+    
+    % Legend
+    \draw[green!70!black, thick] (3, 0.5) -- (3.5, 0.5) node[right, font=\small] {Positive radius};
+    \draw[orange, thick, dashed] (3, 0) -- (3.5, 0) node[right, font=\small] {Margin boundary};
+\end{tikzpicture}
+\caption{Visualization of triplet types based on negative distance from anchor.}
+\label{fig:triplet_types}
+\end{figure}
+
+\subsubsection{Mining Strategies}
+
+\begin{enumerate}
+    \item \textbf{Batch All}: Use all valid triplets in batch
+    \begin{itemize}
+        \item Pro: No selection bias
+        \item Con: Most triplets are easy, wasted computation
+    \end{itemize}
+    
+    \item \textbf{Batch Hard}: For each anchor, hardest positive and hardest negative in batch
+    \begin{itemize}
+        \item Pro: Maximum learning signal
+        \item Con: Can collapse (mislabeled data, outliers)
+    \end{itemize}
+    
+    \item \textbf{Batch Semi-Hard}: Hardest negative that is still farther than positive
+    \begin{itemize}
+        \item Pro: Informative but not destabilizing
+        \item Con: May not exist in small batches
+    \end{itemize}
+    
+    \item \textbf{Distance-Weighted Sampling}: Sample negatives with probability proportional to similarity
+    \begin{itemize}
+        \item Pro: Smooth curriculum
+        \item Con: More complex implementation
+    \end{itemize}
+\end{enumerate}
+
+\begin{algorithm}[H]
+\caption{Batch Semi-Hard Mining}
+\begin{algorithmic}[1]
+\REQUIRE Embeddings $\{z_i\}$, labels $\{y_i\}$, margin $m$
+\STATE Compute pairwise distances $D_{ij} = d(z_i, z_j)$
+\FOR{each anchor $a$}
+    \STATE $\mathcal{P} \gets \{i : y_i = y_a, i \neq a\}$ \COMMENT{Positives}
+    \STATE $\mathcal{N} \gets \{i : y_i \neq y_a\}$ \COMMENT{Negatives}
+    \STATE $p^* \gets \argmax_{p \in \mathcal{P}} D_{ap}$ \COMMENT{Hardest positive}
+    \STATE $\mathcal{N}_{sh} \gets \{n \in \mathcal{N} : D_{ap^*} < D_{an} < D_{ap^*} + m\}$ \COMMENT{Semi-hard}
+    \IF{$\mathcal{N}_{sh} \neq \emptyset$}
+        \STATE $n^* \gets \argmin_{n \in \mathcal{N}_{sh}} D_{an}$ \COMMENT{Hardest semi-hard}
+        \STATE Add triplet $(a, p^*, n^*)$ to batch
+    \ENDIF
+\ENDFOR
+\RETURN Valid triplets
+\end{algorithmic}
+\end{algorithm}
+
+\begin{warningbox}
+\textbf{Common Pitfall: Embedding Collapse}
+
+With aggressive hard negative mining, embeddings can collapse to a point or subspace. Signs:
+\begin{itemize}
+    \item All embeddings become very similar
+    \item Training loss stays high but validation metrics don't improve
+    \item Embedding norms become very small or very large
+\end{itemize}
+
+\textbf{Solutions}: Use semi-hard mining, normalize embeddings, add regularization, use larger batches.
+\end{warningbox}
+
+\subsection{Margin Selection}
+
+The margin $m$ determines the required separation:
+
+\begin{table}[H]
+\centering
+\caption{Effect of margin size}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Margin} & \textbf{Effect} & \textbf{When to Use} \\
+\midrule
+Small (0.1-0.3) & Easy to satisfy, classes can be close & Fine-grained similarity \\
+Medium (0.3-0.7) & Moderate separation & General retrieval \\
+Large (0.7-1.0+) & Strong separation required & Coarse categories \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+For normalized embeddings ($\|\vz\| = 1$), typical margins: $m \in [0.2, 0.5]$ for Euclidean, $m \in [0.1, 0.3]$ for cosine.
+
+\subsection{Advantages Over Siamese + Contrastive}
+
+\begin{enumerate}
+    \item \textbf{Relative ranking}: Only cares about ordering, not absolute distances
+    \item \textbf{More informative}: Each triplet provides ranking information
+    \item \textbf{Natural for retrieval}: Directly optimizes retrieval objective
+\end{enumerate}
+
+%==============================================================================
+\section{Two-Tower (Dual Encoder) Architecture}
+\label{sec:two_tower}
+%==============================================================================
+
+\subsection{Architecture Overview}
+
+Two-tower architecture uses \textit{separate} encoders for queries and items, enabling efficient large-scale retrieval.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm,
+    box/.style={rectangle, draw, minimum width=2.5cm, minimum height=0.8cm, rounded corners},
+    tower/.style={box, fill=lightblue, minimum height=2cm, align=center},
+    input/.style={box, fill=lightgray},
+    output/.style={box, fill=lightgreen}
+]
+    % Query tower
+    \node[input] (q) {Query $q$};
+    \node[tower, below=0.8cm of q] (qenc) {Query\\Encoder\\$f_q(\cdot; \theta_q)$};
+    \node[below=0.8cm of qenc] (qemb) {$\vq = f_q(q)$};
+    
+    % Item tower
+    \node[input, right=4cm of q] (i) {Item $i$};
+    \node[tower, below=0.8cm of i] (ienc) {Item\\Encoder\\$f_i(\cdot; \theta_i)$};
+    \node[below=0.8cm of ienc] (iemb) {$\vk = f_i(i)$};
+    
+    % Similarity
+    \node[output, below=1.5cm of $(qemb)!0.5!(iemb)$] (score) {$\text{score} = \vq^T \vk$};
+    
+    % Edges
+    \draw[->] (q) -- (qenc);
+    \draw[->] (i) -- (ienc);
+    \draw[->] (qenc) -- (qemb);
+    \draw[->] (ienc) -- (iemb);
+    \draw[->] (qemb) -- (score);
+    \draw[->] (iemb) -- (score);
+    
+    % Note about separate encoders
+    \node[font=\small\itshape, text width=3cm, align=center] at ($(qenc)!0.5!(ienc)$) {May share weights\\or be independent};
+\end{tikzpicture}
+\caption{Two-tower architecture with separate query and item encoders.}
+\label{fig:two_tower}
+\end{figure}
+
+\subsection{Mathematical Formulation}
+
+Let $f_q: \mathcal{Q} \to \R^d$ be the query encoder and $f_i: \mathcal{I} \to \R^d$ be the item encoder.
+
+\begin{equation}
+\text{score}(q, i) = f_q(q)^T f_i(i) = \vq^T \vk
+\end{equation}
+
+For retrieval from a corpus $\mathcal{C}$:
+\begin{equation}
+i^* = \argmax_{i \in \mathcal{C}} \vq^T \vk_i
+\end{equation}
+
+\subsection{Key Insight: Decomposability}
+
+The score decomposes into independent query and item computations:
+
+\begin{proposition}[Computational Decomposition]
+For a query $q$ and $N$ items $\{i_1, \ldots, i_N\}$:
+\begin{itemize}
+    \item \textbf{Item embeddings}: Can be pre-computed offline, $O(N)$ total
+    \item \textbf{Query embedding}: Computed at query time, $O(1)$
+    \item \textbf{Scoring}: Dot products, $O(N \cdot d)$ but parallelizable
+    \item \textbf{With ANN index}: $O(\log N)$ or $O(1)$ per query
+\end{itemize}
+\end{proposition}
+
+This is the fundamental reason two-tower scales to billions of items.
+
+\subsection{Training Two-Tower Models}
+
+\subsubsection{Loss Functions}
+
+\textbf{InfoNCE / Softmax Cross-Entropy:}
+\begin{equation}
+\loss = -\log \frac{\exp(\vq^T \vk^+ / \tau)}{\exp(\vq^T \vk^+ / \tau) + \sum_{j=1}^{K} \exp(\vq^T \vk_j^- / \tau)}
+\end{equation}
+
+\textbf{Batch Softmax (in-batch negatives):}
+For batch of $B$ query-item pairs $(q_i, i_i)$:
+\begin{equation}
+\loss_i = -\log \frac{\exp(\vq_i^T \vk_i / \tau)}{\sum_{j=1}^{B} \exp(\vq_i^T \vk_j / \tau)}
+\end{equation}
+
+\subsubsection{Negative Sampling Strategies}
+
+\begin{table}[H]
+\centering
+\caption{Negative sampling strategies for two-tower training}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Strategy} & \textbf{Description} & \textbf{Trade-off} \\
+\midrule
+In-batch & Other items in batch & Efficient but biased by batch composition \\
+Random & Uniformly sampled items & Easy negatives, slow learning \\
+Popularity-based & Sample proportional to popularity & Corrects for exposure bias \\
+Hard (BM25) & Lexically similar but irrelevant & Better gradients for semantic distinction \\
+Hard (model) & High-scoring negatives from current model & Best but expensive, need periodic refresh \\
+Mixed & Combine multiple strategies & Often best in practice \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{algorithm}[H]
+\caption{Two-Tower Training with Mixed Negatives}
+\begin{algorithmic}[1]
+\REQUIRE Dataset $\mathcal{D}$, query encoder $f_q$, item encoder $f_i$, negative ratio $k$
+\FOR{each batch $\mathcal{B} = \{(q_i, i_i^+)\}$}
+    \STATE Compute query embeddings: $\vq_i = f_q(q_i)$
+    \STATE Compute positive item embeddings: $\vk_i^+ = f_i(i_i^+)$
+    \STATE \COMMENT{In-batch negatives}
+    \STATE $\mathcal{N}_{ib} = \{(q_i, i_j^+) : j \neq i\}$
+    \STATE \COMMENT{Additional hard negatives}
+    \FOR{each $q_i$}
+        \STATE Sample $k$ hard negatives $\{i_{i1}^-, \ldots, i_{ik}^-\}$
+        \STATE Compute: $\vk_{ij}^- = f_i(i_{ij}^-)$
+    \ENDFOR
+    \STATE Compute loss with all negatives
+    \STATE Update $\theta_q, \theta_i$
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{When to Share Weights}
+
+\begin{table}[H]
+\centering
+\caption{Weight sharing in two-tower models}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Scenario} & \textbf{Recommendation} & \textbf{Reason} \\
+\midrule
+Same modality (text-text) & Share or separate & Sharing: regularization; Separate: more capacity \\
+Different modality (text-image) & Separate & Different input structures \\
+Asymmetric task & Separate & Query and item have different roles \\
+Limited data & Share & Regularization, parameter efficiency \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Limitations of Two-Tower}
+
+\begin{enumerate}
+    \item \textbf{No query-item interaction}: Embeddings computed independently
+    \item \textbf{Bottleneck}: All information compressed to fixed-size vector
+    \item \textbf{Hard to capture fine-grained matching}: Word-level alignment lost
+    \item \textbf{Asymmetric information}: Short queries vs. long documents
+\end{enumerate}
+
+\begin{interviewq}
+\textbf{Q: Your two-tower model retrieves documents that share keywords with the query but aren't actually relevant. How do you fix this?}
+
+\textbf{A:} This is a common failure mode—the model learns lexical matching instead of semantic matching. Solutions:
+
+\begin{enumerate}
+    \item \textbf{Hard negative mining}: Add BM25-retrieved-but-irrelevant documents as negatives. These teach the model to distinguish lexical from semantic similarity.
+    
+    \item \textbf{Add a reranking stage}: Use a cross-encoder to rerank top-k results from two-tower. The cross-encoder sees query-document interaction.
+    
+    \item \textbf{Better training data}: Include paraphrases (same meaning, different words) as positives and keyword-overlap negatives.
+    
+    \item \textbf{Data augmentation}: Query paraphrasing, document summarization to reduce lexical dependence.
+    
+    \item \textbf{Pre-training}: Use models pre-trained with contrastive objectives (e.g., Sentence-BERT, E5).
+\end{enumerate}
+\end{interviewq}
+
+%==============================================================================
+\section{Cross-Encoder Architecture}
+\label{sec:cross_encoder}
+%==============================================================================
+
+\subsection{Architecture Overview}
+
+Cross-encoder processes query and item \textit{jointly}, enabling full interaction.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    box/.style={rectangle, draw, minimum width=3cm, minimum height=0.8cm, rounded corners},
+    encoder/.style={box, fill=lightblue, minimum height=1.5cm, minimum width=4cm, align=center},
+    input/.style={box, fill=lightgray},
+    output/.style={box, fill=lightgreen}
+]
+    % Input
+    \node[input, minimum width=5cm] (input) {{[CLS]} Query {[SEP]} Item {[SEP]}};
+    
+    % Encoder
+    \node[encoder, below=1cm of input] (enc) {Transformer Encoder\\(BERT, RoBERTa, etc.)};
+    
+    % CLS output
+    \node[below=1cm of enc] (cls) {$\vh_{{[CLS]}}$};
+    
+    % Score
+    \node[output, below=0.8cm of cls] (score) {$\text{score} = \mW^T \vh_{{[CLS]}} + b$};
+    
+    % Edges
+    \draw[->] (input) -- (enc);
+    \draw[->] (enc) -- (cls);
+    \draw[->] (cls) -- (score);
+    
+    % Attention visualization
+    \node[right=2cm of enc, text width=3cm, font=\small\itshape, align=left] {Full self-attention:\\Query tokens attend\\to Item tokens};
+\end{tikzpicture}
+\caption{Cross-encoder architecture with joint query-item encoding.}
+\label{fig:cross_encoder}
+\end{figure}
+
+\subsection{Mathematical Formulation}
+
+Concatenate query and item tokens:
+\begin{equation}
+\vx = [\text{[CLS]}; q_1; \ldots; q_n; \text{[SEP]}; i_1; \ldots; i_m; \text{[SEP]}]
+\end{equation}
+
+Pass through transformer:
+\begin{equation}
+\mH = \text{Transformer}(\vx)
+\end{equation}
+
+Score from [CLS] representation:
+\begin{equation}
+\text{score}(q, i) = \mW^T \vh_{[CLS]} + b
+\end{equation}
+
+\subsection{Why Cross-Encoder is More Accurate}
+
+\begin{enumerate}
+    \item \textbf{Full attention}: Every query token attends to every item token
+    \item \textbf{Token-level alignment}: Can capture word-level matching
+    \item \textbf{Contextualized interaction}: Query meaning influenced by item
+    \item \textbf{No information bottleneck}: Not compressed to single vector
+\end{enumerate}
+
+\begin{example}[Cross-Encoder Advantage]
+Query: ``apple stock price''\\
+Item 1: ``Apple Inc. (AAPL) shares rose 3\% today...'' \checkmark\\
+Item 2: ``The price of apples at grocery stores...'' $\times$
+
+A two-tower model might struggle because ``apple'' and ``price'' appear in both. Cross-encoder can attend from ``stock'' to ``Inc.'', ``AAPL'', ``shares'' to disambiguate.
+\end{example}
+
+\subsection{Computational Cost}
+
+\begin{proposition}[Cross-Encoder Complexity]
+For query length $n$, item length $m$, and $N$ items:
+\begin{itemize}
+    \item \textbf{Per pair}: $O((n+m)^2)$ for attention
+    \item \textbf{Total for $N$ items}: $O(N \cdot (n+m)^2)$
+    \item \textbf{No pre-computation}: Must run for every query-item pair
+\end{itemize}
+\end{proposition}
+
+For 1 million items with a 12-layer BERT:
+\begin{itemize}
+    \item Two-tower: ~1 second (with ANN index)
+    \item Cross-encoder: ~hours (1M forward passes)
+\end{itemize}
+
+\subsection{When to Use Cross-Encoder}
+
+\begin{itemize}
+    \item \textbf{Reranking stage}: Top-k results from fast retrieval
+    \item \textbf{Small candidate sets}: $< 1000$ items
+    \item \textbf{High-stakes decisions}: When accuracy matters more than speed
+    \item \textbf{Fine-grained matching}: Semantic similarity, NLI, QA
+\end{itemize}
+
+%==============================================================================
+\section{Poly-Encoder: A Middle Ground}
+\label{sec:poly_encoder}
+%==============================================================================
+
+\subsection{Architecture Overview}
+
+Poly-encoder uses learned ``global features'' for the query, attended by the item embedding.
+
+{%
+% \newcommand{\vh}{\mathbf{h}}%
+% \newcommand{\vc}{\mathbf{c}}%
+% \newcommand{\vy}{\mathbf{y}}%
+% \newcommand{\vk}{\mathbf{k}}%
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.7cm, rounded corners, align=center},
+    encoder/.style={box, fill=lightblue, align=center},
+    input/.style={box, fill=lightgray},
+    output/.style={box, fill=lightgreen}
+]
+    % Query side
+    \node[input] (q) {Query};
+    \node[encoder, below=0.8cm of q, minimum height=1.2cm] (qenc) {Query\\Encoder};
+    \node[below=0.8cm of qenc] (qtok) {$\vh_1^q, \ldots, \vh_n^q$};
+    
+    % Code vectors
+    \node[box, fill=lightyellow, right=0.5cm of qtok] (codes) {Code Vectors\\$\vc_1, \ldots, \vc_m$};
+    
+    % Attention
+    \node[box, fill=orange!20, below=0.8cm of $(qtok)!0.5!(codes)$] (attn1) {Attention};
+    \node[below=0.6cm of attn1] (yq) {$\vy_1^q, \ldots, \vy_m^q$};
+    
+    % Item side
+    \node[input, right=4cm of q] (i) {Item};
+    \node[encoder, below=0.8cm of i, minimum height=1.2cm] (ienc) {Item\\Encoder};
+    \node[below=0.8cm of ienc] (itok) {$\vk = \vh_{{[CLS]}}^i$};
+    
+    % Final attention
+    \node[box, fill=orange!20, below=1.5cm of $(yq)!0.5!(itok)$] (attn2) {Attention};
+    
+    % Score
+    \node[output, below=0.8cm of attn2] (score) {Score};
+    
+    % Edges
+    \draw[->] (q) -- (qenc);
+    \draw[->] (qenc) -- (qtok);
+    \draw[->] (i) -- (ienc);
+    \draw[->] (ienc) -- (itok);
+    \draw[->] (qtok) -- (attn1);
+    \draw[->] (codes) -- (attn1);
+    \draw[->] (attn1) -- (yq);
+    \draw[->] (yq) -- (attn2);
+    \draw[->] (itok) -- (attn2);
+    \draw[->] (attn2) -- (score);
+\end{tikzpicture}
+\caption{Poly-encoder architecture with learned code vectors.}
+\label{fig:poly_encoder}
+\end{figure}
+}%
+
+\subsection{Mathematical Formulation}
+
+\textbf{Step 1}: Encode query and item separately
+\begin{align}
+\mH^q &= \text{Encoder}(q) \in \R^{n \times d} \\
+\vk &= \text{Encoder}(i)_{[CLS]} \in \R^d
+\end{align}
+
+\textbf{Step 2}: Compute $m$ global query features using code vectors $\{\vc_i\}_{i=1}^m$
+\begin{equation}
+\vy_i^q = \sum_j \text{softmax}\left(\vc_i^T \mH^q_{:,j}\right) \cdot \mH^q_{:,j}
+\end{equation}
+
+\textbf{Step 3}: Attend from item to query features
+\begin{equation}
+\text{score} = \vk^T \sum_i \text{softmax}(\vk^T \vy_i^q) \cdot \vy_i^q
+\end{equation}
+
+\subsection{Complexity Analysis}
+
+\begin{itemize}
+    \item \textbf{Query encoding}: $O(n^2)$ — done once per query
+    \item \textbf{Item encoding}: $O(m^2)$ — can be pre-computed
+    \item \textbf{Scoring per item}: $O(m \cdot d)$ where $m$ = number of codes (typically 16-360)
+\end{itemize}
+
+\begin{proposition}[Poly-Encoder Trade-off]
+With $m$ code vectors, poly-encoder:
+\begin{itemize}
+    \item Has $m \times$ more computation than two-tower per item
+    \item Has $O(N)$ cost (vs. $O(N \cdot L^2)$ for cross-encoder where $L$ = sequence length)
+    \item Captures more query-item interaction than two-tower
+\end{itemize}
+\end{proposition}
+
+\subsection{Comparison Summary}
+
+\begin{table}[H]
+\centering
+\caption{Comprehensive comparison of similarity architectures}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Aspect} & \textbf{Two-Tower} & \textbf{Poly-Encoder} & \textbf{Cross-Encoder} \\
+\midrule
+Item pre-compute & Yes & Yes & No \\
+Query-item interaction & None & Limited & Full \\
+Scoring complexity & $O(d)$ & $O(md)$ & $O(L^2)$ \\
+Quality (typical) & Good & Better & Best \\
+Scale & Billions & Millions & Thousands \\
+Use case & Retrieval & Retrieval + light rerank & Reranking \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Two-Stage Retrieval Systems}
+\label{sec:two_stage}
+%==============================================================================
+
+\subsection{The Standard Pattern}
+
+Production systems almost always use multiple stages:
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    box/.style={rectangle, draw, minimum width=3cm, minimum height=1cm, rounded corners},
+    stage/.style={box, fill=lightblue, align=center},
+    arrow/.style={->, thick}
+]
+    % Query
+    \node[box, fill=lightgray] (query) {Query};
+    
+    % Stage 1
+    \node[stage, right=1.5cm of query] (retrieval) {Retrieval\\(Two-Tower + ANN)};
+    \node[below=0.3cm of retrieval, font=\small] {1B items $\rightarrow$ 1K candidates};
+    
+    % Stage 2
+    \node[stage, right=1.5cm of retrieval] (rerank) {Reranking\\(Cross-Encoder)};
+    \node[below=0.3cm of rerank, font=\small] {1K $\rightarrow$ 10--100};
+    
+    % Output
+    \node[box, fill=lightgreen, right=1.5cm of rerank] (output) {Results};
+    
+    % Edges
+    \draw[arrow] (query) -- (retrieval);
+    \draw[arrow] (retrieval) -- (rerank);
+    \draw[arrow] (rerank) -- (output);
+    
+    % Timing
+    \node[above=0.5cm of retrieval, font=\small\itshape] {$\sim$10ms};
+    \node[above=0.5cm of rerank, font=\small\itshape] {$\sim$50ms};
+\end{tikzpicture}
+\caption{Two-stage retrieval pipeline combining speed and accuracy.}
+\label{fig:two_stage}
+\end{figure}
+
+\subsection{Stage 1: Retrieval}
+
+\textbf{Objective}: High recall, acceptable precision
+
+\textbf{Architecture}: Two-tower with approximate nearest neighbor (ANN) index
+
+\textbf{Metrics}: Recall@K (e.g., Recall@1000)
+
+\textbf{ANN Options}:
+\begin{itemize}
+    \item \textbf{HNSW}: Graph-based, best quality, more memory
+    \item \textbf{IVF}: Inverted index, good balance
+    \item \textbf{LSH}: Hash-based, fastest, lower quality
+    \item \textbf{ScaNN}: Google's optimized, state-of-art
+\end{itemize}
+
+\subsection{Stage 2: Reranking}
+
+\textbf{Objective}: High precision in top results
+
+\textbf{Architecture}: Cross-encoder or feature-rich ranking model
+
+\textbf{Metrics}: NDCG@K, MRR (for top results)
+
+\textbf{Features can include}:
+\begin{itemize}
+    \item Semantic score from cross-encoder
+    \item Lexical features (BM25, TF-IDF)
+    \item Popularity, freshness
+    \item User-item interaction history
+    \item Business rules
+\end{itemize}
+
+\subsection{Optional Stage 3: Re-reranking / Business Logic}
+
+Final adjustments for:
+\begin{itemize}
+    \item Diversity (avoid showing similar items)
+    \item Freshness boosting
+    \item Personalization
+    \item Business rules (promotions, etc.)
+\end{itemize}
+
+\begin{interviewq}
+\textbf{Q: Design a semantic search system for 1 billion documents with <100ms latency.}
+
+\textbf{A:} I'd use a two-stage architecture:
+
+\textbf{Stage 1 - Retrieval (target: 10ms)}:
+\begin{itemize}
+    \item Two-tower model: Query encoder (BERT-base) + Document encoder
+    \item Pre-compute all document embeddings (768-dim)
+    \item HNSW index for approximate nearest neighbor
+    \item Retrieve top-1000 candidates
+    \item Shard across machines if needed
+\end{itemize}
+
+\textbf{Stage 2 - Reranking (target: 50ms)}:
+\begin{itemize}
+    \item Cross-encoder (DistilBERT for speed) on 1000 candidates
+    \item GPU batching for parallelism
+    \item Return top-10 results
+\end{itemize}
+
+\textbf{Optimizations}:
+\begin{itemize}
+    \item Quantize embeddings (768 float → 768 int8)
+    \item Cache popular queries
+    \item Use smaller models with distillation
+    \item Product quantization for index compression
+\end{itemize}
+\end{interviewq}
+
+%==============================================================================
+\section{Approximate Nearest Neighbor (ANN) Algorithms}
+\label{sec:ann}
+%==============================================================================
+
+\subsection{Why ANN?}
+
+Exact nearest neighbor search is $O(N)$—too slow for millions of items. ANN trades small accuracy loss for massive speedup.
+
+\subsection{HNSW (Hierarchical Navigable Small World)}
+
+\textbf{Idea}: Build a hierarchy of proximity graphs.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.8]
+    % Layer 2 (sparse)
+    \node at (-3, 4) {\textbf{Layer 2}};
+    \fill[blue] (0, 4) circle (3pt);
+    \fill[blue] (3, 4) circle (3pt);
+    \draw (0, 4) -- (3, 4);
+    
+    % Layer 1 (medium)
+    \node at (-3, 2) {\textbf{Layer 1}};
+    \fill[blue] (0, 2) circle (3pt);
+    \fill[blue] (1.5, 2) circle (3pt);
+    \fill[blue] (3, 2) circle (3pt);
+    \fill[blue] (4.5, 2) circle (3pt);
+    \draw (0, 2) -- (1.5, 2) -- (3, 2) -- (4.5, 2);
+    \draw (0, 2) -- (3, 2);
+    
+    % Layer 0 (dense)
+    \node at (-3, 0) {\textbf{Layer 0}};
+    \foreach \x in {0, 0.75, 1.5, 2.25, 3, 3.75, 4.5, 5.25} {
+        \fill[blue] (\x, 0) circle (3pt);
+    }
+    \draw (0, 0) -- (0.75, 0) -- (1.5, 0) -- (2.25, 0) -- (3, 0) -- (3.75, 0) -- (4.5, 0) -- (5.25, 0);
+    \draw (0, 0) -- (1.5, 0);
+    \draw (1.5, 0) -- (3, 0);
+    \draw (3, 0) -- (4.5, 0);
+    
+    % Vertical connections
+    \draw[dashed] (0, 4) -- (0, 2) -- (0, 0);
+    \draw[dashed] (3, 4) -- (3, 2) -- (3, 0);
+    \draw[dashed] (1.5, 2) -- (1.5, 0);
+    \draw[dashed] (4.5, 2) -- (4.5, 0);
+    
+    % Query path
+    \fill[red] (2, -0.5) circle (4pt) node[below] {Query};
+    \draw[->, thick, red] (2, -0.3) -- (0, 3.8);
+    \draw[->, thick, red] (0.1, 3.9) -- (2.9, 3.9);
+    \draw[->, thick, red] (2.9, 3.8) -- (3, 2.1);
+    \draw[->, thick, red] (2.9, 2) -- (2.3, 0.1);
+    
+\end{tikzpicture}
+\caption{HNSW structure: Navigate from sparse upper layers to dense lower layers.}
+\label{fig:hnsw}
+\end{figure}
+
+\textbf{Search}: Start at top layer, greedily descend, refine at bottom.
+
+\textbf{Complexity}: $O(\log N)$ with high probability.
+
+\textbf{Trade-offs}:
+\begin{itemize}
+    \item Best recall-speed trade-off
+    \item High memory (graph structure + vectors)
+    \item Slow index construction
+\end{itemize}
+
+\subsection{IVF (Inverted File Index)}
+
+\textbf{Idea}: Cluster vectors, search only relevant clusters.
+
+\begin{enumerate}
+    \item Cluster all vectors into $k$ centroids (k-means)
+    \item At query time, find $n_{probe}$ nearest centroids
+    \item Search only vectors in those clusters
+\end{enumerate}
+
+\textbf{Trade-offs}:
+\begin{itemize}
+    \item Lower memory than HNSW
+    \item Faster index construction
+    \item Quality depends on clustering
+\end{itemize}
+
+\subsection{Product Quantization (PQ)}
+
+\textbf{Idea}: Compress vectors by quantizing subspaces.
+
+\begin{enumerate}
+    \item Split $d$-dimensional vector into $m$ subvectors
+    \item Quantize each subvector to one of $k$ centroids
+    \item Store $m$ centroid indices (typically 1 byte each)
+\end{enumerate}
+
+\textbf{Compression}: $d \times 4$ bytes → $m$ bytes (e.g., 768×4=3KB → 96 bytes)
+
+\textbf{Used with}: IVF-PQ combines clustering with quantization.
+
+\subsection{ANN Algorithm Selection}
+
+\begin{table}[H]
+\centering
+\caption{ANN algorithm comparison}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Algorithm} & \textbf{Recall} & \textbf{Speed} & \textbf{Memory} & \textbf{Build Time} \\
+\midrule
+HNSW & Best & Fast & High & Slow \\
+IVF & Good & Fast & Medium & Medium \\
+IVF-PQ & Good & Very fast & Low & Medium \\
+LSH & Lower & Very fast & Low & Fast \\
+ScaNN & Best & Very fast & Medium & Medium \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Architecture Selection Guide}
+\label{sec:arch_selection}
+%==============================================================================
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, font=\small},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2.5cm, font=\small, align=center},
+    arrow/.style={->, thick}
+]
+    % Start
+    \node[decision] (scale) {Corpus size?};
+    
+    % Scale branches
+    \node[decision, below left=1.5cm and 1cm of scale] (small) {Latency?};
+    \node[decision, below right=1.5cm and 1cm of scale] (large) {Real-time?};
+    
+    % Results
+    \node[result, below left=1cm and 0cm of small] (cross) {Cross-Encoder};
+    \node[result, below right=1cm and 0cm of small] (poly) {Poly-Encoder};
+    \node[result, below left=1cm and 0cm of large] (twostage) {Two-Stage\\(Two-Tower + Rerank)};
+    \node[result, below right=1cm and 0cm of large] (tower) {Two-Tower Only};
+    
+    % Edges
+    \draw[arrow] (scale) -- node[above left, font=\small] {$<$10K} (small);
+    \draw[arrow] (scale) -- node[above right, font=\small] {$>$10K} (large);
+    \draw[arrow] (small) -- node[left, font=\small] {Flexible} (cross);
+    \draw[arrow] (small) -- node[right, font=\small] {$<$100ms} (poly);
+    \draw[arrow] (large) -- node[left, font=\small] {Yes} (twostage);
+    \draw[arrow] (large) -- node[right, font=\small] {Batch} (tower);
+\end{tikzpicture}
+\caption{Decision tree for similarity architecture selection.}
+\label{fig:arch_decision}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Architecture selection by use case}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Use Case} & \textbf{Recommended} & \textbf{Notes} \\
+\midrule
+Face verification & Siamese & Same image type, symmetric \\
+Image search (1M+) & Two-Tower + HNSW & Pre-compute image embeddings \\
+Document retrieval (1B) & Two-Stage & Two-tower retrieval + cross-encoder rerank \\
+Semantic similarity & Cross-Encoder & Full interaction needed \\
+Recommendation & Two-Tower & User/item can be pre-computed \\
+QA retrieval & Two-Stage & Dense retrieval + reader \\
+Duplicate detection & Siamese or Two-Tower & Depends on scale \\
+Few-shot classification & Siamese & Compare to class examples \\
+\bottomrule
+\end{tabularx}
+\end{table}
