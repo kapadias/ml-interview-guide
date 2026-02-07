@@ -5,6 +5,8 @@
 Activation functions introduce nonlinearity; normalization techniques stabilize training. This chapter covers the evolution of activations (sigmoid → ReLU → GELU → SwiGLU), normalization methods (BatchNorm, LayerNorm, RMSNorm), and when to use each. Understanding why these components work—and their failure modes—is essential for debugging training issues.
 \end{tldr}
 
+Activation functions and normalization are building blocks interviewers use to test debugging intuition. Expect questions about vanishing gradients from sigmoid, why transformers use LayerNorm instead of BatchNorm, dead ReLU neurons, and what happens when you remove normalization from a deep network.
+
 \section{Activation Functions}
 \label{sec:activations}
 
@@ -97,6 +99,52 @@ Nonlinearity enables learning complex decision boundaries and representations.
     \item Saturates for negative values (noise robustness)
 \end{itemize}
 
+%--- Q6: Dying ReLU (after ReLU Family section) ---
+
+\begin{interviewq}
+\textbf{Q: Explain the dying ReLU problem. How do modern activations solve it?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+\textbf{The dying ReLU problem:} ReLU outputs zero for all negative inputs: $\text{ReLU}(x) = \max(0,x)$. Critically, its gradient is also zero for $x \leq 0$. If a neuron's pre-activation is negative for \textit{every} sample in the dataset, it receives zero gradient and its weights never update---the neuron is permanently ``dead.''
+
+\textbf{How neurons die:} (1) A large gradient update pushes the bias to a very negative value, shifting the pre-activation distribution below zero. (2) Poor initialization (e.g., large negative biases) starts neurons in the dead zone. (3) High learning rates amplify both effects. Once dead, the neuron can never recover because it receives exactly zero gradient---there is no mechanism to ``revive'' it. In deep networks, this can cascade: dead neurons in layer $l$ reduce the expressivity available to layer $l+1$, potentially killing more neurons.
+
+\textbf{Diagnosis:} Compute the fraction of zero activations per layer. If $>$30--40\% of neurons are consistently zero across the dataset, dying ReLU is a problem. In PyTorch: register a forward hook that logs \texttt{(output == 0).float().mean()}.
+
+\textbf{Modern solutions, from simplest to most complex:}
+
+\textit{Leaky ReLU / PReLU:} $f(x) = \max(\alpha x, x)$ with $\alpha = 0.01$ (Leaky) or learned (PReLU). The small negative slope ensures a nonzero gradient for $x < 0$, so neurons can always receive updates. Simple, effective, but the negative slope is somewhat arbitrary.
+
+\textit{ELU:} $f(x) = x$ for $x > 0$, $\alpha(e^x - 1)$ for $x \leq 0$. Smooth at zero, and the negative saturation pushes mean activations closer to zero. But the exponential is more expensive than ReLU.
+
+\textit{GELU:} $f(x) = x \cdot \Phi(x)$. Smoothly gates the input by its Gaussian percentile. For large negative inputs, the output and gradient are small but nonzero. For values near zero, the transition is smooth, avoiding the gradient discontinuity. This ``soft thresholding'' is the key conceptual advance: instead of a hard zero/pass decision, GELU makes a probabilistic decision.
+
+\textit{SiLU/Swish:} $f(x) = x \cdot \sigma(x)$. Self-gated: the sigmoid of $x$ gates $x$ itself. Has a small negative region (minimum $\approx -0.28$ at $x \approx -1.28$), which empirically acts as regularization. Used in EfficientNet and as part of SwiGLU.
+
+All modern activations solve dying ReLU through the same principle: ensuring \textbf{nonzero gradients for negative inputs}. The evolution is from simple fixes (Leaky ReLU) to smooth, expressive functions (GELU, SiLU) that additionally provide better optimization landscapes.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Dying ReLU happens when the output is zero''---the problem is that the \textit{gradient} is zero, preventing recovery.
+    \item ``Just use a smaller learning rate''---this reduces the probability but doesn't eliminate the fundamental issue.
+    \item Not knowing that GELU still allows near-zero activations for negative inputs; the key is that the gradient is nonzero.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of the interaction between activation functions and gradient flow, the ability to explain \textit{why} a neuron can never recover (zero gradient = zero update), and knowledge of how each modern activation addresses this.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Explains the problem clearly (zero gradient for negative inputs prevents recovery), names 2--3 solutions, and can diagnose it in practice.
+    \item \textbf{L6:} Connects to initialization theory (He initialization was designed to keep pre-activations balanced around zero for ReLU), explains the cascade effect in deep networks, and discusses the interaction with normalization (LayerNorm re-centers activations, reducing the probability of dying neurons).
+    \item \textbf{L7:} Discusses the representation capacity implications---dead neurons reduce the effective width of the network, and the relationship between dead neuron fraction and model quality follows a phase transition-like curve. Connects to the lottery ticket hypothesis (sparse networks with many ``dead'' neurons can still work if the right neurons survive).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How does He initialization specifically address dying ReLU?'' ``Can a dead ReLU neuron ever recover?'' ``What is the relationship between activation sparsity and model quality?''
+\end{interviewq}
+
 \subsection{Modern Activations}
 
 \subsubsection{GELU (Gaussian Error Linear Unit)}
@@ -145,6 +193,42 @@ For FFN in Transformers:
 \textbf{Used in}: LLaMA, PaLM, modern LLMs
 
 \textbf{Note}: Requires 3 weight matrices instead of 2, so FFN expansion factor reduced (8/3 instead of 4).
+
+%--- Q3: GELU vs ReLU vs SwiGLU (after Modern Activations) ---
+
+\begin{interviewq}
+\textbf{Q: Why GELU over ReLU? Why SwiGLU over GELU?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+\textbf{ReLU to GELU.} ReLU applies a hard threshold: $\text{ReLU}(x) = \max(0,x)$. This has two problems for Transformers. (1) The \textit{dying ReLU} problem: neurons receiving consistently negative inputs have exactly zero gradient and never recover. In deep Transformers with hundreds of sublayers, this compounds---entire channels can go permanently dead. (2) The \textit{hard discontinuity} at $x=0$ means the gradient is undefined at zero and jumps from 0 to 1, creating a non-smooth loss landscape.
+
+GELU smooths this by weighting the input by its Gaussian CDF: $\text{GELU}(x) = x \cdot \Phi(x)$. Near zero, GELU has a smooth transition instead of a hard cutoff. This means small negative inputs get small but \textit{nonzero} outputs and gradients, preventing dead neurons. The smooth curvature also benefits optimization---Adam and other adaptive optimizers work better with smooth gradients. Empirically, GELU gives 0.5--1\% improvement on Transformer benchmarks (BERT, GPT-2, ViT) with negligible compute overhead.
+
+\textbf{GELU to SwiGLU.} SwiGLU replaces the two-matrix FFN ($\text{FFN}(x) = \text{GELU}(x\mW_1)\mW_2$) with a three-matrix gated structure: $\text{SwiGLU}(x) = (\text{Swish}(x\mW_1) \odot x\mV)\mW_2$. The key innovation is the \textit{multiplicative gating}: $x\mV$ acts as a gate on $\text{Swish}(x\mW_1)$. This element-wise multiplication creates richer feature interactions within the FFN, allowing the network to learn more expressive transformations. The Swish activation ($x\sigma(x)$) is itself smooth and self-gated.
+
+The cost is an extra weight matrix ($\mV$), so to keep parameter count constant, the hidden dimension is reduced from $4d$ to $\frac{8}{3}d$. Despite fewer hidden units, the multiplicative interaction compensates, and SwiGLU consistently outperforms GELU by 0.5--2\% across model scales (shown in PaLM and LLaMA ablations). This is why essentially all modern LLMs (LLaMA, Mistral, Gemma, Qwen) use SwiGLU.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``GELU is just a smoother version of ReLU''---this undersells the gradient flow and dying neuron benefits.
+    \item ``SwiGLU is better because it's newer''---need to explain the gating mechanism.
+    \item Not mentioning the parameter budget trade-off (3 matrices instead of 2, reduced hidden dim).
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Whether you understand the progression of design choices, the specific failure modes each addresses, and the engineering trade-offs (compute, parameters, expressivity) at each step.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Clearly explains dying ReLU fix (GELU) and gating mechanism (SwiGLU), mentions the $\frac{8}{3}d$ hidden dim.
+    \item \textbf{L6:} Cites ablation results from PaLM/LLaMA papers, explains why multiplicative interactions increase expressivity (bilinear maps can represent higher-order feature interactions), discusses compute-quality Pareto frontier.
+    \item \textbf{L7:} Connects to the broader GLU family (original GLU by Dauphin et al., ReGLU, GEGLU), discusses how activation choice interacts with scaling laws, and notes that the benefit of SwiGLU is more pronounced at larger model scales.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What is the GLU family and how do variants compare?'' ``How does activation choice interact with initialization?'' ``Would you use SwiGLU in a CNN?''
+\end{interviewq}
 
 \subsection{Activation Selection Guide}
 
@@ -209,307 +293,7 @@ where $\gamma, \beta$ are learned parameters.
     \item Not used in Transformers
 \end{itemize}
 
-\subsection{Layer Normalization}
-
-\begin{mathresult}{Layer Normalization}
-For each sample, normalize across features:
-\begin{align}
-\mu &= \frac{1}{d}\sum_{i=1}^d x_i \\
-\sigma^2 &= \frac{1}{d}\sum_{i=1}^d (x_i - \mu)^2 \\
-\hat{x}_i &= \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} \\
-y_i &= \gamma_i \hat{x}_i + \beta_i
-\end{align}
-\end{mathresult}
-
-\textbf{Key difference from BatchNorm}: Normalizes across features (within sample), not across batch.
-
-\textbf{Advantages}:
-\begin{itemize}
-    \item Works with any batch size (even 1)
-    \item Same behavior train and test
-    \item Natural for sequence models
-\end{itemize}
-
-\textbf{Used in}: Transformers (BERT, GPT, etc.)
-
-\subsection{RMSNorm}
-
-\begin{mathresult}{RMSNorm}
-\begin{equation}
-\text{RMSNorm}(\vx) = \frac{\vx}{\text{RMS}(\vx)} \odot \bm{\gamma}, \quad \text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_{i=1}^d x_i^2}
-\end{equation}
-\end{mathresult}
-
-\textbf{Simplification of LayerNorm}:
-\begin{itemize}
-    \item No mean centering (only scale normalization)
-    \item No bias term $\beta$
-    \item Empirically similar performance
-    \item 10-15\% faster
-\end{itemize}
-
-\textbf{Used in}: LLaMA, Mistral, most modern LLMs
-
-\subsection{Other Normalization Variants}
-
-\subsubsection{Instance Normalization}
-
-Normalize each channel of each sample independently.
-\begin{equation}
-\text{IN}(x_{nchw}) = \frac{x_{nchw} - \mu_{nc}}{\sigma_{nc}}
-\end{equation}
-
-\textbf{Used in}: Style transfer, image generation
-
-\subsubsection{Group Normalization}
-
-Divide channels into groups, normalize within groups.
-
-\textbf{Used in}: When batch size is very small (object detection)
-
-\subsubsection{Weight Normalization}
-
-Reparameterize weights: $\vw = g \frac{\vv}{\|\vv\|}$
-
-\textbf{Used in}: Some generative models
-
-\subsection{Pre-Norm vs. Post-Norm}
-
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-    node distance=0.5cm,
-    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.6cm, rounded corners, font=\small},
-    norm/.style={box, fill=lightyellow},
-    sublayer/.style={box, fill=lightblue}
-]
-    % Post-norm
-    \begin{scope}[shift={(0,0)}]
-        \node[sublayer] (sub1) {SubLayer};
-        \node[above=0.3cm of sub1] (add1) {$+$};
-        \node[norm, above=0.3cm of add1] (norm1) {Norm};
-        \node[above=0.5cm of norm1] (out1) {};
-        \node[below=0.5cm of sub1] (in1) {};
-        
-        \draw[->] (in1) -- (sub1);
-        \draw[->] (sub1) -- (add1);
-        \draw[->] (add1) -- (norm1);
-        \draw[->] (norm1) -- (out1);
-        \draw[->] (in1.north) -- ++(-0.8,0) |- (add1.west);
-        
-        \node[below=1cm of sub1, font=\bfseries] {Post-Norm};
-        \node[below=1.4cm of sub1, font=\small] {(Original Transformer)};
-    \end{scope}
-    
-    % Pre-norm
-    \begin{scope}[shift={(5,0)}]
-        \node[norm] (norm2) {Norm};
-        \node[sublayer, above=0.3cm of norm2] (sub2) {SubLayer};
-        \node[above=0.3cm of sub2] (add2) {$+$};
-        \node[above=0.5cm of add2] (out2) {};
-        \node[below=0.5cm of norm2] (in2) {};
-        
-        \draw[->] (in2) -- (norm2);
-        \draw[->] (norm2) -- (sub2);
-        \draw[->] (sub2) -- (add2);
-        \draw[->] (add2) -- (out2);
-        \draw[->] (in2.north) -- ++(-0.8,0) |- (add2.west);
-        
-        \node[below=1cm of norm2, font=\bfseries] {Pre-Norm};
-        \node[below=1.4cm of norm2, font=\small] {(Modern Standard)};
-    \end{scope}
-\end{tikzpicture}
-\caption{Pre-norm vs. post-norm placement in Transformer blocks.}
-\end{figure}
-
-\textbf{Pre-norm advantages}:
-\begin{itemize}
-    \item More stable training (gradient flows through residual directly)
-    \item No learning rate warmup needed
-    \item Standard in modern LLMs
-\end{itemize}
-
-\subsection{Normalization Selection Guide}
-
-\begin{table}[H]
-\centering
-\caption{Normalization selection by architecture}
-\begin{tabularx}{\textwidth}{lXX}
-\toprule
-\textbf{Architecture} & \textbf{Recommended} & \textbf{Why} \\
-\midrule
-CNN (large batch) & BatchNorm & Proven, effective \\
-CNN (small batch) & GroupNorm & Batch-independent \\
-Transformer & LayerNorm & Sequence-friendly \\
-Modern LLM & RMSNorm & Faster, similar quality \\
-Style transfer & InstanceNorm & Per-image normalization \\
-GAN discriminator & SpectralNorm & Stabilizes training \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\begin{warningbox}
-BatchNorm in multi-GPU training requires explicit synchronization (SyncBatchNorm). Without it, each GPU computes statistics from its local batch, which can be too small and lead to noisy estimates. This is a common source of subtle training bugs when scaling to multiple GPUs---loss looks fine but model quality degrades.
-\end{warningbox}
-
-%==============================================================================
-\section{Interview Questions}
-\label{sec:activation_norm_questions}
-%==============================================================================
-
-%--- Rewritten Q1 ---
-
-\begin{interviewq}
-\textbf{Q: Why don't Transformers use BatchNorm? Derive the reasoning from first principles.}
-
-\textbf{Difficulty:} L6 \quad \textbf{Type:} First Principles \quad \textbf{Frequency:} \freqmed{}
-
-\textbf{Strong answer:}
-
-BatchNorm computes statistics across the batch dimension for each feature channel: $\mu_c = \frac{1}{BT}\sum_{b,t} x_{b,t,c}$ where $B$ is batch size and $T$ is sequence length. This creates several fundamental incompatibilities with Transformers.
-
-First, \textbf{variable sequence lengths} mean that different positions in the batch are padding tokens. BatchNorm statistics mix real tokens with padding, polluting the normalization. You could mask padding, but this makes the effective batch size position-dependent---positions near the end of sequences see fewer real tokens, leading to noisy statistics for those positions.
-
-Second, \textbf{autoregressive generation} processes one token at a time (batch size = 1). BatchNorm's running statistics from training (where sequences are packed) don't match this inference regime. The distribution of activations at generation time---conditioned on partial sequences---differs from the training-time distribution computed over full sequences.
-
-Third, \textbf{the batch dimension in Transformers is fundamentally different from CNNs}. In a CNN, different images in the batch have the same spatial structure, so normalizing across the batch at each spatial-channel position makes sense. In a Transformer, different tokens in different positions have different roles (subject, verb, padding), so normalizing across the batch at a fixed position mixes semantically unrelated activations.
-
-LayerNorm resolves all three issues: it normalizes across the feature dimension \textit{within} each token independently ($\mu = \frac{1}{d}\sum_{i=1}^d x_i$), requiring no batch statistics, behaving identically at train and test time, and treating each token as a self-contained unit. This aligns with how attention processes sequences: each token's representation is updated independently through Q/K/V projections before interacting with other tokens.
-
-\textbf{Red flags} (what NOT to say):
-\begin{itemize}
-    \item ``BatchNorm just doesn't work for sequences''---this is hand-waving without explaining the mechanism.
-    \item Failing to mention the train/test discrepancy for autoregressive generation.
-    \item Not distinguishing the batch dimension semantics between CNNs and Transformers.
-\end{itemize}
-
-\textbf{What the interviewer is testing:} Whether you can derive \textit{why} an architectural choice was made from the mechanics of both the normalization method and the architecture, rather than just memorizing ``Transformers use LayerNorm.''
-
-\textbf{What separates good from great:}
-\begin{itemize}
-    \item \textbf{L5:} States the variable-length and train/test issues clearly.
-    \item \textbf{L6:} Derives the incompatibility from the formulas, explains why the batch dimension semantics differ between CNNs and Transformers, and mentions that PowerNorm and other BatchNorm variants have been tried in Transformers with limited success.
-    \item \textbf{L7:} Connects to the broader design principle that normalization should be \textit{per-example} in architectures where batch composition is variable, discusses the smoothing effect on the loss landscape, and mentions that some recent work (e.g., nGPT) removes normalization entirely in favor of representation learning on the hypersphere.
-\end{itemize}
-
-\textbf{Common follow-ups:} ``Why RMSNorm over LayerNorm in modern LLMs?'' ``Where is BatchNorm still preferred and why?'' ``What is pre-norm vs. post-norm and why does it matter for training stability?''
-\end{interviewq}
-
-%--- Rewritten Q2 ---
-
-\begin{interviewq}
-\textbf{Q: Training loss is NaN after a few hundred steps. Which activation/normalization issues could cause this?}
-
-\textbf{Difficulty:} L5 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
-
-\textbf{Strong answer:}
-
-NaN loss within the first few hundred steps points to numerical instability rather than slow divergence. I would diagnose in order of likelihood.
-
-\textbf{Check 1: Gradient explosion before NaN.} Insert gradient norm logging. If gradient norms spike (e.g., from $\sim$1 to $>10^4$) before the NaN step, the issue is gradient explosion. Common causes: (a) post-norm placement---gradients must flow through normalization layers, which can amplify them in deep networks; switching to pre-norm often fixes this immediately; (b) no gradient clipping---add max-norm clipping at 1.0; (c) learning rate too high for the architecture depth.
-
-\textbf{Check 2: Activation overflow in softmax or attention.} Large pre-softmax logits cause $\exp(\cdot)$ overflow. In attention, if Q/K projections are poorly initialized, dot products can be $O(d)$ instead of $O(1)$, making logits huge. Verify that attention is scaled by $1/\sqrt{d_k}$. Also check that temperature/scaling parameters haven't been accidentally set to values near zero (which amplifies logits).
-
-\textbf{Check 3: Division by near-zero in normalization.} BatchNorm or LayerNorm compute $\hat{x} = (x - \mu)/\sqrt{\sigma^2 + \epsilon}$. If $\epsilon$ is too small (e.g., $10^{-12}$ instead of $10^{-5}$) and a batch has near-constant activations, the denominator approaches zero. This is especially dangerous in mixed-precision training where FP16 has limited range---$\epsilon$ should be at least $10^{-5}$ for FP16.
-
-\textbf{Check 4: Dying ReLU cascade.} With aggressive initialization or high learning rates, a large fraction of ReLU neurons can die (output zero for all inputs). This creates zero gradients for those neurons, concentrating gradient flow through fewer active neurons, which then receive larger updates and can overflow. Check the fraction of dead neurons per layer; if $>$50\%, switch to GELU or LeakyReLU.
-
-\textbf{Check 5: Mixed-precision loss scaling.} If using FP16 training, the loss scaler may not be configured correctly. FP16 underflows at $\sim 6 \times 10^{-8}$ and overflows at $\sim 65504$. Without dynamic loss scaling, gradients can underflow to zero (then weights don't update, then loss spikes) or overflow to Inf/NaN. Verify that the GradScaler is enabled and its initial scale is appropriate.
-
-\textbf{Red flags} (what NOT to say):
-\begin{itemize}
-    \item ``Just lower the learning rate''---this is a symptom-level fix without diagnosing the root cause.
-    \item Not mentioning mixed-precision training issues---this is the most common NaN source in modern training.
-    \item Forgetting to check $\epsilon$ values in normalization layers.
-\end{itemize}
-
-\textbf{What the interviewer is testing:} Systematic debugging approach for numerical instability, understanding the chain of events that leads to NaN (overflow $\to$ Inf $\to$ NaN in a subsequent operation), and awareness of the interaction between activations, normalization, and precision.
-
-\textbf{What separates good from great:}
-\begin{itemize}
-    \item \textbf{L5:} Identifies the top 3 causes (softmax overflow, gradient explosion, normalization epsilon) and proposes concrete fixes.
-    \item \textbf{L6:} Adds mixed-precision analysis, explains the FP16 range limitations quantitatively, and proposes systematic instrumentation (gradient norms, activation histograms, per-layer NaN detection) to localize the failing layer.
-    \item \textbf{L7:} Discusses the interaction between initialization, normalization, and gradient flow in deep networks; mentions that pre-norm architectures are inherently more stable because the residual stream has an uninterrupted gradient path; references the ``edge of stability'' phenomenon where training can oscillate near the stability threshold before diverging.
-\end{itemize}
-
-\textbf{Common follow-ups:} ``How do you instrument a training run to catch NaN before it propagates?'' ``What is the relationship between normalization placement and gradient magnitude?'' ``How does BF16 compare to FP16 for training stability?''
-\end{interviewq}
-
-%--- New Q3 ---
-
-\begin{interviewq}
-\textbf{Q: Why GELU over ReLU? Why SwiGLU over GELU?}
-
-\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
-
-\textbf{Strong answer:}
-
-\textbf{ReLU to GELU.} ReLU applies a hard threshold: $\text{ReLU}(x) = \max(0,x)$. This has two problems for Transformers. (1) The \textit{dying ReLU} problem: neurons receiving consistently negative inputs have exactly zero gradient and never recover. In deep Transformers with hundreds of sublayers, this compounds---entire channels can go permanently dead. (2) The \textit{hard discontinuity} at $x=0$ means the gradient is undefined at zero and jumps from 0 to 1, creating a non-smooth loss landscape.
-
-GELU smooths this by weighting the input by its Gaussian CDF: $\text{GELU}(x) = x \cdot \Phi(x)$. Near zero, GELU has a smooth transition instead of a hard cutoff. This means small negative inputs get small but \textit{nonzero} outputs and gradients, preventing dead neurons. The smooth curvature also benefits optimization---Adam and other adaptive optimizers work better with smooth gradients. Empirically, GELU gives 0.5--1\% improvement on Transformer benchmarks (BERT, GPT-2, ViT) with negligible compute overhead.
-
-\textbf{GELU to SwiGLU.} SwiGLU replaces the two-matrix FFN ($\text{FFN}(x) = \text{GELU}(x\mW_1)\mW_2$) with a three-matrix gated structure: $\text{SwiGLU}(x) = (\text{Swish}(x\mW_1) \odot x\mV)\mW_2$. The key innovation is the \textit{multiplicative gating}: $x\mV$ acts as a gate on $\text{Swish}(x\mW_1)$. This element-wise multiplication creates richer feature interactions within the FFN, allowing the network to learn more expressive transformations. The Swish activation ($x\sigma(x)$) is itself smooth and self-gated.
-
-The cost is an extra weight matrix ($\mV$), so to keep parameter count constant, the hidden dimension is reduced from $4d$ to $\frac{8}{3}d$. Despite fewer hidden units, the multiplicative interaction compensates, and SwiGLU consistently outperforms GELU by 0.5--2\% across model scales (shown in PaLM and LLaMA ablations). This is why essentially all modern LLMs (LLaMA, Mistral, Gemma, Qwen) use SwiGLU.
-
-\textbf{Red flags} (what NOT to say):
-\begin{itemize}
-    \item ``GELU is just a smoother version of ReLU''---this undersells the gradient flow and dying neuron benefits.
-    \item ``SwiGLU is better because it's newer''---need to explain the gating mechanism.
-    \item Not mentioning the parameter budget trade-off (3 matrices instead of 2, reduced hidden dim).
-\end{itemize}
-
-\textbf{What the interviewer is testing:} Whether you understand the progression of design choices, the specific failure modes each addresses, and the engineering trade-offs (compute, parameters, expressivity) at each step.
-
-\textbf{What separates good from great:}
-\begin{itemize}
-    \item \textbf{L5:} Clearly explains dying ReLU fix (GELU) and gating mechanism (SwiGLU), mentions the $\frac{8}{3}d$ hidden dim.
-    \item \textbf{L6:} Cites ablation results from PaLM/LLaMA papers, explains why multiplicative interactions increase expressivity (bilinear maps can represent higher-order feature interactions), discusses compute-quality Pareto frontier.
-    \item \textbf{L7:} Connects to the broader GLU family (original GLU by Dauphin et al., ReGLU, GEGLU), discusses how activation choice interacts with scaling laws, and notes that the benefit of SwiGLU is more pronounced at larger model scales.
-\end{itemize}
-
-\textbf{Common follow-ups:} ``What is the GLU family and how do variants compare?'' ``How does activation choice interact with initialization?'' ``Would you use SwiGLU in a CNN?''
-\end{interviewq}
-
-%--- New Q4 ---
-
-\begin{interviewq}
-\textbf{Q: RMSNorm vs LayerNorm---when would you choose each?}
-
-\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
-
-\textbf{Strong answer:}
-
-LayerNorm normalizes by centering (subtracting mean) and scaling (dividing by standard deviation): $\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}$, then applies learned affine: $y_i = \gamma_i \hat{x}_i + \beta_i$. RMSNorm drops the mean-centering step entirely: $\hat{x}_i = \frac{x_i}{\text{RMS}(\vx)} \cdot \gamma_i$, where $\text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_j x_j^2}$.
-
-\textbf{Choose RMSNorm when:} (1) Training modern LLMs where every percentage of compute matters---RMSNorm saves 10--15\% wall-clock time on the normalization operation by eliminating the mean computation and the bias parameter. (2) The architecture uses pre-norm placement, where the re-centering property of LayerNorm is less critical because the residual stream preserves the mean. (3) You want a simpler implementation (fewer parameters: no $\beta$).
-
-\textbf{Choose LayerNorm when:} (1) Working with encoder-only models like BERT where the original architecture uses LayerNorm and swapping may require re-tuning. (2) Post-norm architectures, where the mean-centering provides additional stability. (3) Tasks where the mean of activations carries important information---removing it may slightly hurt in some settings. (4) When using well-established codebases that default to LayerNorm and switching offers marginal gains.
-
-The empirical insight from Zhang and Sennrich (2019) is that mean-centering contributes negligibly to LayerNorm's effectiveness---the scale normalization (preventing activations from growing or shrinking) does the heavy lifting. This is why RMSNorm achieves comparable quality: it preserves the essential re-scaling while being cheaper to compute.
-
-In practice, the quality difference between LayerNorm and RMSNorm is within noise for most tasks. The choice is primarily driven by compute efficiency, and for any new LLM project, RMSNorm is the default recommendation.
-
-\textbf{Red flags} (what NOT to say):
-\begin{itemize}
-    \item ``RMSNorm is strictly better''---there are cases where mean-centering matters.
-    \item Not knowing that RMSNorm removes both the mean subtraction \textit{and} the bias term $\beta$.
-    \item Overstating the speed difference---10--15\% is on the normalization op, not the full model.
-\end{itemize}
-
-\textbf{What the interviewer is testing:} Understanding of what each component (mean-centering, variance scaling, learned affine) contributes, and making principled trade-off decisions rather than blindly following trends.
-
-\textbf{What separates good from great:}
-\begin{itemize}
-    \item \textbf{L5:} Knows the formula difference, states RMSNorm is faster with similar quality, and recommends it for new LLM projects.
-    \item \textbf{L6:} Explains \textit{why} mean-centering is less important (the re-scaling prevents activation explosion, which is the primary benefit), cites the Zhang and Sennrich analysis, and discusses interaction with pre-norm vs. post-norm.
-    \item \textbf{L7:} Discusses how the choice interacts with residual stream dynamics (pre-norm + RMSNorm means the residual stream is only scaled, not shifted, preserving information in the mean), and mentions emerging approaches like QK-norm and nGPT that further simplify normalization.
-\end{itemize}
-
-\textbf{Common follow-ups:} ``What if you removed normalization entirely?'' ``How does normalization interact with learning rate selection?'' ``What is QK-norm and why is it needed?''
-\end{interviewq}
-
-%--- New Q5 ---
+%--- Q5: Train vs inference normalization (after BatchNorm) ---
 
 \begin{interviewq}
 \textbf{Q: Your model shows different behavior at training vs inference. What normalization issue could cause this?}
@@ -549,53 +333,68 @@ The most common culprit is \textbf{BatchNorm's train/eval mode discrepancy}. Dur
 \textbf{Common follow-ups:} ``How would you verify that running statistics are correct?'' ``Does dropout cause a similar train/test discrepancy?'' ``How does BatchNorm interact with gradient accumulation?''
 \end{interviewq}
 
-%--- New Q6 ---
+\subsection{Layer Normalization}
+
+\begin{mathresult}{Layer Normalization}
+For each sample, normalize across features:
+\begin{align}
+\mu &= \frac{1}{d}\sum_{i=1}^d x_i \\
+\sigma^2 &= \frac{1}{d}\sum_{i=1}^d (x_i - \mu)^2 \\
+\hat{x}_i &= \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} \\
+y_i &= \gamma_i \hat{x}_i + \beta_i
+\end{align}
+\end{mathresult}
+
+\textbf{Key difference from BatchNorm}: Normalizes across features (within sample), not across batch.
+
+\textbf{Advantages}:
+\begin{itemize}
+    \item Works with any batch size (even 1)
+    \item Same behavior train and test
+    \item Natural for sequence models
+\end{itemize}
+
+\textbf{Used in}: Transformers (BERT, GPT, etc.)
+
+%--- Q1: BatchNorm-Transformer incompatibility (after LayerNorm) ---
 
 \begin{interviewq}
-\textbf{Q: Explain the dying ReLU problem. How do modern activations solve it?}
+\textbf{Q: Why don't Transformers use BatchNorm? Derive the reasoning from first principles.}
 
-\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+\textbf{Difficulty:} L6 \quad \textbf{Type:} First Principles \quad \textbf{Frequency:} \freqmed{}
 
 \textbf{Strong answer:}
 
-\textbf{The dying ReLU problem:} ReLU outputs zero for all negative inputs: $\text{ReLU}(x) = \max(0,x)$. Critically, its gradient is also zero for $x \leq 0$. If a neuron's pre-activation is negative for \textit{every} sample in the dataset, it receives zero gradient and its weights never update---the neuron is permanently ``dead.''
+BatchNorm computes statistics across the batch dimension for each feature channel: $\mu_c = \frac{1}{BT}\sum_{b,t} x_{b,t,c}$ where $B$ is batch size and $T$ is sequence length. This creates several fundamental incompatibilities with Transformers.
 
-\textbf{How neurons die:} (1) A large gradient update pushes the bias to a very negative value, shifting the pre-activation distribution below zero. (2) Poor initialization (e.g., large negative biases) starts neurons in the dead zone. (3) High learning rates amplify both effects. Once dead, the neuron can never recover because it receives exactly zero gradient---there is no mechanism to ``revive'' it. In deep networks, this can cascade: dead neurons in layer $l$ reduce the expressivity available to layer $l+1$, potentially killing more neurons.
+First, \textbf{variable sequence lengths} mean that different positions in the batch are padding tokens. BatchNorm statistics mix real tokens with padding, polluting the normalization. You could mask padding, but this makes the effective batch size position-dependent---positions near the end of sequences see fewer real tokens, leading to noisy statistics for those positions.
 
-\textbf{Diagnosis:} Compute the fraction of zero activations per layer. If $>$30--40\% of neurons are consistently zero across the dataset, dying ReLU is a problem. In PyTorch: register a forward hook that logs \texttt{(output == 0).float().mean()}.
+Second, \textbf{autoregressive generation} processes one token at a time (batch size = 1). BatchNorm's running statistics from training (where sequences are packed) don't match this inference regime. The distribution of activations at generation time---conditioned on partial sequences---differs from the training-time distribution computed over full sequences.
 
-\textbf{Modern solutions, from simplest to most complex:}
+Third, \textbf{the batch dimension in Transformers is fundamentally different from CNNs}. In a CNN, different images in the batch have the same spatial structure, so normalizing across the batch at each spatial-channel position makes sense. In a Transformer, different tokens in different positions have different roles (subject, verb, padding), so normalizing across the batch at a fixed position mixes semantically unrelated activations.
 
-\textit{Leaky ReLU / PReLU:} $f(x) = \max(\alpha x, x)$ with $\alpha = 0.01$ (Leaky) or learned (PReLU). The small negative slope ensures a nonzero gradient for $x < 0$, so neurons can always receive updates. Simple, effective, but the negative slope is somewhat arbitrary.
-
-\textit{ELU:} $f(x) = x$ for $x > 0$, $\alpha(e^x - 1)$ for $x \leq 0$. Smooth at zero, and the negative saturation pushes mean activations closer to zero. But the exponential is more expensive than ReLU.
-
-\textit{GELU:} $f(x) = x \cdot \Phi(x)$. Smoothly gates the input by its Gaussian percentile. For large negative inputs, the output and gradient are small but nonzero. For values near zero, the transition is smooth, avoiding the gradient discontinuity. This ``soft thresholding'' is the key conceptual advance: instead of a hard zero/pass decision, GELU makes a probabilistic decision.
-
-\textit{SiLU/Swish:} $f(x) = x \cdot \sigma(x)$. Self-gated: the sigmoid of $x$ gates $x$ itself. Has a small negative region (minimum $\approx -0.28$ at $x \approx -1.28$), which empirically acts as regularization. Used in EfficientNet and as part of SwiGLU.
-
-All modern activations solve dying ReLU through the same principle: ensuring \textbf{nonzero gradients for negative inputs}. The evolution is from simple fixes (Leaky ReLU) to smooth, expressive functions (GELU, SiLU) that additionally provide better optimization landscapes.
+LayerNorm resolves all three issues: it normalizes across the feature dimension \textit{within} each token independently ($\mu = \frac{1}{d}\sum_{i=1}^d x_i$), requiring no batch statistics, behaving identically at train and test time, and treating each token as a self-contained unit. This aligns with how attention processes sequences: each token's representation is updated independently through Q/K/V projections before interacting with other tokens.
 
 \textbf{Red flags} (what NOT to say):
 \begin{itemize}
-    \item ``Dying ReLU happens when the output is zero''---the problem is that the \textit{gradient} is zero, preventing recovery.
-    \item ``Just use a smaller learning rate''---this reduces the probability but doesn't eliminate the fundamental issue.
-    \item Not knowing that GELU still allows near-zero activations for negative inputs; the key is that the gradient is nonzero.
+    \item ``BatchNorm just doesn't work for sequences''---this is hand-waving without explaining the mechanism.
+    \item Failing to mention the train/test discrepancy for autoregressive generation.
+    \item Not distinguishing the batch dimension semantics between CNNs and Transformers.
 \end{itemize}
 
-\textbf{What the interviewer is testing:} Understanding of the interaction between activation functions and gradient flow, the ability to explain \textit{why} a neuron can never recover (zero gradient = zero update), and knowledge of how each modern activation addresses this.
+\textbf{What the interviewer is testing:} Whether you can derive \textit{why} an architectural choice was made from the mechanics of both the normalization method and the architecture, rather than just memorizing ``Transformers use LayerNorm.''
 
 \textbf{What separates good from great:}
 \begin{itemize}
-    \item \textbf{L5:} Explains the problem clearly (zero gradient for negative inputs prevents recovery), names 2--3 solutions, and can diagnose it in practice.
-    \item \textbf{L6:} Connects to initialization theory (He initialization was designed to keep pre-activations balanced around zero for ReLU), explains the cascade effect in deep networks, and discusses the interaction with normalization (LayerNorm re-centers activations, reducing the probability of dying neurons).
-    \item \textbf{L7:} Discusses the representation capacity implications---dead neurons reduce the effective width of the network, and the relationship between dead neuron fraction and model quality follows a phase transition-like curve. Connects to the lottery ticket hypothesis (sparse networks with many ``dead'' neurons can still work if the right neurons survive).
+    \item \textbf{L5:} States the variable-length and train/test issues clearly.
+    \item \textbf{L6:} Derives the incompatibility from the formulas, explains why the batch dimension semantics differ between CNNs and Transformers, and mentions that PowerNorm and other BatchNorm variants have been tried in Transformers with limited success.
+    \item \textbf{L7:} Connects to the broader design principle that normalization should be \textit{per-example} in architectures where batch composition is variable, discusses the smoothing effect on the loss landscape, and mentions that some recent work (e.g., nGPT) removes normalization entirely in favor of representation learning on the hypersphere.
 \end{itemize}
 
-\textbf{Common follow-ups:} ``How does He initialization specifically address dying ReLU?'' ``Can a dead ReLU neuron ever recover?'' ``What is the relationship between activation sparsity and model quality?''
+\textbf{Common follow-ups:} ``Why RMSNorm over LayerNorm in modern LLMs?'' ``Where is BatchNorm still preferred and why?'' ``What is pre-norm vs. post-norm and why does it matter for training stability?''
 \end{interviewq}
 
-%--- New Q7 ---
+%--- Q7: Derive BatchNorm incompatibility (after Q1, both on BatchNorm vs LayerNorm) ---
 
 \begin{interviewq}
 \textbf{Q: Derive why BatchNorm doesn't work well for Transformers.}
@@ -641,7 +440,205 @@ Then normalizes: $\hat{x}_{b,t,j} = (x_{b,t,j} - \mu_j)/\sqrt{\sigma_j^2 + \epsi
 \textbf{Common follow-ups:} ``What about GroupNorm for Transformers?'' ``Could you make BatchNorm work if you computed statistics per-position?'' ``What is the effect of normalization on the rank of representations?''
 \end{interviewq}
 
-%--- New Q8 ---
+\subsection{RMSNorm}
+
+\begin{mathresult}{RMSNorm}
+\begin{equation}
+\text{RMSNorm}(\vx) = \frac{\vx}{\text{RMS}(\vx)} \odot \bm{\gamma}, \quad \text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_{i=1}^d x_i^2}
+\end{equation}
+\end{mathresult}
+
+\textbf{Simplification of LayerNorm}:
+\begin{itemize}
+    \item No mean centering (only scale normalization)
+    \item No bias term $\beta$
+    \item Empirically similar performance
+    \item 10-15\% faster
+\end{itemize}
+
+\textbf{Used in}: LLaMA, Mistral, most modern LLMs
+
+%--- Q4: RMSNorm vs LayerNorm (after RMSNorm) ---
+
+\begin{interviewq}
+\textbf{Q: RMSNorm vs LayerNorm---when would you choose each?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+LayerNorm normalizes by centering (subtracting mean) and scaling (dividing by standard deviation): $\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}$, then applies learned affine: $y_i = \gamma_i \hat{x}_i + \beta_i$. RMSNorm drops the mean-centering step entirely: $\hat{x}_i = \frac{x_i}{\text{RMS}(\vx)} \cdot \gamma_i$, where $\text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_j x_j^2}$.
+
+\textbf{Choose RMSNorm when:} (1) Training modern LLMs where every percentage of compute matters---RMSNorm saves 10--15\% wall-clock time on the normalization operation by eliminating the mean computation and the bias parameter. (2) The architecture uses pre-norm placement, where the re-centering property of LayerNorm is less critical because the residual stream preserves the mean. (3) You want a simpler implementation (fewer parameters: no $\beta$).
+
+\textbf{Choose LayerNorm when:} (1) Working with encoder-only models like BERT where the original architecture uses LayerNorm and swapping may require re-tuning. (2) Post-norm architectures, where the mean-centering provides additional stability. (3) Tasks where the mean of activations carries important information---removing it may slightly hurt in some settings. (4) When using well-established codebases that default to LayerNorm and switching offers marginal gains.
+
+The empirical insight from Zhang and Sennrich (2019) is that mean-centering contributes negligibly to LayerNorm's effectiveness---the scale normalization (preventing activations from growing or shrinking) does the heavy lifting. This is why RMSNorm achieves comparable quality: it preserves the essential re-scaling while being cheaper to compute.
+
+In practice, the quality difference between LayerNorm and RMSNorm is within noise for most tasks. The choice is primarily driven by compute efficiency, and for any new LLM project, RMSNorm is the default recommendation.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``RMSNorm is strictly better''---there are cases where mean-centering matters.
+    \item Not knowing that RMSNorm removes both the mean subtraction \textit{and} the bias term $\beta$.
+    \item Overstating the speed difference---10--15\% is on the normalization op, not the full model.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of what each component (mean-centering, variance scaling, learned affine) contributes, and making principled trade-off decisions rather than blindly following trends.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows the formula difference, states RMSNorm is faster with similar quality, and recommends it for new LLM projects.
+    \item \textbf{L6:} Explains \textit{why} mean-centering is less important (the re-scaling prevents activation explosion, which is the primary benefit), cites the Zhang and Sennrich analysis, and discusses interaction with pre-norm vs. post-norm.
+    \item \textbf{L7:} Discusses how the choice interacts with residual stream dynamics (pre-norm + RMSNorm means the residual stream is only scaled, not shifted, preserving information in the mean), and mentions emerging approaches like QK-norm and nGPT that further simplify normalization.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``What if you removed normalization entirely?'' ``How does normalization interact with learning rate selection?'' ``What is QK-norm and why is it needed?''
+\end{interviewq}
+
+\subsection{Other Normalization Variants}
+
+\subsubsection{Instance Normalization}
+
+Normalize each channel of each sample independently.
+\begin{equation}
+\text{IN}(x_{nchw}) = \frac{x_{nchw} - \mu_{nc}}{\sigma_{nc}}
+\end{equation}
+
+\textbf{Used in}: Style transfer, image generation
+
+\subsubsection{Group Normalization}
+
+Divide channels into groups, normalize within groups.
+
+\textbf{Used in}: When batch size is very small (object detection)
+
+\subsubsection{Weight Normalization}
+
+Reparameterize weights: $\vw = g \frac{\vv}{\|\vv\|}$
+
+\textbf{Used in}: Some generative models
+
+\subsection{Pre-Norm vs. Post-Norm}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.6cm, rounded corners, font=\small},
+    norm/.style={box, fill=lightyellow},
+    sublayer/.style={box, fill=lightblue}
+]
+    % Post-norm
+    \begin{scope}[shift={(0,0)}]
+        \node[sublayer] (sub1) {SubLayer};
+        \node[above=0.3cm of sub1] (add1) {$+$};
+        \node[norm, above=0.3cm of add1] (norm1) {Norm};
+        \node[above=0.5cm of norm1] (out1) {};
+        \node[below=0.5cm of sub1] (in1) {};
+
+        \draw[->] (in1) -- (sub1);
+        \draw[->] (sub1) -- (add1);
+        \draw[->] (add1) -- (norm1);
+        \draw[->] (norm1) -- (out1);
+        \draw[->] (in1.north) -- ++(-0.8,0) |- (add1.west);
+
+        \node[below=1cm of sub1, font=\bfseries] {Post-Norm};
+        \node[below=1.4cm of sub1, font=\small] {(Original Transformer)};
+    \end{scope}
+
+    % Pre-norm
+    \begin{scope}[shift={(5,0)}]
+        \node[norm] (norm2) {Norm};
+        \node[sublayer, above=0.3cm of norm2] (sub2) {SubLayer};
+        \node[above=0.3cm of sub2] (add2) {$+$};
+        \node[above=0.5cm of add2] (out2) {};
+        \node[below=0.5cm of norm2] (in2) {};
+
+        \draw[->] (in2) -- (norm2);
+        \draw[->] (norm2) -- (sub2);
+        \draw[->] (sub2) -- (add2);
+        \draw[->] (add2) -- (out2);
+        \draw[->] (in2.north) -- ++(-0.8,0) |- (add2.west);
+
+        \node[below=1cm of norm2, font=\bfseries] {Pre-Norm};
+        \node[below=1.4cm of norm2, font=\small] {(Modern Standard)};
+    \end{scope}
+\end{tikzpicture}
+\caption{Pre-norm vs. post-norm placement in Transformer blocks.}
+\end{figure}
+
+\textbf{Pre-norm advantages}:
+\begin{itemize}
+    \item More stable training (gradient flows through residual directly)
+    \item No learning rate warmup needed
+    \item Standard in modern LLMs
+\end{itemize}
+
+\subsection{Normalization Selection Guide}
+
+\begin{table}[H]
+\centering
+\caption{Normalization selection by architecture}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Architecture} & \textbf{Recommended} & \textbf{Why} \\
+\midrule
+CNN (large batch) & BatchNorm & Proven, effective \\
+CNN (small batch) & GroupNorm & Batch-independent \\
+Transformer & LayerNorm & Sequence-friendly \\
+Modern LLM & RMSNorm & Faster, similar quality \\
+Style transfer & InstanceNorm & Per-image normalization \\
+GAN discriminator & SpectralNorm & Stabilizes training \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}
+BatchNorm in multi-GPU training requires explicit synchronization (SyncBatchNorm). Without it, each GPU computes statistics from its local batch, which can be too small and lead to noisy estimates. This is a common source of subtle training bugs when scaling to multiple GPUs---loss looks fine but model quality degrades.
+\end{warningbox}
+
+%--- Q2: NaN training loss debugging (after normalization content) ---
+
+\begin{interviewq}
+\textbf{Q: Training loss is NaN after a few hundred steps. Which activation/normalization issues could cause this?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+NaN loss within the first few hundred steps points to numerical instability rather than slow divergence. I would diagnose in order of likelihood.
+
+\textbf{Check 1: Gradient explosion before NaN.} Insert gradient norm logging. If gradient norms spike (e.g., from $\sim$1 to $>10^4$) before the NaN step, the issue is gradient explosion. Common causes: (a) post-norm placement---gradients must flow through normalization layers, which can amplify them in deep networks; switching to pre-norm often fixes this immediately; (b) no gradient clipping---add max-norm clipping at 1.0; (c) learning rate too high for the architecture depth.
+
+\textbf{Check 2: Activation overflow in softmax or attention.} Large pre-softmax logits cause $\exp(\cdot)$ overflow. In attention, if Q/K projections are poorly initialized, dot products can be $O(d)$ instead of $O(1)$, making logits huge. Verify that attention is scaled by $1/\sqrt{d_k}$. Also check that temperature/scaling parameters haven't been accidentally set to values near zero (which amplifies logits).
+
+\textbf{Check 3: Division by near-zero in normalization.} BatchNorm or LayerNorm compute $\hat{x} = (x - \mu)/\sqrt{\sigma^2 + \epsilon}$. If $\epsilon$ is too small (e.g., $10^{-12}$ instead of $10^{-5}$) and a batch has near-constant activations, the denominator approaches zero. This is especially dangerous in mixed-precision training where FP16 has limited range---$\epsilon$ should be at least $10^{-5}$ for FP16.
+
+\textbf{Check 4: Dying ReLU cascade.} With aggressive initialization or high learning rates, a large fraction of ReLU neurons can die (output zero for all inputs). This creates zero gradients for those neurons, concentrating gradient flow through fewer active neurons, which then receive larger updates and can overflow. Check the fraction of dead neurons per layer; if $>$50\%, switch to GELU or LeakyReLU.
+
+\textbf{Check 5: Mixed-precision loss scaling.} If using FP16 training, the loss scaler may not be configured correctly. FP16 underflows at $\sim 6 \times 10^{-8}$ and overflows at $\sim 65504$. Without dynamic loss scaling, gradients can underflow to zero (then weights don't update, then loss spikes) or overflow to Inf/NaN. Verify that the GradScaler is enabled and its initial scale is appropriate.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just lower the learning rate''---this is a symptom-level fix without diagnosing the root cause.
+    \item Not mentioning mixed-precision training issues---this is the most common NaN source in modern training.
+    \item Forgetting to check $\epsilon$ values in normalization layers.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Systematic debugging approach for numerical instability, understanding the chain of events that leads to NaN (overflow $\to$ Inf $\to$ NaN in a subsequent operation), and awareness of the interaction between activations, normalization, and precision.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies the top 3 causes (softmax overflow, gradient explosion, normalization epsilon) and proposes concrete fixes.
+    \item \textbf{L6:} Adds mixed-precision analysis, explains the FP16 range limitations quantitatively, and proposes systematic instrumentation (gradient norms, activation histograms, per-layer NaN detection) to localize the failing layer.
+    \item \textbf{L7:} Discusses the interaction between initialization, normalization, and gradient flow in deep networks; mentions that pre-norm architectures are inherently more stable because the residual stream has an uninterrupted gradient path; references the ``edge of stability'' phenomenon where training can oscillate near the stability threshold before diverging.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you instrument a training run to catch NaN before it propagates?'' ``What is the relationship between normalization placement and gradient magnitude?'' ``How does BF16 compare to FP16 for training stability?''
+\end{interviewq}
+
+%--- Q8: Validation accuracy gap / normalization debugging (after Q2) ---
 
 \begin{interviewq}
 \textbf{Q: Your model's validation accuracy is significantly lower than training accuracy, and you suspect normalization. What is your debugging process?}

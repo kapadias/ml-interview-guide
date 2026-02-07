@@ -1068,3 +1068,548 @@ Few-shot classification & Siamese & Compare to class examples \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:similarity_questions}
+%==============================================================================
+
+%--- Q1 ---
+
+\begin{interviewq}
+\textbf{Q: Your two-tower model retrieves documents that share keywords with the query but aren't actually relevant. How do you fix this?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+This is a classic failure mode: the two-tower model has learned \textit{lexical matching} instead of \textit{semantic matching}. The dot product of query and document embeddings correlates with keyword overlap rather than relevance. I would diagnose and fix in stages.
+
+\textbf{Diagnosis.} Retrieve the top-50 results for 100 diverse queries. Annotate each result as relevant/irrelevant. For the false positives, check: do they share specific keywords with the query? If so, this confirms the lexical matching hypothesis. Also compute BM25 scores for the same queries---if BM25 and the two-tower model agree on most results, the model has effectively learned BM25 in embedding space.
+
+\textbf{Root cause: insufficient hard negatives.} With random or in-batch negatives, the model only needs to distinguish topically unrelated items (easy) and never learns to distinguish ``keyword-similar but irrelevant'' from ``truly relevant.'' The gradient signal from easy negatives is near zero.
+
+\textbf{Fix 1: BM25 hard negatives.} For each query, retrieve the top-100 BM25 results, filter out the true positives, and use the remaining as hard negatives. These share keywords with the query but were not clicked/labeled as relevant. Training against these specifically teaches the model to go beyond lexical matching. Mix hard negatives with random negatives (e.g., 30\% hard, 70\% random) to avoid training instability from exclusively hard examples.
+
+\textbf{Fix 2: Paraphrase augmentation.} Add paraphrased queries as positives---these have the same meaning but different words. This forces the model to encode meaning rather than specific word patterns. Generate paraphrases using back-translation or an LLM.
+
+\textbf{Fix 3: Add a cross-encoder reranking stage.} Even with improved embeddings, a two-tower model cannot capture fine-grained query-document interactions. A cross-encoder reranker on the top-100 candidates captures word-level alignment and resolves ambiguity (e.g., ``apple stock price'' vs. ``price of apples''). This is the most reliable fix and is standard in production search systems.
+
+\textbf{Fix 4: Pre-train with contrastive objectives.} Start from a model already trained for retrieval (E5, BGE) rather than vanilla BERT. These models have already learned to distinguish semantic from lexical similarity during their pre-training.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just increase the model size''---this doesn't fix the training signal problem.
+    \item Not mentioning hard negatives---this is the single most impactful fix for this failure mode.
+    \item ``Remove keywords from the query''---this destroys information rather than improving the model.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Diagnosis of a specific retrieval failure mode (lexical vs. semantic matching), understanding of why it happens (training signal from easy negatives), and knowledge of the standard fix (hard negatives from BM25).
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies hard negative mining as the key fix, proposes BM25-based negatives.
+    \item \textbf{L6:} Adds the diagnosis step (confirming the lexical matching hypothesis), proposes a mixed negative strategy, and adds cross-encoder reranking as a complementary fix.
+    \item \textbf{L7:} Discusses the curriculum of negative difficulty (start with moderate negatives, increase difficulty over training), proposes an asynchronous hard negative mining pipeline that refreshes negatives as the model improves, and notes that the hardest negatives should be mined from the \textit{current} model, not a static BM25 ranker.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How often should you refresh hard negatives during training?'' ``What happens if you use only hard negatives?'' ``How do you measure whether the model is doing lexical vs. semantic matching?''
+\end{interviewq}
+
+%--- Q2 ---
+
+\begin{interviewq}
+\textbf{Q: Design a multi-stage retrieval pipeline: candidate generation, reranking, and final scoring.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+Production retrieval systems use a funnel architecture: each stage reduces the candidate set while increasing scoring quality. I would design three stages.
+
+\textbf{Stage 1 --- Candidate Generation (target: 10ms, 1B $\to$ 1K).} Architecture: Two-tower model with separate query and document encoders. Pre-compute all document embeddings offline (768-dim, stored in FP16 $\to$ $768 \times 2$ bytes $\times$ 1B = 1.5 TB). Use HNSW index sharded across machines (e.g., 20 shards of 50M each, queried in parallel). Each shard returns top-50, merge and take global top-1000. Latency budget: $\sim$10ms with proper sharding. Key metric: Recall@1000---this is the ceiling for downstream stages. If a relevant document is missed here, no subsequent stage can recover it.
+
+\textbf{Stage 2 --- Reranking (target: 40ms, 1K $\to$ 100).} Architecture: Cross-encoder (12-layer BERT) processes [CLS] query [SEP] document [SEP] for each of the 1000 candidates. With GPU batching (batch=1000, sequence length $\sim$256), this takes $\sim$30--40ms on an A100. The cross-encoder provides full query-document interaction, capturing fine-grained semantic matching that the two-tower misses. Distill a smaller cross-encoder (6-layer, knowledge distilled from a 12-layer model) if latency is tight.
+
+\textbf{Stage 3 --- Final scoring and business logic (target: 5ms, 100 $\to$ 10).} Combine the cross-encoder score with additional features: BM25 lexical score, document freshness, popularity (click count), user personalization signals, and business rules (promoted content, diversity constraints). Use a lightweight gradient-boosted tree or linear model to combine these features. Apply diversity re-ranking (MMR or similar) to avoid showing redundant results.
+
+\textbf{Optimizations across stages:} (1) \textit{Embedding quantization}: Compress 768-dim FP16 to INT8 or use product quantization (96 bytes per vector $\to$ 96 GB total, fits in memory on a single large machine). (2) \textit{Query caching}: Cache results for the top 10K most frequent queries (can serve 30--50\% of traffic from cache). (3) \textit{Asynchronous pre-computation}: When a new document is added, compute its embedding and insert into the ANN index asynchronously. (4) \textit{Tiered reranking}: Rerank top-200 with the full cross-encoder, top-1000 with a lightweight scorer.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Proposing a cross-encoder on all 1B documents---this is computationally infeasible.
+    \item Not estimating latency per stage---the interviewer expects back-of-envelope math.
+    \item Skipping the business logic stage---real systems always have non-ML scoring factors.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} System design thinking---the funnel architecture pattern, latency budgeting across stages, the trade-off between scoring quality and computational cost, and awareness of production concerns beyond just the model.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Describes the two-stage pattern (retrieval + reranking) with reasonable architecture choices.
+    \item \textbf{L6:} Adds the third stage (business logic), provides latency estimates per stage, discusses sharding for the ANN index, and proposes specific optimizations (PQ, caching, distillation).
+    \item \textbf{L7:} Designs for operational reality---monitoring per-stage recall/latency, A/B testing framework for model updates, graceful degradation (if the reranker is slow, fall back to two-tower scores), and discusses how feedback loops (user clicks) can improve both the retrieval and reranking models over time.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you shard the ANN index?'' ``What if the latency budget were 20ms instead of 100ms?'' ``How do you evaluate each stage independently?''
+\end{interviewq}
+
+%--- Q3 ---
+
+\begin{interviewq}
+\textbf{Q: Siamese vs Triplet vs Two-Tower---decision framework for a new retrieval project.}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+These architectures form a spectrum from simple symmetric comparison to scalable asymmetric retrieval. The choice depends on the problem structure.
+
+\textbf{Siamese networks} use a single shared encoder for both inputs. Best when: (1) the two inputs are the same type (image-image, sentence-sentence), (2) comparison is symmetric (order doesn't matter), (3) you have limited training data (weight sharing acts as strong regularization), and (4) the corpus is small enough that pairwise comparison is feasible ($<$100K items). Classic use cases: face verification, signature verification, one-shot learning. Loss: contrastive loss or cosine similarity loss on pairs.
+
+\textbf{Triplet networks} extend Siamese with anchor-positive-negative triplets and triplet loss: $\loss = \max(0, d(a,p) - d(a,n) + m)$. Better than Siamese when: (1) you care about \textit{relative ranking} rather than absolute similarity, (2) you have enough data to construct informative triplets (requires many examples per class for good mining). Key challenge: triplet mining---easy triplets contribute zero gradient, hard triplets can destabilize training. Semi-hard mining is the standard default. Use cases: image retrieval, person re-identification, fine-grained visual similarity.
+
+\textbf{Two-tower (dual encoder)} uses separate encoders for queries and items, enabling asymmetric inputs and pre-computed item embeddings. Choose when: (1) query and item types differ (text query, product item), (2) the corpus is large ($>$1M items)---item embeddings are computed once and indexed, (3) real-time retrieval is needed ($<$10ms), (4) you need to serve high QPS (queries per second). Training typically uses InfoNCE with in-batch negatives + hard negatives. Use cases: search, recommendation, ad matching.
+
+\textbf{Decision framework:}
+\begin{itemize}
+    \item Same-type symmetric comparison + small corpus $\to$ Siamese
+    \item Same-type ranking + medium corpus + abundant per-class data $\to$ Triplet
+    \item Cross-type or large-scale retrieval + latency constraints $\to$ Two-tower
+    \item Any scale where precision matters more than latency $\to$ Cross-encoder (not covered above, but often used as a reranker on top of two-tower)
+\end{itemize}
+
+In practice, modern systems often skip the Siamese/Triplet distinction and go directly to two-tower with InfoNCE loss (which subsumes both contrastive and triplet objectives when using in-batch negatives).
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Triplet networks are outdated''---they remain effective for fine-grained similarity where per-class data is abundant.
+    \item ``Two-tower is always better''---for symmetric same-type comparison with limited data, Siamese with weight sharing is more data-efficient.
+    \item Not mentioning scale as the primary decision factor.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Ability to choose the right architecture for a given problem by reasoning about the constraints (data type, corpus size, latency, training data availability) rather than always defaulting to the most popular approach.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Clearly states when each architecture is appropriate, mentions scale as the key differentiator.
+    \item \textbf{L6:} Discusses how InfoNCE subsumes contrastive and triplet objectives, explains the weight-sharing decision for two-tower, and proposes combining two-tower + cross-encoder for production systems.
+    \item \textbf{L7:} Discusses evolution from these discrete architecture choices to unified contrastive frameworks (CLIP-style) that scale seamlessly, and how modern systems often blend retrieval architectures (multiple two-tower models + BM25 + cross-encoder) in an ensemble.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``When would you use both a Siamese and a two-tower model in the same system?'' ``How does the loss function choice differ across architectures?'' ``What is the minimum training data needed for each?''
+\end{interviewq}
+
+%--- Q4 ---
+
+\begin{interviewq}
+\textbf{Q: Estimate the ANN index size and query latency for 1B 768-dim embeddings.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+\textbf{Raw embedding storage.} $10^9 \times 768 \times 4$ bytes (FP32) = 3.07 TB. In FP16: 1.54 TB. This is the baseline---the index metadata adds overhead on top.
+
+\textbf{HNSW index.} HNSW stores the vectors plus a graph structure. Each vector has $M$ neighbors per layer (typically $M=16$). The graph overhead is approximately $M \times L_{avg} \times 8$ bytes per vector (neighbor IDs as 64-bit integers), where $L_{avg}$ is the average number of layers per node ($\approx 1.5$ for random level assignment). Per-vector graph overhead: $16 \times 1.5 \times 8 \approx 192$ bytes. Total graph overhead: $192 \times 10^9 \approx 192$ GB. Total HNSW index: $\sim$1.54 TB (vectors in FP16) + $\sim$192 GB (graph) $\approx$ \textbf{1.73 TB}. This requires distributed deployment---e.g., 20 machines with 96 GB RAM each, 50M vectors per shard.
+
+\textbf{With product quantization (IVF-PQ).} Compress each 768-dim vector to 96 bytes (split into 96 subvectors of 8 dims, each quantized to 1 byte = 256 centroids). Storage: $96 \times 10^9 = 96$ GB for vectors + IVF structure overhead ($\sim$10 GB) $\approx$ \textbf{106 GB}. This fits on a single high-memory machine (128 GB RAM).
+
+\textbf{Query latency estimates.}
+\begin{itemize}
+    \item \textit{HNSW (per shard, 50M vectors)}: $\sim$1--5ms per query (log-scale traversal, $\sim$200--500 distance computations). With 20 shards queried in parallel: $\sim$5ms (dominated by the slowest shard + merge).
+    \item \textit{IVF-PQ (1B vectors, single machine)}: $\sim$5--20ms per query depending on $n_{probe}$ (number of clusters searched). With $n_{probe}=64$ out of $\sqrt{10^9} \approx 32K$ clusters, approximately $64/32K \times 10^9 = 2M$ vectors scanned with PQ distance, which takes $\sim$10ms.
+    \item \textit{Flat exhaustive search (for reference)}: $\sim$2--5 seconds per query. Completely impractical.
+\end{itemize}
+
+\textbf{Trade-off summary:} HNSW gives better recall ($>$95\% at reasonable parameters) but requires $\sim$16$\times$ more memory than IVF-PQ. IVF-PQ is more memory-efficient but recall degrades for very high-precision requirements. For 1B vectors, the practical choice is often HNSW with FP16/INT8 quantized vectors, or IVF-PQ with aggressive compression.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Getting the order of magnitude wrong on storage (it's TB-scale for 1B FP32 vectors, not GB-scale).
+    \item Not mentioning that HNSW at 1B scale requires sharding---it won't fit on a single machine.
+    \item Assuming flat exhaustive search is feasible at this scale.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Ability to estimate storage and latency from first principles, understanding of the memory-quality-latency trade-off for ANN algorithms, and awareness of practical deployment constraints.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correct storage calculation, knows HNSW is $O(\log N)$ and IVF is $O(\sqrt{N})$, estimates latency within an order of magnitude.
+    \item \textbf{L6:} Includes graph overhead for HNSW, PQ compression ratio, and discusses sharding strategy. Compares recall-latency trade-offs between HNSW and IVF-PQ.
+    \item \textbf{L7:} Discusses hybrid approaches (IVF + HNSW within each cluster), tiered storage (hot vectors in memory, cold on SSD with DiskANN), and how to scale to 10B+ vectors with multi-tier architectures.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you shard the index---by hash or by cluster?'' ``What is the recall@100 for HNSW vs IVF-PQ at this scale?'' ``How do you handle index updates when new documents arrive?''
+\end{interviewq}
+
+%--- Q5 ---
+
+\begin{interviewq}
+\textbf{Q: Your two-tower model's recall@10 is good but precision@10 is poor. What's wrong?}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+Good recall@10 means the model \textit{can} retrieve relevant documents in the top 10. Poor precision@10 means the top 10 also contains many irrelevant documents. This is a \textit{ranking quality} problem within the retrieved set, not a retrieval failure.
+
+\textbf{Diagnosis 1: Insufficient discrimination among close embeddings.} The two-tower model maps both relevant and semi-relevant documents near the query in embedding space. All 10 retrieved documents are ``close'' to the query, but the model can't distinguish ``highly relevant'' from ``somewhat related.'' This happens when: (a) training used only binary relevance labels (relevant/not) without graded relevance, so the model learns a coarse boundary; (b) the embedding dimension is too low to capture fine-grained distinctions; (c) the InfoNCE temperature is too high, making the loss insensitive to small similarity differences.
+
+\textbf{Diagnosis 2: Popularity bias.} Popular items appear as in-batch negatives less often (or are actually clicked frequently regardless of relevance). The model learns to rank popular items highly even when they're not relevant to the specific query. Check: are the false positives in the top-10 disproportionately popular items?
+
+\textbf{Diagnosis 3: The evaluation reveals a fundamental two-tower limitation.} The two-tower model computes query and document embeddings independently---no cross-attention between them. Fine-grained relevance often requires understanding how specific query terms relate to specific document phrases. The two-tower model compresses the document to a single vector, losing word-level matching information.
+
+\textbf{Fixes:}
+\begin{enumerate}
+    \item \textbf{Add a cross-encoder reranker}: Rerank the top-10 (or top-100 to give the reranker more candidates) with a cross-encoder. This is the most reliable fix because the cross-encoder provides full query-document interaction.
+    \item \textbf{Graded relevance training}: If you have graded labels, use a listwise loss (LambdaLoss) or margin-based loss that preserves the relevance ordering, not just binary in/out.
+    \item \textbf{Lower the temperature}: A lower $\tau$ in InfoNCE sharpens the similarity distribution, increasing discrimination among similar items. But too low causes training instability---tune carefully.
+    \item \textbf{Hard negative calibration}: Ensure hard negatives are ``hard but irrelevant,'' not ``actually relevant but unlabeled.'' Poor hard negatives can teach the model to push away relevant items.
+    \item \textbf{Popularity debiasing}: Apply inverse propensity weighting or a popularity correction in the loss to reduce the model's tendency to rank popular items highly regardless of query relevance.
+\end{enumerate}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Increase recall@K to get better precision''---recall@10 is already good, the problem is ranking within the top 10.
+    \item ``Train longer''---this is a structural limitation of two-tower models, not a convergence issue.
+    \item Confusing precision@10 with overall precision across the entire corpus.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding the difference between retrieval (finding relevant items at all) and ranking (ordering them correctly), and the fundamental limitation of two-tower models for fine-grained ranking.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies the ranking-within-retrieved-set problem and proposes a cross-encoder reranker.
+    \item \textbf{L6:} Adds popularity bias diagnosis, temperature tuning, and graded relevance training. Explains the information bottleneck of single-vector representations.
+    \item \textbf{L7:} Proposes a Poly-Encoder as a middle ground (richer interaction than two-tower without the full cost of a cross-encoder), discusses late interaction models (ColBERT) that retain token-level matching while enabling pre-computation, and designs a monitoring system that tracks precision@K per query category to detect systematic ranking failures.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you measure ranking quality vs retrieval quality separately?'' ``What is a late-interaction model and how does it help?'' ``How does ColBERT compare to a standard cross-encoder?''
+\end{interviewq}
+
+%--- Q6 ---
+
+\begin{interviewq}
+\textbf{Q: Cross-encoder vs bi-encoder---when is the quality gap worth the latency cost?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+A bi-encoder (two-tower) computes query and document embeddings independently, enabling $O(1)$ retrieval with pre-computed document vectors. A cross-encoder processes query and document jointly through full self-attention, providing $O(N)$ inference cost (one forward pass per candidate). The quality gap between them typically ranges from 3--8\% on NDCG@10 for retrieval benchmarks, sometimes more for complex semantic matching tasks.
+
+\textbf{When the quality gap is worth the cost:}
+
+(1) \textbf{Reranking a small candidate set.} When a bi-encoder has already reduced 1B documents to 100--1000 candidates, running a cross-encoder on this small set adds 20--50ms latency. The quality improvement is almost always worth it because: you're only paying for $\sim$100--1000 forward passes (not millions), and the reranker directly improves the user-visible top-K results.
+
+(2) \textbf{High-stakes decisions.} In legal document review, medical literature search, or compliance checks, a 5\% improvement in ranking quality can have significant downstream impact. The additional latency (even seconds) is acceptable if the decision quality matters more than response time.
+
+(3) \textbf{Offline batch processing.} For tasks like building a curated dataset, computing document similarity matrices, or generating training labels, latency doesn't matter. Use the cross-encoder for maximum quality.
+
+(4) \textbf{Complex semantic matching.} Tasks where word-level interaction is critical---natural language inference, fact verification, fine-grained relevance---benefit disproportionately from cross-encoder's full attention. The quality gap can be $>$10\% for these tasks.
+
+\textbf{When the latency cost is not worth it:}
+
+(1) \textbf{Real-time retrieval at scale.} If you need $<$10ms latency on 1M+ documents, a cross-encoder is infeasible (even at 100 candidates, 10ms is tight for a cross-encoder). Use a well-tuned bi-encoder, possibly with late-interaction (ColBERT) for a middle ground.
+
+(2) \textbf{High QPS with tight SLAs.} At 10K+ QPS with p99 latency requirements, the GPU cost of running cross-encoders on every request may exceed the quality benefit. A distilled bi-encoder that closes part of the quality gap is often preferable.
+
+(3) \textbf{When the quality gap is small.} On some benchmarks and domains, a well-trained bi-encoder (E5, BGE with hard negatives) approaches cross-encoder quality. Always measure the actual gap on your data before adding the complexity of a reranker.
+
+\textbf{The standard production pattern:} Bi-encoder retrieval (top-100 to top-1000) $\to$ cross-encoder reranking (top-10 to top-100). This gets $\sim$95\% of the cross-encoder's quality at $\sim$1\% of the cost of running it on the full corpus.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Cross-encoder is always better''---it depends on the domain-specific quality gap and latency constraints.
+    \item ``Just use a bigger bi-encoder to close the gap''---the gap is \textit{architectural} (independent vs. joint encoding), not just about model size.
+    \item Not quantifying the latency difference---it's a concrete engineering trade-off, not abstract.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Whether you can make nuanced cost-benefit trade-offs in system design, quantify both the quality and latency dimensions, and know the standard production pattern.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Clearly explains the quality-latency trade-off, knows the standard two-stage pattern.
+    \item \textbf{L6:} Quantifies the quality gap (3--8\% NDCG), mentions ColBERT as a middle ground, and discusses the economics (GPU cost vs. quality improvement).
+    \item \textbf{L7:} Discusses how to optimally allocate the latency budget across stages (e.g., investing more in the reranker by reducing the candidate set), proposes distilling the cross-encoder into a better bi-encoder (knowledge distillation from reranker to retriever), and discusses emerging approaches that blur the bi/cross boundary (Poly-Encoder, ColBERTv2, SPLADE).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you distill a cross-encoder into a bi-encoder?'' ``What is ColBERT and how does it compare?'' ``How do you decide the candidate set size for reranking?''
+\end{interviewq}
+
+%--- Q7 ---
+
+\begin{interviewq}
+\textbf{Q: Hard negative mining strategies---how to choose and when each fails.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Trade-off \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+Hard negative mining is the process of selecting training negatives that are challenging for the model---items that are similar to the query but not relevant. The choice of mining strategy significantly impacts model quality and training stability.
+
+\textbf{Strategy 1: In-batch negatives.} Use other items in the same batch as negatives. Effective batch size of negatives = $B - 1$ per query. \textit{Pros}: Zero extra computation, naturally diverse. \textit{Fails when}: Batch size is small (weak negative signal), or when the dataset has selection bias (items in the same batch may be from similar categories, making all negatives too easy). \textit{Fix}: Increase batch size, or use cross-GPU negative sharing (gather negatives from all GPUs).
+
+\textbf{Strategy 2: BM25 hard negatives.} For each query, retrieve top-K BM25 results, remove true positives, use the rest as negatives. These share keywords with the query but are irrelevant. \textit{Pros}: Cheap to compute (BM25 is fast), excellent for teaching lexical-vs-semantic distinction. \textit{Fails when}: The task requires semantic-only matching (BM25 negatives may be too easy for an already semantically-trained model), or when BM25 returns items that are actually relevant but unlabeled (false negatives in your training data).
+
+\textbf{Strategy 3: Model-mined hard negatives.} Use the current model's retrieval results as negatives (top-K retrieved but not labeled as relevant). \textit{Pros}: Most informative---these are exactly the items the model currently confuses. \textit{Fails when}: The model's negatives are so hard that many are actually relevant but unlabeled---this teaches the model to push away good results (catastrophic). Also, the model's view of ``hard'' changes during training, so static mining becomes stale. \textit{Fix}: Re-mine periodically (every 5--10K steps), use a separate ``teacher'' model for mining, or add a relevance filter (dedup against known positives, use an LLM to filter).
+
+\textbf{Strategy 4: Cross-batch memory bank (MoCo-style).} Maintain a queue of recent embeddings as a large pool of negatives. \textit{Pros}: Effectively very large negative set without increasing batch size. \textit{Fails when}: Embeddings in the queue become stale as the model updates (the encoder has changed since those embeddings were computed). \textit{Fix}: Use a momentum-updated encoder for the queue (MoCo), or refresh the queue frequently.
+
+\textbf{Strategy 5: Mixed negatives.} Combine multiple sources: 60\% in-batch, 20\% BM25, 20\% model-mined. \textit{Pros}: Diversity of difficulty levels prevents overfitting to one type of negative. \textit{This is the standard practice} for production retrieval models.
+
+\textbf{General principle:} Negatives should be hard enough to provide gradient signal but not so hard that they're actually positive (false negatives). The optimal difficulty is \textit{semi-hard}: negatives that are close to the decision boundary but on the correct side.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Always use the hardest negatives possible''---this causes training instability and false negative poisoning.
+    \item ``Random negatives are sufficient''---they're too easy for any non-trivial model.
+    \item Not mentioning the false negative problem with hard mining.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Deep understanding of how negative sampling affects contrastive learning dynamics, awareness of failure modes for each strategy, and practical knowledge of the standard mixed-negative approach.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Knows BM25 negatives and in-batch negatives, understands why hard negatives help.
+    \item \textbf{L6:} Discusses false negative poisoning, staleness of model-mined negatives, and proposes the mixed-negative strategy with specific ratios.
+    \item \textbf{L7:} Designs an automated hard negative mining pipeline with: periodic re-mining, relevance filtering (LLM-based or human-in-the-loop), difficulty annealing (start with easier negatives, increase difficulty during training), and monitoring for false negative rate in the mined set.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you detect that your hard negatives contain false negatives?'' ``How often should you re-mine?'' ``What is the interaction between negative difficulty and learning rate?''
+\end{interviewq}
+
+%--- Q8 ---
+
+\begin{interviewq}
+\textbf{Q: Cosine similarity vs dot product vs L2 distance for embeddings---when each?}
+
+\textbf{Difficulty:} L5 \quad \textbf{Type:} Conceptual \quad \textbf{Frequency:} \freqhigh{}
+
+\textbf{Strong answer:}
+
+These three metrics are closely related but differ in whether they account for embedding magnitude, which has practical implications.
+
+\textbf{Cosine similarity}: $\cos(\vu, \vv) = \frac{\vu^T\vv}{\|\vu\|\|\vv\|}$. Measures the angle between vectors, ignoring magnitude. Range: $[-1, 1]$. \textbf{Use when:} (1) You want purely directional similarity (semantic similarity regardless of ``confidence'' or frequency). (2) Embeddings have variable norms (e.g., frequent items have larger norms due to more gradient updates). (3) Combining embeddings from different models or scales. \textbf{Practical note:} If you L2-normalize all embeddings to unit norm at indexing time, cosine similarity equals dot product, and you can use the faster dot product at query time.
+
+\textbf{Dot product}: $\vu^T\vv = \|\vu\|\|\vv\|\cos(\vu,\vv)$. Measures both angular similarity and magnitude. Range: $(-\infty, \infty)$. \textbf{Use when:} (1) Magnitude carries useful information---e.g., the norm of a document embedding correlates with document quality or relevance, and you want the retrieval score to reflect this. (2) MIPS (Maximum Inner Product Search) is your retrieval primitive---most ANN libraries are optimized for this. (3) Embeddings are already normalized (then dot product = cosine). \textbf{Example:} In recommendation systems, item embedding norms often correlate with popularity. Dot product naturally boosts popular items, which may be desirable.
+
+\textbf{L2 (Euclidean) distance}: $\|\vu - \vv\|_2 = \sqrt{\sum_i(u_i-v_i)^2}$. Measures geometric distance. Range: $[0, \infty)$. \textbf{Use when:} (1) You need a proper distance metric (triangle inequality holds, useful for clustering algorithms). (2) The embedding space was trained with L2-based losses (triplet loss with Euclidean distance, contrastive loss with distance). (3) You're doing k-means clustering on embeddings. \textbf{Relationship:} For unit-normalized vectors, $\|\vu - \vv\|_2^2 = 2(1 - \cos(\vu,\vv))$, so L2 distance is a monotonic function of cosine similarity. In this case, all three metrics produce the same nearest-neighbor ranking.
+
+\textbf{Key insight for interviews:} The choice matters most when embeddings are \textit{not} normalized. With L2-normalized embeddings, all three metrics produce identical rankings, so the choice is purely about computational convenience (dot product is fastest for ANN search).
+
+\textbf{When the choice has real impact:}
+\begin{itemize}
+    \item \textit{Unnormalized embeddings}: Dot product favors high-norm vectors (popular/frequent items). Cosine ignores this. L2 penalizes large-norm differences. Choose based on whether popularity bias is desired.
+    \item \textit{Multi-modal embeddings}: CLIP normalizes embeddings to the unit sphere, so all metrics are equivalent. But if combining CLIP with other features (price, recency), dot product on unnormalized concatenated vectors lets different feature groups contribute different magnitudes.
+    \item \textit{ANN index compatibility}: HNSW natively supports L2 and inner product. Faiss supports all three. Choose based on your infrastructure.
+\end{itemize}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Cosine is always best for embeddings''---it depends on whether magnitude carries useful information.
+    \item Not knowing the equivalence for normalized vectors---this is the most commonly tested fact.
+    \item ``L2 distance and cosine similarity are unrelated''---they are monotonically related for unit vectors.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of when these metrics differ (unnormalized embeddings), when they're equivalent (normalized), and practical judgment about which to use in different scenarios.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Correctly explains all three metrics, knows the equivalence for normalized vectors, and picks appropriate use cases.
+    \item \textbf{L6:} Discusses the magnitude/popularity bias in dot product, the normalize-then-dot-product trick for efficient ANN search, and the interaction with the loss function used during training.
+    \item \textbf{L7:} Discusses how the choice of similarity metric at training time must match the metric at inference time (training with cosine loss but retrieval with dot product on unnormalized embeddings will fail), and how to handle the case where you want cosine similarity for ranking but dot product for ANN efficiency.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How does the choice of similarity metric interact with ANN algorithms?'' ``What is MIPS and why is it the standard retrieval primitive?'' ``How would you handle a case where you want cosine for ranking but dot product for speed?''
+\end{interviewq}
+
+%--- Q9 ---
+
+\begin{interviewq}
+\textbf{Q: Your contrastive model produces good embeddings for frequent items but poor for rare items. Why?}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Debugging \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+This is a fundamental challenge in contrastive learning: \textit{frequency bias}. Frequent items appear in many training pairs and receive abundant gradient updates, while rare items appear in few pairs and their embeddings are under-trained. The problem has multiple interacting causes.
+
+\textbf{Cause 1: Gradient imbalance.} In contrastive learning, each item's embedding is updated when it appears as a positive or a hard negative. Frequent items (e.g., popular products, common queries) appear in thousands of training pairs; rare items appear in tens. The cumulative gradient signal for frequent items is orders of magnitude larger, so their embeddings converge to high-quality representations while rare item embeddings remain noisy.
+
+\textbf{Cause 2: In-batch negative bias.} With in-batch negatives, frequent items are more likely to appear in the batch and serve as negatives. The model learns to ``push away'' from frequent items (because it sees them as negatives often), effectively learning to discriminate them well. Rare items rarely appear as negatives, so the model never learns to distinguish them from nearby items.
+
+\textbf{Cause 3: Embedding norm disparity.} Without L2 normalization, frequent items develop larger embedding norms (more gradient updates = larger weights). Dot-product similarity then systematically favors frequent items over rare ones, regardless of semantic relevance. Even with normalization, the \textit{direction} of frequent item embeddings is better calibrated.
+
+\textbf{Cause 4: Hard negative mining ignores rare items.} Model-mined hard negatives are biased toward frequent items (they appear in more retrieval results). Rare items are rarely retrieved and therefore rarely selected as hard negatives, further reducing the training signal for the rare-item region of embedding space.
+
+\textbf{Fixes:}
+\begin{enumerate}
+    \item \textbf{Inverse frequency sampling}: Up-sample rare items in training pairs so each item appears with roughly equal frequency. Weight the loss by inverse document frequency.
+    \item \textbf{Separate embedding heads}: Use a shared backbone but add a projection head specifically trained with a higher weight on rare-item pairs.
+    \item \textbf{Temperature annealing by frequency}: Use a lower temperature ($\tau$) for rare-item pairs, creating stronger gradient signal per pair to compensate for fewer pairs.
+    \item \textbf{Synthetic augmentation}: Generate synthetic variations of rare items (text paraphrasing, image augmentation) to increase their effective training frequency.
+    \item \textbf{Pre-trained initialization}: Initialize the embedding model from a strong pre-trained model (CLIP, E5) that has already seen diverse data. The pre-trained representations provide a better starting point for rare items than random initialization.
+    \item \textbf{Nearest-neighbor regularization}: Regularize rare item embeddings toward the centroid of their category's embeddings. This leverages the category-level structure learned from frequent items.
+\end{enumerate}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just train longer''---more training actually widens the gap (frequent items improve faster).
+    \item ``Use a larger model''---the bias is in the training distribution, not model capacity.
+    \item Not identifying the frequency imbalance as the root cause.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Understanding of how training data distribution affects learned representations, ability to identify the multiple interacting mechanisms that create frequency bias, and knowledge of mitigation strategies.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Identifies gradient imbalance as the cause and proposes up-sampling.
+    \item \textbf{L6:} Adds in-batch negative bias, embedding norm disparity, and temperature annealing. Proposes measuring embedding quality stratified by item frequency to quantify the gap.
+    \item \textbf{L7:} Connects to the broader long-tail problem in retrieval systems, proposes a curriculum that first trains on all data (building general representations) then fine-tunes with emphasis on rare items (improving the tail), and discusses how this interacts with the ANN index (rare items may be poorly indexed because their embedding neighborhoods are noisy).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you measure embedding quality separately for frequent and rare items?'' ``How does this interact with the ANN index?'' ``What is the cold-start problem for new items and how does it relate?''
+\end{interviewq}
+
+%--- Q10 ---
+
+\begin{interviewq}
+\textbf{Q: Estimate the QPS of a retrieval system using HNSW on 100M documents.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+To estimate QPS (queries per second), I need to estimate per-query latency and then account for parallelism.
+
+\textbf{Per-query latency for HNSW.} HNSW search involves traversing the graph from top layers to bottom. At each step, the algorithm evaluates $ef\_search$ candidates (a tunable parameter, typically 64--256 for good recall). Each evaluation requires computing a distance (768-dim dot product or L2 distance). With $ef\_search = 128$ and $\sim 2 \times$ overhead for graph traversal bookkeeping, we compute approximately 256 distance calculations.
+
+Each 768-dim FP32 distance computation: $768 \times 2$ FLOPS (multiply + add) = 1536 FLOPS. Total: $256 \times 1536 \approx 400K$ FLOPS. On a modern CPU with AVX-512 at $\sim$100 GFLOPS single-thread throughput: $400K / 100G = 4 \mu s$ for pure compute. But memory access dominates---each candidate vector is 3 KB (768 $\times$ 4 bytes), and the access pattern is random (graph traversal is not cache-friendly). At $\sim$10 ns per cache miss and $\sim$256 cache misses: $256 \times 100ns \approx 25 \mu s$ (some hits L3 cache at $\sim$30ns, some go to DRAM at $\sim$100ns).
+
+\textbf{Total per-query latency}: $\sim$0.5--2 ms per query per thread, depending on whether vectors are in L3 cache (hot queries) or DRAM (cold queries).
+
+\textbf{QPS per machine.} Modern servers have 32--64 cores. With multi-threaded search: $64 \text{ cores} / 1 \text{ ms per query} = \sim$64K QPS for hot workloads, $\sim$16--32K QPS for mixed workloads. In practice, with overhead (network, serialization, load balancing): $\sim$10--20K QPS per machine is a conservative estimate for 100M vectors on a single machine.
+
+\textbf{Memory requirement check.} 100M vectors $\times$ 768 dims $\times$ 4 bytes = 307 GB (FP32) or 154 GB (FP16). Plus HNSW graph: $\sim$20 GB. Total: $\sim$174 GB in FP16. This fits on a single machine with 256 GB RAM.
+
+\textbf{Scaling.} To serve 100K QPS: $\sim$5--10 replicas of the same index, behind a load balancer. Each replica is a separate machine with the full 100M vector index. Total cost: 5--10 machines with 256 GB RAM each.
+
+\textbf{With product quantization.} Compress to INT8 ($\sim$77 GB) or use scalar quantization. This both reduces memory and improves cache hit rates, potentially doubling QPS to $\sim$20--40K per machine.
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Ignoring memory access patterns---distance computation is memory-bound, not compute-bound.
+    \item Assuming single-threaded execution---modern ANN libraries are heavily multi-threaded.
+    \item Not checking whether the index fits in memory on a single machine.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Ability to reason about system performance from first principles---understanding the bottleneck (memory access, not compute), accounting for parallelism, and checking resource requirements.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Estimates per-query latency within an order of magnitude ($\sim$1ms), knows to multiply by core count for QPS.
+    \item \textbf{L6:} Identifies memory access as the bottleneck, estimates cache miss impact, and checks memory requirements. Proposes quantization to improve cache efficiency.
+    \item \textbf{L7:} Discusses the interaction between $ef\_search$ and recall (higher $ef\_search$ = better recall but lower QPS), proposes profiling the Pareto frontier of recall vs. QPS for the specific dataset, and discusses techniques like prefetching and SIMD-optimized distance computation (ScaNN) that push the frontier further.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How does ef\_search affect the recall-latency trade-off?'' ``What if you needed to serve 1M QPS?'' ``How would you handle a workload with very skewed query popularity?''
+\end{interviewq}
+
+%--- Q11 ---
+
+\begin{interviewq}
+\textbf{Q: How would you update embeddings in production without re-indexing the entire ANN?}
+
+\textbf{Difficulty:} L7 \quad \textbf{Type:} Architecture Design \quad \textbf{Frequency:} \freqlow{}
+
+\textbf{Strong answer:}
+
+This is an operational challenge that arises whenever the embedding model is retrained. New embeddings live in a \textit{different} embedding space than old ones (even small model changes rotate the space), so mixing old and new embeddings in the same index produces incorrect similarity scores. Full re-indexing (re-encoding all documents and rebuilding the ANN) is correct but expensive---for 1B documents, re-encoding takes hours to days, and index rebuilding takes additional hours.
+
+\textbf{Strategy 1: Shadow indexing (blue-green deployment).} Build the new index alongside the old one. When ready, atomically swap traffic. \textit{Pros}: Clean separation, no mixed-space contamination, simple to reason about. \textit{Cons}: Requires 2$\times$ memory/storage during transition, re-encoding all documents takes hours. \textit{Best for}: Periodic model updates (weekly/monthly) where the re-encoding cost is amortized.
+
+\textbf{Strategy 2: Incremental re-encoding with compatibility.} Re-encode documents in batches (e.g., 1\% per hour over 4 days). During transition, the index contains a mix of old and new embeddings. To make this work, the new model must produce embeddings that are \textit{backward-compatible} with the old model. \textit{Approach}: Train the new model with a backward-compatibility loss: $\loss = \loss_{\text{task}} + \lambda \cdot \|\vz_{\text{new}}(x) - \vz_{\text{old}}(x)\|^2$, constraining new embeddings to be close to old ones. \textit{Pros}: No downtime, gradual rollout, can detect quality regressions early. \textit{Cons}: Backward-compatibility constraint limits improvement, the model can't freely reorganize the embedding space.
+
+\textbf{Strategy 3: Adapter/projection layer.} Keep the base model frozen, add a trainable projection layer on top: $\vz_{\text{final}} = \text{Proj}(\vz_{\text{base}})$. When updating, only retrain the projection layer (much faster) and apply it to all documents. \textit{Pros}: Base embeddings don't change, re-indexing only requires a matrix multiply over stored base embeddings (fast, can be done in minutes). \textit{Cons}: Limited expressivity---the projection can only perform linear transformations of the embedding space.
+
+\textbf{Strategy 4: Model versioning with version-aware retrieval.} Maintain separate index partitions per model version. At query time, encode the query with \textit{all} active model versions, search each partition with the corresponding version, merge results, and rerank. \textit{Pros}: No compatibility constraints on the model. \textit{Cons}: Increases query latency linearly with the number of active versions, and index memory scales with versions.
+
+\textbf{Strategy 5: Matryoshka + dimension-aligned training.} Train all model versions with Matryoshka objectives and enforce that the first $k$ dimensions are semantically stable across versions. This allows partial compatibility---the first 128 dimensions can be compared across versions for coarse retrieval, then the full embedding (which differs across versions) is used for fine reranking.
+
+\textbf{Recommended approach for most teams:} Shadow indexing (Strategy 1) for its simplicity and correctness. Invest in making re-encoding fast (batch GPU inference, distributed processing) rather than in complex compatibility schemes. For very large corpora ($>$10B documents) where re-encoding is impractical, use the adapter approach (Strategy 3).
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item ``Just update embeddings in-place''---new and old embeddings are in different spaces, mixing them is incorrect.
+    \item ``The new model's embeddings are similar enough''---even small rotations of the embedding space destroy ANN retrieval quality.
+    \item Not considering the backward-compatibility problem at all.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} Operational thinking about ML systems---understanding that model updates have ripple effects on serving infrastructure, and designing strategies that balance freshness, correctness, and cost.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Recognizes the embedding space incompatibility problem and proposes shadow indexing.
+    \item \textbf{L6:} Adds backward-compatible training and the adapter approach, discusses the trade-offs between strategies.
+    \item \textbf{L7:} Designs a complete embedding lifecycle management system: automated re-encoding pipelines, A/B testing framework for embedding model updates, rollback capability, and monitoring for embedding space drift. Discusses how companies like Google (ScaNN) and Meta (FAISS) handle this operationally at billion-scale.
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How do you verify that new embeddings are better before switching?'' ``What is the cost of re-encoding 1B documents?'' ``How would you handle rollback if the new embeddings are worse?''
+\end{interviewq}
+
+%--- Q12 ---
+
+\begin{interviewq}
+\textbf{Q: Estimate the QPS of a retrieval system using HNSW on 100M documents with a cross-encoder reranker on the top 100.}
+
+\textbf{Difficulty:} L6 \quad \textbf{Type:} Estimation \quad \textbf{Frequency:} \freqmed{}
+
+\textbf{Strong answer:}
+
+This is a two-stage system, so I need to estimate each stage separately and then combine.
+
+\textbf{Stage 1: HNSW retrieval.} As estimated previously (for 100M vectors): $\sim$1--2ms per query per thread, $\sim$10--20K QPS per machine with multi-threading. This stage runs on CPU.
+
+\textbf{Stage 2: Cross-encoder reranking on top 100.} The cross-encoder processes 100 query-document pairs. Each pair is a BERT-base forward pass (12 layers, 110M parameters, sequence length $\sim$256 tokens).
+
+Per forward pass on GPU: BERT-base at sequence length 256 takes $\sim$2--3ms on an A100 (batch=1). But we can batch all 100 pairs: batch=100, sequence length=256. A100 BERT-base inference: $\sim$10--15ms for batch=100 (GPU saturates with this batch size, so latency doesn't scale linearly with batch).
+
+With a DistilBERT cross-encoder (6 layers, 66M params): $\sim$6--8ms for batch=100.
+
+\textbf{Combined per-query latency}: $\sim$2ms (HNSW) + $\sim$12ms (cross-encoder) + $\sim$2ms (overhead: network, serialization, merge) $\approx$ \textbf{16ms per query}.
+
+\textbf{System QPS.} The bottleneck is the cross-encoder (GPU-bound). An A100 can process $\sim$1000/12 \approx 83$ queries/second (each query = one batch of 100 pairs). With 4 A100s: $\sim$330 QPS. With 10 A100s: $\sim$830 QPS.
+
+The HNSW stage is CPU-bound and runs in parallel. At 20K QPS per CPU machine, a single CPU machine can feed $\sim$24 A100s, so the GPU reranker is always the bottleneck.
+
+\textbf{Cost analysis.} At \$3/hr per A100, serving 1000 QPS costs $\sim$\$3 $\times$ 12 = \$36/hr or \$26K/month. This is why companies use the reranker selectively---only on queries where it adds value (e.g., ambiguous queries, high-revenue queries), or use distilled/smaller rerankers.
+
+\textbf{Optimizations to increase QPS:}
+\begin{enumerate}
+    \item \textbf{Reduce reranking set}: Top-50 instead of top-100 ($\sim$2$\times$ QPS, small quality loss).
+    \item \textbf{Smaller cross-encoder}: DistilBERT or TinyBERT ($\sim$2$\times$ QPS).
+    \item \textbf{FP16/INT8 quantization}: BERT in INT8 is $\sim$2--3$\times$ faster with TensorRT.
+    \item \textbf{Batched request queuing}: Accumulate requests for 5ms, batch-process for better GPU utilization.
+    \item \textbf{Skip reranking for easy queries}: If HNSW top-1 score is much higher than top-2, the ranking is likely correct---skip the reranker.
+\end{enumerate}
+
+\textbf{Red flags} (what NOT to say):
+\begin{itemize}
+    \item Not identifying the cross-encoder as the bottleneck---the HNSW stage is much faster.
+    \item Assuming the cross-encoder processes one pair at a time---batching is essential.
+    \item Not estimating cost---at staff level, system design must consider economics.
+\end{itemize}
+
+\textbf{What the interviewer is testing:} End-to-end system throughput estimation, ability to identify bottlenecks, and awareness of the cost-quality trade-off in serving infrastructure.
+
+\textbf{What separates good from great:}
+\begin{itemize}
+    \item \textbf{L5:} Estimates per-query latency for both stages, identifies the GPU reranker as the bottleneck.
+    \item \textbf{L6:} Adds cost analysis, proposes specific optimizations (INT8, smaller model, reduced reranking set), and estimates the QPS improvement from each optimization.
+    \item \textbf{L7:} Designs an adaptive system that dynamically decides whether to invoke the reranker based on retrieval confidence, proposes a cost-per-quality-point metric for comparing system configurations, and discusses how to handle traffic spikes (graceful degradation by disabling the reranker).
+\end{itemize}
+
+\textbf{Common follow-ups:} ``How would you decide which queries get reranked?'' ``What is the cost-quality Pareto frontier for this system?'' ``How does the reranking set size affect end-to-end quality?''
+\end{interviewq}
