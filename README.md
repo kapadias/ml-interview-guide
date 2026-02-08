@@ -1,6 +1,6 @@
 # Deep Learning Essentials
 
-A comprehensive deep learning interview reference for Staff and Principal ML Engineering positions. Written as a LaTeX book with 24 chapters, 248 interview questions, and practical frameworks — designed as an interview playbook, not a textbook.
+A comprehensive deep learning interview reference for ML Engineering interviews. Written as a LaTeX book with 24 chapters, 248 interview questions, and practical frameworks — designed as an interview playbook, not a textbook.
 
 ## What's Inside
 
