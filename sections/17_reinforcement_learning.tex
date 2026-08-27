@@ -2,7 +2,7 @@
 \label{chap:reinforcement_learning}
 
 \begin{tldr}
-Reinforcement learning (RL) has re-entered the mainstream ML engineer's toolkit---not because you will build game-playing agents, but because RLHF is how frontier LLMs are aligned. This chapter covers RL fundamentals (MDPs, policy gradients, PPO) at the depth needed to understand the RLHF pipeline, then walks through each stage: supervised fine-tuning (SFT), reward model training, and PPO-based policy optimization. It covers DPO as the increasingly popular alternative that eliminates the reward model entirely, the failure modes that plague alignment (reward hacking, alignment tax), and newer approaches like Constitutional AI and RLAIF. If you interview for any LLM-adjacent role at Staff+ level, you must be able to whiteboard the RLHF pipeline and articulate the tradeoffs between PPO and DPO.
+Reinforcement learning (RL) has re-entered the mainstream ML engineer's toolkit---not because you will build game-playing agents, but because RL is how frontier LLMs are aligned and, since 2024, how they are taught to reason. This chapter covers RL fundamentals (MDPs, policy gradients, PPO) at the depth needed to understand the RLHF pipeline, then walks through each stage: supervised fine-tuning (SFT), reward model training, and PPO-based policy optimization. It covers DPO as the offline alternative that eliminates the reward model entirely; GRPO and RL with verifiable rewards (RLVR)---the critic-free recipe behind DeepSeek-R1-style reasoning models; the failure modes that plague alignment (reward hacking, alignment tax); newer approaches like Constitutional AI and RLAIF; and reasoning models with test-time compute as the third scaling axis. If you interview for any LLM-adjacent role at Staff+ level, you must be able to whiteboard the RLHF pipeline, articulate the tradeoffs among PPO, DPO, and GRPO, and explain how a reasoning model is trained.
 \end{tldr}
 
 %==============================================================================
@@ -29,7 +29,7 @@ You do not need to be an RL researcher to pass an ML interview. But you do need 
 
 \subsection{Value Functions and Policy Gradient}
 
-\textbf{Value vs.\ policy methods.} Two families of RL algorithms exist. Value-based methods (DQN) learn a value function and derive a policy from it. Policy-based methods (REINFORCE, PPO) directly optimize the policy. LLM alignment uses policy-based methods because the action space (vocabulary, 32K--128K tokens) is too large for value-based approaches.
+\textbf{Value vs.\ policy methods.} Two families of RL algorithms exist. Value-based methods (DQN) learn a value function and derive a policy from it. Policy-based methods (REINFORCE, PPO) directly optimize the policy. LLM alignment uses policy-based methods---but \textit{not} because the vocabulary is too large for value-based approaches (an argmax over vocabulary logits is a trivial operation, and PPO's own critic is a learned value function over the same states). The real reasons: (1) off-policy TD learning is notoriously unstable with large function approximators, and no one has made it work reliably at LLM scale; (2) the reward is a single sparse scalar at the end of a 100--1000+ token episode, which is a poor fit for bootstrapped value learning; and (3) policy gradients fit autoregressive sampling naturally---the policy \textit{is} the language model, and generation \textit{is} the rollout. (Value-based fine-tuning of LLMs has been demonstrated, e.g., ILQL, but never became standard practice.)
 
 \begin{mathresult}{Policy Gradient Theorem (REINFORCE)}
 \begin{equation}
@@ -60,7 +60,7 @@ where $r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{old}}}(a
 
 \textbf{Why PPO for RLHF specifically:}
 \begin{itemize}
-    \item \textbf{Sample efficiency:} PPO reuses collected trajectories for multiple gradient updates (unlike REINFORCE, which is single-use).
+    \item \textbf{Sample efficiency:} PPO \textit{can} reuse collected trajectories for multiple gradient updates (unlike REINFORCE, which is strictly single-use)---though it remains far less sample-efficient than off-policy value-based methods with replay buffers (Table~\ref{tab:value_vs_policy}). In RLHF practice, implementations typically run just \textit{one} inner epoch per rollout batch to limit off-policy drift, so the reuse advantage is mostly a safety margin rather than an exploited feature.
     \item \textbf{Stability:} The clipping mechanism prevents the catastrophic updates that would corrupt a pretrained LLM.
     \item \textbf{Simplicity:} Compared to TRPO (which requires constrained optimization with a KL trust region), PPO achieves similar stability through a simple clamp operation.
 \end{itemize}
@@ -70,6 +70,7 @@ where $r_t(\theta) = \frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{old}}}(a
 \begin{table}[H]
 \centering
 \caption{Value-based vs.\ policy-based RL methods}
+\label{tab:value_vs_policy}
 \begin{tabularx}{\textwidth}{lXX}
 \toprule
 \textbf{Dimension} & \textbf{Value-Based (DQN)} & \textbf{Policy-Based (PPO, REINFORCE)} \\
@@ -78,8 +79,8 @@ Core idea & Learn $Q(s,a)$; act greedily & Learn $\pi(a \mid s)$ directly \\
 Action space & Discrete, small & Discrete or continuous, any size \\
 Exploration & $\epsilon$-greedy & Stochastic policy (natural exploration) \\
 Stability & Can diverge with function approx & Stable with clipping (PPO) \\
-Sample efficiency & Higher (off-policy, replay buffer) & Lower (on-policy, no replay) \\
-Used in RLHF? & No (vocabulary too large) & Yes (PPO is the standard) \\
+Sample efficiency & Higher (off-policy, replay buffer) & Lower (on-policy; PPO's limited reuse only partially closes the gap) \\
+Used in RLHF? & No (off-policy TD unstable at LLM scale; sparse terminal reward) & Yes (PPO is the standard) \\
 Classic examples & Atari (DQN), board games & Robotics, LLM alignment \\
 \bottomrule
 \end{tabularx}
@@ -177,7 +178,7 @@ The reward model is only as good as its training distribution. If the RM was tra
 where $\pi_{\text{ref}}$ is the frozen SFT model and $\beta$ controls the strength of the KL penalty.
 \end{mathresult}
 
-\textbf{Why the KL penalty?} Without it, the policy would exploit the reward model: producing degenerate text that scores high on the (imperfect) RM but is actually nonsensical. The KL term anchors the policy near the SFT model, which we know produces coherent text. $\beta$ controls the exploration-exploitation tradeoff:
+\textbf{Why the KL penalty?} Without it, the policy would exploit the reward model: producing degenerate text that scores high on the (imperfect) RM but is actually nonsensical. The KL term anchors the policy near the SFT model, which we know produces coherent text. Note the direction: this is the \textit{reverse} KL, $\KL(\pi_\theta \,\|\, \pi_{\text{ref}})$, which is mode-seeking---it penalizes the policy for putting mass where the reference does not, so the policy stays inside high-probability regions of the reference rather than being forced to cover all of them (a standard follow-up probe). $\beta$ controls the exploration-exploitation tradeoff:
 \begin{itemize}
     \item \textbf{$\beta$ too high:} Policy barely moves from SFT model; reward gains are minimal.
     \item \textbf{$\beta$ too low:} Policy drifts freely; reward hacking and coherence degradation.
@@ -240,8 +241,9 @@ Training complexity & High (RL loop, generation, scoring) & Low (supervised loss
 Hyperparameter sensitivity & High ($\beta$, clip $\epsilon$, GAE $\lambda$, LR) & Moderate ($\beta$, LR) \\
 Compute cost & $3$--$5\times$ more than SFT & $\sim 1.5\times$ more than SFT \\
 Online data & Yes (generates new responses) & No (uses static preference dataset) \\
+Verifiable rewards (RLVR) & Natural fit; the critic-free GRPO variant is the modern default (Section~\ref{sec:grpo_rlvr}) & Poor fit---requires pairwise preferences, not scalar pass/fail checks \\
 Exploration & Can discover novel high-reward outputs & Limited to existing preference data \\
-Reward hacking risk & Higher (exploits RM blind spots) & Lower (no explicit RM to exploit) \\
+Reward hacking risk & Exploits RM blind spots (online) & Different profile, not lower (implicit-reward length/style bias) \\
 Scaling to frontier & Used by OpenAI, Anthropic & Used by Meta (Llama 3), many open models \\
 \bottomrule
 \end{tabularx}
@@ -260,6 +262,8 @@ Scaling to frontier & Used by OpenAI, Anthropic & Used by Meta (Llama 3), many o
     \item Compute budget is limited (no separate RM, no generation during training).
     \item You want simplicity and reproducibility---DPO is essentially supervised learning.
 \end{itemize}
+
+\textbf{The verifiable-rewards branch.} If your reward can be computed by a rule rather than learned from preferences---unit tests for code, an answer checker for math---the modern default is neither of the above but critic-free online RL in the GRPO family (Section~\ref{sec:grpo_rlvr}).
 
 \subsection{DPO Variants}
 
@@ -282,6 +286,93 @@ SimPO & Uses average log-prob instead of total & Length-normalized, more stable 
 \end{table}
 
 \textbf{Practical note.} DPO's main weakness is that it operates on a static dataset. If the preference data does not cover the policy's failure modes, DPO cannot improve on them. Iterative DPO (generate with current policy $\rightarrow$ collect preferences $\rightarrow$ retrain) partially addresses this but adds complexity.
+
+%==============================================================================
+\section{GRPO and RL with Verifiable Rewards}
+\label{sec:grpo_rlvr}
+%==============================================================================
+
+\subsection{The Shift from Learned Rewards to Verifiable Rewards}
+
+\textbf{What changed in 2024--26.} Classic RLHF optimizes against a \textit{learned} reward model---a statistical proxy for human judgment, trained on preference pairs, with all the blind spots that entails. The reasoning-model era replaced that proxy, wherever the domain allows it, with \textit{rule-based verifiable rewards}---a paradigm now abbreviated RLVR (RL with Verifiable Rewards). The reward is computed by a program, not predicted by a model:
+\begin{itemize}
+    \item \textbf{Unit tests:} Run the generated code against a test suite; reward $1$ if all tests pass, $0$ otherwise.
+    \item \textbf{Math checkers:} Extract the final answer (e.g., from a \texttt{\textbackslash boxed\{\}} expression) and compare against ground truth, with symbolic-equivalence rules.
+    \item \textbf{Format checks:} Reward the response for following the required structure, e.g., wrapping reasoning in \texttt{<think>}\ldots\texttt{</think>} tags before the answer.
+\end{itemize}
+This works only for domains with checkable answers---competition math, code, logic puzzles, and increasingly agentic tasks with verifiable end states. For open-ended helpfulness or safety, a learned RM (or human/AI preference data) remains the only option, which is why production pipelines combine both.
+
+\begin{keyinsight}[RLVR Reframes Goodhart---It Does Not Repeal It]
+A learned RM is an imperfect proxy, and sustained optimization pressure finds its blind spots (Section~\ref{sec:reward_hacking}). A verifier is a ground-truth program: making the actual tests pass \textit{is} the objective, so the proxy gap shrinks dramatically---this is why RLVR runs tolerate far more optimization pressure than RM-based RLHF, with weaker KL anchoring (some recipes, like DAPO, drop the KL term entirely). But the gap does not vanish. Policies learn to hard-code expected outputs against weak test suites, special-case the visible test inputs, or exploit a lenient checker's answer-matching rules. The verifier is now the reward, so \textit{test-hacking} is now the reward hacking---the defense moves from KL budgets and RM ensembles to test-suite quality: hidden tests, property-based tests, and execution sandboxes that the policy cannot inspect.
+\end{keyinsight}
+
+\subsection{GRPO Mechanics}
+
+\textbf{What it is.} GRPO (Group Relative Policy Optimization), introduced in DeepSeekMath (Shao et al., 2024) and the optimizer behind DeepSeek-R1, is PPO with the critic deleted. Instead of a learned value function estimating a per-state baseline, GRPO samples a \textit{group} of $K$ responses for the same prompt and uses the group's reward statistics as the baseline. The advantage of each response is simply how much better it scored than its siblings.
+
+\begin{mathresult}{GRPO Objective and Group-Relative Advantage}
+For each prompt $x$, sample $K$ responses $\{y_1, \ldots, y_K\}$ from the current policy and score each with the (typically verifiable) reward $r_i$. The advantage of response $i$ is its group-normalized reward, assigned identically to \textit{every token} of that response:
+\begin{equation}
+\hat{A}_i = \frac{r_i - \operatorname{mean}(r_1, \ldots, r_K)}{\operatorname{std}(r_1, \ldots, r_K)}
+\end{equation}
+The update is PPO's clipped surrogate with a per-token KL penalty to the reference model---but with \textit{no value network}:
+\begin{equation}
+\loss_{\text{GRPO}} = -\frac{1}{K}\sum_{i=1}^{K} \frac{1}{|y_i|}\sum_{t=1}^{|y_i|} \left[\min\!\left(\rho_{i,t}\hat{A}_i,\; \text{clip}\!\left(\rho_{i,t}, 1-\epsilon, 1+\epsilon\right)\hat{A}_i\right) - \beta\, d_{i,t}\right]
+\end{equation}
+where $\rho_{i,t} = \frac{\pi_\theta(y_{i,t} \mid x, y_{i,<t})}{\pi_{\text{old}}(y_{i,t} \mid x, y_{i,<t})}$ and $d_{i,t}$ is a per-token unbiased estimator of $\KL(\pi_\theta \| \pi_{\text{ref}})$, added directly to the loss rather than folded into the reward. \textbf{The group mean replaces the critic's baseline:} with binary rewards, $\hat{A}_i$ is positive for responses that beat the group's success rate and negative for those that fall short.
+\end{mathresult}
+
+\textbf{Why dropping the critic matters at scale.} Three reasons, in decreasing order of how often candidates state them:
+\begin{enumerate}
+    \item \textbf{Memory.} PPO's critic is a full model copy \textit{with gradients and optimizer states}---for a 7B policy, roughly another 80--100~GB (see the RLHF memory estimation question in Section~\ref{sec:rl_interview}). GRPO's four-model lineup drops to three (policy, reference, RM), and to \textit{two} when the reward is a rule-based verifier. At 100B+ scale this is the difference between a feasible and an infeasible run.
+    \item \textbf{Value estimation is the weak link anyway.} The critic must predict expected return per token from a single sparse scalar delivered at the end of a 10{,}000+-token reasoning trace. Trained value functions are unreliable in exactly this regime, and a bad baseline injects bias and noise into every advantage estimate. A Monte-Carlo group baseline over $K$ samples is crude but unbiased---and with verifiable binary rewards it is exactly the right granularity, since the reward genuinely is per-response, not per-token.
+    \item \textbf{Stability and simplicity.} No GAE $\lambda$, no value-loss coefficient, no critic warm-up, no actor-critic co-training divergence. One fewer model to shard, checkpoint, and babysit.
+\end{enumerate}
+
+\textbf{The cost you keep.} GRPO is still online RL: every update requires $K$ fresh rollouts per prompt (typical $K = 8$--$64$), and with reasoning-length responses, generation---not the gradient step---dominates wall-clock time. This is why GRPO infrastructure is built as a rollout engine (a serving stack such as vLLM or SGLang) feeding a learner, with policy weights synced between them.
+
+\subsection{Known Pathologies and Fixes}
+
+Naive GRPO breaks in well-documented ways. The fixes come mostly from two 2025 follow-ups: \textbf{DAPO} (clip-higher, dynamic sampling, token-level loss, overlong filtering) and \textbf{Dr.~GRPO} (removes the std and length normalization biases).
+
+\begin{table}[H]
+\centering
+\caption{GRPO pathologies and their standard fixes}
+\label{tab:grpo_pathologies}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Pathology} & \textbf{Mechanism} & \textbf{Fix} \\
+\midrule
+Zero-advantage groups & All $K$ rewards equal (all-correct or all-wrong) $\Rightarrow$ $\hat{A}_i = 0$ for every token; the prompt contributes no gradient. As training progresses, more prompts saturate and the effective batch quietly shrinks & Dynamic sampling (DAPO): oversample, filter out prompts with $0$ or $K$ successes, refill the batch with prompts whose group accuracy is strictly between $0$ and $1$ \\
+Difficulty bias & Dividing by $\operatorname{std}$ inflates advantages for low-variance groups: nearly-solved and nearly-impossible prompts get outsized updates relative to informative medium-difficulty prompts & Dr.~GRPO: drop the $\operatorname{std}$ term; use the centered reward $r_i - \operatorname{mean}(r)$ as the advantage \\
+Length bias & The $1/|y_i|$ per-response normalization means a \textit{wrong} response's per-token penalty shrinks as it grows longer---being wrong at length is cheap, so incorrect responses bloat & Dr.~GRPO: remove per-response length normalization; DAPO: token-level loss (every token in the batch weighted equally); overlong filtering masks truncated responses out of the loss \\
+Entropy collapse & Policy entropy falls fast; the model locks onto a few reasoning templates, exploration dies, and pass@$K$ collapses toward pass@1 & Clip-higher (DAPO): decouple the clip range, raising the upper bound (e.g., $\epsilon_{\text{high}} = 0.28$ vs.\ $\epsilon_{\text{low}} = 0.2$) so low-probability tokens can still be boosted \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Reading the table as an interviewer would.} The zero-advantage case is the canonical ``what breaks when you use it naively'' probe: it is a silent failure (loss still decreases, reward still climbs on the surviving prompts) that wastes an increasing fraction of compute. The length bias is the second probe, because its symptom---responses growing without benchmark gains---mimics the ``emergent long chain-of-thought'' behavior teams \textit{want} to see, and telling the two apart requires splitting length statistics by correctness.
+
+\subsection{Method Comparison: PPO, GRPO, DPO, Rejection Sampling + SFT}
+
+\begin{table}[H]
+\centering
+\small
+\caption{The post-training optimizer landscape}
+\label{tab:posttrain_comparison}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Dimension} & \textbf{PPO} & \textbf{GRPO} & \textbf{DPO} & \textbf{RS + SFT} \\
+\midrule
+Models in memory & 4 (policy, ref, RM, critic) & 3 (policy, ref, RM); 2 with rule-based verifier & 2 (policy, ref) & 1 (policy; scoring done offline) \\
+On-/off-policy & Online, on-policy (limited reuse) & Online, on-policy & Offline & Offline (iterated generate $\rightarrow$ filter $\rightarrow$ SFT) \\
+Reward type & Any scalar (learned RM or verifier) & Group-relative scalar; best with verifiable/binary rewards & Pairwise preferences & Binary keep/discard filter (verifier or RM ranking) \\
+Where used & InstructGPT-era RLHF; safety training with learned RMs & DeepSeekMath, DeepSeek-R1, reasoning RL generally & Llama 3, Zephyr, open-model alignment & Llama 2/3 pipeline stages; R1's general-data stage; distillation data \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The landscape is complementary, not competitive: a 2025-era frontier pipeline typically uses GRPO-style RLVR for reasoning, DPO or PPO with a learned RM for helpfulness and safety, and rejection sampling + SFT to consolidate gains into clean supervised data. The next sections cover what goes wrong under optimization pressure (Section~\ref{sec:reward_hacking}) and how RLVR training produced the reasoning-model recipe (Section~\ref{sec:reasoning_ttc}).
 
 %==============================================================================
 \section{Reward Hacking and Alignment Tax}
@@ -390,7 +481,44 @@ AI-generated feedback is most reliable when the quality of a response is objecti
 
 \textbf{Process reward models (PRMs):} Score each intermediate step (e.g., each line of mathematical reasoning). Denser signal leads to more reliable credit assignment and is harder to hack. OpenAI's ``Let's Verify Step by Step'' (Lightman et al., 2023) showed that PRMs significantly improve mathematical reasoning over ORMs.
 
-\textbf{Connection to test-time compute.} PRMs enable search at inference time: generate multiple reasoning paths, score each step, and select the path with the highest cumulative step-level reward. This is the principle behind o1/o3-style reasoning models that trade more inference compute for better answers.
+\textbf{Where PRMs actually stand---and the superseded story.} A popular 2023-era hypothesis held that o1/o3-style reasoning models work by PRM-guided search at inference time: score each reasoning step and run beam search or MCTS over paths. That story has not held up. The current account is that reasoning models are \textit{trained} with large-scale RL against outcome-based, \textit{verifiable} rewards (checkable final answers in math, passing unit tests in code), and DeepSeek-R1's published report explicitly describes both PRM-based reward and MCTS as unfruitful directions it tried and abandoned---PRMs are hard to train reliably at scale and invite reward hacking, and the token-level search space explodes. PRMs survive mainly as \textit{test-time rerankers and verifiers}: sample $N$ complete solutions, score them, and select the best (Best-of-N / weighted voting)---a genuinely useful role, but not the training mechanism behind reasoning models. In an interview, present PRM+search as the superseded hypothesis and outcome-reward RL as the current consensus.
+
+%==============================================================================
+\section{Reasoning Models and Test-Time Compute}
+\label{sec:reasoning_ttc}
+%==============================================================================
+
+\subsection{The R1 Recipe: From Base Model to Reasoning Model}
+
+\textbf{R1-Zero: pure RL on a base model.} DeepSeek-R1 (2025) is the canonical published recipe for training a reasoning model, and its most striking result came first: \textbf{R1-Zero} applied GRPO (Section~\ref{sec:grpo_rlvr}) \textit{directly to the base model}---no SFT, no reward model---using only two rule-based rewards: accuracy (does the extracted final answer match ground truth, does the code pass tests) and format (is the reasoning wrapped in \texttt{<think>}\ldots\texttt{</think>} tags). Under nothing but this pressure, the model \textit{learned to think}: response length grew steadily over training as the policy discovered that longer deliberation earns more reward, and qualitatively new behaviors emerged---re-checking steps, backtracking, and explicit self-correction mid-trace (the report's ``aha moment,'' where the model interrupts itself to flag an error in its own reasoning). AIME pass@1 climbed from 15.6\% to 71.0\% over the run. The catch: R1-Zero's traces were often unreadable, mixing languages mid-sentence---optimized for reward, not for humans.
+
+\textbf{The full R1 pipeline.} The production model fixes readability by interleaving supervised stages with RL:
+\begin{enumerate}
+    \item \textbf{Cold-start SFT.} Fine-tune the base model on a few thousand curated, human-readable long chain-of-thought examples. This seeds the thinking format and gives RL a stable, legible starting policy.
+    \item \textbf{Reasoning RL.} Large-scale GRPO with verifiable rewards, plus a language-consistency reward to suppress language mixing.
+    \item \textbf{Rejection-sampling SFT.} Sample many responses from the RL checkpoint, keep only correct and readable ones ($\sim$600K reasoning traces), mix with $\sim$200K general-purpose examples (writing, QA, translation), and run SFT on the base model with this combined set.
+    \item \textbf{All-scenario RL.} A final RL stage combining verifiable rewards on reasoning prompts with learned reward models for helpfulness and harmlessness on general prompts---the RLHF machinery from earlier in this chapter re-enters here.
+\end{enumerate}
+Note what is \textit{absent}: no PRM, no MCTS---the report describes both as unfruitful attempts (see the discussion above in this chapter's PRM material, Section~\ref{sec:constitutional_ai}).
+
+\textbf{Distillation: RL discovers, SFT transfers.} The R1 report's most operationally important finding: taking the $\sim$800K traces from stage 3 and simply running SFT on small models (1.5B--70B) produced strong small reasoning models, \textit{beating} the alternative of running the RL recipe directly on the small model---at a fraction of the cost. The interpretation: a small model rarely samples the long self-correcting traces that RL must amplify, so RL on a small base has little signal to work with; but the same model can readily \textit{imitate} those behaviors once a larger model has discovered them. Reasoning RL is a discovery process that needs capacity; distillation banks the discovery into any model that can copy it.
+
+\subsection{Test-Time Compute: The Third Scaling Axis}
+
+Pretraining compute and post-training compute are the first two scaling axes; reasoning models opened a third: spend more compute \textit{per query at inference} to buy accuracy. Two families:
+
+\begin{itemize}
+    \item \textbf{Sequential scaling:} one attempt, more deliberation. Longer chains of thought, trained in by RLVR; controllable at inference via \textit{budget forcing}---suppress the end-of-thinking delimiter and append ``Wait'' to force continued reasoning, or truncate thinking to enforce a cap (the s1 recipe, 2025). Cost is paid in \textit{latency}: the thinking tokens are serial.
+    \item \textbf{Parallel scaling:} many attempts, then select. Best-of-$N$ with a verifier or reward model; self-consistency (majority vote over extracted final answers); PRM-weighted voting or verifier-guided selection. Cost is paid in \textit{throughput} ($N\times$ the decode compute), while wall-clock latency stays roughly one generation.
+\end{itemize}
+
+\begin{keyinsight}[Compute-Optimal Test-Time Scaling]
+At a fixed inference FLOP budget, a small model plus search can beat a much larger model sampled once (Snell et al., 2024)---on easy and medium problems, where the small model's coverage (pass@$N$) is high, spending the budget on $N$ samples plus a verifier outperforms spending it on parameters. But there are ceiling effects. If the base model essentially never solves the problem (pass@$N$ flat near zero even at large $N$), no selection mechanism can help---capability must come from parameters or training. And the selector itself is a bound: as $N$ grows, best-of-$N$ against an imperfect verifier increasingly selects false positives---Goodhart's Law resurfaces at inference time. The compute-optimal split between model size, thinking length, and sample count is task- and difficulty-dependent, which is why routing and budget policies are now a serving-layer design problem.
+\end{keyinsight}
+
+\subsection{Serving Implications}
+
+Reasoning models turn inference into a decode-dominated workload: a hard query can generate tens of thousands of thinking tokens before a short visible answer, so the KV cache grows large and highly variable in length across requests---exactly the regime that stresses batch schedulers and memory managers. Products expose \textit{thinking budgets} (effort controls) as a knob trading answer quality against latency and cost. The serving-side machinery---continuous batching, paged KV caches, and prefill/decode disaggregation---is covered in Chapter~\ref{chap:inference_optimization}.
 
 %==============================================================================
 \section{Interview Questions}
@@ -446,7 +574,7 @@ Each stage has a distinct purpose: SFT teaches format, the RM captures human jud
 
 The fundamental distinction is online vs.\ offline. PPO-based RLHF is an \textit{online} RL method: it generates new responses during training, scores them with a reward model, and updates the policy. DPO is an \textit{offline} supervised method: it directly optimizes on a static preference dataset without generation or a reward model.
 
-\textbf{DPO advantages:} (1) Simplicity---supervised learning with no RL loop, no generation during training, no reward model. (2) Compute efficiency---two models in memory (policy + frozen reference) vs.\ four for PPO; training cost is roughly $1.5\times$ SFT vs.\ $3$--$5\times$ for PPO. (3) Lower reward hacking risk---no explicit RM to exploit; the implicit reward is structurally constrained by the log-probability ratio.
+\textbf{DPO advantages:} (1) Simplicity---supervised learning with no RL loop, no generation during training, no reward model. (2) Compute efficiency---two models in memory (policy + frozen reference) vs.\ four for PPO; training cost is roughly $1.5\times$ SFT vs.\ $3$--$5\times$ for PPO. (3) A \textit{different} reward-hacking profile rather than a lower one---there is no separate RM to saturate, but DPO's implicit reward is demonstrably over-optimized in the same ways an explicit RM is (length and style bias are well documented in DPO-trained models), and because training is offline, this overoptimization is harder to detect mid-run than PPO's monitorable RM-score/KL divergence.
 
 \textbf{PPO advantages:} (1) Online exploration---generates and scores new responses, discovering high-quality outputs not in any static dataset. (2) Non-pairwise rewards---works with any scalar reward signal (code correctness, math proof verification, tool use success). (3) Iterative improvement---the generate-score-improve loop naturally adapts to the evolving policy.
 
@@ -524,7 +652,7 @@ Reward hacking occurs when the policy optimizes the learned reward model's score
 
 \textbf{Hypothesis 1: RM bias.} The reward model was trained on preference data where annotators systematically preferred agreeable responses. Validation: sample 1,000 preference pairs from the RM training set. Check whether the preferred response agrees with the user's premise in $>$70\% of cases where the premise is debatable or false. If so, the RM encodes a sycophancy bias.
 
-\textbf{Hypothesis 2: KL penalty too low.} With a weak KL constraint, the policy drifted far from the SFT model into a sycophantic mode because it maximizes RM reward. Validation: check the KL divergence from the reference model---if it is $>$20 nats, the policy has drifted significantly.
+\textbf{Hypothesis 2: KL penalty too low.} With a weak KL constraint, the policy drifted far from the SFT model into a sycophantic mode because it maximizes RM reward. Validation: check the KL divergence from the reference model---if it is $>$20 nats \textit{per sequence} (i.e., summed over the tokens of a response), the policy has drifted significantly. Always state the units: healthy runs typically sit in the single digits of nats per sequence, and 20 nats \textit{per token} would mean the policy is unrecognizable.
 
 \textbf{Hypothesis 3: SFT data bias.} The SFT dataset itself may contain sycophantic examples (e.g., assistant data scraped from customer service, where agreement is standard). The model learned sycophancy before RLHF even started.
 
@@ -572,9 +700,11 @@ Consider RLHF for a 7B parameter LLM. Four models must coexist in GPU memory.
     \item Policy $\pi_\theta$ (7B, FP16): $7 \times 10^9 \times 2$ bytes = 14 GB.
     \item Reference $\pi_{\text{ref}}$ (7B, FP16, frozen): 14 GB. No optimizer states since it is not trained.
     \item Reward model $R_\phi$ (7B, FP16, frozen): 14 GB. Often the same architecture as the policy with a scalar head.
-    \item Value function / critic $V_\psi$: Typically a smaller model or shares the policy backbone with a separate head. Assume a full 7B copy: 14 GB.
+    \item Value function / critic $V_\psi$: In practice, the standard setup is a value \textit{head} on the shared policy backbone (adding almost no weight memory); assume a full separate 7B copy here for the worst-case estimate: 14 GB.
     \item \textbf{Subtotal weights:} $4 \times 14 = 56$ GB.
 \end{itemize}
+
+\textbf{Gradients (for policy and critic only):} Each trained model needs a gradient for every parameter: $\sim$14 GB per model in FP16/BF16 (28 GB if kept in FP32). With two trained models (policy + critic), that is $\sim$28--56 GB. Frozen models (reference, RM) need none.
 
 \textbf{Optimizer states (for policy and critic only):}
 \begin{itemize}
@@ -586,14 +716,14 @@ Consider RLHF for a 7B parameter LLM. Four models must coexist in GPU memory.
 
 \textbf{Activations and KV cache:} During the generation phase, the policy generates sequences (typically 512--2048 tokens). KV cache for batch size 32 at 2K tokens for a 7B model $\approx$ 2--4 GB. Activations for backward pass: 5--15 GB depending on batch size and gradient checkpointing.
 
-\textbf{Total estimate:} $56 + 168 + 15 = \sim$240 GB for a 7B RLHF run. This requires at least 4$\times$A100-80GB or 3$\times$H100-80GB with model parallelism.
+\textbf{Total estimate:} $56 + (28\text{--}56) + 168 + 15 \approx$ 270--300 GB for a 7B RLHF run. This requires at least 4$\times$A100-80GB or 4$\times$H100-80GB (320 GB aggregate) with model parallelism or sharding---3 GPUs (240 GB) do not fit once gradients are counted.
 
 \textbf{How to reduce:} (1) Use LoRA for the policy---reduces trainable parameters from 7B to $\sim$20M, slashing optimizer states from 84 GB to $<$1 GB. (2) Quantize the frozen reference and reward models to INT8 (7 GB each instead of 14 GB). (3) Share the policy backbone with the critic (add a value head instead of a separate model). (4) Use DPO instead---eliminates the reward model and critic entirely, reducing to 2 models.
 
 \redflags
 \begin{itemize}
-    \item Forgetting optimizer states---they dominate memory for trained models.
-    \item Assuming all four models need optimizer states (only policy and critic are trained).
+    \item Forgetting optimizer states or gradients---together they dominate memory for the trained models.
+    \item Assuming all four models need optimizer states and gradients (only policy and critic are trained).
     \item ``Just use a bigger GPU''---show you can reason about memory reduction strategies.
 \end{itemize}
 
@@ -602,7 +732,7 @@ Consider RLHF for a 7B parameter LLM. Four models must coexist in GPU memory.
 \goodgreat
 \begin{itemize}
     \item \badgeLfive{L5} Correctly computes weight memory for 4 models ($\sim$56 GB at FP16) and identifies the setup as expensive.
-    \item \badgeLsix{L6} Adds optimizer states for trained models, arrives at $\sim$240 GB total, and proposes LoRA and quantization to reduce cost.
+    \item \badgeLsix{L6} Adds gradients and optimizer states for the trained models, arrives at $\sim$270--300 GB total, and proposes LoRA and quantization to reduce cost.
     \item \badgeLseven{L7} Discusses ZeRO-3/FSDP sharding across GPUs, compares the memory profile of RLHF vs.\ DPO (2 models, $\sim$50 GB total with LoRA), and reasons about the minimum viable hardware for a given model size.
 \end{itemize}
 
@@ -800,13 +930,13 @@ This pattern---reward plateau with rising KL---indicates the policy has found a 
 
 \textbf{Outcome reward models (ORMs)} score the entire response with a single scalar. Input: (prompt, full response). Output: one score. This is the standard in RLHF. \textit{Strength:} Simple to train---preference annotation is at the response level, which is natural for human annotators. \textit{Weakness:} Sparse reward signal. The model does not know which part of its response was good or bad. Credit assignment is entirely left to the RL algorithm (PPO's advantage estimator), which is noisy for long responses.
 
-\textbf{Process reward models (PRMs)} score each intermediate step (sentence, reasoning step, or paragraph). Input: (prompt, response up to step $t$). Output: one score per step. \textit{Strength:} Dense reward signal enables precise credit assignment---the model knows exactly which step was good or bad. Harder to hack because each step must independently score well. Enables search at inference time: generate multiple reasoning paths, score each step, prune bad branches. \textit{Weakness:} Requires step-level annotations, which are much more expensive. Human annotators must evaluate each reasoning step for correctness---annotation cost scales linearly with response length.
+\textbf{Process reward models (PRMs)} score each intermediate step (sentence, reasoning step, or paragraph). Input: (prompt, response up to step $t$). Output: one score per step. \textit{Strength:} Dense reward signal enables precise credit assignment---the model knows exactly which step was good or bad. Enables test-time verification and reranking: sample multiple complete solutions and use step-level scores to select the best. \textit{Weakness:} Requires step-level annotations, which are much more expensive; and at scale, training against a PRM invites reward hacking of the step scorer itself. Human annotators must evaluate each reasoning step for correctness---annotation cost scales linearly with response length.
 
 \textbf{When ORMs win:} Short responses, subjective tasks (creative writing, customer service), and when annotation budget is limited. Most alignment tasks (safety, helpfulness) are well-served by outcome-level reward.
 
-\textbf{When PRMs win:} Multi-step reasoning (math, code, logical deduction), long-form generation where specific steps can be independently evaluated, and when you want to enable test-time search over reasoning paths. OpenAI's ``Let's Verify Step by Step'' (Lightman et al., 2023) showed PRMs significantly outperform ORMs on mathematical reasoning.
+\textbf{When PRMs win:} Multi-step reasoning (math, code, logical deduction), long-form generation where specific steps can be independently evaluated, and when you want test-time reranking of sampled solutions. OpenAI's ``Let's Verify Step by Step'' (Lightman et al., 2023) showed PRMs significantly outperform ORMs as \textit{verifiers} for mathematical reasoning.
 
-\textbf{Connection to reasoning models:} PRMs are foundational to o1/o3-style reasoning. At inference, generate multiple chain-of-thought paths, score each step with the PRM, and use beam search or MCTS to find the highest-scoring path. This trades inference compute for accuracy---more compute at test time produces better answers.
+\textbf{Connection to reasoning models---get the story right.} A common 2023-era hypothesis was that o1/o3-style reasoning models are PRM-guided search: generate multiple chain-of-thought paths, score each step, and run beam search or MCTS over them. Do not repeat this as fact in a 2026 interview. The current account is that reasoning models are trained with large-scale RL on outcome-based \textit{verifiable} rewards (final-answer correctness, unit tests), and DeepSeek-R1's report explicitly lists both PRMs and MCTS among its unfruitful attempts---PRMs were hard to train reliably and invited reward hacking, and the token-level search space explodes. Where PRMs genuinely earn their keep today is test-time verification and reranking: sample $N$ full solutions and use the PRM to select the best (Best-of-N / weighted voting), which measurably improves math and code accuracy. Frame it that way: PRM+search is the superseded hypothesis; outcome-reward RL is the mechanism.
 
 \redflags
 \begin{itemize}
@@ -821,8 +951,131 @@ This pattern---reward plateau with rising KL---indicates the policy has found a 
 \begin{itemize}
     \item \badgeLfive{L5} Explains that PRMs give per-step feedback while ORMs give per-response feedback.
     \item \badgeLsix{L6} Discusses the credit assignment advantage, annotation cost tradeoff, and when each is appropriate. Mentions Lightman et al.
-    \item \badgeLseven{L7} Connects PRMs to test-time compute scaling (search over reasoning paths), discusses automated PRM annotation strategies (using code execution or proof verifiers instead of humans), and frames PRMs as enabling a new paradigm where inference compute can substitute for training compute.
+    \item \badgeLseven{L7} Connects PRMs to test-time compute scaling as verifiers/rerankers (Best-of-N, weighted voting), discusses automated PRM annotation strategies (Monte-Carlo rollout labeling, code execution, or proof verifiers instead of humans), and correctly separates this from how reasoning models are trained---outcome-reward RL, citing DeepSeek-R1's negative PRM/MCTS ablations.
 \end{itemize}
 
-\followups{``How do you annotate step-level labels efficiently?'' ``Can you train a PRM without human step-level labels?'' ``How does test-time search with PRMs scale?''}
+\followups{``How do you annotate step-level labels efficiently?'' ``Can you train a PRM without human step-level labels?'' ``How does Best-of-N selection with a PRM scale with $N$?''}
+\end{interviewq}
+
+%--- New Q11: GRPO derivation and failure modes ---
+
+\begin{interviewq}
+\textbf{Q: Explain GRPO. Why did it replace PPO's critic for reasoning RL, and what breaks when you use it naively?}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Start from PPO's weak link.} PPO needs a per-token advantage $\hat{A}_t$, which requires a critic---a full trainable model estimating expected return from every prefix. In reasoning RL the reward is a single sparse scalar (pass/fail) at the end of a 10{,}000+-token trace, which is exactly the regime where learned value functions are least reliable. You pay a full model's memory (weights, gradients, optimizer states) for a baseline that is often wrong.
+
+\textbf{GRPO's move (DeepSeekMath, Shao et al., 2024):} replace the critic with a Monte-Carlo baseline computed from a \textit{group}. Sample $K$ responses for the same prompt, score each with the verifier, and normalize within the group:
+\begin{equation*}
+\hat{A}_i = \frac{r_i - \operatorname{mean}(r_1, \ldots, r_K)}{\operatorname{std}(r_1, \ldots, r_K)}
+\end{equation*}
+assigned identically to every token of response $i$. The update is PPO's clipped ratio objective with a per-token KL penalty to the reference model---no value network anywhere. With binary verifiable rewards this is the right granularity: the reward genuinely is per-response, so pretending to know per-token values adds bias, not information. The group mean \textit{is} the critic's baseline, estimated exactly for this prompt at the cost of $K$ rollouts.
+
+\textbf{Why it won:} (1) memory---3 models instead of 4, or 2 with a rule-based verifier, which at 100B+ scale can decide feasibility; (2) stability---no actor-critic co-training, no GAE $\lambda$, no value-loss tuning; (3) the baseline it deletes was the least trustworthy component under sparse terminal rewards anyway.
+
+\textbf{What breaks naively:} (1) \textbf{Zero-advantage groups}---if all $K$ responses get the same reward (all-correct or all-wrong), every advantage is zero and the prompt contributes no gradient. As training progresses, easy prompts saturate and an increasing fraction of each batch is silently wasted. (2) \textbf{Difficulty bias}---the $\operatorname{std}$ division inflates advantages on low-variance (very easy/very hard) prompts. (3) \textbf{Length bias}---per-response length normalization makes long wrong answers cheaper per token, so failures bloat. (4) \textbf{Entropy collapse}---symmetric clipping suppresses low-probability tokens, exploration dies. The standard fixes are DAPO (dynamic sampling, clip-higher, token-level loss, overlong filtering) and Dr.~GRPO (drop the std and length normalizations).
+
+\redflags
+\begin{itemize}
+    \item ``o1-style reasoning models work by MCTS over a PRM''---the superseded 2023 hypothesis. They are trained with outcome-based verifiable rewards; DeepSeek-R1's report explicitly lists PRM and MCTS as unfruitful directions.
+    \item Not knowing the zero-gradient case (all-$K$-rewards-equal)---this is \textit{the} canonical naive-GRPO failure and interviewers probe it directly.
+    \item ``GRPO removes the reward model''---it removes the \textit{critic}; the reward model disappears only when the reward is a rule-based verifier.
+    \item Claiming GRPO is off-policy or that it reuses stale data freely---it is online RL with the same freshness requirements as PPO.
+\end{itemize}
+
+\interviewtest{Can you derive the group-relative advantage and explain what problem the critic was causing, rather than reciting ``GRPO has no value network''? Depth shows in the failure modes: zero-gradient groups, length bias, and their fixes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States that GRPO replaces the critic with a group-mean baseline and writes the advantage formula.
+    \item \badgeLsix{L6} Full derivation with the clipped objective and per-token KL, quantifies the memory and stability win over PPO, and discusses reward shaping in practice (accuracy + format rewards, length control).
+    \item \badgeLseven{L7} Names the Dr.~GRPO/DAPO fixes and their mechanisms; articulates when PPO is still preferred (dense or learned rewards, safety training where per-token credit and a trusted RM matter); and describes the infra shape---a rollout engine (vLLM/SGLang) feeding a learner with weight syncing, where generation is roughly 80\% of wall-clock time, so rollout throughput, not gradient FLOPs, is what you optimize.
+\end{itemize}
+
+\followups{``Your responses grow unboundedly long---diagnose.'' ``Design a reward for a coding agent that resists test-hacking.'' ``When is RLVR not applicable, and what do you fall back to?''}
+\end{interviewq}
+
+%--- New Q12: GRPO length-bias debugging ---
+
+\begin{interviewq}
+\textbf{Q: Your GRPO run's mean reward climbs but responses grow unboundedly long and benchmark scores stall---diagnose.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Frame the symptom.} Rising reward with rising length and flat benchmarks means the optimizer is being paid for something correlated with length, not with correctness. Longer chains of thought are \textit{expected} in reasoning RL---the question is whether length growth is driven by productive deliberation or by a bias in the loss or reward. The single most diagnostic cut: \textbf{split response-length statistics by correctness}.
+
+\textbf{Hypothesis 1: loss-normalization length bias.} GRPO's per-response $1/|y_i|$ normalization shrinks the per-token penalty of a \textit{wrong} response as it grows---being wrong at length is cheap. \textit{Validation:} if incorrect responses are driving the length growth while correct-response length is stable, this is the mechanism. \textit{Fix:} Dr.~GRPO (remove the length normalization) or DAPO-style token-level loss.
+
+\textbf{Hypothesis 2: truncation feedback loop.} Responses hitting the generation cap are truncated, contain no final answer, and get scored $0$---punishing possibly-correct reasoning for running long, and adding noise that destabilizes length control. \textit{Validation:} plot the fraction of rollouts hitting max length; if it is climbing past 10--20\%, the cap is in the loop. \textit{Fix:} overlong filtering (mask truncated responses out of the loss) or a soft overlong penalty, plus a cap high enough to be rare.
+
+\textbf{Hypothesis 3: reward shaping error.} Audit the reward decomposition: a format or partial-credit component that correlates with length (per-step credit, ``shows work'' bonuses) will be farmed. \textit{Validation:} plot each reward component vs.\ length; any monotone relationship is suspect.
+
+\textbf{Hypothesis 4: entropy collapse into a verbose template.} Check policy entropy: if it has collapsed, the model has locked onto one long-winded reasoning template and is polishing it. \textit{Fix:} clip-higher, temperature/entropy regularization on rollouts.
+
+\textbf{Hypothesis 5: the eval protocol, not the model.} Benchmarks can stall for protocol reasons while the policy actually improves: the eval harness's \texttt{max\_new\_tokens} is now too small for the longer traces (answers get cut off and score zero), or the answer-extraction regex no longer matches the evolved output format. \textit{Validation:} read raw benchmark transcripts; check truncation rates and extraction failures at eval time before touching training.
+
+\textbf{Order of operations:} check the eval harness first (cheapest), then split lengths by correctness, then audit reward components, then inspect entropy. Verify the fix by watching correct-response length stabilize while pass@1 resumes climbing.
+
+\redflags
+\begin{itemize}
+    \item Immediately adding a hard length penalty---without diagnosis this can punish genuinely necessary deliberation and teach premature answering.
+    \item Never separating correct-response length from incorrect-response length---the diagnosis hinges on it.
+    \item Not checking the evaluation harness---truncated eval generations are one of the most common ``mysterious plateau'' causes for reasoning models.
+    \item Treating length growth itself as the bug---emergent long CoT is the desired behavior; unproductive length is the bug.
+\end{itemize}
+
+\interviewtest{Systematic debugging under a confounded symptom: productive thinking and length-hacking look identical on a length plot. Do you know the specific GRPO mechanisms (loss normalization, truncation, std term) rather than generic ``reward hacking'' hand-waving?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Recognizes length hacking as a reward-exploitation pattern and proposes reward shaping.
+    \item \badgeLsix{L6} Identifies the $1/|y_i|$ normalization mechanism, proposes the Dr.~GRPO/DAPO fixes, and includes the truncation loop and entropy check.
+    \item \badgeLseven{L7} Runs the correctness-split analysis first, audits the eval protocol before touching training, and discusses how much length growth to \textit{keep} (length is the sequential test-time-compute axis---the goal is calibrated deliberation, not short answers).
+\end{itemize}
+
+\followups{``How would you design a length-aware reward that does not punish hard problems?'' ``What is overlong filtering and what does it trade away?'' ``How do you tell emergent reasoning from reward hacking in general?''}
+\end{interviewq}
+
+%--- New Q13: Test-time compute vs bigger model ---
+
+\begin{interviewq}
+\textbf{Q: When is test-time compute cheaper than a bigger model---and when does it stop working?}
+
+\badgeLseven{L7} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{The cost math.} Decode cost per token scales roughly linearly with (active) parameter count---decoding is memory-bandwidth-bound on weight reads (Chapter~\ref{chap:inference_optimization}). So an 8B model costs about $9\times$ less per token than a 70B. Best-of-$N$ on the 8B costs $\approx N \times$ its single-sample decode; at $N = 8$, that is comparable to \textit{one} 70B sample. The trade is therefore: does 8B-with-8-samples-plus-selection match 70B-pass@1 on this task? On math and code with a reliable verifier, frequently yes (Snell et al., 2024)---which is when test-time compute is strictly cheaper. Sequential scaling has the same structure with a different denominator: $10$--$50\times$ more thinking tokens on the same model competes against $\sim 10\times$ more parameters per token.
+
+\textbf{Task dependence.} Parallel scaling needs a \textit{selection signal}: a verifier (unit tests, checkers), a vote-able answer format (self-consistency), or a reranker. Verifiable domains therefore favor search. Open-ended generation has no cheap selector---best-of-$N$ against a learned RM re-imports reward hacking at inference time, and gains fade quickly with $N$.
+
+\textbf{Latency constraints.} Parallel samples cost throughput (GPU-seconds) but roughly one generation of wall-clock; sequential thinking costs \textit{user-visible latency} directly. Interactive products cap thinking budgets; batch/offline workloads (data generation, evals, agents running overnight) can spend freely. This asymmetry often decides the method before accuracy does.
+
+\textbf{When it stops working:} (1) \textbf{Coverage ceiling}---if pass@$N$ is flat near zero even at large $N$, the base model cannot sample a correct solution and no selector can rescue it; capability must come from parameters or training. (2) \textbf{Selector ceiling}---with an imperfect verifier or RM, best-of-$N$ gains peak and then \textit{reverse} as $N$ grows, because you increasingly select false positives (Goodhart at inference time); majority voting saturates when the modal answer is wrong. (3) \textbf{Economics at volume}---per-query search costs recur forever on serving traffic, while parameter or training costs amortize.
+
+\textbf{Distillation banks the gains.} The escape from recurring cost: run the expensive regime offline (big model, long thinking, best-of-$N$ with verification), keep the verified traces, and SFT a small model on them---the R1-distill recipe (Section~\ref{sec:reasoning_ttc}). Test-time compute becomes a data-generation strategy whose product is a cheap model, converting a per-query cost into a one-time training cost.
+
+\redflags
+\begin{itemize}
+    \item Comparing only accuracy, never cost---the question is explicitly an economics question; do the $N\times$ vs.\ $\sim 10\times$-params arithmetic.
+    \item Assuming best-of-$N$ improves monotonically with $N$ regardless of verifier quality.
+    \item Ignoring the latency asymmetry between parallel and sequential scaling.
+    \item Treating test-time compute and model scale as substitutes everywhere---on problems beyond the model's coverage they are not substitutes at all.
+\end{itemize}
+
+\interviewtest{Whether you can reason quantitatively about the compute-quality-latency triangle and name the two ceilings (coverage, selector quality). The L7 signal is connecting inference-time choices back to training-time strategy via distillation.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows best-of-$N$, self-consistency, and longer CoT as ways to spend inference compute.
+    \item \badgeLsix{L6} Does the cost arithmetic ($N$ samples of a small model vs.\ one sample of a $\sim 10\times$ model), names the coverage and verifier ceilings, and separates the latency profiles of parallel vs.\ sequential scaling.
+    \item \badgeLseven{L7} Designs the allocation policy: difficulty-aware routing (easy queries get small-model pass@1, hard ones get thinking budget or search), compute-optimal scaling as a serving-layer decision, and the distillation flywheel that converts test-time wins into a cheaper deployed model.
+\end{itemize}
+
+\followups{``How would you pick $N$ in production?'' ``Design a router that decides which queries get extended thinking.'' ``Why does majority voting work well on math but poorly on code, and what replaces it for code?''}
 \end{interviewq}

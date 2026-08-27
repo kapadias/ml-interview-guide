@@ -120,11 +120,11 @@ Without scaling, dot products grow with dimension $d$ (their variance equals $d$
     ]
     % For 2 classes, softmax(x) vs softmax(-x)
     \addplot[domain=-5:5, samples=100, thick, blue] {exp(x)/(exp(x)+exp(0))};
-    \addlegendentry{Before saturation}
+    \addlegendentry{Softmax output}
 
     % Gradient visualization
     \addplot[domain=-5:5, samples=100, thick, red, dashed] {exp(x)/(exp(x)+exp(0)) * (1 - exp(x)/(exp(x)+exp(0)))};
-    \addlegendentry{Gradient magnitude}
+    \addlegendentry{Gradient}
     \end{axis}
 \end{tikzpicture}
 \caption{Softmax output and gradient. Large inputs cause saturation where gradients vanish.}
@@ -416,13 +416,13 @@ where $f_k$ is a linear transformation (rotation matrix). This allows the model 
 
 \subsection{Learned Positional Embeddings}
 
-\textbf{Learned Positional Embedding.} Instead of using a fixed function of position, maintain a trainable embedding matrix $\mP \in \R^{L_{\max} \times d_{\text{model}}}$ where each row corresponds to a position index. The position encoding for token at position $t$ is simply:
+\textbf{Learned Positional Embedding.} Instead of using a fixed function of position, maintain a trainable embedding matrix $\mathbf{P} \in \R^{L_{\max} \times d_{\text{model}}}$ where each row corresponds to a position index. The position encoding for token at position $t$ is simply:
 
 \begin{equation}
-\mE_{pos} \in \R^{L_{max} \times d}, \quad \text{PE}(t) = \mP[t, :]
+\mE_{pos} \in \R^{L_{max} \times d}, \quad \text{PE}(t) = \mathbf{P}[t, :]
 \end{equation}
 
-This embedding is added to the token embedding exactly as with sinusoidal encodings: $\vx_t = \text{TokenEmbed}(w_t) + \mP[t, :]$. The matrix $\mP$ is initialized randomly and learned end-to-end via backpropagation.
+This embedding is added to the token embedding exactly as with sinusoidal encodings: $\vx_t = \text{TokenEmbed}(w_t) + \mathbf{P}[t, :]$. The matrix $\mathbf{P}$ is initialized randomly and learned end-to-end via backpropagation.
 
 \textbf{Key difference from sinusoidal}: Sinusoidal encodings have a built-in inductive bias for relative positions (the linear-transformation property between positions), while learned embeddings treat each position as an independent embedding with no structural relationship. This means learned PE must discover positional patterns purely from data.
 
@@ -528,7 +528,7 @@ where $m$ is a head-specific slope.
 \toprule
 \textbf{Encoding} & \textbf{Parameters} & \textbf{Extrapolation} & \textbf{Relative} & \textbf{Used In} \\
 \midrule
-Sinusoidal & None & Good & Implicit & Original Transformer \\
+Sinusoidal & None & Degrades empirically & Implicit & Original Transformer \\
 Learned & $L \times d$ & Poor & No & BERT, GPT-2 \\
 Relative (Shaw) & $O(Ld)$ & Moderate & Explicit & T5, XL \\
 RoPE & None & Good & Implicit & LLaMA, Mistral \\
@@ -548,7 +548,7 @@ Standard attention: $O(n^2)$ time and memory
 
 \begin{table}[H]
 \centering
-\caption{Memory requirements for attention at different scales}
+\caption{Memory for a single $n \times n$ attention matrix (per head, per layer, batch size 1) at different sequence lengths}
 \begin{tabular}{lrrr}
 \toprule
 \textbf{Sequence Length} & \textbf{Attention Matrix} & \textbf{At FP16} & \textbf{At FP32} \\
@@ -561,6 +561,8 @@ Standard attention: $O(n^2)$ time and memory
 \bottomrule
 \end{tabular}
 \end{table}
+
+Note these figures are for a \emph{single} head's matrix: naive (pre-Flash-Attention) training materializes one per head, per layer, per batch element, so real memory is $h \times b$ times larger---at 32K with $h=32$ heads that is $\sim$64 GB \emph{per layer} in FP16, which is why avoiding materialization matters so much.
 
 \subsection{Sparse Attention Patterns}
 
@@ -626,7 +628,7 @@ Attend to positions at fixed intervals, similar to dilated convolutions.
 
 \textbf{Trade-off.} Approximation quality varies; often lower quality than full attention. Examples: Performer, Linear Transformer.
 
-\textbf{In practice.} Flash Attention has largely made linear attention unnecessary for moderate sequence lengths ($<$ 32K). Linear attention is mainly relevant for very long sequences where even Flash Attention's $O(n^2)$ compute is prohibitive.
+\textbf{In practice.} For moderate sequence lengths ($<$ 32K), Flash Attention made classic linear attention largely unnecessary---though modern gated linear-attention variants have seen a practical revival in hybrid production models. Linear attention is mainly relevant for very long sequences where even Flash Attention's $O(n^2)$ compute is prohibitive.
 
 \subsection{Multi-Query Attention (MQA)}
 
@@ -641,7 +643,7 @@ Share keys and values across all attention heads:
 
 \textbf{Benefit}: KV cache reduced by factor of $h$ (number of heads).
 
-\textbf{Used in}: PaLM, Falcon
+\textbf{Used in}: PaLM, Falcon-7B (note: Falcon-40B/180B use multiple shared KV heads---effectively GQA, not true MQA)
 
 \subsection{Grouped-Query Attention (GQA)}
 
@@ -658,6 +660,44 @@ Middle ground: Share K/V within groups of heads.
 
 \textbf{Used in}: LLaMA 2, Mistral
 
+\subsection{Multi-head Latent Attention (MLA)}
+\label{sec:mla}
+
+MQA and GQA shrink the KV cache by reducing the \textit{number} of KV heads. Multi-head Latent Attention (MLA), introduced in DeepSeek-V2 (DeepSeek-AI, 2024) and carried into DeepSeek-V3/R1 (DeepSeek-AI, 2024/2025), is the next rung on the same ladder---but it moves along a different axis: keep all the heads, and compress \textit{what is cached}. Instead of storing per-head keys and values at all, MLA jointly compresses each token's KV information into a single low-rank latent vector and caches only that.
+
+\begin{mathresult}{Multi-head Latent Attention}
+Jointly compress each token's KV information into a low-rank latent; reconstruct per-head K/V by up-projection at use time:
+\begin{align}
+\vc_t^{KV} &= \mW^{DKV} \vh_t \qquad (d_c \ll n_h d_h) \\
+\vk_{t,i}^{C} &= \mW_i^{UK} \vc_t^{KV}, \qquad \vv_{t,i}^{C} = \mW_i^{UV} \vc_t^{KV} \\
+\vk_t^{R} &= \mathrm{RoPE}\!\left(\mW^{KR} \vh_t\right) \qquad \text{(decoupled RoPE key, shared across heads)} \\
+\vk_{t,i} &= [\,\vk_{t,i}^{C};\ \vk_t^{R}\,]
+\end{align}
+Only the latent $\vc_t^{KV}$ ($d_c$ elements) and the decoupled RoPE key $\vk_t^{R}$ ($d_r$ elements) are cached. DeepSeek-V3: $d_c = 512$ and $d_r = 64$, versus $2 n_h d_h = 2 \times 128 \times 128 = 32{,}768$ elements per token per layer for full MHA at that scale.
+\end{mathresult}
+
+\textbf{The weight-absorption trick.} At inference, the up-projections never need to run at all. The position-free part of the attention score is
+\[
+\vq_{s,i}^{\top} \vk_{t,i}^{C} = \left(\mW_i^{UQ} \vc_s^{Q}\right)^{\top} \mW_i^{UK} \vc_t^{KV},
+\]
+so the fixed product $\mW_i^{UQ\top} \mW_i^{UK}$ can be folded (``absorbed'') into the query projection, and $\mW_i^{UV}$ can likewise be absorbed into the output projection $\mW^O$. Decode then operates \textit{directly on the cached latent}---no K or V is ever materialized. Since decode is memory-bandwidth-bound, reading 576 elements per token per layer instead of 2,048 (GQA-8) or 32,768 (MHA) translates directly into decode throughput at long context.
+
+\begin{keyinsight}[Why MLA Needs a Decoupled RoPE Key]
+RoPE applies a position-\textit{dependent} rotation to each key. If RoPE were applied to the reconstructed keys, the attention score would contain $\mW_i^{UQ\top} \mR_{t-s}\, \mW_i^{UK}$: the rotation sits \textit{between} the two up-projections and changes with token position, so it does not commute with the low-rank reconstruction and cannot be absorbed into fixed weights. Equivalently, position cannot be applied to the compressed latent retroactively. MLA's fix is to route position through a small separate channel: a \textit{decoupled} RoPE key $\vk_t^{R}$ ($d_r = 64$ in DeepSeek-V3; one per token, shared across all heads) that is rotated \textit{before} caching and concatenated to the position-free reconstructed keys, with a matching per-head RoPE component on the queries.
+\end{keyinsight}
+
+\textbf{Cache math at DeepSeek-V3 scale} ($n_h = 128$, $d_h = 128$), in elements per token per layer:
+\begin{itemize}
+    \item \textbf{MHA}: $2 n_h d_h = 2 \times 128 \times 128 = 32{,}768$
+    \item \textbf{GQA-8} (8 KV heads): $2 \times 8 \times 128 = 2{,}048$ ($16\times$ smaller)
+    \item \textbf{MQA} (1 KV head): $2 \times 1 \times 128 = 256$ ($128\times$ smaller, with quality loss)
+    \item \textbf{MLA}: $d_c + d_r = 512 + 64 = 576$ --- $57\times$ smaller than MHA and $3.6\times$ smaller than GQA-8; in cache terms, equivalent to GQA with only $2.25$ groups
+\end{itemize}
+
+The remarkable part is not the compression ratio---MQA compresses harder---but that MLA \textbf{matches or beats MHA quality} while compressing (DeepSeek-V2/V3 report parity or better). MQA and GQA discard capacity by forcing many query heads to share a few KV projections; MLA instead learns a shared low-rank \textit{basis} for all heads' K/V, out of which each head keeps its own up-projection. Learned joint compression preserves per-head diversity in a way head-count reduction cannot---which is why MLA breaks the old quality-vs-memory trade-off rather than just picking a new point on it.
+
+\textbf{Used in}: DeepSeek-V2/V3/R1; increasingly copied by other open-weight families as the post-GQA rung of the KV-cache ladder.
+
 \begin{table}[H]
 \centering
 \caption{Attention variant comparison}
@@ -668,9 +708,47 @@ Middle ground: Share K/V within groups of heads.
 Multi-Head (MHA) & $h$ & Best & Baseline \\
 Grouped-Query (GQA) & $g < h$ & Very good & Faster \\
 Multi-Query (MQA) & 1 & Good & Fastest \\
+Multi-head Latent (MLA) & none---cached latent ($d_c + d_r$) & Best (MHA parity) & Faster than GQA \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+\begin{interviewq}
+\textbf{Q: Compare MHA, GQA, MQA, and MLA for KV-cache efficiency. Why does MLA need a decoupled RoPE key?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer Three of these sit on one axis---how many KV heads to keep---while MLA moves on a different axis: how much to cache per token. Per token per layer, at DeepSeek-V3 scale ($n_h = 128$, $d_h = 128$):
+
+\begin{itemize}
+    \item \textbf{MHA}: $2 n_h d_h = 32{,}768$ elements. Full quality, full cost.
+    \item \textbf{GQA-8}: $2 \times 8 \times 128 = 2{,}048$ elements ($16\times$ less). Small quality cost.
+    \item \textbf{MQA}: $2 \times 1 \times 128 = 256$ elements ($128\times$ less). Noticeable quality cost.
+    \item \textbf{MLA}: $d_c + d_r = 512 + 64 = 576$ elements ($57\times$ less than MHA, $3.6\times$ less than GQA-8) at MHA-level quality---the cache of a hypothetical ``GQA-2.25'' with none of the quality loss.
+\end{itemize}
+
+The mechanism difference is the crux: GQA/MQA reduce the \textit{number} of cached KV heads; MLA keeps all heads but caches a learned low-rank joint compression of K and V ($\vc^{KV} = \mW^{DKV} \vh$, $d_c \ll n_h d_h$), reconstructing per-head K/V by up-projections at use time. At inference the up-projections are absorbed into the query and output projections, so decode reads only the latent---no K/V is ever materialized.
+
+\textbf{Why the decoupled RoPE key}: RoPE's position-dependent rotation lands \textit{between} the up-projections in the attention score, so it does not commute with the low-rank reconstruction---you cannot apply position to the cached latent retroactively, and with RoPE inside, the absorption trick dies. MLA therefore routes position through a small separate key ($d_r = 64$; per token, shared across all heads), rotated before caching and concatenated to the position-free reconstructed keys.
+
+\redflags
+\begin{itemize}
+    \item ``MLA is just GQA with a lower rank'' --- it is a learned joint compression into a shared basis with per-head up-projections, not head sharing; that is exactly why it keeps MHA quality where GQA gives some up.
+    \item Not knowing why RoPE forces the decoupled key (the position-dependent rotation cannot be absorbed into fixed weights).
+    \item Claiming MLA trades quality for memory --- DeepSeek-V2/V3 report parity or better versus MHA.
+\end{itemize}
+
+\interviewtest{Whether you can do the per-token cache arithmetic and whether you understand MLA as compression of the cache \textit{contents} rather than a head-count trick---the standard 2026 probe on post-GQA architectures.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the ladder MHA $\to$ GQA $\to$ MQA and that MLA caches a compressed latent plus a small RoPE key instead of per-head K/V.
+    \item \badgeLsix{L6} Does the cache math on the spot ($32{,}768$ vs $2{,}048$ vs $576$ elements; $576 \times 61 \times 2\,\text{B} \approx 70$ KB/token across DeepSeek-V3's 61 layers at FP16) and explains the weight-absorption trick.
+    \item \badgeLseven{L7} Explains why absorption matters: decode is memory-bandwidth-bound, and reading only the latent cuts per-token HBM traffic $\sim 57\times$ vs MHA while raising arithmetic intensity (an MQA-like effect---every query head hits the same cached tensor). Knows the tensor-parallelism wrinkle: the latent is shared by \textit{all} heads, so it is replicated on every TP rank rather than sharded like GQA's KV heads---large MLA deployments typically run attention data-parallel instead. Can say when GQA is still the right call: simpler, mature kernel support (FlashAttention/PagedAttention everywhere), TP-friendly sharding, and you can fine-tune from existing GQA checkpoints.
+\end{itemize}
+
+\followups{``Derive the per-token cache bytes for DeepSeek-V3.'' ``Why not compress Q too?'' (DeepSeek does---$d_c' = 1536$---but to cut activation memory in training; Q is never cached, so it does not shrink the KV cache.) ``How does MLA change the batch-size ceiling in serving?''}
+\end{interviewq}
 
 \subsection{Flash Attention}
 
@@ -732,10 +810,10 @@ where $m = \max_j x_j$. Can be computed incrementally as blocks arrive.
 \begin{itemize}
     \item \badgeLfive{L5} Explains the tiling approach and that it's exact, not approximate. Knows memory drops from $O(n^2)$ to $O(n)$.
     \item \badgeLsix{L6} Can explain the online softmax trick, knows the SRAM/HBM sizes on A100, understands the arithmetic intensity shift from memory-bound to compute-bound. Mentions Flash Attention 2 improvements (better parallelism, causal masking optimization).
-    \item \badgeLseven{L7} Discusses implications for system design: Flash Attention changes which operations are the bottleneck (now FFN, not attention). Knows that FA doesn't help for decode phase (which is memory-bound for a different reason: loading model weights, not attention matrix). Can reason about when IO-aware algorithms matter beyond attention.
+    \item \badgeLseven{L7} Discusses implications for system design: Flash Attention changes which operations are the bottleneck (now FFN, not attention). Knows that vanilla FA gives little benefit in the decode phase (a single query has no large attention matrix to avoid; short-context decode is bound by loading model weights)---but that Flash-Decoding (split-KV parallelism) is the standard fix for long-context decode, where reading the KV cache becomes the bottleneck. Can reason about when IO-aware algorithms matter beyond attention.
 \end{itemize}
 
-\followups{``What's the online softmax trick?'' ``When would Flash Attention NOT help?'' (Small sequences where attention isn't the bottleneck; decode phase where the bottleneck is weight loading, not attention matrix.) ``What changed in Flash Attention 2 vs 1?'' (Better work partitioning across thread blocks, reduced non-matmul FLOPs.)}
+\followups{``What's the online softmax trick?'' ``When would Flash Attention NOT help?'' (Small sequences where attention isn't the bottleneck; naive short-context decode where the bottleneck is weight loading---though Flash-Decoding's split-KV parallelism does help long-context decode.) ``What changed in Flash Attention 2 vs 1?'' (Better work partitioning across thread blocks, reduced non-matmul FLOPs.)}
 \end{interviewq}
 
 %==============================================================================
@@ -887,7 +965,7 @@ With $f=4$: FLOPs per layer $\approx 24nd^2 + 4n^2d$
     \item \textbf{Parameters}: 7B $\times$ 2 bytes (BF16) = 14 GB
     \item \textbf{Gradients}: 7B $\times$ 2 bytes (BF16) = 14 GB
     \item \textbf{Optimizer states (AdamW)}: Master weights in FP32 (7B $\times$ 4 = 28 GB) + momentum (7B $\times$ 4 = 28 GB) + variance (7B $\times$ 4 = 28 GB) = 84 GB
-    \item \textbf{Activations}: For a 32-layer model with $d=4096$, seq=2048, batch=1: each layer stores attention input, QKV projections, attention scores, FFN intermediates. Roughly $\sim$34 \textrm{bytes/param} $\times$ seq $\times$ batch for typical Transformers $\approx$ 16--30 GB (highly dependent on checkpointing)
+    \item \textbf{Activations}: For a 32-layer model with $d=4096$, seq=2048, batch=1: each layer stores attention input, QKV projections, attention scores, FFN intermediates. The per-layer estimate (Korthikanti et al.) is $s\,b\,d\,(34 + 5hs/d)$ bytes, where $s$ is sequence length, $b$ batch size, $d$ hidden size, $h$ heads. Evaluating: $2048 \times 1 \times 4096 \times (34 + 5 \times 32 \times 2048/4096) = 2048 \times 4096 \times 114 \approx 0.96$ GB per layer, so $\approx$ 30 GB over 32 layers. Flash Attention avoids storing the attention-scores term ($5hs/d$), leaving $\sim$9--10 GB; gradient checkpointing cuts further
 \end{enumerate}
 
 \textbf{Total}: $\sim$130--140 GB without gradient checkpointing. With mixed-precision training (BF16 compute, FP32 master weights).
@@ -966,7 +1044,7 @@ Three advantages over learned positional embeddings:
 \begin{itemize}
     \item \textbf{Training from scratch, serving many concurrent users}: GQA (best quality/efficiency tradeoff). This is the modern default.
     \item \textbf{Training quality is paramount, inference cost secondary}: MHA. Used when you'll distill or quantize for serving anyway.
-    \item \textbf{Extreme latency constraint, small model}: MQA. Used in PaLM, Falcon. Acceptable when model capacity is large enough to compensate.
+    \item \textbf{Extreme latency constraint, small model}: MQA. Used in PaLM and Falcon-7B (the larger Falcons are effectively GQA). Acceptable when model capacity is large enough to compensate.
 \end{itemize}
 
 \textbf{Concrete KV cache math}: For a 70B model (80 layers, $d_{head}=128$, BF16) at 4K context:
@@ -1030,7 +1108,7 @@ Dividing by $\sqrt{d_k}$ restores unit variance: if $\vq, \vk \sim \mathcal{N}(0
 \begin{itemize}
     \item \badgeLfive{L5} Explains variance growth and softmax saturation. Gets the $\sqrt{d_k}$ normalization right.
     \item \badgeLsix{L6} Can derive the variance formula. Notes that this is specific to dot-product attention (additive attention doesn't need scaling). Connects to temperature-scaled softmax.
-    \item \badgeLseven{L7} Discusses that in practice, Q and K aren't random --- learned correlations can still cause saturation even with scaling. Mentions QK-Norm (normalizing Q and K before dot product) as an alternative used in some architectures. Notes that the $\sqrt{d_k}$ scaling is equivalent to initializing $\mW^Q, \mW^K$ with std $\sim 1/\sqrt{d_k}$.
+    \item \badgeLseven{L7} Discusses that in practice, Q and K aren't random --- learned correlations can still cause saturation even with scaling. Mentions QK-Norm (normalizing Q and K before dot product) as an alternative used in some architectures. Notes that the $\sqrt{d_k}$ scaling matches the effect of initializing $\mW^Q, \mW^K$ with std $\sim 1/\sqrt{d_k}$ \textit{only at initialization}---the explicit logit scaling keeps acting throughout training, whereas an init-time rescaling washes out as the weights move.
 \end{itemize}
 
 \followups{``What if we used additive attention --- would we need scaling?'' ``What's the connection to temperature in softmax?'' ``How does this interact with mixed precision training?''}
@@ -1075,7 +1153,7 @@ For $L=32, d=4096, n=2048$:
 \begin{itemize}
     \item \badgeLfive{L5} Knows the $2P$ forward, $6P$ training rule. Gets the right order of magnitude.
     \item \badgeLsix{L6} Can derive per-layer breakdown. Knows the attention term ($4n^2d$) vs projection term ($24nd^2$). Can identify when attention FLOPs dominate (when $n > 6d$, roughly $n > 24K$ for $d=4096$).
-    \item \badgeLseven{L7} Can convert FLOPs to wall-clock time given GPU specs (A100 = 312 TFLOPS BF16). Knows MFU (Model FLOPs Utilization) is typically 40--60\%. Can estimate total training cost: Chinchilla-optimal for 7B $\approx$ 140B tokens $\rightarrow$ $6 \times 7B \times 140B = 5.88 \times 10^{21}$ FLOPs $\approx$ 30K A100-hours.
+    \item \badgeLseven{L7} Can convert FLOPs to wall-clock time given GPU specs (A100 = 312 TFLOPS BF16). Knows MFU (Model FLOPs Utilization) is typically 40--60\%. Can estimate total training cost: Chinchilla-optimal for 7B $\approx$ 140B tokens $\rightarrow$ $6 \times 7B \times 140B = 5.88 \times 10^{21}$ FLOPs $\approx$ 9--13K A100-hours at 40--60\% MFU.
 \end{itemize}
 
 \followups{``How does this change at 128K context?'' ``What's the training cost in GPU-hours?'' ``Where does the $6P$ come from?'' (2P forward + 4P backward.)}
@@ -1121,7 +1199,7 @@ LLaMA 70B specs: 80 layers, 8 KV heads (GQA), $d_{\text{head}} = 128$, BF16 (2 b
 \begin{itemize}
     \item \badgeLfive{L5} Correctly applies the formula, gets the right answer. Knows KV cache is the memory bottleneck for long context.
     \item \badgeLsix{L6} Discusses mitigation strategies: KV cache quantization (INT8 halves it), PagedAttention (reduces fragmentation waste), GQA (already reflected in LLaMA 70B's 8 KV heads).
-    \item \badgeLseven{L7} Reasons about system-level implications: at 128K with 42 GB KV cache per sequence, batch size is effectively 1 on a single 80 GB A100 (after model weights). Proposes disaggregated prefill/decode, or prefix caching for shared system prompts. Mentions H100 with 188 GB HBM3 or multi-GPU serving as solutions.
+    \item \badgeLseven{L7} Reasons about system-level implications: at 128K with 42 GB KV cache per sequence, batch size is effectively 1 on a single 80 GB A100 (after model weights). Proposes disaggregated prefill/decode, or prefix caching for shared system prompts. Mentions H200 with 141 GB HBM3e (the H100 has 80 GB) or multi-GPU serving as solutions.
 \end{itemize}
 
 \followups{``How would you reduce this KV cache size?'' ``What batch size can you support on 8xA100?'' ``How does prefix caching help for chatbot workloads?''}
@@ -1187,7 +1265,7 @@ Formally: $\text{SelfAttn}(\pi(\mX)) = \pi(\text{SelfAttn}(\mX))$ for any permut
     \item \textbf{Scales to deeper models}: 100+ layer pre-norm Transformers train reliably. Post-norm often fails beyond 24 layers without special initialization.
 \end{enumerate}
 
-\textbf{The case for Post-norm}: When it converges, it can achieve slightly better final quality. Some evidence suggests the LayerNorm on the residual stream provides a beneficial regularization effect. This is why some models (PaLM) use Post-norm with careful initialization (e.g., the $1/\sqrt{2N}$ scaling from DeepNet).
+\textbf{The case for Post-norm}: When it converges, it can achieve slightly better final quality. Some evidence suggests the LayerNorm on the residual stream provides a beneficial regularization effect. This is why post-norm survives in some designs: BERT uses it, DeepNet makes it trainable at extreme depth with careful initialization (the $1/\sqrt{2N}$ scaling), and Gemma-2's sandwich norm applies RMSNorm both before \textit{and} after each sublayer. (PaLM, sometimes miscited as post-norm, is actually pre-norm with parallel attention+FFN blocks.)
 
 \redflags
 \begin{itemize}
@@ -1452,7 +1530,7 @@ For $d = 4096$:
     \item $n = 128K$: ratio = $0.5 + 131072/16384 = 8.5$ --- attention overwhelmingly dominates
 \end{itemize}
 
-\textbf{Crossover point}: Attention and FFN FLOPs are equal when $n = 2d$. For $d=4096$, this is $n \approx 8K$.
+\textbf{Crossover point}: Attention and FFN FLOPs are equal when $n = 2d$. For $d=4096$, this is $n \approx 8K$. Note this compares the \textit{total attention block} (including QKV/output projections) against the FFN; the FLOPs question's $n > 6d$ threshold instead compares the $O(n^2 d)$ score/value terms alone ($4nd$ per token) against \textit{all} the $O(nd^2)$ matmuls ($24d^2$ per token)---both are correct under their respective definitions.
 
 \textbf{Practical implication}: Below 8K tokens, optimizing FFN (MoE, quantization) gives more speedup. Above 8K, optimizing attention (Flash Attention, sparse attention, GQA) is more important.
 
@@ -1468,7 +1546,7 @@ For $d = 4096$:
 \begin{itemize}
     \item \badgeLfive{L5} Knows attention is $O(n^2 d)$ and FFN is $O(nd^2)$. Can state which dominates at long vs short sequences.
     \item \badgeLsix{L6} Can derive the crossover point ($n \approx 2d$). Gives concrete numbers for specific models and sequence lengths.
-    \item \badgeLseven{L7} Distinguishes training (all tokens processed in parallel, attention usually subdominant) from inference (decode phase: $n=1$ per step, FFN totally dominates for weight loading). Notes that Flash Attention changes the practical bottleneck even when attention theoretically dominates (by making attention compute-bound instead of memory-bound).
+    \item \badgeLseven{L7} Distinguishes training (all tokens processed in parallel, attention usually subdominant) from inference (decode phase: $n=1$ per step, so weight loading dominates at short context---but at long context the per-step KV-cache read becomes the dominant memory traffic). Notes that Flash Attention changes the practical bottleneck even when attention theoretically dominates (by making attention compute-bound instead of memory-bound).
 \end{itemize}
 
 \followups{``How does this analysis change for inference vs training?'' ``Where should you spend your optimization effort for a 128K-context model?''}
@@ -1544,7 +1622,7 @@ Standard Transformers assume full-sequence access. Streaming requires three fund
 \begin{itemize}
     \item \textbf{$n < 32K$}: Use Flash Attention. The $O(n^2)$ compute is manageable, and you get exact attention. Linear attention's quality gap is not worth the compute savings.
     \item \textbf{$32K < n < 128K$}: Depends on quality requirements. Flash Attention still works but becomes expensive. If approximate attention is acceptable, linear methods can help.
-    \item \textbf{$n > 128K$}: Seriously consider linear attention, sparse attention, or SSMs. Flash Attention's $O(n^2)$ compute becomes prohibitive ($128K^2 \approx 16B$ operations per layer per head).
+    \item \textbf{$n > 128K$}: Seriously consider linear attention, sparse attention, or SSMs. Flash Attention's $O(n^2)$ compute becomes prohibitive: $128K^2 \approx 17$B score-matrix \textit{entries} per layer per head, i.e.\ $2n^2 d_{head} \approx 4 \times 10^{12}$ FLOPs for the scores alone at $d_{head} = 128$.
     \item \textbf{Inference streaming}: Linear attention has an $O(d^2)$ recurrent state, enabling efficient streaming without KV cache growth. This is its killer use case.
 \end{itemize}
 
@@ -1561,8 +1639,8 @@ Standard Transformers assume full-sequence access. Streaming requires three fund
 \begin{itemize}
     \item \badgeLfive{L5} Correctly states that Flash Attention is exact while linear attention is approximate. Knows Flash is $O(n^2)$ compute.
     \item \badgeLsix{L6} Explains the kernel trick behind linear attention. Identifies the streaming use case. Quantifies the crossover point ($\sim$32K).
-    \item \badgeLseven{L7} Discusses recent work combining both (e.g., Hedgehog: learning the kernel $\phi$ to approximate softmax more closely). Notes that in practice, Mamba/SSMs have largely displaced linear attention for the ``efficient long-context'' niche because they achieve better quality at similar efficiency.
+    \item \badgeLseven{L7} Discusses recent work combining both (e.g., Hedgehog: learning the kernel $\phi$ to approximate softmax more closely). Notes that Mamba/SSMs and modern gated linear-attention variants both compete for the ``efficient long-context'' niche---and that rather than one displacing the other, production models increasingly hybridize them with full-attention layers.
 \end{itemize}
 
-\followups{``What's the kernel trick in linear attention?'' ``Why have SSMs been more successful than linear attention?'' ``Can you combine Flash Attention with sparse attention patterns?''}
+\followups{``What's the kernel trick in linear attention?'' ``How do SSMs compare to linear attention in practice?'' ``Can you combine Flash Attention with sparse attention patterns?''}
 \end{interviewq}

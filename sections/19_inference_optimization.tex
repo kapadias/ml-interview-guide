@@ -45,6 +45,23 @@ The factor of 2 accounts for both keys and values.
 Grouped-query attention (GQA) and multi-query attention (MQA) share key-value heads across multiple query heads. This was not primarily about training efficiency---it was designed to shrink the KV cache at inference. MQA uses a single KV head (maximum compression, some quality loss); GQA uses a small group (e.g., 8 heads), striking a balance. Nearly every modern serving-optimized LLM uses GQA.
 \end{keyinsight}
 
+\subsection{MLA: Compressing the Cache Itself}
+\label{sec:mla_serving}
+
+GQA and MQA shrink the cache by cutting the number of KV heads. Multi-head Latent Attention (MLA; DeepSeek-AI, 2024, used in DeepSeek-V2/V3/R1) compresses the cache \textit{contents} instead: each token's K/V information is jointly projected into a low-rank latent ($d_c = 512$ in DeepSeek-V3) plus a small decoupled RoPE key ($d_r = 64$), and only those 576 elements per layer are cached---at decode, the reconstruction projections are absorbed into the query and output projections, so attention reads the latent directly. The mechanism, the RoPE complication, and the weight-absorption trick are covered in Chapter~\ref{chap:attention_transformers} (Section~\ref{sec:mla}); here is what it does to serving.
+
+\textbf{Per-token cache at DeepSeek-V3 scale} (61 layers, $n_h = 128$, $d_h = 128$, FP16):
+\begin{itemize}
+    \item \textbf{Full-MHA equivalent}: $2 \times 128 \times 128 = 32{,}768$ elements/layer $\to 32{,}768 \times 61 \times 2$ B $\approx 4.0$ MB/token
+    \item \textbf{GQA-8 equivalent}: $2 \times 8 \times 128 = 2{,}048$ elements/layer $\to 2{,}048 \times 61 \times 2$ B $\approx 250$ KB/token
+    \item \textbf{MLA}: $512 + 64 = 576$ elements/layer $\to 576 \times 61 \times 2$ B $\approx 70$ KB/token ($57\times$ below MHA, $3.6\times$ below GQA-8)
+\end{itemize}
+For calibration against the running example: LLaMA-2 70B with GQA-8 caches $\approx 0.3$ MB/token---MLA at V3 scale caches less than a quarter of that, despite V3 being a far larger model.
+
+\textbf{Concurrent-request ceiling.} At 32K context, one request's cache costs $\approx 131$ GB under the MHA-equivalent configuration---more than a single H100's entire 80 GB of HBM on its own---versus $\approx 8.2$ GB with GQA-8 and $\approx 2.3$ GB with MLA. Per 100 GB of KV budget, that is roughly 12 concurrent 32K requests with GQA-8 and 43 with MLA. Since decode throughput scales with batch size until KV memory (not compute) runs out, cache compression is directly a throughput multiplier.
+
+\textbf{Long-context economics.} At 128K context, MLA holds a request at $\approx 9$ GB (vs.\ $\approx 33$ GB GQA-8-equivalent and $\approx 524$ GB MHA-equivalent), which is what makes long-context serving of a frontier-scale model economically sane; it also shrinks the KV transfer volume in disaggregated prefill/decode setups by the same factor. FP8 KV-cache quantization stacks multiplicatively on top---the cached latent quantizes like any other KV tensor, halving the numbers above again. One serving-side caveat: the latent is shared by all attention heads, so under tensor parallelism it is replicated on every rank rather than sharded the way GQA's KV heads are---large MLA deployments therefore typically run attention data-parallel.
+
 \subsection{PagedAttention}
 
 \textbf{The problem.} Traditional KV cache implementations pre-allocate contiguous memory for the maximum possible sequence length of each request. If you allocate for 4K tokens but the request only uses 500, you waste 87\% of that memory. Across hundreds of concurrent requests, this waste is catastrophic for throughput.
@@ -152,11 +169,11 @@ Autoregressive decoding is fundamentally sequential: you generate token $t$ befo
 \centering
 \begin{tikzpicture}[
     node distance=0.3cm,
-    step/.style={rectangle, draw, minimum width=1.6cm, minimum height=0.6cm, font=\small, rounded corners=2pt},
-    draft/.style={step, fill=lightblue},
-    verify/.style={step, fill=lightgreen},
-    accept/.style={step, fill=green!30},
-    reject/.style={step, fill=red!15},
+    tok/.style={rectangle, draw, minimum width=1.6cm, minimum height=0.6cm, font=\small, rounded corners=2pt},
+    draft/.style={tok, fill=lightblue},
+    verify/.style={tok, fill=lightgreen},
+    accept/.style={tok, fill=green!30},
+    reject/.style={tok, fill=red!15},
     arrow/.style={->, thick, >=stealth},
     label/.style={font=\small\bfseries}
 ]
@@ -315,7 +332,7 @@ Duration & Short (one pass over prompt) & Long (one pass per output token) \\
 \end{itemize}
 
 \begin{keyinsight}[Decode Is Memory-Bandwidth-Bound, Not Compute-Bound]
-During decode, generating one token for a 70B model requires reading $\sim$140 GB of weights from GPU memory, but only performs $\sim$140 billion multiply-adds. On an A100 (2 TB/s bandwidth, 312 TFLOPS), the bandwidth time is $140/2000 = 70$ms but the compute time is $140\text{B}/312\text{T} = 0.4$ms. The GPU spends 99\% of its time waiting for memory reads. This is why quantization (reducing bytes read) and larger batch sizes (amortizing weight reads across requests) are the two most effective decode optimizations---they directly attack the bandwidth bottleneck.
+During decode, generating one token for a 70B model requires reading $\sim$140 GB of weights from GPU memory, but only performs $\sim$140 billion multiply-adds. Using A100 numbers (2 TB/s bandwidth, 312 TFLOPS)---and noting that 140 GB exceeds a single A100's 80 GB, so read this as \textit{per aggregate GPU memory and bandwidth} across the GPUs holding the shards---the bandwidth time is $140/2000 = 70$ms but the compute time is $140\text{B}/312\text{T} = 0.4$ms. The GPU spends 99\% of its time waiting for memory reads. This is why quantization (reducing bytes read) and larger batch sizes (amortizing weight reads across requests) are the two most effective decode optimizations---they directly attack the bandwidth bottleneck.
 \end{keyinsight}
 
 %==============================================================================
@@ -405,7 +422,7 @@ Start with back-of-the-envelope sizing before touching architecture.
 
 \textbf{Sizing the model.} A 70B model in INT4 (AWQ/GPTQ) requires $\sim$35 GB for weights. With GQA and 4K average context, the KV cache per request is $\sim$1.3 GB (Section~\ref{sec:kv_cache}). On an 8$\times$H100 node (80 GB each, 640 GB total), the model with TP=8 leaves $\sim$600 GB of headroom for KV cache, supporting $\sim$400 concurrent requests per node.
 
-\textbf{Throughput estimation.} At decode speeds of $\sim$40 tokens/sec/request with a batch of 100, and assuming 200 output tokens on average, each request takes $\sim$5 seconds. To sustain 1,000 QPS, I need $\sim$5,000 concurrent requests. With $\sim$400 concurrent requests per node, that is $\sim$13 replica nodes.
+\textbf{Throughput estimation.} Run each node at its KV-memory limit of $\sim$400 active requests. At batch 400 the decode step is compute-bound: $400 \times 17.5$ GFLOPs per GPU $\approx 7$ TFLOPs per step, $\approx$14 ms at $\sim$495 effective TFLOPS---call it $\sim$25 ms ITL with real-world overhead, i.e., $\sim$40 tokens/sec/request and $\sim$16{,}000 tokens/sec aggregate per node. Assuming 200 output tokens on average, each request takes $\sim$5 seconds of decode. By Little's law, sustaining 1,000 QPS requires $\sim$5,000 concurrent requests; at $\sim$400 per node, that is $\sim$13 replica nodes.
 
 \textbf{Architecture.} (1) \textit{Load balancer}: least-connections routing across replicas with health checks. (2) \textit{Serving engine}: vLLM with continuous batching and PagedAttention; enable chunked prefill to avoid stalling decode batches. (3) \textit{Quantization}: AWQ 4-bit weights, FP16 KV cache---halves memory, doubles batch capacity. (4) \textit{Parallelism}: TP=8 within each node (NVLink); no PP needed since model fits in one node at INT4. (5) \textit{Prefix caching}: share system-prompt KV across requests. (6) \textit{Auto-scaling}: scale replicas on queue depth.
 
@@ -481,7 +498,7 @@ I would attack this from multiple angles, ordered by implementation difficulty a
 
 \textbf{Immediate mitigations (no model changes):} (1) \textit{PagedAttention}: eliminates memory fragmentation from static pre-allocation, typically recovering 40--60\% of wasted KV memory. (2) \textit{Prefix caching}: if requests share a system prompt, cache the shared prefix KV across requests. (3) \textit{Admission control}: limit concurrent requests based on available KV memory; queue excess requests rather than OOMing. (4) \textit{Shorter contexts}: enforce max context length; truncate or summarize long inputs.
 
-\textbf{Compression techniques (moderate effort):} (1) \textit{KV cache quantization}: quantize KV to INT8 or FP8 (separate from weight quantization). The KV cache tolerates lower precision well because softmax is robust to small perturbations. 2$\times$ memory reduction with minimal quality impact. (2) \textit{Choose GQA/MQA models}: reduces KV cache by $n_{\text{heads}} / n_{\text{kv\_heads}}$ (training-time decision, but you can select a GQA model at serving time). (3) \textit{Sliding window attention}: models like Mistral bound KV growth to the most recent $W$ tokens.
+\textbf{Compression techniques (moderate effort):} (1) \textit{KV cache quantization}: quantize KV to INT8 or FP8 (separate from weight quantization). The KV cache tolerates lower precision well because softmax is robust to small perturbations. 2$\times$ memory reduction with minimal quality impact. (2) \textit{Choose GQA/MQA models}: reduces KV cache by $n_{\text{heads}} / n_{\text{kv\_heads}}$ (training-time decision, but you can select a GQA model at serving time); MLA models (DeepSeek-V3/R1) go further still, caching a compressed latent $\approx 57\times$ smaller than the MHA-equivalent (Section~\ref{sec:mla_serving}). (3) \textit{Sliding window attention}: models like Mistral bound KV growth to the most recent $W$ tokens.
 
 \textbf{Advanced techniques:} (1) \textit{KV offloading}: spill older KV entries to CPU memory or SSD. (2) \textit{Token eviction}: evict KV for low-attention tokens (H2O: Heavy Hitter Oracle)---risky for long-range retrieval tasks. (3) \textit{More GPUs}: distribute KV cache via TP or data parallelism.
 
@@ -500,7 +517,7 @@ Recommended order: PagedAttention first, then KV quantization, then prefix cachi
 \begin{itemize}
     \item \badgeLfive{L5} Identifies PagedAttention and KV quantization as the primary tools. Knows the KV memory formula.
     \item \badgeLsix{L6} Computes the KV cache size for the specific model on the spot, orders solutions by effort/impact, discusses quality tradeoffs of each compression method.
-    \item \badgeLseven{L7} Reasons about second-order effects---e.g., admission control causing queue buildup and cascading latency, KV offloading interacting poorly with speculative decoding, and when the right answer is to switch to a GQA model rather than patching the serving stack.
+    \item \badgeLseven{L7} Reasons about second-order effects---e.g., admission control causing queue buildup and cascading latency, KV offloading interacting poorly with speculative decoding, and when the right answer is to switch to a GQA (or MLA) model rather than patching the serving stack.
 \end{itemize}
 
 \followups{``How much memory does the KV cache use for your model at 32K context?'' ``What is the quality impact of KV cache quantization?'' ``Could you use RAG to reduce context length instead?''}
@@ -519,13 +536,13 @@ This requires reasoning about whether we are compute-bound or memory-bandwidth-b
 
 \textbf{Step 1: Model memory.} 70B params in FP16 = 140 GB. With TP=8, each GPU holds $140/8 = 17.5$ GB of weights.
 
-\textbf{Step 2: Decode (batch size 1) is memory-bandwidth-bound.} Each token requires reading all 140 GB of weights across the 8 GPUs. Each H100 has $\sim$3.35 TB/s HBM bandwidth. Reading 17.5 GB per GPU: $17.5 / 3{,}350 \approx 5.2$ ms. Add all-reduce overhead ($\sim$0.5 ms per layer with NVLink). Effective single-token latency $\approx$ 6--7 ms, giving $\sim$140--170 tokens/sec for a single request.
+\textbf{Step 2: Decode (batch size 1) is memory-bandwidth-bound.} Each token requires reading all 140 GB of weights across the 8 GPUs. Each H100 has $\sim$3.35 TB/s HBM bandwidth. Reading 17.5 GB per GPU: $17.5 / 3{,}350 \approx 5.2$ ms. Add all-reduce overhead: TP requires \textit{two} all-reduces per layer (after the attention output projection and the MLP down projection), each latency-dominated at batch 1 ($\sim$10 $\mu$s on NVLink), so $\sim$20 $\mu$s per layer $\times$ 80 layers $\approx$ 1.6 ms. Effective single-token latency $\approx$ 6--7 ms, giving $\sim$140--170 tokens/sec for a single request. Note this is a roofline upper bound: production stacks typically observe $\sim$50--90 tokens/sec for a 70B at batch 1 on 8$\times$H100 once kernel-launch overhead, sampling, and scheduling are included.
 
-\textbf{Step 3: Decode (large batch) becomes compute-bound.} Each H100 has $\sim$990 TFLOPS (FP16 with sparsity) or $\sim$495 TFLOPS dense. Per-token FLOPs for a 70B model $\approx 2 \times 70\text{B} = 140$ GFLOPs. Per GPU: $140 / 8 = 17.5$ GFLOPs. At batch $B$, total compute per step = $17.5 \times B$ GFLOPs. Compute time = $(17.5B) / 495{,}000$ seconds. Bandwidth time stays $\sim$5.2 ms (weights are read once regardless of batch size). The system becomes compute-bound when compute time exceeds bandwidth time: $17.5B / 495{,}000 > 0.0052$, which gives $B > 147$. So batches above $\sim$150 are compute-bound.
+\textbf{Step 3: Decode (large batch) becomes compute-bound.} An H100 (SXM) delivers $\sim$1{,}979 TFLOPS FP16/BF16 only with 2:4 structured sparsity; the dense figure is $\sim$990 TFLOPS, and realistic utilization on decode GEMMs is $\sim$50\%, giving $\sim$495 effective TFLOPS. Per-token FLOPs for a 70B model $\approx 2 \times 70\text{B} = 140$ GFLOPs. Per GPU: $140 / 8 = 17.5$ GFLOPs. At batch $B$, total compute per step = $17.5 \times B$ GFLOPs. Compute time = $(17.5B) / 495{,}000$ seconds. Bandwidth time stays $\sim$5.2 ms (weights are read once regardless of batch size). The system becomes compute-bound when compute time exceeds bandwidth time: $17.5B / 495{,}000 > 0.0052$, which gives $B > 147$. So batches above $\sim$150 are compute-bound.
 
 \textbf{Step 4: Throughput at optimal batch.} At batch 128 (bandwidth-bound): $128 / 0.006 \approx 21{,}000$ tokens/sec total. At batch 256 (compute-bound): $256 \times 17.5\text{G} = 4.48$ TFLOPS per GPU; time = $4{,}480 / 495{,}000 \approx 9$ ms; throughput $= 256 / 0.009 \approx 28{,}000$ tokens/sec. In practice, with overhead, expect $\sim$15{,}000--25{,}000 output tokens/sec on 8$\times$H100 at high batch.
 
-\textbf{Step 5: Prefill throughput.} Prefill is compute-bound (large matrix multiply). At $\sim$495 TFLOPS per GPU dense, processing a 1K-token prompt: $1{,}000 \times 140\text{G} = 140$ TFLOPS total; per GPU = 17.5 TFLOPS; time = $17.5 / 495 \approx 35$ ms. In practice $\sim$50--100 ms with overhead.
+\textbf{Step 5: Prefill throughput.} Prefill is compute-bound (large matrix multiply). At $\sim$495 effective TFLOPS per GPU ($\sim$990 TFLOPS dense peak), processing a 1K-token prompt: $1{,}000 \times 140\text{G} = 140$ TFLOPS total; per GPU = 17.5 TFLOPS; time = $17.5 / 495 \approx 35$ ms. In practice $\sim$50--100 ms with overhead.
 
 \redflags
 \begin{itemize}
@@ -692,7 +709,7 @@ The core distinction is \textit{what} you split and \textit{how often} you commu
     \item \textbf{Throughput-sensitive (batch processing):} Consider data parallelism (replicate the full model) instead of PP. At high batch sizes, each replica is well-utilized, and you avoid pipeline bubbles entirely.
 \end{itemize}
 
-\textbf{Quantitative intuition.} For a 70B FP16 model (140 GB), TP=8 on one 8$\times$H100 node: each GPU holds 17.5 GB of weights. The all-reduce per layer sends $\sim$2$\times$ hidden\_size $\times$ bytes = $2 \times 8192 \times 2 \approx 32$ KB at batch=1, completing in $<$0.1 ms on NVLink. Negligible. Over InfiniBand at 50 GB/s, the same all-reduce takes $\sim$0.6 $\mu$s per layer but adds up to $\sim$50 $\mu$s over 80 layers---still small, but jitter and latency variance make it unreliable for latency-critical serving at scale. At larger batch sizes, the all-reduce volume grows linearly, and the cross-node cost becomes prohibitive.
+\textbf{Quantitative intuition.} For a 70B FP16 model (140 GB), TP=8 on one 8$\times$H100 node: each GPU holds 17.5 GB of weights. There are \textit{two} all-reduces per layer (after the attention output projection and the MLP down projection), each sending $\sim$hidden\_size $\times$ bytes $= 8192 \times 2 \approx 16$ KB at batch=1. At these message sizes the cost is dominated by per-collective \textit{latency}, not bandwidth: on NVLink each collective completes in $\sim$10 $\mu$s, so $\sim$20 $\mu$s per layer and $\sim$1.6 ms over 80 layers---a tolerable fraction of a $\sim$5 ms decode step. Cross-node, the bandwidth-only math looks deceptively cheap (16 KB at 50 GB/s is well under a microsecond), but per-collective latency over InfiniBand is $\sim$10--20 $\mu$s; at $2 \times 80 = 160$ collectives per token, that is $\sim$2--4 ms of pure communication latency \textit{per token}---which is precisely why cross-node TP is avoided. At larger batch sizes, the all-reduce volume grows linearly, and the cross-node cost becomes worse still.
 
 \redflags
 \begin{itemize}
