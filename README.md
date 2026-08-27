@@ -37,22 +37,22 @@ Every topic follows a consistent format: **What it is** → **Key formula** (onl
 |---|---------|-----------|
 | 15 | Training & Optimization | 12 |
 | 16 | Transfer Learning | 10 |
-| 20 | Reinforcement Learning & RLHF | 10 |
+| 17 | Reinforcement Learning & RLHF | 10 |
 
 ### Part V: Modern Frontiers
 | # | Chapter | Questions |
 |---|---------|-----------|
-| 21 | Multimodal Learning | 10 |
-| 22 | Inference Optimization | 12 |
-| 23 | Safety & Alignment | 8 |
-| 24 | Long Context & RAG | 10 |
+| 18 | Multimodal Learning | 10 |
+| 19 | Inference Optimization | 12 |
+| 20 | Safety & Alignment | 8 |
+| 21 | Long Context & RAG | 10 |
 
 ### Part VI: Practice & Systems
 | # | Chapter | Questions |
 |---|---------|-----------|
-| 17 | Production ML Systems | 10 |
-| 18 | Evaluation & Metrics | 10 |
-| 19 | Decision Frameworks | 8 |
+| 22 | Production ML Systems | 10 |
+| 23 | Evaluation & Metrics | 10 |
+| 24 | Decision Frameworks | 8 |
 
 ### Appendix
 - **Question Index** — all 248 questions organized by difficulty, type, frequency, and topic, with curated study plans
@@ -89,7 +89,7 @@ The double compile is needed to resolve the table of contents and internal cross
     ├── 01_mathematical_foundations.tex
     ├── 02_learning_theory.tex
     ├── ...
-    ├── 24_long_context_rag.tex
+    ├── 24_decision_frameworks.tex
     └── appendix_question_index.tex
 ```
 
