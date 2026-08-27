@@ -247,19 +247,19 @@ on clean benchmarks.
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[
-    step/.style={draw=deepblue, fill=lightblue, rounded corners=4pt,
+    pipestage/.style={draw=deepblue, fill=lightblue, rounded corners=4pt,
                  font=\small\sffamily, minimum width=2.6cm, minimum height=0.9cm, align=center},
     arrow/.style={-{Stealth[length=2.5mm]}, thick, deepblue!70},
     note/.style={font=\scriptsize\sffamily\itshape, text=gray!70!black, align=center}
 ]
-    \node[step] (raw) at (0,0) {Raw Text};
-    \node[step] (enc) at (3.2,0) {Encoding\\Normalization};
-    \node[step] (uni) at (6.4,0) {Unicode\\Normalization};
-    \node[step] (tok) at (9.6,0) {Tokenization};
-    \node[step] (case) at (0,-2.2) {Case\\Normalization};
-    \node[step] (stop) at (3.2,-2.2) {Stopword\\Removal};
-    \node[step] (stem) at (6.4,-2.2) {Stemming /\\Lemmatization};
-    \node[step] (feat) at (9.6,-2.2) {Feature\\Extraction};
+    \node[pipestage] (raw) at (0,0) {Raw Text};
+    \node[pipestage] (enc) at (3.2,0) {Encoding\\Normalization};
+    \node[pipestage] (uni) at (6.4,0) {Unicode\\Normalization};
+    \node[pipestage] (tok) at (9.6,0) {Tokenization};
+    \node[pipestage] (case) at (0,-2.2) {Case\\Normalization};
+    \node[pipestage] (stop) at (3.2,-2.2) {Stopword\\Removal};
+    \node[pipestage] (stem) at (6.4,-2.2) {Stemming /\\Lemmatization};
+    \node[pipestage] (feat) at (9.6,-2.2) {Feature\\Extraction};
 
     \draw[arrow] (raw) -- (enc);
     \draw[arrow] (enc) -- (uni);
@@ -705,6 +705,15 @@ where:
 \end{equation}
 \end{mathresult}
 
+\begin{warningbox}
+A known gotcha: the classic probabilistic idf in Eq.~\eqref{eq:bm25_idf} becomes
+\emph{negative} whenever $\text{df}(q_i) > N/2$---a term appearing in more than half the
+documents---so matching such a term would \emph{lower} a document's score. Production
+implementations guard against this: Lucene (and therefore Elasticsearch) computes
+$\text{idf}(q_i) = \log\bigl(1 + \frac{N - \text{df}(q_i) + 0.5}{\text{df}(q_i) + 0.5}\bigr)$,
+adding 1 inside the logarithm precisely so the idf stays positive.
+\end{warningbox}
+
 \subsubsection{Understanding the BM25 Parameters}
 
 \textbf{Term Frequency Saturation ($k_1$):}
@@ -787,7 +796,8 @@ Part-of-Speech (POS) tagging assigns a grammatical category to each word in a se
 
 \subsubsection{The Penn Treebank Tagset}
 
-The Penn Treebank tagset defines 36 POS tags for English, including:
+The Penn Treebank tagset defines 45 tags for English (36 word-class POS tags plus
+punctuation and symbol tags), including:
 
 \begin{table}[H]
 \centering
@@ -838,7 +848,7 @@ The evolution of POS tagging mirrors the broader NLP paradigm shifts:
 \end{enumerate}
 
 \subsection{Named Entity Recognition (NER)}
-\label{sec:ner}
+\label{sec:classical_ner}
 
 Named Entity Recognition identifies and classifies named entities in text into predefined
 categories.
@@ -913,7 +923,10 @@ BIOES provides more explicit boundary information. In BIO, the model must infer 
 boundaries from transitions (B-PER $\to$ I-PER vs. B-PER $\to$ B-PER for adjacent
 entities). BIOES makes boundaries explicit, which is especially helpful for (1) adjacent
 entities of the same type (``New York'' [LOC] next to ``City Hall'' [LOC]) and (2)
-single-token entities. Empirically, BIOES improves NER F1 by 0.5--1.5\% over BIO.
+single-token entities. Empirically, BIOES improved NER F1 by 0.5--1.5\% over BIO in the
+CRF-era literature (Ratinov \& Roth, 2009); with modern transformer-based taggers the
+difference is usually within run-to-run noise, so BIO remains a perfectly defensible
+default.
 \end{keyinsight}
 
 \subsubsection{Why Not Classify Each Token Independently?}
@@ -1081,114 +1094,18 @@ Even in the LLM era, syntactic knowledge remains relevant:
 
 % ============================================================================
 \section{N-Gram Language Models}
-\label{sec:ngram_lm}
+\label{sec:ngram_forward}
 % ============================================================================
 
-Language models assign probabilities to sequences of words. N-gram language models are the
-classical approach, and understanding them is essential because they illuminate fundamental
-concepts (chain rule, Markov assumption, smoothing, perplexity) that remain central to
-modern NLP.
-
-\subsection{The Chain Rule of Probability}
-\label{sec:chain_rule}
-
-The probability of a sequence of words $w_1, w_2, \ldots, w_T$ decomposes via the chain
-rule:
-\begin{equation}
-    P(w_1, w_2, \ldots, w_T) = \prod_{t=1}^{T} P(w_t \given w_1, \ldots, w_{t-1})
-    \label{eq:chain_rule}
-\end{equation}
-
-This is exact but intractable: estimating $P(w_t \given w_1, \ldots, w_{t-1})$ requires
-conditioning on the \emph{entire} preceding context, which creates a combinatorial
-explosion.
-
-\subsection{The Markov Assumption}
-\label{sec:markov}
-
-The $n$-gram approximation applies the Markov assumption: the probability of the next
-word depends only on the previous $n - 1$ words:
-
-\begin{mathresult}{N-Gram Language Model}
-\begin{equation}
-    P(w_t \given w_1, \ldots, w_{t-1}) \approx P(w_t \given w_{t-n+1}, \ldots, w_{t-1})
-    \label{eq:ngram_lm}
-\end{equation}
-
-Estimated from counts via Maximum Likelihood Estimation (MLE):
-\begin{equation}
-    P_{\text{MLE}}(w_t \given w_{t-n+1}, \ldots, w_{t-1}) = \frac{\text{count}(w_{t-n+1}, \ldots, w_t)}{\text{count}(w_{t-n+1}, \ldots, w_{t-1})}
-    \label{eq:ngram_mle}
-\end{equation}
-\end{mathresult}
-
-\begin{itemize}
-    \item \textbf{Unigram ($n=1$):} $P(w_t) = \text{count}(w_t) / N_{\text{total}}$.
-    No context at all.
-    \item \textbf{Bigram ($n=2$):} $P(w_t \given w_{t-1})$. One word of context.
-    \item \textbf{Trigram ($n=3$):} $P(w_t \given w_{t-2}, w_{t-1})$. Two words of context.
-\end{itemize}
-
-\subsection{Smoothing}
-\label{sec:smoothing}
-
-The MLE estimate assigns zero probability to any $n$-gram not seen in the training corpus.
-This is catastrophic: a single unseen $n$-gram makes the entire sentence probability zero.
-Smoothing techniques redistribute probability mass to unseen events.
-
-\begin{itemize}
-    \item \textbf{Laplace (Add-1) Smoothing:} Add 1 to all counts. Simple but assigns too
-    much mass to unseen events, especially with large vocabularies.
-    \begin{equation}
-        P_{\text{Laplace}}(w_t \given w_{t-1}) = \frac{\text{count}(w_{t-1}, w_t) + 1}{\text{count}(w_{t-1}) + V}
-    \end{equation}
-
-    \item \textbf{Add-$k$ Smoothing:} Generalization with tunable $k < 1$. Better but
-    still ad hoc.
-
-    \item \textbf{Interpolation:} Combine $n$-gram models of different orders:
-    \begin{equation}
-        P_{\text{interp}}(w_t \given w_{t-2}, w_{t-1}) = \lambda_3 P_3 + \lambda_2 P_2 + \lambda_1 P_1, \quad \sum_i \lambda_i = 1
-    \end{equation}
-    where $\lambda_i$ are learned on held-out data.
-
-    \item \textbf{Kneser-Ney Smoothing:} The gold standard. Uses absolute discounting
-    (subtract a fixed $d$ from each count) and a novel backoff distribution based on the
-    \emph{number of distinct contexts} a word appears in (continuation probability), not
-    raw frequency. ``Francisco'' has high unigram count but low continuation count (almost
-    always follows ``San''), so Kneser-Ney correctly gives it low backoff probability.
-\end{itemize}
-
-\subsection{Perplexity}
-\label{sec:perplexity}
-
-Perplexity is the standard evaluation metric for language models, measuring how ``surprised''
-the model is by test data.
-
-\begin{mathresult}{Perplexity}
-For a test sequence $w_1, w_2, \ldots, w_T$:
-\begin{equation}
-    \text{PP}(W) = P(w_1, w_2, \ldots, w_T)^{-1/T} = \exp\!\left(-\frac{1}{T} \sum_{t=1}^{T} \log P(w_t \given w_{<t})\right)
-    \label{eq:perplexity}
-\end{equation}
-
-Equivalently, $\text{PP} = \exp(H)$ where $H$ is the cross-entropy of the model on the
-test data. Lower perplexity indicates a better model.
-\end{mathresult}
-
-\textbf{Intuition:} Perplexity represents the effective number of equally likely choices
-the model faces at each step---the weighted average branching factor. A perplexity of 100
-means the model is as uncertain as if it were choosing uniformly among 100 options at
-each token.
-
-\begin{warningbox}
-Perplexity is widely used but has important limitations: (1) it does not measure
-fluency, coherence, or factual accuracy of generated text; (2) it is
-vocabulary-dependent---models with different tokenizers have incomparable perplexities;
-(3) it penalizes all errors equally, whether they are severe (wrong fact) or minor (synonym
-choice). For LLM evaluation, downstream task performance and human evaluation are more
-informative than perplexity alone.
-\end{warningbox}
+Language models assign probabilities to sequences of words, and n-gram models are the
+classical approach. This material---the chain rule decomposition, the Markov assumption,
+maximum likelihood estimation from counts, smoothing techniques (Laplace, add-$k$,
+interpolation, Kneser-Ney), and perplexity---forms the probabilistic backbone of
+statistical NLP and is covered in full depth, with derivations and worked examples, in
+Chapter~\ref{chap:statistical_nlp}. For this chapter's narrative, the essential point is
+that n-gram models formalized the insight that local word context carries predictive
+signal, and their limitations (data sparsity, no generalization across semantically
+similar words) motivated the neural language models that followed.
 
 % ============================================================================
 \section{Classical Text Classification}
@@ -1246,9 +1163,12 @@ needed---the linear kernel suffices and scales to millions of features.
 
 \begin{keyinsight}[When Classical Methods Beat Neural]
 Classical pipelines (TF-IDF + SVM/logistic regression) can outperform fine-tuned BERT when:
-(1) training data is very small ($< 100$ examples); (2) latency requirements are extremely
-tight ($< 1$ ms); (3) the task is simple (binary classification with clear keyword
-signals); (4) interpretability is required (TF-IDF weights are directly inspectable). A
+(1) latency requirements are extremely tight ($< 1$ ms); (2) the task is simple (binary
+classification with clear keyword signals); (3) interpretability is required (TF-IDF
+weights are directly inspectable). The once-standard claim that classical models also win
+whenever training data is very small ($< 100$ examples) is now contested: SetFit-style
+contrastive fine-tuning and LLM few-shot prompting are usually stronger in that regime, so
+treat small data as a reason to \emph{try} the classical baseline, not to assume it wins. A
 strong interview answer demonstrates knowing the right tool for the right situation, not
 defaulting to the most complex model.
 \end{keyinsight}
@@ -1450,7 +1370,8 @@ algorithm to find the globally optimal sequence rather than a sequence of locall
 labels.
 
 The BIOES variant adds E (end of entity) and S (singleton entity) tags, providing more
-explicit boundary information and typically improving F1 by 0.5--1.5\%.
+explicit boundary information; in CRF-era systems this typically improved F1 by
+0.5--1.5\%, though with transformer taggers the gap is usually negligible.
 
 \redflags
 \begin{itemize}
@@ -1734,68 +1655,7 @@ limitations?}
 
 \vspace{0.5em}
 
-% --- Question 9: Perplexity ---
-\begin{interviewq}
-\textbf{Q: What is perplexity? How is it computed, and what are its limitations as an evaluation metric?}
-
-\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
-
-\stronganswer
-Perplexity is the standard intrinsic evaluation metric for language models. It measures how
-well a probability model predicts a held-out test set. Formally, for a test sequence of
-$T$ tokens:
-
-\[
-\text{PP}(W) = \exp\!\left(-\frac{1}{T}\sum_{t=1}^{T}\log P(w_t \given w_{<t})\right)
-\]
-
-This is the exponential of the cross-entropy. Intuitively, perplexity represents the
-effective branching factor: a perplexity of 50 means the model is, on average, as uncertain
-as if choosing uniformly among 50 options at each step. Lower is better.
-
-\textbf{Limitations:} (1) \emph{Vocabulary dependence}---models with different tokenizers
-produce incomparable perplexities because they predict different units. A character-level
-model and a subword-level model cannot be directly compared. (2) \emph{Does not capture
-quality}---perplexity measures prediction accuracy, not fluency, coherence, factuality, or
-usefulness of generated text. A model could have low perplexity but generate toxic or
-factually incorrect content. (3) \emph{Domain sensitivity}---perplexity measured on
-Wikipedia does not predict performance on clinical notes. (4) \emph{Equal weighting}---all
-tokens contribute equally, but predicting function words (``the,'' ``of'') is trivially
-easy while predicting content words or rare terms is what matters for downstream tasks.
-
-For LLM evaluation, downstream benchmarks (MMLU, HumanEval, GSM8K) and human evaluation are
-far more informative than perplexity alone.
-
-\redflags
-\begin{itemize}
-    \item Not knowing the formula or the connection to cross-entropy.
-    \item Saying ``lower perplexity means the model is better at generating text'' without
-    qualification.
-    \item Not mentioning the vocabulary dependence problem.
-\end{itemize}
-
-\interviewtest{Understanding of language model evaluation, mathematical rigor, awareness
-of metric limitations.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5}: States the formula, gives the branching factor intuition, names
-    two limitations.
-    \item \badgeLsix{L6}: Explains the cross-entropy connection, discusses bits-per-character
-    as an alternative for cross-tokenizer comparison, and connects to downstream evaluation.
-    \item \badgeLseven{L7}: Discusses calibration (does low perplexity imply the model's
-    probabilities are well-calibrated?), the relationship between perplexity and downstream
-    performance (weak correlation for capable models), and how perplexity relates to
-    scaling laws.
-\end{itemize}
-
-\followups{How would you compare perplexity between models with different tokenizers?
-What is bits-per-byte? What is the relationship between perplexity and cross-entropy loss?}
-\end{interviewq}
-
-\vspace{0.5em}
-
-% --- Question 10: Naive Bayes vs. BERT ---
+% --- Question 9: Naive Bayes vs. BERT ---
 \begin{interviewq}
 \textbf{Q: When would you choose Naive Bayes over a fine-tuned BERT for text classification? Justify your answer.}
 
@@ -1805,10 +1665,12 @@ What is bits-per-byte? What is the relationship between perplexity and cross-ent
 I would choose Naive Bayes over fine-tuned BERT in several specific scenarios:
 
 \textbf{1. Very small training sets ($<$ 100 examples):} Naive Bayes has far fewer
-parameters to estimate. With 50 labeled examples, BERT fine-tuning is prone to overfitting
-on the classification head, while Naive Bayes with TF-IDF features can still produce
-reasonable results. BERT's advantage comes from pretraining, but fine-tuning requires enough
-task-specific data to adapt the classification head.
+parameters to estimate. With 50 labeled examples, vanilla BERT fine-tuning is prone to
+overfitting on the classification head, while Naive Bayes with TF-IDF features can still
+produce reasonable results. The honest caveat: plain fine-tuning is no longer the strongest
+neural option in this regime---SetFit-style contrastive fine-tuning and LLM few-shot
+prompting typically beat both---so this is an argument for Naive Bayes as a fast baseline,
+not a guaranteed winner.
 
 \textbf{2. Extreme latency requirements ($<$ 1 ms):} Naive Bayes inference is a sparse
 vector multiplication---microseconds. BERT inference requires a forward pass through 12+

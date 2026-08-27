@@ -82,8 +82,10 @@ merged according to the priority of each rule.
 
 \paragraph{Handling OOV words.}
 BPE never produces an \texttt{[UNK]} token (assuming byte-level BPE).  Any unseen word
-is decomposed into the longest matching subword units.  For example, a rare word like
-``unparalleledly'' might tokenize as \texttt{["un", "parallel", "ed", "ly"]}.
+is decomposed by splitting it into characters (or bytes) and applying the learned merges
+in priority order; whatever subwords the merges produce are the output.  (Greedy
+longest-match-first lookup is \emph{WordPiece} inference, not BPE.)  For example, a rare
+word like ``unparalleledly'' might tokenize as \texttt{["un", "parallel", "ed", "ly"]}.
 
 \begin{keyinsight}[BPE Is a Compression Algorithm]
 BPE was originally a data compression algorithm (Gage, 1994).  Its application to NLP is
@@ -136,14 +138,16 @@ Unigram finds the \emph{most probable} segmentation using the Viterbi algorithm.
 is a key advantage over BPE: Unigram has a principled probabilistic model over
 segmentations, while BPE's greedy merge is a heuristic.
 
-\paragraph{Used by:} T5, XLNet, LLaMA (via SentencePiece), ALBERT.
+\paragraph{Used by:} T5, XLNet, ALBERT (all via SentencePiece).  Note that LLaMA also
+uses SentencePiece, but with the \emph{BPE} algorithm, not Unigram.
 
 \subsection{SentencePiece and Byte-Level BPE}
 
 \paragraph{SentencePiece} (Kudo and Richardson, EMNLP 2018) is a tokenizer library
 (not an algorithm) that implements both BPE and Unigram.  Its key feature is
-\emph{language agnosticism}: it treats the input as a raw byte stream with no
-pre-tokenization (no whitespace splitting, no language-specific rules).  This makes it
+\emph{language agnosticism}: it treats the input as a raw stream of Unicode text with no
+pre-tokenization (no whitespace splitting, no language-specific rules), with optional
+byte-fallback for characters outside the vocabulary.  This makes it
 essential for multilingual models.  Whitespace is treated as a regular character
 (represented as \texttt{\textunderscore}).
 
@@ -175,10 +179,10 @@ structured syntax.  Production approaches include:
 \toprule
 \textbf{Vocab Size} & \textbf{Seq.\ Length} & \textbf{Embedding Params} & \textbf{Models} \\
 \midrule
-$\sim$32K  & Longer   & 130M (at $d{=}4096$) & GPT-2, LLaMA 1 \\
-$\sim$50K  & Moderate & 200M (at $d{=}4096$) & GPT-3, BERT \\
-$\sim$100K & Shorter  & 400M (at $d{=}4096$) & GPT-4, LLaMA 3 \\
-$\sim$150K & Shortest & 600M (at $d{=}4096$) & Gemini \\
+$\sim$30--32K & Longer   & 130M (at $d{=}4096$) & BERT (30,522), LLaMA 1/2 (32K) \\
+$\sim$50K  & Moderate & 200M (at $d{=}4096$) & GPT-2/GPT-3 (50,257) \\
+$\sim$100--128K & Shorter  & 400--520M (at $d{=}4096$) & GPT-4 ($\sim$100K), LLaMA 3 (128K) \\
+$\sim$256K & Shortest & 1B (at $d{=}4096$) & Gemini, Gemma \\
 \bottomrule
 \end{tabularx}
 \caption{Vocabulary size tradeoffs.  Larger vocabularies reduce sequence length (saving
@@ -319,8 +323,10 @@ they are computed only once.
 
 \begin{keyinsight}[KV-Cache Is the Main Inference Bottleneck]
 During decoding, the model reads the entire KV-cache from GPU memory for every single
-token generated.  For a 70B parameter model with 128K context, the KV-cache alone can
-exceed 40\,GB---larger than the model weights themselves.  This makes LLM inference
+token generated.  For a 70B parameter model with GQA ($H_{\text{kv}}{=}8$) at 128K
+context, the KV-cache alone exceeds 40\,GB \emph{per request}---larger than the INT4-quantized
+weights ($\sim$35\,GB), and across even a few concurrent long-context requests the total
+cache outgrows the 140\,GB of FP16 weights.  This makes LLM inference
 \textbf{memory-bandwidth-bound}, not compute-bound.  Understanding this distinction is
 essential: most serving optimizations (GQA, quantization, PagedAttention) target
 KV-cache memory, not raw compute.
@@ -431,8 +437,8 @@ wasted for 490 steps.
           requests.
     \item Remove completed sequences immediately, freeing their KV-cache memory.
     \item Insert new requests into the batch without waiting for others to finish.
-    \item Result: GPU utilization approaches 100\%, throughput increases 2--5$\times$
-          over static batching.
+    \item Result: GPU utilization approaches 100\%, throughput increases 2--8$\times$
+          over static batching in practice.
 \end{itemize}
 
 This is the default scheduling strategy in production serving frameworks (vLLM,
@@ -711,8 +717,9 @@ combined: distill a large model into a smaller one, then quantize the student to
 \label{sec:speculative_decoding}
 
 Autoregressive generation is inherently sequential: each token depends on the previous
-one.  For a 70B parameter model, generating a single token takes $\sim$30\,ms on an A100
-(reading 140\,GB of weights at $\sim$2\,TB/s memory bandwidth).  With speculative
+one.  For a 70B parameter model, generating a single token takes $\sim$70\,ms of pure
+memory traffic on A100-class hardware (reading 140\,GB of weights at $\sim$2\,TB/s
+aggregate memory bandwidth across the GPUs holding the shards).  With speculative
 decoding, we can generate 2--3$\times$ more tokens per second without any change in
 output quality.
 
@@ -754,8 +761,12 @@ pairs.  The effective speedup is approximately:
 \[
     \text{Speedup} \approx \frac{\text{avg.\ accepted tokens} + 1}{1 + k \cdot (c_{\text{draft}} / c_{\text{target}})}
 \]
-where $c_{\text{draft}} / c_{\text{target}} \ll 1$.  With $k = 5$ and 80\% acceptance
-rate, this yields roughly $2.5\times$ speedup.
+where $c_{\text{draft}} / c_{\text{target}} \ll 1$.  Worked through: with $k = 5$, a
+per-token acceptance rate of $0.8$ (expected accepted tokens
+$\sum_{i=1}^{5} 0.8^i \approx 2.7$), and a cost ratio
+$c_{\text{draft}}/c_{\text{target}} \approx 0.03$, the formula gives
+$(2.7 + 1)/(1 + 5 \times 0.03) \approx 3.2\times$; scheduling overhead and imperfect
+batching bring realized speedups down to the commonly quoted $2$--$3\times$.
 
 \paragraph{Variants.}
 \begin{itemize}
@@ -1019,18 +1030,33 @@ adversarial inputs evolve.  Monitor for:
 
 \stronganswer
 This requires reasoning across the full serving stack.  10K QPS with 500ms TTFT is
-extremely demanding---let me work through the key design decisions.
+extremely demanding---let me state assumptions first, then work the token budget
+honestly.  \textbf{Assumptions:} 7B-class model with GQA ($H_{\text{kv}}{=}8$),
+1K-token prompts, $\sim$200-token responses, H100-class GPUs ($\sim$3.35\,TB/s HBM;
+$\sim$990 dense BF16 TFLOPS of which $\sim$50\% is realistically sustained, i.e.\
+$\sim$500 effective TFLOPS; FP8 roughly doubles that).
 
 \textbf{Model selection and optimization:}  Start with the smallest model that meets
-quality requirements.  A 7B model with INT4 quantization (AWQ or GPTQ) fits on a single
-A100/H100.  TTFT is dominated by prefill: for a 1K-token prompt on a 7B INT4 model,
-prefill takes $\sim$50ms on H100.  If a 70B model is required, use GQA + INT4
-quantization + tensor parallelism across 4 GPUs.
+quality requirements.  A 7B model with INT4 weight quantization (AWQ or GPTQ) fits on
+a single GPU with ample room for KV-cache.  TTFT is dominated by prefill, which is
+\emph{compute}-bound: a 1K-token prompt costs $2N \approx 14$\,GFLOPs per token
+$\times$ 1K tokens $= 14$\,TFLOPs, i.e.\ $\sim$30\,ms at 500 effective TFLOPS
+($\sim$15\,ms with FP8)---well inside the 500ms budget \emph{per request}.  The hard
+part is aggregate throughput, not single-request latency.  If a 70B model is required,
+use GQA + quantization + tensor parallelism across a node, and every count below
+scales up by roughly $10\times$.
 
-\textbf{Batching:}  Continuous batching is essential.  With iteration-level scheduling,
-the system can sustain much higher throughput than static batching.  A single H100 can
-serve a 7B INT4 model at $\sim$500 QPS with 1K-token prompts.  So 10K QPS requires
-$\sim$20 GPUs.
+\textbf{Batching and the token budget:}  Continuous batching is essential, but the GPU
+count follows from the \emph{token} budget, not the request count.  10K QPS $\times$
+1K prompt tokens $=$ 10M prefill tokens/s.  One H100 sustains roughly
+$500\,\text{TFLOPS} / 14\,\text{GFLOPs per token} \approx 35\text{K}$ prefill tokens/s
+in BF16 ($\sim$70K with FP8)---only $\sim$35--70 QPS of 1K-token prefill per GPU.
+Prefill alone therefore needs $\sim$140 (FP8) to $\sim$280 (BF16) GPUs.  Decode adds
+10K QPS $\times$ 200 output tokens $=$ 2M tokens/s; at high batch, decode is also
+compute-bound at the same per-GPU token rate, adding another $\sim$30--60 GPUs.
+Total: on the order of \textbf{200--350 H100s} ($\sim$25--45 8-GPU nodes), plus
+headroom for P99 and traffic spikes---an order of magnitude more than a naive
+request-count estimate suggests.
 
 \textbf{Infrastructure:}
 \begin{itemize}
@@ -1046,10 +1072,15 @@ Speculative decoding reduces inter-token latency (but TTFT is dominated by prefi
 so speculative decoding helps less here).  FP8 on H100 provides $\sim$2$\times$
 prefill speedup over FP16.
 
-\textbf{Capacity planning:}  With 10K QPS and 500ms TTFT, at any given moment there are
-$\sim$5,000 concurrent requests in prefill.  Each request's KV-cache (7B model, 1K
-context, INT4 KV) is $\sim$64MB.  Total KV-cache memory: $\sim$320GB across the cluster.
-PagedAttention is essential to manage this efficiently.
+\textbf{Capacity planning:}  Apply Little's law: each request spends ${\sim}100$\,ms in
+prefill and ${\sim}3$\,s in decode (200 tokens at ${\sim}15$\,ms/token at high batch),
+so at 10K QPS roughly $10{,}000 \times 3 \approx 30{,}000$ requests are in flight at any
+moment.  Per-request KV-cache for the assumed GQA-8 7B model at ${\sim}1.2$K tokens with
+INT4 KV is $2 \cdot L \cdot H_{\text{kv}} \cdot S \cdot d_h \cdot b = 2 \times 32 \times
+8 \times 1200 \times 128 \times 0.5 \approx 40$\,MB (the same cache with MHA in FP16
+would be ${\sim}630$\,MB).  Cluster-wide that is ${\sim}1.2$\,TB of KV---only a few GB
+per GPU spread across ${\sim}300$ GPUs.  With PagedAttention this is manageable; in this
+regime the binding constraint is prefill compute, not KV memory.
 
 \redflags
 \begin{itemize}

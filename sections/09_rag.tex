@@ -190,8 +190,9 @@ a non-zero score.
 \begin{itemize}
     \item \textbf{Exact lexical matching:} Handles entity names, product IDs,
           technical jargon, and rare terms that dense models often miss.
-    \item \textbf{Efficiency:} Inverted index lookup is $O(1)$ per term; no
-          GPU required at query time.
+    \item \textbf{Efficiency:} Inverted index lookup is $O(1)$ per term
+          (scoring then costs time proportional to the length of each term's
+          posting list); no GPU required at query time.
     \item \textbf{No training data needed:} Works out of the box on any corpus.
     \item \textbf{Interpretable:} Scores decompose into per-term contributions.
 \end{itemize}
@@ -303,8 +304,11 @@ and these MaxSim scores are summed:
 \paragraph{Tradeoffs.}
 ColBERT achieves higher quality than bi-encoders because token-level matching
 captures fine-grained semantic alignment.  However, it requires storing
-per-token embeddings for every document, resulting in significantly larger
-indices (typically $20$--$40\times$ larger than single-vector bi-encoder indices).
+per-token embeddings for every document, and the index-size penalty is
+\emph{compression-dependent}: stored uncompressed, per-token embeddings can be
+roughly two orders of magnitude larger than a single-vector bi-encoder index,
+while ColBERTv2's residual compression brings the overhead down to roughly
+$6$--$10\times$.  Quote the assumption along with the number.
 
 \subsection{Cross-Encoder Re-Ranker}
 
@@ -316,8 +320,9 @@ query and document tokens:
 \]
 
 This produces the highest quality scores because the model can perform deep
-token-level interaction.  However, the cost is $O(n)$ \emph{per document}:
-each (query, document) pair requires a full forward pass.  This makes
+token-level interaction.  However, each (query, document) pair requires its
+own full transformer forward pass---$O(N)$ forward passes to score $N$
+candidate documents, with nothing precomputable offline.  This makes
 cross-encoders impractical for searching a full corpus but ideal for
 \emph{re-ranking} a small candidate set (Section~\ref{sec:reranking}).
 
@@ -1599,9 +1604,15 @@ A single machine can handle 200--1000 QPS depending on index size and parameters
 For 1K QPS, deploy 2--4 retrieval replicas behind a load balancer.  BM25 via
 Elasticsearch scales horizontally with sharding.
 
-\textbf{Re-ranking:} Cross-encoder re-ranking of 50 candidates takes
-$\sim$200ms on GPU.  At 1K QPS, need $\sim$200 GPU-seconds per second;
-deploy a pool of $\sim$4$-$8 GPU instances with batched inference.
+\textbf{Re-ranking:} Work in (query, document) pairs: 1K QPS $\times$ 50
+candidates $=$ 50,000 pairs/second.  Scored sequentially ($\sim$200ms per
+50-candidate set), that is 200 GPU-seconds of work arriving every second---a
+200-GPU fleet, which is not viable.  Batching is what closes the gap: a
+compact cross-encoder (e.g., a distilled 6-layer re-ranker) with large
+cross-request batches sustains roughly 5--10K pairs/second per GPU,
+amortizing each candidate set to $\sim$5--10ms of GPU time.  That implies a
+pool of $\sim$5--10 GPUs plus headroom for peaks---and it is why production
+re-rankers are small distilled models, not full-size cross-encoders.
 
 \textbf{LLM generation:} The bottleneck.  At 1K QPS with $\sim$500ms per
 generation, need $\sim$500 concurrent generation slots.  Use a high-throughput

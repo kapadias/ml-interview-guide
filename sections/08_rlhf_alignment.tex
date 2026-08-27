@@ -357,14 +357,20 @@ Value function $V_\psi$ & Estimates expected cumulative reward (critic) & Yes \\
 \bottomrule
 \end{tabularx}
 \caption{The four models required for PPO-based RLHF.  For a 70B parameter
-policy, this means approximately 280B parameters in GPU memory.}
+policy, this means up to $\sim$280B parameters in GPU memory \emph{if all
+four models are policy-sized}---in practice the RM and critic are often
+smaller (the critic is commonly initialized from the RM), and optimizer
+states and activations add substantially more memory on top of the raw
+parameters.}
 \label{tab:four_models}
 \end{table}
 
 \begin{warningbox}
 \textbf{PPO for RLHF is notoriously difficult to tune.}  Practical
 challenges include: (a)~the four-model memory footprint---for a 70B policy,
-you need $\sim$280B parameters in memory simultaneously; (b)~hyperparameter
+up to $\sim$280B parameters in memory simultaneously if all four models are
+policy-sized (before counting optimizer states and activations);
+(b)~hyperparameter
 sensitivity---the KL coefficient $\beta$, learning rate, clipping range
 $\epsilon$, GAE parameters $\gamma$ and $\lambda$, and number of PPO
 epochs per batch all interact in complex ways; (c)~training instability---
@@ -709,17 +715,29 @@ per prompt and asking annotators to compare them, while pointwise feedback
 can be collected passively from user interactions (upvotes, regeneration
 requests, thumbs-up buttons).
 
-The KTO loss uses the Kahneman-Tversky value function, which assigns
-asymmetric weight to gains (preferred responses) and losses (dispreferred
-responses), reflecting the empirical finding that humans are loss-averse:
+The KTO loss uses a Kahneman-Tversky-inspired value function, which treats
+desirable and undesirable examples with \emph{opposite-signed} arguments and
+asymmetric weights, reflecting the empirical finding that humans are
+loss-averse:
 \begin{equation}
-\loss_{\text{KTO}} = \E_{(x,y)} \bigl[
-  w(y) \cdot \bigl(1 - \sigma\!\bigl(\beta \, r_\theta(x, y) - z_{\text{ref}}\bigr)\bigr)
-\bigr]
+\loss_{\text{KTO}} = \E_{(x,y)} \bigl[ \lambda_y - v(x, y) \bigr],
+\qquad
+v(x, y) =
+\begin{cases}
+  \lambda_D \, \sigma\!\bigl(\beta \, r_\theta(x, y) - z_{\text{ref}}\bigr)
+    & y \text{ desirable} \\[4pt]
+  \lambda_U \, \sigma\!\bigl(z_{\text{ref}} - \beta \, r_\theta(x, y)\bigr)
+    & y \text{ undesirable}
+\end{cases}
 \end{equation}
 where $r_\theta(x, y) = \log(\pi_\theta(y|x) / \pi_{\text{ref}}(y|x))$
-is the implicit reward, $z_{\text{ref}}$ is a running-mean baseline, and
-$w(y)$ weights desirable and undesirable examples differently.
+is the implicit reward, $z_{\text{ref}}$ is a reference point (an estimate
+of the KL divergence between policy and reference), and
+$\lambda_D, \lambda_U$ (with $\lambda_y \in \{\lambda_D, \lambda_U\}$)
+weight desirable and undesirable examples asymmetrically.  A desirable
+response is rewarded for exceeding the reference point; an undesirable
+response is penalized for not falling below it---collapsing the two cases
+into a single term would mis-train the undesirable examples.
 
 
 % ============================================================================
@@ -890,8 +908,8 @@ assigns a correctness score to each step of a chain-of-thought solution:
 
 \subsection{Search over Reasoning Paths}
 
-The most powerful application of PRMs is enabling \textbf{tree search}
-over reasoning paths---the approach behind models like o1 and o3:
+PRMs can be used to guide \textbf{search} over reasoning paths at
+inference time:
 
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Generate:} The model produces multiple candidate next steps.
@@ -902,9 +920,22 @@ over reasoning paths---the approach behind models like o1 and o3:
   to a previous step and try alternative paths.
 \end{enumerate}
 
-This is essentially \textbf{test-time compute scaling}: spending more
+This is one form of \textbf{test-time compute scaling}: spending more
 computation at inference to search for better reasoning paths, rather than
 relying solely on the model's one-shot generation.
+
+\begin{warningbox}
+Do not describe PRM-guided search as the mechanism behind reasoning models
+like o1 and o3---that was the leading 2023 hypothesis, and it is now
+superseded.  DeepSeek-R1, the one frontier reasoning model with a public
+training report, explicitly describes PRM- and MCTS-based approaches as
+unfruitful in its experiments; its reasoning capability came from
+reinforcement learning on \emph{outcome-based verifiable rewards} (answer
+checkers, unit tests).  In current practice, PRMs survive mainly as
+\textbf{test-time verifiers and rerankers}---scoring sampled candidate
+solutions for Best-of-N selection---rather than as the training mechanism
+of reasoning models.
+\end{warningbox}
 
 \begin{keyinsight}[Process vs.\ Outcome Supervision]
 Process supervision addresses the \textbf{credit assignment problem} that
@@ -946,9 +977,9 @@ time (generate $n$ candidates, score, return best).}
 \label{tab:alignment_choice}
 \end{table}
 
-\subsection{The Current Alignment Recipe (2024--2025)}
+\subsection{The Standard Alignment Recipe (2023--2024 Practice)}
 
-Most frontier labs follow a recipe similar to:
+Most frontier labs have followed a recipe similar to:
 
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Pretraining:} Train the base model on trillions of tokens.
@@ -1276,8 +1307,10 @@ most?  How would you collect KTO-style data from a production system?}
 
 \stronganswer
 A good reward model should: (1)~have high \textbf{agreement} with human
-preferences on a held-out test set (accuracy of 65--75\% is typical, given
-that human inter-annotator agreement is only 70--80\%); (2)~\textbf{generalize}
+preferences on a held-out test set---the achievable ceiling is set by the
+dataset's inter-annotator agreement (often only 70--80\%), so accuracies of
+65--75\% are typical on noisy general-chat preference sets, while top RMs
+exceed this on cleaner modern preference benchmarks; (2)~\textbf{generalize}
 beyond its training distribution to novel prompts and response styles;
 (3)~be \textbf{robust} to surface-level features (length, formatting) that
 correlate with but do not cause quality; (4)~provide \textbf{calibrated}
@@ -1413,8 +1446,12 @@ significantly outperform ORMs for mathematical reasoning tasks.
 
 PRMs also enable \textbf{search over reasoning paths}: the model generates
 multiple candidate next steps, the PRM scores each, and search algorithms
-(beam search, MCTS) select the most promising paths.  This is the
-mechanism behind test-time compute scaling in models like o1.
+(beam search, MCTS) select the most promising paths.  This is one way to
+spend test-time compute, but it is \emph{not} how o1/R1-class reasoning
+models were built: DeepSeek-R1's published report found PRM and MCTS
+unfruitful, and those models are instead trained with RL on
+outcome-verifiable rewards.  In practice PRMs today serve mainly as
+test-time verifiers and rerankers (Best-of-N selection).
 
 Use an ORM for general-purpose alignment (chat, instruction following)
 where there is no natural decomposition into steps.  Use a PRM when the
@@ -1444,10 +1481,11 @@ worth the added cost.}
 \item \badgeLsix{L6}: Discusses Lightman et al.'s results, explains
   how PRMs enable tree search (beam search, MCTS over reasoning steps),
   and considers automated process supervision.
-\item \badgeLseven{L7}: Connects to test-time compute scaling (o1-style
-  reasoning), discusses the relationship between process supervision and
-  formal verification, and considers how PRMs change the scaling laws
-  (trading training compute for inference compute).
+\item \badgeLseven{L7}: Connects to test-time compute scaling while noting
+  that current reasoning models were trained with RL on outcome-verifiable
+  rewards rather than PRM-guided search, discusses the relationship between
+  process supervision and formal verification, and considers how PRMs
+  change the scaling laws (trading training compute for inference compute).
 \end{itemize}
 
 \followups{How does test-time compute scaling work?  How would you
