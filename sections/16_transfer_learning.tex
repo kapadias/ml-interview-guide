@@ -223,7 +223,7 @@ Earlier layers get smaller learning rates ($\gamma \approx 0.9$).
 \textbf{The problem with full fine-tuning for LLMs}:
 \begin{itemize}
     \item 7B model: 28 GB for weights alone (FP32)
-    \item Gradients and optimizer states: Additional 56+ GB
+    \item Gradients and optimizer states: additional 84 GB (FP32 gradients 28 GB + Adam's two moments 56 GB)---$\sim$120 GB total once activations are included
     \item Separate model copy per task
     \item Deployment nightmare with multiple fine-tuned versions
 \end{itemize}
@@ -587,13 +587,15 @@ where $e_i$ are learnable embeddings.
 \textbf{Method} & \textbf{Params Added} & \textbf{Inference Cost} & \textbf{Quality} & \textbf{Best For} \\
 \midrule
 LoRA & 0.1-1\% & None (merge) & 95-99\% & General adaptation \\
-QLoRA & 0.1-1\% & None & 90-95\% & Memory-limited \\
+QLoRA & 0.1-1\% & None & 90-99\% (config-dep.) & Memory-limited \\
 Adapters & 1-5\% & Small & 95-99\% & Multi-task \\
 Prefix Tuning & ~1\% & Small & 90-95\% & Generation \\
 Prompt Tuning & 0.01\% & Small & 80-95\% & Large models only \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+QLoRA's quality figure is task- and configuration-dependent rather than a fixed penalty: with NF4, double quantization, and adapters on \textit{all} linear layers, the QLoRA paper reports matching 16-bit LoRA (and full fine-tuning) on its benchmarks, while narrower adapter placement or harder tasks can show a real gap. Verify against a 16-bit LoRA baseline on your task.
 
 %==============================================================================
 \section{Practical Guidelines}
@@ -650,7 +652,7 @@ Learning rate & 1e-4 to 3e-4 & Higher than full FT \\
     \item \textbf{Rank too low}: Insufficient capacity for complex tasks
     \item \textbf{Wrong target layers}: Missing key layers limits adaptation
     \item \textbf{Learning rate too low}: PEFT often needs higher LR
-    \item \textbf{Forgetting quantization effects}: QLoRA has some quality loss
+    \item \textbf{Forgetting quantization effects}: QLoRA can lose quality if misconfigured---verify against a 16-bit LoRA baseline
 \end{enumerate}
 
 \begin{warningbox}
@@ -736,7 +738,7 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 
 \begin{enumerate}
     \item \textbf{Data preparation}: Clean, deduplicate, format into instruction/completion pairs. Quality filtering (perplexity-based filtering using the base model itself) dramatically outperforms quantity.
-    \item \textbf{Base model selection}: Match model size to data quantity. Rule of thumb: for $N$ training examples, you need at most a model where each example is seen $\sim$3--5 times in a few epochs.
+    \item \textbf{Base model selection}: Choose the smallest model that meets the quality bar, weighing three factors: data volume (a few thousand examples can steer a model of any size via PEFT, but rarely justify the cost of adapting a very large one), task complexity (narrow formatting or classification tasks work with 1--8B models; open-ended generation or reasoning in a specialized domain often needs 7--70B), and serving budget (the fine-tuned model must fit the latency and cost envelope it will be deployed into). Validate with a quick LoRA run on a small model before scaling up.
     \item \textbf{Method selection}: Full FT for $>$100K examples with compute; LoRA for 1K--100K; QLoRA if memory-constrained; prompt tuning only for $>$10B models with simple tasks.
     \item \textbf{Hyperparameter tuning}: LoRA rank, learning rate, number of epochs. Use a small validation split. LoRA is relatively robust to hyperparameters compared to full FT.
     \item \textbf{Evaluation}: Task-specific metrics on held-out data \textit{plus} general capability benchmarks to detect catastrophic forgetting. Always evaluate on both.
@@ -805,11 +807,11 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 
 \badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
 
-\stronganswer The decision depends on four axes: data quantity, compute budget, quality requirements, and serving constraints. \textbf{Full fine-tuning}: use when you have $>$100K high-quality examples, multi-GPU infrastructure, and need maximum quality---for example, training a production model that justifies the cost. Achieves the best quality but requires 4--8$\times$ the memory of the model weights (optimizer states, gradients). \textbf{LoRA}: the default choice for most fine-tuning. Use with 1K--100K examples on a single GPU. Trains 0.1--1\% of parameters, achieves 95--99\% of full FT quality, and can merge adapters for zero inference overhead. The key advantage is multi-task serving: swap adapters without duplicating the base model. \textbf{QLoRA}: LoRA on a 4-bit quantized base model. Use when memory is the binding constraint---e.g., fine-tuning a 70B model on a single 24GB GPU. Trades $\sim$2--5\% quality for a 3--4$\times$ memory reduction. The quality gap comes from quantization noise during forward passes. \textbf{Prompt tuning}: trains only soft prompt embeddings ($<$0.01\% parameters). Use only for very large models ($>$10B) on simple tasks, or when you need hundreds of task-specific variants served from one base model with minimal per-task storage. Quality is significantly lower than LoRA for models under 10B.
+\stronganswer The decision depends on four axes: data quantity, compute budget, quality requirements, and serving constraints. \textbf{Full fine-tuning}: use when you have $>$100K high-quality examples, multi-GPU infrastructure, and need maximum quality---for example, training a production model that justifies the cost. Achieves the best quality but requires 4--8$\times$ the memory of the model weights (optimizer states, gradients). \textbf{LoRA}: the default choice for most fine-tuning. Use with 1K--100K examples on a single GPU. Trains 0.1--1\% of parameters, achieves 95--99\% of full FT quality, and can merge adapters for zero inference overhead. The key advantage is multi-task serving: swap adapters without duplicating the base model. \textbf{QLoRA}: LoRA on a 4-bit quantized base model. Use when memory is the binding constraint---e.g., fine-tuning a 70B model on a single 24GB GPU. Buys a 3--4$\times$ memory reduction at a quality cost that is task- and configuration-dependent: with NF4, double quantization, and adapters on all linear layers, the QLoRA paper reports parity with 16-bit LoRA, while narrower adapter placement or harder tasks can show a few percent gap from quantization noise in the frozen base's forward pass. Benchmark against a 16-bit LoRA baseline rather than assuming a fixed penalty. \textbf{Prompt tuning}: trains only soft prompt embeddings ($<$0.01\% parameters). Use only for very large models ($>$10B) on simple tasks, or when you need hundreds of task-specific variants served from one base model with minimal per-task storage. Quality is significantly lower than LoRA for models under 10B.
 
 \redflags
 \begin{itemize}
-    \item Treating QLoRA as strictly better than LoRA (it has a quality cost)
+    \item Treating QLoRA as strictly better than LoRA (quality parity is configuration-dependent and must be verified per task)
     \item Not mentioning the serving/deployment dimension
     \item ``Always use full fine-tuning for best results'' without considering the cost-quality tradeoff
 \end{itemize}
@@ -831,7 +833,7 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 
 \badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
 
-\stronganswer With 10K examples, I would use LoRA on a 7B--13B model. The pipeline has six stages. \textbf{Stage 1---Data preparation}: Clean and deduplicate the 10K examples. Format as instruction-completion pairs matching the model's chat template. Run quality filtering: compute perplexity under the base model and remove outliers (likely noisy examples). Split 80/10/10 for train/val/test. \textbf{Stage 2---Base model selection}: 7B model is the sweet spot for 10K examples. A 70B model would overfit, a 1B model lacks capacity for complex domains. \textbf{Stage 3---LoRA configuration}: Rank 16 targeting Q, K, V, O, and FFN projections. Alpha = 16 (scale factor 1.0). Learning rate 2e-4 with cosine schedule and 10\% warmup. BF16 mixed precision. Gradient checkpointing to fit in a single 40GB GPU. \textbf{Stage 4---Training}: 3 epochs with early stopping on validation loss. Effective batch size 32 via gradient accumulation. Monitor for validation loss plateau. \textbf{Stage 5---Evaluation}: Domain-specific metrics on the held-out test set PLUS general capability benchmarks (MMLU, HellaSwag) to detect catastrophic forgetting. Only deploy if domain metrics improve and general metrics do not degrade beyond tolerance ($<$2\% drop). \textbf{Stage 6---Deployment}: Merge LoRA weights into base model for production serving with zero adapter overhead. Keep unmerged LoRA checkpoint for continued iteration.
+\stronganswer With 10K examples, I would use LoRA on a 7B--13B model. The pipeline has six stages. \textbf{Stage 1---Data preparation}: Clean and deduplicate the 10K examples. Format as instruction-completion pairs matching the model's chat template. Run quality filtering: compute perplexity under the base model and remove outliers (likely noisy examples). Split 80/10/10 for train/val/test. \textbf{Stage 2---Base model selection}: A 7B--13B model is the sweet spot here---not because a 70B model would overfit (with PEFT, larger models are generally \textit{more} sample-efficient), but because of cost, iteration speed, and serving: a 7B LoRA run finishes in hours on a single GPU, so you can iterate on data and hyperparameters many times, and the result is cheap to serve. A 1B model likely lacks capacity for a complex domain. Move up to 70B only if the smaller model's quality plateaus below the bar and the serving budget supports it. \textbf{Stage 3---LoRA configuration}: Rank 16 targeting Q, K, V, O, and FFN projections. Alpha = 16 (scale factor 1.0). Learning rate 2e-4 with cosine schedule and 10\% warmup. BF16 mixed precision. Gradient checkpointing to fit in a single 40GB GPU. \textbf{Stage 4---Training}: 3 epochs with early stopping on validation loss. Effective batch size 32 via gradient accumulation. Monitor for validation loss plateau. \textbf{Stage 5---Evaluation}: Domain-specific metrics on the held-out test set PLUS general capability benchmarks (MMLU, HellaSwag) to detect catastrophic forgetting. Only deploy if domain metrics improve and general metrics do not degrade beyond tolerance ($<$2\% drop). \textbf{Stage 6---Deployment}: Merge LoRA weights into base model for production serving with zero adapter overhead. Keep unmerged LoRA checkpoint for continued iteration.
 
 \redflags
 \begin{itemize}
@@ -935,7 +937,7 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 
 \badgeLfive{L5} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
 
-\stronganswer I would use QLoRA. Here is the memory budget: 70B parameters at 4-bit quantization (NF4) = $\sim$35 GB for the base model. LoRA adapters at rank 16 targeting Q, K, V, O projections: $\sim$100M parameters at BF16 = $\sim$200 MB. Optimizer states for LoRA params (Adam has 2 states per param): $\sim$800 MB. Activations and gradients with gradient checkpointing: $\sim$20--30 GB depending on batch size and sequence length. Total: $\sim$60 GB, fitting within the 80 GB A100. Configuration: 4-bit NF4 with double quantization, LoRA rank 16--64, $\alpha = r$, target all attention projections plus FFN up/down/gate. Training: learning rate 2e-4, batch size 1 with gradient accumulation to effective batch 32, 1--3 epochs depending on dataset size. Use gradient checkpointing and paged optimizers to handle memory spikes. Evaluation: domain-specific benchmarks plus MMLU/HellaSwag for general capability. Deployment: merge LoRA weights, re-quantize the merged model for serving (e.g., GPTQ or AWQ 4-bit), or serve with the separate adapter if multi-task switching is needed.
+\stronganswer I would use QLoRA. Here is the memory budget: 70B parameters at 4-bit quantization (NF4) = $\sim$35 GB for the base model. LoRA adapters at rank 16 targeting Q, K, V, O projections: Llama-2-70B uses GQA, so K/V projections are $8192 \times 1024$ while Q/O are $8192 \times 8192$; across 80 layers that is $80 \times 16 \times (2 \times 16384 + 2 \times 9216) \approx 65$M parameters, at BF16 $\sim$130 MB. Optimizer states for LoRA params (Adam keeps 2 FP32 states per param): $\sim$0.5 GB. Activations and gradients with gradient checkpointing: $\sim$20--30 GB depending on batch size and sequence length. Total: $\sim$60 GB, fitting within the 80 GB A100. Configuration: 4-bit NF4 with double quantization, LoRA rank 16--64, $\alpha = r$, target all attention projections plus FFN up/down/gate. Training: learning rate 2e-4, batch size 1 with gradient accumulation to effective batch 32, 1--3 epochs depending on dataset size. Use gradient checkpointing and paged optimizers to handle memory spikes. Evaluation: domain-specific benchmarks plus MMLU/HellaSwag for general capability. Deployment: merge LoRA weights, re-quantize the merged model for serving (e.g., GPTQ or AWQ 4-bit), or serve with the separate adapter if multi-task switching is needed.
 
 \redflags
 \begin{itemize}

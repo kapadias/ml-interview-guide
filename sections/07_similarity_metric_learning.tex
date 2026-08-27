@@ -46,16 +46,16 @@ Similarity learning underpins:
     
     % Points
     \fill[blue] (1.5, 3.5) circle (3pt) node[above right] {Two-Tower};
+    \fill[orange] (1.5, 2.8) circle (3pt) node[right] {Siamese};
     \fill[green!70!black] (3, 2.5) circle (3pt) node[above right] {Poly-Encoder};
     \fill[red] (5, 0.8) circle (3pt) node[above right] {Cross-Encoder};
-    \fill[orange] (2.5, 3) circle (3pt) node[below right] {Siamese};
-    
-    % Annotations
-    \node[font=\small, blue] at (1.5, 3) {O(n+m)};
-    \node[font=\small, green!70!black] at (3, 2) {O(n+mk)};
-    \node[font=\small, red] at (5, 0.3) {O(nm)};
+
+    % Annotations (per-candidate scoring cost)
+    \node[font=\small, blue] at (1.5, 2.2) {$O(d)$};
+    \node[font=\small, green!70!black] at (3, 2) {$O(md)$};
+    \node[font=\small, red] at (5, 0.3) {$O(L^2)$};
 \end{tikzpicture}
-\caption{Trade-off between matching quality and computational efficiency for similarity architectures.}
+\caption{Trade-off between matching quality and computational efficiency for similarity architectures. Labels give the per-candidate scoring cost once candidate representations are pre-computed: $d$ = embedding dimension, $m$ = number of poly-encoder code vectors, $L$ = joint query--candidate sequence length (the cross-encoder cannot pre-compute anything and pays a full transformer forward pass per pair). Siamese and two-tower are both bi-encoders: they sit in the same quality band, since any quality difference comes from training data and objectives, not the architecture.}
 \label{fig:similarity_tradeoff}
 \end{figure}
 
@@ -678,8 +678,8 @@ A two-tower model might struggle because ``apple'' and ``price'' appear in both.
 
 For 1 million items with a 12-layer BERT:
 \begin{itemize}
-    \item Two-tower: ~1 second (with ANN index)
-    \item Cross-encoder: ~hours (1M forward passes)
+    \item Two-tower: a few milliseconds per query (ANN lookup over pre-computed embeddings; see Q10)
+    \item Cross-encoder: minutes per query on a GPU---batched BERT-base at sequence length 256 sustains $\sim$2--3K pairs/s on an A100 (see Q12), so 1M forward passes take $\sim$5--8 minutes; on CPU it is hours. Either way, orders of magnitude outside any online latency budget.
 \end{itemize}
 
 \subsection{When to Use Cross-Encoder}
@@ -1014,7 +1014,7 @@ ScaNN & Best & Very fast & Medium & Medium \\
 
 %==============================================================================
 \section{Architecture Selection Guide}
-\label{sec:arch_selection}
+\label{sec:similarity_arch_selection}
 %==============================================================================
 
 \begin{figure}[H]
@@ -1129,7 +1129,7 @@ Production retrieval systems use a funnel architecture: each stage reduces the c
 
 \textbf{Stage 1 --- Candidate Generation (target: 10ms, 1B $\to$ 1K).} Architecture: Two-tower model with separate query and document encoders. Pre-compute all document embeddings offline (768-dim, stored in FP16 $\to$ $768 \times 2$ bytes $\times$ 1B = 1.5 TB). Use HNSW index sharded across machines (e.g., 20 shards of 50M each, queried in parallel). Each shard returns top-50, merge and take global top-1000. Latency budget: $\sim$10ms with proper sharding. Key metric: Recall@1000---this is the ceiling for downstream stages. If a relevant document is missed here, no subsequent stage can recover it.
 
-\textbf{Stage 2 --- Reranking (target: 40ms, 1K $\to$ 100).} Architecture: Cross-encoder (12-layer BERT) processes [CLS] query [SEP] document [SEP] for each of the 1000 candidates. With GPU batching (batch=1000, sequence length $\sim$256), this takes $\sim$30--40ms on an A100. The cross-encoder provides full query-document interaction, capturing fine-grained semantic matching that the two-tower misses. Distill a smaller cross-encoder (6-layer, knowledge distilled from a 12-layer model) if latency is tight.
+\textbf{Stage 2 --- Reranking (target: 40ms, 1K $\to$ 100).} Architecture: Cross-encoder processes [CLS] query [SEP] document [SEP] for each of the 1000 candidates. Do the FLOPs math before promising a latency: 1000 pairs through a 12-layer BERT-base at sequence length 256 is $1000 \times 56$ GFLOPs $\approx 56$ TFLOPs, which is $\geq$180ms on an A100 even at 100\% FP16 utilization---realistically 300--500ms at achievable utilization. A 40ms budget therefore cannot be met with a full BERT-base over 1000 candidates on one GPU; it requires a distilled cross-encoder (2--6 layers, knowledge distilled from the 12-layer teacher), sequence length trimmed to $\sim$128, and/or sharding the candidates across multiple GPUs. For example, a 2-layer MiniLM-style reranker at sequence length 128 cuts the work by roughly an order of magnitude, scoring 1000 candidates in $\sim$30--50ms on a single A100; splitting across two GPUs brings it safely under budget. The cross-encoder provides full query-document interaction, capturing fine-grained semantic matching that the two-tower misses.
 
 \textbf{Stage 3 --- Final scoring and business logic (target: 5ms, 100 $\to$ 10).} Combine the cross-encoder score with additional features: BM25 lexical score, document freshness, popularity (click count), user personalization signals, and business rules (promoted content, diversity constraints). Use a lightweight gradient-boosted tree or linear model to combine these features. Apply diversity re-ranking (MMR or similar) to avoid showing redundant results.
 
@@ -1211,7 +1211,7 @@ In practice, modern systems often skip the Siamese/Triplet distinction and go di
 
 \textbf{Raw embedding storage.} $10^9 \times 768 \times 4$ bytes (FP32) = 3.07 TB. In FP16: 1.54 TB. This is the baseline---the index metadata adds overhead on top.
 
-\textbf{HNSW index.} HNSW stores the vectors plus a graph structure. Each vector has $M$ neighbors per layer (typically $M=16$). The graph overhead is approximately $M \times L_{avg} \times 8$ bytes per vector (neighbor IDs as 64-bit integers), where $L_{avg}$ is the average number of layers per node ($\approx 1.5$ for random level assignment). Per-vector graph overhead: $16 \times 1.5 \times 8 \approx 192$ bytes. Total graph overhead: $192 \times 10^9 \approx 192$ GB. Total HNSW index: $\sim$1.54 TB (vectors in FP16) + $\sim$192 GB (graph) $\approx$ \textbf{1.73 TB}. This requires distributed deployment---e.g., 20 machines with 96 GB RAM each, 50M vectors per shard.
+\textbf{HNSW index.} HNSW stores the vectors plus a graph structure. Each vector has $M$ neighbors per layer (typically $M=16$). The graph overhead is approximately $M \times L_{avg} \times 4$ bytes per vector---standard implementations (hnswlib, Faiss) store neighbor IDs as 32-bit internal integers, which cover up to $\sim$4B vectors per shard---where $L_{avg}$ is the average number of layers per node ($\approx 1.5$ for random level assignment). Per-vector graph overhead: $16 \times 1.5 \times 4 \approx 96$ bytes. Total graph overhead: $96 \times 10^9 \approx 96$ GB. Total HNSW index: $\sim$1.54 TB (vectors in FP16) + $\sim$96 GB (graph) $\approx$ \textbf{1.64 TB}. This requires distributed deployment---e.g., 20 machines with 96 GB RAM each, 50M vectors per shard.
 
 \textbf{With product quantization (IVF-PQ).} Compress each 768-dim vector to 96 bytes (split into 96 subvectors of 8 dims, each quantized to 1 byte = 256 centroids). Storage: $96 \times 10^9 = 96$ GB for vectors + IVF structure overhead ($\sim$10 GB) $\approx$ \textbf{106 GB}. This fits on a single high-memory machine (128 GB RAM).
 
@@ -1301,7 +1301,7 @@ A bi-encoder (two-tower) computes query and document embeddings independently, e
 
 \textbf{When the quality gap is worth the cost:}
 
-(1) \textbf{Reranking a small candidate set.} When a bi-encoder has already reduced 1B documents to 100--1000 candidates, running a cross-encoder on this small set adds 20--50ms latency. The quality improvement is almost always worth it because: you're only paying for $\sim$100--1000 forward passes (not millions), and the reranker directly improves the user-visible top-K results.
+(1) \textbf{Reranking a small candidate set.} When a bi-encoder has already reduced 1B documents to 100--1000 candidates, running a cross-encoder on this small set adds tens of milliseconds of latency ($\sim$35--60ms for 100 candidates with BERT-base on an A100; a 1000-candidate set needs a distilled reranker to stay in that range). The quality improvement is almost always worth it because: you're only paying for $\sim$100--1000 forward passes (not millions), and the reranker directly improves the user-visible top-K results.
 
 (2) \textbf{High-stakes decisions.} In legal document review, medical literature search, or compliance checks, a 5\% improvement in ranking quality can have significant downstream impact. The additional latency (even seconds) is acceptable if the decision quality matters more than response time.
 
@@ -1486,13 +1486,13 @@ To estimate QPS (queries per second), I need to estimate per-query latency and t
 
 \textbf{Per-query latency for HNSW.} HNSW search involves traversing the graph from top layers to bottom. At each step, the algorithm evaluates $ef\_search$ candidates (a tunable parameter, typically 64--256 for good recall). Each evaluation requires computing a distance (768-dim dot product or L2 distance). With $ef\_search = 128$ and $\sim 2 \times$ overhead for graph traversal bookkeeping, we compute approximately 256 distance calculations.
 
-Each 768-dim FP32 distance computation: $768 \times 2$ FLOPS (multiply + add) = 1536 FLOPS. Total: $256 \times 1536 \approx 400K$ FLOPS. On a modern CPU with AVX-512 at $\sim$100 GFLOPS single-thread throughput: $400K / 100G = 4 \mu s$ for pure compute. But memory access dominates---each candidate vector is 3 KB (768 $\times$ 4 bytes), and the access pattern is random (graph traversal is not cache-friendly). At $\sim$10 ns per cache miss and $\sim$256 cache misses: $256 \times 100ns \approx 25 \mu s$ (some hits L3 cache at $\sim$30ns, some go to DRAM at $\sim$100ns).
+Each 768-dim FP32 distance computation: $768 \times 2$ FLOPS (multiply + add) = 1536 FLOPS. Total: $256 \times 1536 \approx 400K$ FLOPS. On a modern CPU with AVX-512 at $\sim$100 GFLOPS single-thread throughput: $400K / 100G = 4 \mu s$ for pure compute. But memory access dominates, and the right unit of cost is a \textit{full vector fetch}, not a single cache miss: each candidate vector is 3 KB ($768 \times 4$ bytes) $= \sim$48 cache lines of 64 bytes, and because graph traversal jumps to random neighbors, those fetches mostly go to DRAM at $\sim$100ns per line. Cost per query: $256 \text{ candidates} \times 48 \text{ lines} \times 100\text{ns} \approx 1.2$ ms. Hardware prefetching within each contiguous vector and L3 hits on hot graph regions claw back some of this.
 
-\textbf{Total per-query latency}: $\sim$0.5--2 ms per query per thread, depending on whether vectors are in L3 cache (hot queries) or DRAM (cold queries).
+\textbf{Total per-query latency}: $\sim$0.5--2 ms per query per thread---the memory-bound estimate above, faster when prefetching and cache hits help (hot regions), slower for cold DRAM-resident traversals.
 
 \textbf{QPS per machine.} Modern servers have 32--64 cores. With multi-threaded search: $64 \text{ cores} / 1 \text{ ms per query} = \sim$64K QPS for hot workloads, $\sim$16--32K QPS for mixed workloads. In practice, with overhead (network, serialization, load balancing): $\sim$10--20K QPS per machine is a conservative estimate for 100M vectors on a single machine.
 
-\textbf{Memory requirement check.} 100M vectors $\times$ 768 dims $\times$ 4 bytes = 307 GB (FP32) or 154 GB (FP16). Plus HNSW graph: $\sim$20 GB. Total: $\sim$174 GB in FP16. This fits on a single machine with 256 GB RAM.
+\textbf{Memory requirement check.} 100M vectors $\times$ 768 dims $\times$ 4 bytes = 307 GB (FP32) or 154 GB (FP16). Plus HNSW graph ($\sim$96 bytes/vector with 32-bit neighbor IDs): $\sim$10 GB. Total: $\sim$164 GB in FP16. This fits on a single machine with 256 GB RAM.
 
 \textbf{Scaling.} To serve 100K QPS: $\sim$5--10 replicas of the same index, behind a load balancer. Each replica is a separate machine with the full 100M vector index. Total cost: 5--10 machines with 256 GB RAM each.
 
@@ -1574,17 +1574,17 @@ This is a two-stage system, so I need to estimate each stage separately and then
 
 \textbf{Stage 2: Cross-encoder reranking on top 100.} The cross-encoder processes 100 query-document pairs. Each pair is a BERT-base forward pass (12 layers, 110M parameters, sequence length $\sim$256 tokens).
 
-Per forward pass on GPU: BERT-base at sequence length 256 takes $\sim$2--3ms on an A100 (batch=1). But we can batch all 100 pairs: batch=100, sequence length=256. A100 BERT-base inference: $\sim$10--15ms for batch=100 (GPU saturates with this batch size, so latency doesn't scale linearly with batch).
+Per forward pass on GPU: BERT-base at sequence length 256 takes $\sim$2--3ms on an A100 (batch=1, latency-bound at low utilization). But we can batch all 100 pairs: batch=100, sequence length=256. Sanity-check with FLOPs before quoting a number: $100 \times 56$ GFLOPs per pair $\approx 5.6$ TFLOPs; at a realistic 30--50\% of the A100's 312 TFLOPS dense FP16 peak, that is $\sim$\textbf{35--60ms} for batch=100 (call it $\sim$45ms). A figure like 10--15ms would imply $\sim$470 TFLOPS sustained---above the hardware peak---so it cannot be right.
 
-With a DistilBERT cross-encoder (6 layers, 66M params): $\sim$6--8ms for batch=100.
+With a DistilBERT cross-encoder (6 layers, 66M params, roughly half the FLOPs): $\sim$20--30ms for batch=100.
 
-\textbf{Combined per-query latency}: $\sim$2ms (HNSW) + $\sim$12ms (cross-encoder) + $\sim$2ms (overhead: network, serialization, merge) $\approx$ \textbf{16ms per query}.
+\textbf{Combined per-query latency}: $\sim$2ms (HNSW) + $\sim$45ms (cross-encoder) + $\sim$2ms (overhead: network, serialization, merge) $\approx$ \textbf{50ms per query}.
 
-\textbf{System QPS.} The bottleneck is the cross-encoder (GPU-bound). An A100 can process $\sim$1000/12 \approx 83$ queries/second (each query = one batch of 100 pairs). With 4 A100s: $\sim$330 QPS. With 10 A100s: $\sim$830 QPS.
+\textbf{System QPS.} The bottleneck is the cross-encoder (GPU-bound). An A100 can process $1000/45 \approx 22$ queries/second (each query = one batch of 100 pairs). With 4 A100s: $\sim$90 QPS. With 10 A100s: $\sim$220 QPS.
 
-The HNSW stage is CPU-bound and runs in parallel. At 20K QPS per CPU machine, a single CPU machine can feed $\sim$24 A100s, so the GPU reranker is always the bottleneck.
+The HNSW stage is CPU-bound and runs in parallel. At 20K QPS per CPU machine, a single CPU machine can feed hundreds of A100s, so the GPU reranker is always the bottleneck.
 
-\textbf{Cost analysis.} At \$3/hr per A100, serving 1000 QPS costs $\sim$\$3 $\times$ 12 = \$36/hr or \$26K/month. This is why companies use the reranker selectively---only on queries where it adds value (e.g., ambiguous queries, high-revenue queries), or use distilled/smaller rerankers.
+\textbf{Cost analysis.} At \$3/hr per A100, serving 1000 QPS takes $1000/22 \approx 45$ GPUs, costing $\sim$\$3 $\times$ 45 = \$135/hr or roughly \$100K/month (about half that with a DistilBERT reranker). This is why companies use the reranker selectively---only on queries where it adds value (e.g., ambiguous queries, high-revenue queries), or use distilled/smaller rerankers.
 
 \textbf{Optimizations to increase QPS:}
 \begin{enumerate}

@@ -95,19 +95,19 @@ The number of message passing layers $L$ determines how far information propagat
 
 \subsection{GCN: Graph Convolutional Network}
 
-\textbf{What it is.} The foundational GNN architecture (Kipf and Welling, 2017). Uses a symmetric normalized aggregation that averages neighbor features, weighted by degree.
+\textbf{What it is.} The foundational GNN architecture (Kipf and Welling, 2017). Uses a symmetric degree-normalized \textit{sum} aggregation: each neighbor's features are scaled by $1/\sqrt{\hat{d}_v \hat{d}_u}$ before summation.
 
 \begin{mathresult}{GCN Layer}
 \begin{equation}
-\vh_v^{(l)} = \sigma\!\left(\mW^{(l)} \cdot \text{MEAN}\!\left(\left\{\,\frac{\vh_u^{(l-1)}}{\sqrt{|\mathcal{N}(v)| \cdot |\mathcal{N}(u)|}} : u \in \mathcal{N}(v) \cup \{v\}\,\right\}\right)\right)
+\vh_v^{(l)} = \sigma\!\left(\mW^{(l)} \sum_{u \in \mathcal{N}(v) \cup \{v\}} \frac{\vh_u^{(l-1)}}{\sqrt{\hat{d}_v\,\hat{d}_u}}\right)
 \label{eq:gcn}
 \end{equation}
-where $\sigma$ is a nonlinearity (ReLU), and the self-loop ($v \in \mathcal{N}(v)$) ensures the node retains its own information.
+where $\hat{d}_v = |\mathcal{N}(v)| + 1$ is the degree of $v$ counting the self-loop, $\sigma$ is a nonlinearity (ReLU), and the self-loop (the $u = v$ term) ensures the node retains its own information. Note the aggregation is a normalized \textit{sum}, not a mean: the $1/\sqrt{\hat{d}_v \hat{d}_u}$ factors already provide the normalization, and additionally averaging over $|\mathcal{N}(v)|$ would normalize twice.
 \end{mathresult}
 
 \textbf{When to use.} Good default for homogeneous graphs with moderate size. Simple, fast, well-understood.
 
-\textbf{Pitfalls.} Requires the full adjacency matrix at training time (transductive by default---cannot handle unseen nodes without retraining). The symmetric normalization treats all neighbors equally, which limits expressivity.
+\textbf{Pitfalls.} As standardly trained, GCN is transductive: training is full-batch over a fixed adjacency matrix, with normalization computed on the whole graph, so unseen nodes are not handled out of the box. The limitation is the full-batch training formulation, not the parameterization---the learned weight matrices apply to any graph, and sampling-based mini-batch training (the GraphSAGE recipe) makes the same layer inductive. The symmetric normalization treats all neighbors equally, which limits expressivity.
 
 \subsection{GraphSAGE}
 
@@ -151,7 +151,7 @@ GAT uses multi-head attention (same concept as in Transformers): $H$ independent
 \toprule
 \textbf{Model} & \textbf{Aggregation} & \textbf{Strengths} & \textbf{Weaknesses} & \textbf{Scale} & \textbf{Year} \\
 \midrule
-GCN & Normalized mean & Simple, fast, solid baseline & Transductive, equal neighbor weight & Medium & 2017 \\
+GCN & Degree-normalized sum & Simple, fast, solid baseline & Transductive training, equal neighbor weight & Medium & 2017 \\
 GraphSAGE & Sampled + concat & Inductive, scalable & Sampling variance, exponential fan-out & Large & 2017 \\
 GAT & Attention-weighted & Learns neighbor importance & Higher compute, GATv1 attention is limited & Medium & 2018 \\
 GIN & Sum (injective) & Most expressive (WL-equivalent) & Can overfit on small graphs & Small--Med & 2019 \\
@@ -164,7 +164,7 @@ Graph Transformer & Full attention (all nodes) & Global context, no locality bia
 
 \textbf{What it is.} The Graph Isomorphism Network (Xu et al., 2019) is designed to be \textit{maximally expressive} among message-passing GNNs. Its aggregation uses sum (not mean or max), which preserves multiset structure and makes the layer update injective.
 
-\textbf{Why it matters (the WL test intuition).} The Weisfeiler-Leman (WL) graph isomorphism test is a classical algorithm that iteratively refines node labels by hashing each node's label together with the \textit{multiset} of its neighbors' labels. Xu et al.\ proved that message-passing GNNs are \textit{at most} as powerful as the 1-WL test at distinguishing non-isomorphic graphs. GIN achieves this upper bound; GCN and GraphSAGE (which use mean aggregation) do not---they cannot distinguish certain graph structures that sum aggregation can.
+\textbf{Why it matters (the WL test intuition).} The Weisfeiler-Leman (WL) graph isomorphism test is a classical algorithm that iteratively refines node labels by hashing each node's label together with the \textit{multiset} of its neighbors' labels. Xu et al.\ proved that message-passing GNNs are \textit{at most} as powerful as the 1-WL test at distinguishing non-isomorphic graphs. GIN achieves this upper bound; GCN and GraphSAGE (whose degree-normalized and mean aggregations discard multiset counts) do not---they cannot distinguish certain graph structures that sum aggregation can.
 
 \textbf{Concrete example.} Mean aggregation cannot distinguish a node with two neighbors of feature $[1, 0]$ from a node with one such neighbor---both produce mean $[1, 0]$. Sum aggregation produces $[2, 0]$ vs.\ $[1, 0]$, preserving the count.
 
@@ -460,7 +460,7 @@ The most likely cause is \textbf{over-smoothing}: as you stack more GNN layers, 
 
 All three follow the message-passing framework but make different design choices for aggregation, and these choices have direct practical consequences.
 
-\textbf{GCN} (Kipf and Welling, 2017) uses a symmetric degree-normalized mean aggregation. All neighbors contribute equally, weighted only by their degree. It is \textit{transductive} by default---requires the full adjacency matrix at training time and cannot directly handle unseen nodes without retraining.
+\textbf{GCN} (Kipf and Welling, 2017) uses a symmetric degree-normalized sum aggregation. All neighbors contribute equally, weighted only by their degrees. It is \textit{transductive} as standardly trained---full-batch over the complete adjacency matrix---so it does not handle unseen nodes out of the box. (The weights themselves apply to any graph; the limitation is the full-batch training formulation, not the parameterization.)
 \begin{itemize}
     \item \textbf{Use when:} You have a moderately sized, static graph where all nodes are known at training time. Good default for homogeneous graphs. Simple and fast.
     \item \textbf{Avoid when:} New nodes appear at inference time, the graph is very large, or you need to differentiate neighbor importance.
@@ -528,7 +528,7 @@ In sparse CSR format, this is similar: row pointer array ($10\text{M} \times 4\t
 Layer 1: $128 \times 256 = 32\text{K params}$. Layers 2--3: $256 \times 256 = 65\text{K each}$. Total $\approx 162\text{K params} \times 4\text{B} \approx 0.6\text{ MB}$. \textit{Negligible.}
 
 \textbf{4. Intermediate activations (for training):}
-Each layer produces embeddings for all nodes: $10\text{M} \times 256 \times 4\text{B} = 10.2\text{ GB per layer}$. For 3 layers with backprop, you store all intermediate activations: $\sim$30 GB.
+Each layer produces embeddings for all nodes: $10\text{M} \times 256 \times 4\text{B} = 10.2\text{ GB per layer}$. For 3 layers with backprop, you store all intermediate activations: $\sim$30 GB. The backward pass then materializes gradient buffers \textit{with respect to these activations}---up to another $\sim$30 GB at peak if buffers for all layers coexist (frameworks free them layer by layer, so the true peak is somewhat lower, but budgeting the full amount is the safe estimate). Note this is not parameter-gradient memory, which is as negligible as the parameters themselves.
 
 \textbf{5. Optimizer states (Adam):}
 Two momentum buffers per parameter: $2 \times 162\text{K} \times 4\text{B} \approx 1.3\text{ MB}$. \textit{Negligible} (parameters are tiny in GNNs; the cost is in activations and graph storage).
@@ -536,7 +536,7 @@ Two momentum buffers per parameter: $2 \times 162\text{K} \times 4\text{B} \appr
 \textbf{Total estimate:}
 \begin{itemize}
     \item \textbf{Inference:} Features (5 GB) + graph (2 GB) + activations (10 GB for one layer) $\approx$ \textbf{17 GB}
-    \item \textbf{Full-batch training:} Features (5 GB) + graph (2 GB) + all activations (30 GB) + gradients (30 GB) $\approx$ \textbf{67 GB}---does not fit on a single 80 GB A100 with margin.
+    \item \textbf{Full-batch training:} Features (5 GB) + graph (2 GB) + stored activations (30 GB) + activation-gradient buffers ($\sim$30 GB at peak) $\approx$ \textbf{67 GB}---nominally under 80 GB, but borderline on a single A100 once the CUDA context, workspace buffers, and fragmentation are accounted for; there is no real margin.
 \end{itemize}
 
 \textbf{Why full-batch is infeasible and what to do:}
@@ -571,9 +571,9 @@ Full-batch training on 10M nodes is impractical. Use GraphSAGE-style neighbor sa
 
 For a production recommendation system at scale (billions of user-item interactions, millions of new items daily), the answer is almost always \textbf{GraphSAGE or a GraphSAGE-style architecture} (e.g., PinSage). Here is why, by elimination:
 
-\textbf{GCN is ruled out} because it is transductive---it requires the full adjacency matrix at training time and cannot handle unseen nodes without retraining. In a recommendation system, new users and items appear constantly. Retraining the entire model for every new node is infeasible.
+\textbf{GCN is ruled out} because its standard full-batch, fixed-graph training formulation is transductive---embeddings for new nodes are not available without recomputing over the updated graph. (The learned weights would apply to new nodes in principle; but once you add neighbor sampling and mini-batch training to exploit that, you have essentially rebuilt GraphSAGE.) In a recommendation system, new users and items appear constantly, so recomputing over the full graph for every new node is infeasible.
 
-\textbf{GAT is problematic at scale} because attention computes a per-edge weight, which means $O(|E|)$ attention computations per forward pass. On a graph with billions of edges, this is expensive. Additionally, GAT's attention benefit (learning neighbor importance) is less critical for recommendations where collaborative filtering signal is relatively uniform---a user's past interactions are all roughly equally informative.
+\textbf{GAT is problematic at scale} because attention computes a per-edge weight, which means $O(|E|)$ attention computations per forward pass. On a graph with billions of edges, this is expensive. Neighbor importance genuinely varies in recommendations---Chapter~\ref{chap:recommendation}'s DIN discussion is built on exactly that premise---but at this scale the benefit can be approximated far more cheaply by importance-based neighbor \textit{sampling}: PinSage weights neighbors by random-walk visit counts, selecting and weighting the important neighbors before aggregation instead of computing a learned attention weight on every edge. The argument against GAT is cost-effectiveness at billions of edges, not that all interactions are equally informative.
 
 \textbf{GraphSAGE wins because:}
 \begin{itemize}
@@ -592,7 +592,7 @@ For a production recommendation system at scale (billions of user-item interacti
 
 \redflags
 \begin{itemize}
-    \item ``Use GAT because attention is always better''---at recommendation scale, the per-edge attention cost is prohibitive and the benefit is marginal.
+    \item ``Use GAT because attention is always better''---at recommendation scale, the per-edge attention cost is prohibitive, and importance-based neighbor sampling captures most of the benefit at far lower cost.
     \item ``GCN is fine, just retrain when new items arrive''---this shows no understanding of production constraints at scale.
     \item Ignoring the serving architecture---the model is only half the system; retrieval, caching, and incremental updates matter as much.
 \end{itemize}
@@ -621,7 +621,7 @@ Message-passing GNNs are bounded by the \textbf{1-dimensional Weisfeiler-Leman (
 
 \textbf{Why this limit exists.} The WL test iteratively refines node labels by hashing each node's label together with the \textit{multiset} of its neighbors' labels. Xu et al.\ (2019) proved that message-passing GNNs are \textit{at most} as powerful as 1-WL at distinguishing graphs. The proof is intuitive: both message passing and WL perform the same operation---aggregate neighbor information and update---so they have the same discriminative power.
 
-\textbf{Which GNNs hit the bound.} GIN (Graph Isomorphism Network) achieves the 1-WL upper bound by using sum aggregation (which is injective on multisets). GCN and GraphSAGE use mean aggregation, which is \textit{not} injective---they cannot even distinguish between a node with two neighbors of feature $[1, 0]$ and a node with one such neighbor (both produce mean $[1, 0]$; sum produces $[2, 0]$ vs.\ $[1, 0]$).
+\textbf{Which GNNs hit the bound.} GIN (Graph Isomorphism Network) achieves the 1-WL upper bound by using sum aggregation (which is injective on multisets). GCN (degree-normalized sum) and GraphSAGE (mean) use aggregations that are \textit{not} injective---they cannot even distinguish between a node with two neighbors of feature $[1, 0]$ and a node with one such neighbor (both produce mean $[1, 0]$; sum produces $[2, 0]$ vs.\ $[1, 0]$).
 
 \textbf{When this matters in practice:}
 \begin{itemize}

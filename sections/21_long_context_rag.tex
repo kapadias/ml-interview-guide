@@ -64,7 +64,7 @@ Not all long-context solutions modify position encodings:
     \item \textbf{ALiBi} (Attention with Linear Biases): Adds a position-dependent penalty directly to attention logits. No learned positional parameters. Extrapolates naturally but cannot match RoPE quality at very long contexts.
     \item \textbf{Ring Attention}: Distributes the long sequence across multiple devices, with each device computing attention for its local chunk and passing KV blocks in a ring topology. Enables context lengths limited only by the number of devices, not memory.
     \item \textbf{Landmark / infini-attention}: Compress old context into fixed-size memory states, maintaining a ``compressive memory'' that the model can attend to. Trades exact retrieval for bounded memory.
-    \item \textbf{Training on long data}: The most reliable method. Models like Gemini 1.5 and GPT-4 Turbo are trained natively on long sequences (up to 1M--2M tokens). Requires significant compute but avoids all extension artifacts.
+    \item \textbf{Training on long data}: The most reliable method. Models like Gemini 1.5 (context up to 1M--2M tokens) and GPT-4 Turbo (128K) are trained natively on long sequences. Requires significant compute but avoids all extension artifacts.
 \end{itemize}
 
 %==============================================================================
@@ -143,7 +143,7 @@ At query time:
     \item \textbf{Generation:} Concatenate the top-$k$ chunks into the LLM prompt with appropriate instructions. Generate the answer.
 \end{enumerate}
 
-\textbf{Why two-stage retrieval?} Embedding similarity (bi-encoder) is fast ($O(1)$ with ANN) but imprecise---it compresses all semantics into a single vector. Cross-encoder reranking is precise but slow ($O(N)$ forward passes). The two-stage design gives you both speed and quality.
+\textbf{Why two-stage retrieval?} Embedding similarity (bi-encoder) is fast ($O(\log N)$ per query with an HNSW ANN index) but imprecise---it compresses all semantics into a single vector. Cross-encoder reranking is precise but slow ($O(N)$ forward passes). The two-stage design gives you both speed and quality.
 
 %==============================================================================
 \section{Chunking Strategies}
@@ -255,7 +255,7 @@ where $\vq_i$ and $\vk_j$ are the contextualized embeddings of the $i$-th query 
 
 \textbf{Why it matters.} ColBERT achieves near-cross-encoder quality with bi-encoder-like precomputation. Document token embeddings can be stored at index time. Only the lightweight MaxSim scoring happens at query time. This makes it 10--100$\times$ faster than cross-encoder reranking while retaining most of the quality gain.
 
-\textbf{Trade-off.} Storage cost is significant: each document stores one embedding per token, not one embedding per chunk. For a 512-token chunk with 128-dim embeddings, ColBERT stores 64KB vs.\ 512 bytes for a single-vector bi-encoder (125$\times$ more storage).
+\textbf{Trade-off.} Storage cost is significant: each document stores one embedding per token, not one embedding per chunk. For a 512-token chunk with 128-dim embeddings at 1 byte per dimension (a common quantized setting), ColBERT stores $512 \times 128 = 64$KB---at FP16 it would be 128KB---vs.\ 512 bytes for a single-vector bi-encoder (128-dim FP32), roughly 125$\times$ more storage.
 
 \begin{table}[H]
 \centering
@@ -318,7 +318,7 @@ Context recall & Do the retrieved chunks contain the information needed? & Retri
 \textbf{End-to-end evaluation:} Accuracy or F1 on a held-out QA dataset, human evaluation of answer quality, and the RAGAS metrics above. Always evaluate end-to-end because component improvements do not always translate---a better retriever might surface chunks that confuse the generator.
 
 \begin{keyinsight}[The Retriever Is Usually the Bottleneck]
-When a RAG system produces wrong answers, the root cause is retrieval failure roughly 70\% of the time. The generator is good at synthesizing an answer from relevant context; it is bad at working with irrelevant context. Debug the retriever first: check retrieval recall on a sample of failure cases. If the correct passage is not in the top $k$, no amount of prompt engineering or generator improvement will fix the problem. Invest in retrieval quality before tuning the generator.
+When a RAG system produces wrong answers, the root cause is retrieval failure more often than not---as a practitioner's rule of thumb (not a measured statistic), figure roughly 70\% of the time. The generator is good at synthesizing an answer from relevant context; it is bad at working with irrelevant context. Debug the retriever first: check retrieval recall on a sample of failure cases. If the correct passage is not in the top $k$, no amount of prompt engineering or generator improvement will fix the problem. Invest in retrieval quality before tuning the generator.
 \end{keyinsight}
 
 %==============================================================================
@@ -448,7 +448,7 @@ Failure mode & ``Lost in the middle'' attention degradation & Retrieval misses r
     \item Input: 128K tokens of context + $\sim$200 tokens of query/instructions = $\sim$128K input tokens.
     \item Output: $\sim$500 tokens (typical answer length).
     \item Cost at \$10/M input tokens, \$30/M output tokens: $(128{,}000 \times \$10 / 10^6) + (500 \times \$30 / 10^6) = \$1.28 + \$0.015 = \$1.30$ per query.
-    \item Latency: 128K prefill at $\sim$1M tokens/sec (H100 optimized) $\approx$ 128ms prefill + $\sim$500 tokens at 50 tok/sec $\approx$ 10s decode $= \sim$10.1s total.
+    \item Latency: 128K prefill is \textit{not} fast---prefill is compute-bound. For a 70B-class model, one forward pass over 128K tokens costs $\approx 2 \times 70 \times 10^9 \times 131{,}072 \approx 1.8 \times 10^{16}$ FLOPs; on 8$\times$H100 at 40\% MFU ($\approx 3.2 \times 10^{15}$ FLOPS) that is $\approx$5--6s of prefill, and real API time-to-first-token at 128K is commonly $\sim$10--30s. Add $\sim$500 tokens at 50 tok/sec $\approx$ 10s decode, for $\sim$15--40s total.
 \end{itemize}
 
 \textbf{RAG approach:} Retrieve top-$k$ chunks, stuff only those.
@@ -461,14 +461,14 @@ Failure mode & ``Lost in the middle'' attention degradation & Retrieval misses r
     \item LLM cost: $(2{,}760 \times \$10/10^6) + (500 \times \$30/10^6) = \$0.028 + \$0.015 = \$0.043$ per query.
     \item Embedding + retrieval infra: $\sim$\$0.002 per query (amortized).
     \item \textbf{Total RAG cost: $\sim$\$0.045 per query.}
-    \item Latency: retrieval ($\sim$55ms) + LLM prefill ($\sim$3ms) + decode ($\sim$10s) $\approx$ 10.1s.
+    \item Latency: retrieval ($\sim$55ms) + LLM prefill of 2,760 tokens ($\sim$100--300ms in practice) + decode ($\sim$10s) $\approx$ 10.2--10.4s---and time-to-first-token is well under a second.
 \end{itemize}
 
 \textbf{Comparison:}
 \begin{itemize}
     \item \textbf{Cost ratio:} Long context is $\sim$29$\times$ more expensive (\$1.30 vs.\ \$0.045).
     \item \textbf{At 10K queries/day:} Long context = \$13,000/day. RAG = \$450/day. Difference: \$12,550/day = \$4.6M/year.
-    \item \textbf{Latency:} Comparable for decode-dominated responses. For short answers ($<$100 tokens), long context has higher latency due to prefill.
+    \item \textbf{Latency:} Not comparable where users feel it: RAG's time-to-first-token is sub-second, while the long-context approach pays multi-second (often 10s+) prefill before the first token appears. Fast TTFT is a genuine RAG advantage; total wall-clock converges only for long, decode-dominated answers, and prefix caching is what rescues long context in multi-turn sessions.
     \item \textbf{Quality:} Long context is better for cross-document reasoning. RAG is better when the answer is localized in 1--2 passages.
 \end{itemize}
 
@@ -523,7 +523,7 @@ RAG evaluation must decompose into component-level and end-to-end metrics, becau
 
 \textbf{Debugging protocol:} When end-to-end quality is poor, triage in this order:
 \begin{enumerate}
-    \item Check retrieval recall (cause in $\sim$70\% of failures).
+    \item Check retrieval recall first (the most common culprit---a practitioner rule of thumb puts it at $\sim$70\% of failures).
     \item Check reranking (correct passage retrieved but ranked too low).
     \item Check generation (correct passage in top-$k$ but answer is wrong---model ignoring context).
     \item Check the question (genuinely unanswerable from the knowledge base).
@@ -860,11 +860,11 @@ This is not an either/or decision. The right choice depends on four factors: cor
 
 These three models represent a quality-speed tradeoff in retrieval and reranking.
 
-\textbf{Bi-encoder:} Encodes query and document independently into single vectors. Similarity = cosine distance. \textit{Speed:} Fastest---document embeddings are pre-computed; only the query embedding is computed at query time. ANN search is $O(1)$ amortized. \textit{Quality:} Lowest---the single-vector bottleneck loses fine-grained token-level matching. \textit{Use for:} First-stage retrieval over the full corpus. Cannot be used for reranking (it already is the retrieval model).
+\textbf{Bi-encoder:} Encodes query and document independently into single vectors. Similarity = cosine distance. \textit{Speed:} Fastest---document embeddings are pre-computed; only the query embedding is computed at query time. ANN search is $O(\log N)$ per query (HNSW). \textit{Quality:} Lowest---the single-vector bottleneck loses fine-grained token-level matching. \textit{Use for:} First-stage retrieval over the full corpus. Cannot be used for reranking (it already is the retrieval model).
 
 \textbf{Cross-encoder:} Processes query + document \textit{jointly} as a single input: \texttt{[CLS] query [SEP] document [SEP]}. Full self-attention between query and document tokens. \textit{Speed:} Slowest---requires $N$ forward passes (one per candidate). Cannot pre-compute. \textit{Quality:} Highest---token-level interaction captures fine-grained relevance signals (exact-match, negation, paraphrase). \textit{Use for:} Reranking top 20--100 candidates from the bi-encoder.
 
-\textbf{ColBERT (late interaction):} Encodes query and document independently (like bi-encoder) but retains per-token embeddings. Similarity = MaxSim (sum of maximum per-token similarities). \textit{Speed:} Medium---document token embeddings are pre-computed. Query-time computation is lightweight MaxSim. 10--100$\times$ faster than cross-encoder. \textit{Quality:} Near cross-encoder quality---token-level matching without joint encoding. \textit{Storage cost:} High---one embedding per token (vs.\ one per document for bi-encoder). A 512-token document at 128 dims stores 64KB vs.\ 512 bytes for a bi-encoder (125$\times$ more). \textit{Use for:} Reranking when cross-encoder latency is too high, or as a fast first-stage retrieval with higher quality than bi-encoder.
+\textbf{ColBERT (late interaction):} Encodes query and document independently (like bi-encoder) but retains per-token embeddings. Similarity = MaxSim (sum of maximum per-token similarities). \textit{Speed:} Medium---document token embeddings are pre-computed. Query-time computation is lightweight MaxSim. 10--100$\times$ faster than cross-encoder. \textit{Quality:} Near cross-encoder quality---token-level matching without joint encoding. \textit{Storage cost:} High---one embedding per token (vs.\ one per document for bi-encoder). A 512-token document at 128 dims (1 byte/dim) stores 64KB vs.\ 512 bytes for a bi-encoder (125$\times$ more). \textit{Use for:} Reranking when cross-encoder latency is too high, or as a fast first-stage retrieval with higher quality than bi-encoder.
 
 \textbf{Decision framework:}
 \begin{itemize}

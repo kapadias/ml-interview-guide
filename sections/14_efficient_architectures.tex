@@ -168,7 +168,7 @@ ConvNeXt-T & Modernized ResNet & 29M & 4.5B & 82.1\% & 2022 \\
 \textbf{What it is.} Instead of routing every token through every parameter, MoE models have multiple ``expert'' subnetworks (typically FFN layers) and a learned \textit{router} that selects a sparse subset of experts per input. This decouples parameter count from per-token compute cost: a model can have hundreds of billions of parameters but activate only a fraction for each token.
 
 \begin{keyinsight}[MoE Gives You More Parameters Without Proportional Compute]
-A dense 7B model processes every token through all 7B parameters. A MoE model with 8 experts and top-2 routing has $\sim$47B total parameters but activates only $\sim$14B per token---achieving dense-model quality at a fraction of the per-token cost. The tradeoff: you still need enough memory to hold all 47B parameters.
+A dense 7B model processes every token through all 7B parameters. A MoE model with 8 experts and top-2 routing (Mixtral 8x7B) has 46.7B total parameters but activates only $\sim$12.9B per token---achieving dense-model quality at a fraction of the per-token cost. The tradeoff: you still need enough memory to hold all 46.7B parameters.
 \end{keyinsight}
 
 \subsection{Gating Mechanism}
@@ -182,7 +182,7 @@ G(\vx) = \text{TopK}\bigl(\softmax(\mW_g \vx)\bigr), \quad \text{output} = \sum_
 where $\mW_g \in \R^{N_{experts} \times d}$ is the router weight matrix, $E_i$ is expert $i$, and the output is a weighted sum of the selected experts.
 \end{mathresult}
 
-Typical choices: $N_{experts} = 8\text{--}64$, $k = 1\text{--}2$. The router is a simple linear layer---complexity is in the load balancing, not the routing itself.
+Typical choices in the 2023-era designs covered here: $N_{experts} = 8\text{--}64$, $k = 1\text{--}2$ (newer fine-grained MoEs push to far higher expert counts with larger $k$). The router is a simple linear layer---complexity is in the load balancing, not the routing itself.
 
 \subsection{Load Balancing: The Central Challenge}
 
@@ -225,7 +225,7 @@ DeepSeek-MoE & Top-2 & 64 fine + 2 shared & Shared + routed experts & 2024 \\
 
 \textbf{Switch Transformer} showed that top-1 routing (single expert per token) works well and simplifies implementation. Each token goes to exactly one expert, halving communication overhead compared to top-2.
 
-\textbf{Mixtral 8x7B} demonstrated that moderate-scale MoE (8 experts, top-2) can match or exceed a dense 70B model while activating only $\sim$13B parameters per token. Every transformer layer is a MoE layer (no dense layers interspersed).
+\textbf{Mixtral 8x7B} demonstrated that moderate-scale MoE (8 experts, top-2) can match or exceed a dense 70B model while activating only $\sim$12.9B of its 46.7B parameters per token. Every transformer layer is a MoE layer (no dense layers interspersed).
 
 \textbf{DeepSeek-MoE} introduced a hybrid design with shared experts (always active, every token) plus routed experts (sparse, token-specific). The shared experts capture common knowledge; routed experts specialize.
 
@@ -369,7 +369,7 @@ FP8 (E4M3) & 8 & PTQ/QAT & 8-bit floating point; drop-in for training and infere
 \textbf{AWQ} observes that a small fraction ($\sim$1\%) of weight channels are disproportionately important (corresponding to channels with large activation magnitudes). It protects these salient channels by scaling them up before quantization, then compensating in the adjacent layer. Faster than GPTQ with comparable results.
 
 \begin{warningbox}
-Quantization affects attention layers more than FFN layers. Attention logits require precise dot products between queries and keys; small quantization errors compound across the softmax and can significantly shift the attention distribution. FFN layers are more robust because ReLU/SiLU activations are less sensitive to small perturbations. When doing mixed-precision quantization, keep attention projections at higher precision.
+Quantization sensitivity is layer- and channel-specific---measure it rather than assuming a blanket rule. Attention logits can be sensitive (small Q/K errors shift the softmax distribution), but outlier channels also concentrate at FFN inputs and down-projections, and many production recipes protect \texttt{down\_proj} and the first/last (boundary) layers rather than attention. When doing mixed-precision quantization, profile per-layer quantization error on your task and keep the empirically sensitive layers at higher precision.
 \end{warningbox}
 
 \textbf{When to use.} INT8 quantization (SmoothQuant, FP8) is nearly free---use it by default for inference. INT4 (GPTQ, AWQ) when you need to fit a model on fewer GPUs or when memory bandwidth is the bottleneck. Sub-4-bit only for experimental or extreme edge deployment.
@@ -383,7 +383,7 @@ Quantization affects attention layers more than FFN layers. Attention logits req
 
 \subsection{Pruning}
 
-\textbf{What it is.} Remove unnecessary weights or structures from a trained model to reduce size and compute. The lottery ticket hypothesis (Frankle and Carlin, 2019) suggests that dense networks contain sparse subnetworks that can match the full model's performance.
+\textbf{What it is.} Remove unnecessary weights or structures from a trained model to reduce size and compute. The lottery ticket hypothesis (Frankle and Carbin, 2019) suggests that dense networks contain sparse subnetworks that can match the full model's performance.
 
 \subsubsection{Structured vs Unstructured Pruning}
 
@@ -563,14 +563,14 @@ The decision depends on the deployment constraints, training infrastructure, and
 
 \textbf{Choose MoE when:}
 \begin{itemize}
-    \item You have the memory budget to hold all experts but need to keep per-token compute (and thus latency) low. A Mixtral 8x7B has 47B total params but only $\sim$13B active per token---faster than a dense 34B model at comparable quality.
+    \item You have the memory budget to hold all experts but need to keep per-token compute (and thus latency) low. A Mixtral 8x7B has 46.7B total params but only $\sim$12.9B active per token---faster than a dense 34B model at comparable quality.
     \item Your workload is diverse. MoE naturally specializes experts for different input types (code, math, languages). Multilingual models benefit strongly from MoE.
     \item You can afford the training infrastructure for expert parallelism (all-to-all communication across GPUs).
 \end{itemize}
 
 \textbf{Choose dense scaling when:}
 \begin{itemize}
-    \item Memory is the binding constraint, not compute. A dense 7B model needs $\sim$14GB; a MoE with comparable quality needs 47B params in memory ($\sim$94GB), even though per-token compute is similar.
+    \item Memory is the binding constraint, not compute. A dense 7B model needs $\sim$14GB; a MoE with comparable quality needs 46.7B params in memory ($\sim$93GB), even though per-token compute is similar.
     \item You need fine-tuning simplicity. Dense models are straightforward to fine-tune; MoE models require careful handling to avoid routing collapse during fine-tuning.
     \item Serving infrastructure is simple. Dense models need standard tensor parallelism; MoE needs expert parallelism with all-to-all communication.
     \item Batch sizes are very small. MoE load balancing degrades with small batches (fewer tokens to distribute). Single-request latency often favors dense models.
@@ -610,7 +610,7 @@ At 100K tokens, the choice depends on what the task requires from those long con
 \textbf{Transformer at 100K tokens:}
 \begin{itemize}
     \item Quadratic attention: $100\text{K}^2 = 10^{10}$ elements in the attention matrix. Even with Flash Attention (which eliminates the memory bottleneck), the compute cost is significant.
-    \item KV cache at inference: For a 7B model with GQA (8 KV heads), 100K context in FP16 requires $\sim$50GB of KV cache alone. This dominates memory.
+    \item KV cache at inference: $2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{seq\_len} \times \text{bytes}$. For a 7B model (32 layers, head dim 128) with GQA (8 KV heads), 100K context in FP16: $2 \times 32 \times 8 \times 128 \times 100\text{K} \times 2\text{B} \approx 13$GB per sequence---and it would be $\sim$52GB with full MHA (32 KV heads), which is exactly why GQA matters at this scale. Either way, the cache (not the $\sim$14GB of weights) dominates per-request memory growth.
     \item Strength: Precise retrieval. If the task is ``find the contract clause on page 47 that contradicts page 3,'' attention can directly look up exact positions.
 \end{itemize}
 
@@ -659,30 +659,30 @@ Let me work through this with concrete numbers, using Mixtral 8x7B as a referenc
 
 \textbf{Parameter accounting:} In a transformer, each layer has two main components: attention (Q/K/V projections + output projection) and FFN (two or three linear layers). In Mixtral-style MoE, only the FFN is replicated across experts; the attention parameters are \textit{shared} across all tokens.
 
-For a model comparable to a dense 45B (Mixtral's effective quality level):
+Using Mixtral's actual configuration (32 layers, $d_{model} = 4096$, FFN dim 14336, GQA attention):
 \begin{itemize}
-    \item \textbf{Shared parameters} (embeddings + attention): $\sim$5B params. Every token uses these.
-    \item \textbf{Expert parameters} (8 FFN experts, each $\sim$5.25B): $8 \times 5.25\text{B} = 42\text{B}$ params.
-    \item \textbf{Total parameters:} $\sim$47B.
-    \item \textbf{Active parameters per token:} Shared (5B) + top-2 experts ($2 \times 5.25\text{B} = 10.5\text{B}$) = $\sim$15.5B.
+    \item \textbf{Shared parameters} (embeddings + attention): $\sim$1.7B params---attention is only $\sim$1.3B because GQA shrinks the K/V projections. Every token uses these.
+    \item \textbf{Expert parameters} (8 FFN experts, each $\sim$5.6B: $32 \times 3 \times 4096 \times 14336$): $8 \times 5.6\text{B} \approx 45\text{B}$ params.
+    \item \textbf{Total parameters:} 46.7B.
+    \item \textbf{Active parameters per token:} Shared ($\sim$1.7B) + top-2 experts ($2 \times 5.6\text{B} = 11.2\text{B}$) $\approx$ 12.9B.
 \end{itemize}
 
 \textbf{Compute comparison:}
 \begin{itemize}
     \item \textbf{Dense 45B model:} Every token activates all 45B parameters. Per-token FLOPs $\approx 2P = 90\text{B FLOPs}$ (forward pass).
-    \item \textbf{MoE 8x7B (top-2):} Per-token FLOPs $\approx 2 \times 15.5\text{B} = 31\text{B FLOPs}$ (forward pass).
-    \item \textbf{Compute savings:} $\frac{90\text{B}}{31\text{B}} \approx 2.9\times$ less compute per token.
+    \item \textbf{MoE 8x7B (top-2):} Per-token FLOPs $\approx 2 \times 12.9\text{B} \approx 26\text{B FLOPs}$ (forward pass).
+    \item \textbf{Compute savings:} $\frac{90\text{B}}{26\text{B}} \approx 3.5\times$ less compute per token.
 \end{itemize}
 
 \textbf{However, the savings are not ``free'':}
 \begin{itemize}
-    \item \textbf{Memory:} You still store all 47B params ($\sim$94GB in FP16), not just the 15.5B active ones.
-    \item \textbf{Communication:} Expert parallelism requires all-to-all communication to route tokens to the correct GPU holding each expert. This overhead reduces the theoretical $2.9\times$ speedup to $\sim$2\times$ in practice.
+    \item \textbf{Memory:} You still store all 46.7B params ($\sim$93GB in FP16), not just the 12.9B active ones.
+    \item \textbf{Communication:} Expert parallelism requires all-to-all communication to route tokens to the correct GPU holding each expert. This overhead reduces the theoretical $3.5\times$ speedup to roughly $2$--$2.5\times$ in practice.
     \item \textbf{Router overhead:} Small (a single linear layer per MoE layer), typically $<$1\% of total compute.
     \item \textbf{Load imbalance:} If experts are unevenly loaded, some GPUs wait while others finish. The effective throughput is limited by the slowest expert.
 \end{itemize}
 
-\textbf{General formula:} For $N$ experts with top-$k$ routing, the compute reduction vs.\ a dense model with equivalent total parameters is approximately $\frac{N}{k}$ for the FFN portion. Since FFN is $\sim$2/3$ of transformer FLOPs, the overall speedup is roughly $\frac{1}{1/3 + (2/3) \cdot (k/N)}$. For $N=8, k=2$: $\frac{1}{1/3 + 2/3 \cdot 1/4} = \frac{1}{1/3 + 1/6} = \frac{1}{1/2} = 2\times$.
+\textbf{General formula:} For $N$ experts with top-$k$ routing, the compute reduction vs.\ a dense model with equivalent total parameters is approximately $\frac{N}{k}$ for the FFN portion. Since FFN is $\sim$2/3 of transformer FLOPs, the overall speedup is roughly $\frac{1}{1/3 + (2/3) \cdot (k/N)}$. For $N=8, k=2$: $\frac{1}{1/3 + 2/3 \cdot 1/4} = \frac{1}{1/3 + 1/6} = \frac{1}{1/2} = 2\times$. Mixtral beats this generic $2\times$ (the worked $\approx 3.5\times$ above) because its FFN share of compute is far higher than 2/3: GQA shrinks attention while the expert FFNs are wide.
 
 \redflags
 \begin{itemize}
@@ -756,7 +756,7 @@ Best method & SmoothQuant, W8A8 & GPTQ, AWQ, GGUF & Native FP8 (torch.float8) \\
 \goodgreat
 \begin{itemize}
     \item \badgeLfive{L5} Knows INT8 is nearly lossless and INT4 degrades quality. Can name at least one method per precision level (GPTQ, SmoothQuant).
-    \item \badgeLsix{L6} Provides the decision framework above. Understands the difference between weight-only quantization (W4A16) and weight+activation quantization (W8A8). Knows that attention layers are more sensitive to quantization than FFN layers. Discusses FP8's per-tensor scaling mechanism.
+    \item \badgeLsix{L6} Provides the decision framework above. Understands the difference between weight-only quantization (W4A16) and weight+activation quantization (W8A8). Knows that quantization sensitivity is layer- and channel-specific (outlier channels, boundary layers) and should be measured per layer. Discusses FP8's per-tensor scaling mechanism.
     \item \badgeLseven{L7} Discusses mixed-precision quantization strategies (keep sensitive layers at higher precision, identified by Hessian-based sensitivity analysis). Knows about the SmoothQuant insight (migrating quantization difficulty via mathematically equivalent scaling). Can reason about when quantization-aware training (QAT) is worth the cost vs.\ PTQ.
 \end{itemize}
 
@@ -790,7 +790,7 @@ This is a common and insidious failure mode of quantization. The root cause is t
 
 \textbf{How to fix:}
 \begin{enumerate}
-    \item \textbf{Mixed-precision quantization:} Keep attention projection layers (Q, K, V, O) at INT8 while quantizing FFN layers to INT4. Or keep the first and last few layers at higher precision.
+    \item \textbf{Mixed-precision quantization:} Keep the layers your per-layer error profile flags as sensitive at INT8 while quantizing the rest to INT4---commonly the first and last few layers and FFN down-projections, sometimes the attention projections.
     \item \textbf{Use AWQ over naive PTQ:} AWQ specifically protects the salient channels that affect reasoning.
     \item \textbf{Increase quantization granularity:} Move from per-tensor to per-channel or per-group quantization. GPTQ with 128-element group size significantly outperforms per-tensor INT4.
     \item \textbf{Quantization-aware training (QAT):} If the accuracy gap is unacceptable, QAT with fine-tuning on domain-specific data can recover most of the loss. This is expensive but effective.

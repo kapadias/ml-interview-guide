@@ -382,6 +382,8 @@ A remarkable property of well-trained embeddings:
 
 This works because embeddings capture relational structure, not just similarity.
 
+\textbf{Caveat}: the canonical result depends partly on the evaluation protocol---the standard analogy test excludes the input words (``king,'' ``man,'' ``woman'') from the candidate set, and without that exclusion the nearest neighbor of the arithmetic result is often ``king'' itself (Nissim et al., 2020). Present the example as evidence of approximate linear regularities in the space, not as exact vector arithmetic; an expert interviewer will push back on the uncritical version.
+
 \begin{warningbox}
 Static word embeddings (Word2Vec, GloVe) are rarely the right choice for modern applications. Always prefer contextual embeddings from pre-trained models. The main exception: when you need extremely fast, fixed-vocabulary lookup (e.g., a feature in a tabular model) or when operating in very low-resource settings.
 \end{warningbox}
@@ -412,7 +414,7 @@ Byte-level (GPT-2+) & Universal across languages & Some tokens are meaningless b
 \end{tabularx}
 \end{table}
 
-\textbf{Vocabulary size trade-off}: Larger vocabularies mean more embedding parameters ($|V| \times d$) and more single-token representations (better per-token semantics), but also larger memory footprint and sparser training signal per token. Common sizes: 32K (GPT-2), 50K (BERT), 128K (LLaMA 3)---the trend is toward larger vocabularies as models scale.
+\textbf{Vocabulary size trade-off}: Larger vocabularies mean more embedding parameters ($|V| \times d$) and more single-token representations (better per-token semantics), but also larger memory footprint and sparser training signal per token. Common sizes: 30,522 (BERT, WordPiece), 50,257 (GPT-2, byte-level BPE), 32K (LLaMA 2), 128K (LLaMA 3)---the trend is toward larger vocabularies as models scale.
 
 \textbf{Key interaction}: Rare words get split into many subword tokens. Each subword has its own embedding, and the model must compose them through attention layers to reconstruct the word's meaning. This means embedding quality for rare words depends on the model's depth and attention capacity, not just the embedding table itself.
 
@@ -432,7 +434,7 @@ Byte-level (GPT-2+) & Universal across languages & Some tokens are meaningless b
 
 Unrelated items clustering together in embedding space means the model has failed to learn discriminative representations. I would diagnose the root cause before applying fixes.
 
-\textbf{Step 1: Characterize the failure.} Compute the average pairwise cosine similarity for random pairs---if it's $>0.8$, this is likely \textit{embedding collapse} (all embeddings converging to a similar region), not just local clustering errors. Plot the singular value spectrum of the embedding matrix: if the effective rank is much lower than the embedding dimension (e.g., 95\% of variance captured by 10 out of 768 dimensions), the embeddings have collapsed to a low-dimensional subspace.
+\textbf{Step 1: Characterize the failure.} Compute the average pairwise cosine similarity for random pairs---if it's $>0.8$ for a contrastively trained model, this is likely \textit{embedding collapse} (all embeddings converging to a similar region), not just local clustering errors. (Caveat: raw pre-trained LM features are anisotropic and can average 0.5--0.9 cosine without being collapsed, so calibrate the threshold to how the embeddings were trained.) Plot the singular value spectrum of the embedding matrix: if the effective rank is much lower than the embedding dimension (e.g., 95\% of variance captured by 10 out of 768 dimensions), the embeddings have collapsed to a low-dimensional subspace.
 
 \textbf{Step 2: Check for collapse causes.} (a) \textit{Insufficient negative mining}: If contrastive training uses only random negatives, the model can achieve low loss by mapping everything to a general ``content'' region. Hard negatives force the model to make fine-grained distinctions. (b) \textit{Temperature too high}: In InfoNCE loss, $\loss = -\log \frac{\exp(\text{sim}^+/\tau)}{\sum \exp(\text{sim}/\tau)}$, a high $\tau$ makes the softmax ``softer,'' reducing the penalty for similar negative scores. Lower $\tau$ (e.g., 0.05--0.1) forces sharper discrimination. (c) \textit{Learning rate too high}: The model may have overshot to a degenerate minimum. (d) \textit{Batch size too small}: With in-batch negatives, small batches provide weak negative signal.
 
@@ -562,9 +564,9 @@ Static embeddings (Word2Vec, GloVe, FastText) assign a single fixed vector per w
 
 \textbf{INT8:} $50{,}000 \times 768 \times 1$ byte = 38,400,000 bytes $\approx$ \textbf{36.6 MB}. Plus quantization parameters: for per-row quantization (one scale and zero-point per vocabulary entry), add $50{,}000 \times 2 \times 4$ bytes (scale + zero-point in FP32) = 400 KB---negligible overhead.
 
-\textbf{Practical context:} A 50K vocab at 768-dim is small (BERT-sized). For modern LLMs with 128K vocab and 4096-dim embeddings: $128{,}000 \times 4{,}096 \times 2$ bytes (FP16) = 1.05 GB just for the embedding table. This is why LLMs often tie input and output embedding weights (saving one copy) and why vocabulary size is a significant architectural decision.
+\textbf{Practical context:} A 50K vocab at 768-dim is small (BERT-sized). For modern LLMs with 128K vocab and 4096-dim embeddings: $128{,}000 \times 4{,}096 \times 2$ bytes (FP16) = 1.05 GB just for the embedding table. Whether to tie input and output embedding weights (saving one copy) depends on scale: tying is common in \textit{smaller} models where the table is a large fraction of total parameters (GPT-2, Gemma), while most large models (the LLaMA family, GPT-3-scale and beyond) leave them untied because the relative saving is small and untying adds flexibility. Either way, vocabulary size is a significant architectural decision.
 
-\textbf{Memory beyond the embedding table:} In production, the embedding table is often a small fraction of total memory. The dominant costs are: (1) model weights (for a 7B model, $\sim$14 GB in FP16), (2) KV cache during inference ($\sim$1--4 GB depending on batch size and sequence length), (3) activation memory during training. The embedding table matters most when it's the primary artifact---e.g., in a pure retrieval system where you store embeddings for millions of items in a vector database.
+\textbf{Memory beyond the embedding table:} In production, the embedding table is often a small fraction of total memory. The dominant costs are: (1) model weights (for a 7B model, $\sim$14 GB in FP16), (2) KV cache during inference ($\sim$1--4 GB for a single sequence at moderate context length; at production batch sizes the KV cache commonly reaches tens of GB and becomes the binding memory constraint for serving), (3) activation memory during training. The embedding table matters most when it's the primary artifact---e.g., in a pure retrieval system where you store embeddings for millions of items in a vector database.
 
 \redflags
 \begin{itemize}
@@ -579,7 +581,7 @@ Static embeddings (Word2Vec, GloVe, FastText) assign a single fixed vector per w
 \begin{itemize}
     \item \badgeLfive{L5} Correct calculation for FP16 and INT8, with clear arithmetic.
     \item \badgeLsix{L6} Adds quantization parameter overhead, scales the calculation to modern LLM vocabulary sizes, and discusses weight tying.
-    \item \badgeLseven{L7} Discusses practical deployment implications---how embedding table size interacts with model parallelism (embedding tables are often replicated across all GPUs), how vocabulary size affects throughput (larger softmax over vocabulary), and the trade-off between vocabulary size and sequence length for a fixed compute budget.
+    \item \badgeLseven{L7} Discusses practical deployment implications---how embedding table size interacts with the parallelism strategy (in Megatron-style tensor parallelism the table is \textit{sharded along the vocabulary dimension}---vocab-parallel embedding---whereas pure data parallelism replicates it on every GPU, as it does all weights), how vocabulary size affects throughput (larger softmax over vocabulary), and the trade-off between vocabulary size and sequence length for a fixed compute budget.
 \end{itemize}
 
 \followups{``How does the output embedding (LM head) relate to the input embedding?'' ``What is weight tying and why is it used?'' ``How would you quantize an embedding table without losing retrieval quality?''}
@@ -596,7 +598,7 @@ Static embeddings (Word2Vec, GloVe, FastText) assign a single fixed vector per w
 
 \textbf{Definition.} Embedding collapse occurs when a learned embedding function maps all (or most) inputs to a small region of the embedding space, losing discriminative power. In the extreme case, all embeddings converge to a single point. In milder forms, embeddings occupy a low-dimensional subspace of the full embedding space (dimensional collapse).
 
-\textbf{Why it happens.} Collapse is a \textit{degenerate global minimum} of many loss functions. Consider a contrastive loss: if all embeddings are identical, the positive similarity and negative similarity are both maximal and equal, so the loss is $-\log(1/N)$---a constant. The model can reach this state by learning a constant function, which is easier than learning discriminative features. Collapse typically occurs when the loss doesn't have sufficient repulsive forces to push embeddings apart.
+\textbf{Why it happens.} The answer depends on the objective, and interviewers probe this distinction. For \textit{positive-only} objectives (e.g., BYOL or SimSiam with the predictor and stop-gradient removed), collapse \textit{is} a degenerate global minimum: mapping every input to the same vector makes every positive pair perfectly aligned at zero loss, and nothing in the loss opposes it---the model can reach this state by learning a constant function, which is easier than learning discriminative features. For contrastive losses \textit{with negatives} (InfoNCE), collapse is \textit{not} the global minimum: if all embeddings are identical, positive and negative similarities are equal, so the loss is $\log N$---chance level, strictly worse than what well-separated embeddings achieve. This repulsive term is precisely why contrastive losses resist collapse. When collapse does occur under a contrastive loss, it is an \textit{optimization} failure (negatives too easy to supply a repulsive gradient, temperature or learning rate poorly set), not a property of the loss's global structure.
 
 \textbf{Types of collapse:}
 \begin{itemize}
@@ -607,7 +609,7 @@ Static embeddings (Word2Vec, GloVe, FastText) assign a single fixed vector per w
 
 \textbf{Detection metrics:}
 \begin{enumerate}
-    \item \textbf{Average pairwise cosine similarity}: Sample 10K random pairs; healthy range is 0.0--0.3; $>$0.7 signals collapse.
+    \item \textbf{Average pairwise cosine similarity}: Sample 10K random pairs; for contrastively trained embeddings a healthy range is 0.0--0.3, and $>$0.7 signals collapse. \textit{Anisotropy caveat}: raw pre-trained LM features (no contrastive fine-tuning) occupy a narrow cone and routinely average 0.5--0.9 cosine while still ranking neighbors usefully---applied naively, this threshold would misdiagnose every vanilla-BERT feature space as collapsed. Use it only for embeddings trained with a contrastive or metric objective.
     \item \textbf{Singular value spectrum}: Compute SVD of the embedding matrix. Plot singular values on a log scale. A sharp drop-off (first few singular values dominate) indicates dimensional collapse.
     \item \textbf{Uniformity metric} (Wang \& Isola, 2020): $\mathcal{L}_{\text{uniform}} = \log \E[\exp(-2\|\vz_i - \vz_j\|^2)]$. More negative = more uniform distribution on the hypersphere = healthier embeddings.
     \item \textbf{Downstream task performance}: If training loss looks fine but downstream recall/accuracy doesn't improve, collapse is likely.
@@ -654,7 +656,7 @@ Subword tokenization (BPE, WordPiece, SentencePiece) determines the granularity 
 
 \textbf{Frequency-quality correlation.} Frequent words get single tokens (``the,'' ``is'') and therefore have dedicated embedding vectors trained on millions of examples. Rare words get split into multiple subword tokens (``photosynthesis'' $\to$ \texttt{[photo, synth, esis]}). Each subword has its own embedding, but the model must \textit{compose} them through subsequent layers (attention, FFN) to reconstruct the word's meaning. This composition is lossy---the model has seen fewer training examples of this specific combination, so the composed representation is noisier.
 
-\textbf{Vocabulary size trade-off.} Larger vocabularies (128K in LLaMA 3 vs. 32K in GPT-2) mean more words get single-token representations. Benefits: better per-token semantics, shorter sequences (fewer tokens per text $\to$ fits more context in the window, faster inference). Costs: larger embedding table (more parameters, more memory), each token seen less frequently during training (sparser signal). The optimal vocabulary size depends on the training data size---more data can support a larger vocabulary.
+\textbf{Vocabulary size trade-off.} Larger vocabularies (128K in LLaMA 3 vs. 50K in GPT-2 or 32K in LLaMA 2) mean more words get single-token representations. Benefits: better per-token semantics, shorter sequences (fewer tokens per text $\to$ fits more context in the window, faster inference). Costs: larger embedding table (more parameters, more memory), each token seen less frequently during training (sparser signal). The optimal vocabulary size depends on the training data size---more data can support a larger vocabulary.
 
 \textbf{Embedding quality impacts by token type:}
 \begin{itemize}
@@ -698,7 +700,7 @@ I would investigate in a systematic order, moving from cheap diagnostics to more
 
 \textbf{Step 1: Visualize.} Use UMAP (preferred over t-SNE for preserving global structure) to project embeddings to 2D. Check if semantically similar items form clusters and if dissimilar items are separated. Color-code by known categories. If the visualization shows no meaningful structure, the embeddings are fundamentally broken.
 
-\textbf{Step 2: Quantitative cluster analysis.} Compute average intra-class cosine similarity (should be high, e.g., $>0.6$) and inter-class cosine similarity (should be low, e.g., $<0.3$). If both are high, this is embedding collapse. If both are moderate, the embeddings are under-trained. If intra-class is low, the model hasn't learned category-level structure---check training data quality.
+\textbf{Step 2: Quantitative cluster analysis.} Compute average intra-class cosine similarity (should be high, e.g., $>0.6$) and inter-class cosine similarity (should be low, e.g., $<0.3$). If both are high, this is embedding collapse---though for raw un-fine-tuned LM features, uniformly high cosine is ordinary anisotropy rather than collapse, so judge by the intra-/inter-class \textit{gap} rather than the absolute values. If both are moderate, the embeddings are under-trained. If intra-class is low, the model hasn't learned category-level structure---check training data quality.
 
 \textbf{Step 3: Nearest neighbor sanity check.} For 50--100 diverse query items, retrieve the top-10 nearest neighbors by cosine similarity. Manually inspect: do neighbors make semantic sense? Are there systematic errors (e.g., neighbors always share surface keywords but not deeper meaning)? This catches both embedding quality issues and similarity metric issues.
 

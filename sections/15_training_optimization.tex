@@ -28,7 +28,7 @@ where $\eta$ is the learning rate and $\beta$ (typically $0.9$) is the momentum 
 
 \textbf{When to use.} Vision tasks (ResNets, ConvNeXt), settings where you want maximum generalization and are willing to tune the learning rate carefully.
 
-\textbf{Pitfalls.} Requires careful LR tuning and a good schedule. Without a schedule, momentum SGD often stalls at saddle points.
+\textbf{Pitfalls.} Requires careful LR tuning and a good schedule. Without a schedule, momentum SGD converges slowly in the late stages of training---the constant learning rate keeps gradient noise high, so the iterates keep bouncing around the minimum instead of settling into it.
 
 \subsection{Adam}
 
@@ -46,6 +46,8 @@ Defaults: $\beta_1 = 0.9$, $\beta_2 = 0.999$, $\epsilon = 10^{-8}$.
 \end{mathresult}
 
 \textbf{Bias correction in one sentence:} Since $m_0 = v_0 = 0$, the early estimates are biased toward zero; dividing by $(1 - \beta^t)$ corrects this. The correction matters most in the first few hundred steps and becomes negligible as $t$ grows.
+
+\textbf{LLM pretraining note:} $\beta_2 = 0.999$ is the textbook default, but LLM pretraining (GPT-3, LLaMA, Chinchilla) universally uses $\beta_2 = 0.95$. With $\beta_2 = 0.999$ the second moment averages over $\sim$1000 steps, so when the gradient scale shifts abruptly (a hard batch, a loss spike), the denominator $\sqrt{\hat{v}_t}$ adapts far too slowly and the optimizer takes oversized steps. $\beta_2 = 0.95$ tracks recent gradient magnitudes ($\sim$20 steps), making training far more resilient to spikes. Quoting $\beta_2 = 0.95$ (with this rationale) is a standard ``have you actually trained an LLM'' signal in interviews.
 
 \textbf{When to use.} NLP tasks, transformers, GANs, any setting where you want fast convergence with less LR tuning. Adam is the default starting point for most deep learning.
 
@@ -458,7 +460,9 @@ Regularization prevents overfitting by constraining model capacity. The right co
 
 \textbf{Critical distinction.} L2 regularization (add $\lambda\theta$ to the gradient) and decoupled weight decay (subtract $\lambda\theta$ from parameters directly) are equivalent for SGD but \textbf{not equivalent for Adam}. See Section~\ref{sec:optimizers} on AdamW.
 
-\textbf{Typical values:} $\lambda = 0.01$ for AdamW (LLMs), $\lambda = 10^{-4}$ for SGD (vision).
+\textbf{Typical values:} $\lambda = 0.1$ for AdamW in LLM pretraining (GPT-3, LLaMA, and essentially all modern LLMs use $0.1$; $0.01$ is a common fine-tuning default), $\lambda = 10^{-4}$ for SGD (vision).
+
+\textbf{What not to decay:} Standard practice excludes LayerNorm parameters, biases, and (usually) embeddings from weight decay. These parameters are scale-sensitive---decaying a LayerNorm gain toward zero directly shrinks the layer's output---and they make up a negligible fraction of total parameters, so decaying them adds instability without meaningful regularization.
 
 \subsection{Data Augmentation}
 
@@ -691,22 +695,26 @@ Gradients & $\nabla_\theta \loss$ for each param & 2 (BF16) or 4 (FP32) \\
 Optimizer states (Adam) & First moment $m$ + second moment $v$ & 8 (FP32 for both) \\
 Master weights & FP32 copy for mixed precision & 4 (FP32) \\
 \midrule
-\textbf{Total (mixed precision + Adam)} & & \textbf{$\sim$18 per param} \\
+\textbf{Total (mixed precision + Adam)} & & \textbf{16 (BF16 grads) or 18 (FP32 grads)} \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\textbf{Rule of thumb:} For a model with $P$ billion parameters trained with AdamW in mixed precision, the parameter-related memory is approximately $18P$ GB. A 7B model needs $\sim$126 GB just for parameters, gradients, and optimizer states---before activations.
+\textbf{State your convention.} The total depends on the gradient precision, and interviewers redo this arithmetic live, so say which convention you are using: with BF16 gradients (the common setup) the total is $2 + 2 + 8 + 4 = 16$ bytes/param; if gradients are kept or accumulated in FP32, it is $2 + 4 + 8 + 4 = 18$ bytes/param.
+
+\textbf{Rule of thumb:} For a model with $P$ billion parameters trained with AdamW in mixed precision, the parameter-related memory is approximately $16P$ GB (BF16 gradients), or $18P$ GB with FP32 gradients. A 7B model needs $\sim$112 GB ($\sim$126 GB with FP32 grads) just for parameters, gradients, and optimizer states---before activations. This book uses the 16 bytes/param convention throughout (e.g., the 70B estimate in the interview questions below).
 
 \subsection{Activation Memory}
 
-Activation memory scales with batch size, sequence length, hidden dimension, and number of layers. For a Transformer with $L$ layers, hidden dimension $d$, sequence length $s$, and batch size $b$:
+Activation memory scales with batch size, sequence length, hidden dimension, and number of layers---and it is much larger than a naive $b \cdot s \cdot h$ estimate, because each Transformer layer stores not just its output but the QKV projections, attention scores, and the $4d$ MLP intermediates for the backward pass. The standard per-layer accounting (Korthikanti et al., 2022) for a Transformer layer with hidden dimension $h$, $a$ attention heads, sequence length $s$, and micro-batch size $b$, stored in BF16 without recomputation, is:
 
 \begin{equation}
-\text{Activation memory} \approx 2 \cdot b \cdot s \cdot d \cdot L \cdot \text{bytes\_per\_element}
+\text{Activation memory per layer} \approx s \cdot b \cdot h \left(34 + 5 \cdot \frac{a \cdot s}{h}\right) \text{ bytes}
 \end{equation}
 
-The factor of 2 accounts for both forward activations and intermediate values needed for backward. Gradient checkpointing reduces this from $O(L)$ to $O(\sqrt{L})$ at the cost of $\sim$33\% recomputation.
+The $34\,sbh$ term covers the linear projections, MLP intermediates, and norms; the $5as^2b$ term is the attention score matrices, which is why long sequences blow up activation memory quadratically (FlashAttention avoids materializing this term, effectively removing it).
+
+\textbf{Worked example.} A 7B LLaMA-style model ($h = 4096$, $a = 32$, $L = 32$ layers) with $b = 1$, $s = 2048$: per layer, $2048 \times 4096 \times (34 + 5 \times 32 \times 2048 / 4096) = 8.4\text{M} \times 114 \approx 0.96$ GB. Across 32 layers: $\sim$31 GB for a \textit{single} sequence---comparable to the model weights themselves. Gradient checkpointing reduces this from $O(L)$ to $O(\sqrt{L})$ at the cost of $\sim$33\% recomputation.
 
 \subsection{LoRA Memory Savings}
 
@@ -747,7 +755,7 @@ For a dense Transformer model with $P$ parameters, the compute per token during 
 \text{Tokens/sec (theoretical)} = \frac{C}{6P}
 \end{equation}
 
-In practice, you achieve 30--50\% of this theoretical peak (called Model FLOPs Utilization, or MFU). An A100 delivers $\sim$312 TFLOP/s in BF16, so a single A100 training a 7B model achieves roughly $\frac{312 \times 10^{12}}{6 \times 7 \times 10^9} \times 0.4 \approx 3{,}000$ tokens/sec.
+In practice, you achieve 30--50\% of this theoretical peak (called Model FLOPs Utilization, or MFU). An A100 delivers $\sim$312 TFLOP/s in BF16, so training a 7B model achieves roughly $\frac{312 \times 10^{12}}{6 \times 7 \times 10^9} \times 0.4 \approx 3{,}000$ tokens/sec \textit{per GPU}. Note that a 7B model does not actually fit for training on a single A100-80GB ($\sim$112 GB of parameter-related state alone, before activations)---so read this as per-GPU throughput within a multi-GPU job (e.g., FSDP across a node), where per-GPU compute is unchanged but memory is sharded.
 
 %==============================================================================
 \section{Interview Questions}
@@ -810,7 +818,7 @@ First, memory estimation. A 70B model with AdamW in mixed precision needs approx
     \item Gradients in BF16: $70\text{B} \times 2 = 140$ GB
     \item Optimizer states (AdamW, FP32 $m$ + $v$): $70\text{B} \times 8 = 560$ GB
     \item FP32 master weights: $70\text{B} \times 4 = 280$ GB
-    \item \textbf{Total:} $\sim$1,120 GB before activations
+    \item \textbf{Total:} $\sim$1,120 GB before activations (16 bytes/param with BF16 gradients; 18 if gradients are kept in FP32)
 \end{itemize}
 
 This does not fit on a single 80 GB A100. I would use \textbf{3D parallelism}:
@@ -1016,7 +1024,7 @@ NaN loss means a numerical infinity or invalid value has propagated through the 
 
 Linear scaling from 1 to 8 GPUs is the theoretical ideal. Getting only 60\% means 40\% of potential throughput is lost to overhead. I would profile and investigate these causes in order:
 
-\textbf{Hypothesis 1 --- Communication bottleneck (most common).} In DDP, gradients are synchronized via all-reduce after every backward pass. If the all-reduce takes a significant fraction of the step time, scaling efficiency drops. \textit{Diagnosis:} Use \texttt{torch.profiler} or NCCL logging to measure the fraction of time spent in all-reduce. For a model with $P$ parameters in BF16, each all-reduce sends $2P$ bytes per GPU. On 8 GPUs with PCIe Gen4 ($\sim$25 GB/s bidirectional), a 7B model sends $\sim$14 GB---this takes $\sim$560 ms, which can dominate a 200 ms compute step. \textit{Fix:} Use NVLink interconnect ($\sim$600 GB/s); overlap communication with computation (\texttt{gradient\_as\_bucket\_view=True} in PyTorch DDP); reduce model size or use gradient compression.
+\textbf{Hypothesis 1 --- Communication bottleneck (most common).} In DDP, gradients are synchronized via all-reduce after every backward pass. If the all-reduce takes a significant fraction of the step time, scaling efficiency drops. \textit{Diagnosis:} Use \texttt{torch.profiler} or NCCL logging to measure the fraction of time spent in all-reduce. For a model with $P$ parameters in BF16, the gradients are $2P$ bytes, and ring all-reduce moves $\approx 2 \times \frac{N-1}{N}$ times that per GPU---roughly $2\times$ the gradient size. For a 7B model that is $\sim$28 GB per GPU; on PCIe Gen4 ($\sim$25 GB/s) that takes $\sim$1.1 s, which can dominate a 200 ms compute step. \textit{Fix:} Use NVLink interconnect ($\sim$600 GB/s). Note that DDP already overlaps bucketed all-reduce with the backward pass by default, so communication is partially hidden---but only up to the point where backward compute runs out (\texttt{gradient\_as\_bucket\_view=True} is a \textit{memory} optimization that avoids a gradient copy, not the overlap mechanism). Beyond that: reduce model size or use gradient compression.
 
 \textbf{Hypothesis 2 --- Data loading starvation.} If the data pipeline cannot feed 8 GPUs fast enough, GPUs idle between steps. \textit{Diagnosis:} Check GPU utilization with \texttt{nvidia-smi}---if it oscillates between 0\% and 100\%, data loading is the bottleneck. \textit{Fix:} Increase \texttt{num\_workers}; use memory-mapped datasets; add prefetching; move data to local SSD.
 
@@ -1184,7 +1192,7 @@ Min hardware & 4$\times$ A100-80GB & 1$\times$ A100-80GB & 1$\times$ A100-40GB \
 \textbf{Constant LR with warmup} (warmup $\to$ constant $\eta$):
 \begin{itemize}
     \item \textbf{When:} The training budget is open-ended or you want to continue training / fine-tune later from a checkpoint. Also useful for continual learning, or when you are uncertain about the right total step count.
-    \item \textbf{Why:} The model never enters a low-LR ``settling'' phase, so checkpoints at any point during training are equally viable for downstream use. Recent work (Chinchilla, MiniCPM) has shown that constant LR followed by a short cooldown phase can match cosine decay in final performance.
+    \item \textbf{Why:} The model never enters a low-LR ``settling'' phase, so checkpoints at any point during training are equally viable for downstream use. The WSD (warmup-stable-decay) line of work (MiniCPM, Hu et al.\ 2024; H\"{a}gele et al.\ 2024) showed that constant LR followed by a short cooldown phase can match cosine decay in final performance. (Do not attribute this to Chinchilla---Chinchilla used cosine, and its schedule finding was that the cosine horizon should match the training length.)
     \item \textbf{Limitation:} Without decay, the constant gradient noise can prevent convergence to a sharp minimum. A short ``cooldown'' (rapid LR decay over the final 5--10\% of training) is usually necessary to close the gap with cosine.
 \end{itemize}
 
@@ -1201,7 +1209,7 @@ Min hardware & 4$\times$ A100-80GB & 1$\times$ A100-80GB & 1$\times$ A100-40GB \
 \goodgreat
 \begin{itemize}
     \item \badgeLfive{L5} Knows cosine is the default for Transformers and can explain the basic schedule shape. Knows warmup is needed.
-    \item \badgeLsix{L6} Identifies the fixed-budget limitation of cosine and proposes constant + cooldown as the alternative. References Chinchilla or similar work on schedule flexibility.
+    \item \badgeLsix{L6} Identifies the fixed-budget limitation of cosine and proposes constant + cooldown as the alternative. References the WSD literature (MiniCPM, H\"{a}gele et al.\ 2024) on schedule flexibility.
     \item \badgeLseven{L7} Discusses how the schedule interacts with the loss landscape (high LR explores, low LR exploits). Knows about WSD (warmup-stable-decay) schedules and their advantages for continual pretraining. Can connect LR schedule to learning rate rewinding for lottery ticket hypothesis or model soups.
 \end{itemize}
 

@@ -171,7 +171,7 @@ Self-supervised learning (SSL) learns representations from unlabeled data by def
 \STATE $h_i = f(\tilde{x}_i)$ for all $i$ \COMMENT{Representations}
 \STATE $z_i = g(h_i)$ for all $i$ \COMMENT{Projections}
 \FOR{each positive pair $(i, j)$}
-    \STATE $\ell_{i,j} = -\log \frac{\exp(\text{sim}(z_i, z_j)/\tau)}{\sum_{k=1}^{2N} \mathbbm{1}_{k \neq i} \exp(\text{sim}(z_i, z_k)/\tau)}$
+    \STATE $\ell_{i,j} = -\log \frac{\exp(\text{sim}(z_i, z_j)/\tau)}{\sum_{k=1}^{2N} \mathds{1}_{k \neq i} \exp(\text{sim}(z_i, z_k)/\tau)}$
 \ENDFOR
 \STATE $\mathcal{L} = \frac{1}{2N} \sum_{k=1}^{N} [\ell_{2k-1, 2k} + \ell_{2k, 2k-1}]$
 \RETURN $\mathcal{L}$
@@ -552,34 +552,31 @@ Mask part of the input, predict the masked content from context.
 \begin{figure}[H]
 \centering
 \begin{tikzpicture}[
-    node distance=1cm,
-    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=yellow!20, font=\small},
-    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2.5cm, font=\small, align=center},
+    box/.style={rectangle, draw, rounded corners, minimum width=1.6cm, minimum height=0.9cm, align=center, font=\footnotesize},
     arrow/.style={->, thick}
 ]
-    % Start
-    \node[decision] (scale) {Corpus size?};
-    
-    % Scale branches
-    \node[decision, below left=1.5cm and 1cm of scale] (small) {Latency?};
-    \node[decision, below right=1.5cm and 1cm of scale] (large) {Real-time?};
-    
-    % Results
-    \node[result, below left=1cm and 0cm of small] (cross) {Cross-Encoder};
-    \node[result, below right=1cm and 0cm of small] (poly) {Poly-Encoder};
-    \node[result, below left=1cm and 0cm of large] (twostage) {Two-Stage\\(Two-Tower + Rerank)};
-    \node[result, below right=1cm and 0cm of large] (tower) {Two-Tower Only};
-    
+    % Pipeline
+    \node[box, fill=lightyellow] (input) {Image\\patches};
+    \node[box, fill=lightyellow, right=0.6cm of input] (visible) {Visible\\patches (25\%)};
+    \node[box, fill=lightblue, right=0.6cm of visible] (enc) {Encoder\\(large ViT)};
+    \node[box, fill=orange!30, right=0.6cm of enc] (masktok) {Append\\mask tokens};
+    \node[box, fill=lightgreen, right=0.6cm of masktok] (dec) {Decoder\\(lightweight)};
+    \node[box, fill=lightyellow, right=0.6cm of dec] (recon) {Pixel\\reconstruction};
+
     % Edges
-    \draw[arrow] (scale) -- node[above left, font=\small] {$<$10K} (small);
-    \draw[arrow] (scale) -- node[above right, font=\small] {$>$10K} (large);
-    \draw[arrow] (small) -- node[left, font=\small] {Flexible} (cross);
-    \draw[arrow] (small) -- node[right, font=\small] {$<$100ms} (poly);
-    \draw[arrow] (large) -- node[left, font=\small] {Yes} (twostage);
-    \draw[arrow] (large) -- node[right, font=\small] {Batch} (tower);
+    \draw[arrow] (input) -- node[above, font=\tiny, align=center] {random\\75\% mask} (visible);
+    \draw[arrow] (visible) -- (enc);
+    \draw[arrow] (enc) -- (masktok);
+    \draw[arrow] (masktok) -- (dec);
+    \draw[arrow] (dec) -- node[above, font=\tiny, align=center] {MSE on masked\\patches only} (recon);
+
+    % Annotations
+    \node[below=0.3cm of enc, font=\tiny, align=center] {processes only\\visible patches};
+    \node[below=0.3cm of masktok, font=\tiny, align=center] {shared learned\\mask token};
+    \node[below=0.3cm of dec, font=\tiny, align=center] {few layers, discarded\\after pre-training};
 \end{tikzpicture}
-\caption{Decision tree for similarity architecture selection.}
-\label{fig:arch_decision}
+\caption{MAE architecture: 75\% of patches are randomly masked, the large encoder processes only the visible 25\%, mask tokens are appended, and a lightweight decoder reconstructs the masked pixels.}
+\label{fig:mae_architecture}
 \end{figure}
 
 \subsubsection{Key Design Choices}
@@ -632,7 +629,7 @@ BERT & Text & 15\% & Token IDs & Bidirectional context \\
 GPT & Text & N/A (causal) & Next token & Autoregressive \\
 MAE & Images & 75\% & Pixels & High masking for vision \\
 BEiT & Images & 40\% & Discrete tokens & BERT-style for vision \\
-data2vec & Multi-modal & 50\% & Latent features & Unified framework \\
+data2vec & Any (trained per modality) & 50\% & Latent features & Modality-agnostic objective \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -646,9 +643,9 @@ data2vec & Multi-modal & 50\% & Latent features & Unified framework \\
 
 \textbf{InfoNCE Lower Bound.} InfoNCE loss provides a lower bound on mutual information:
 \begin{equation}
-I(X; Y) \geq \log(K) - \mathcal{L}_{InfoNCE}
+I(X; Y) \geq \log(K+1) - \mathcal{L}_{InfoNCE}
 \end{equation}
-where $K$ is the number of negative samples.
+where $K$ is the number of negative samples, so $K+1$ is the total number of candidates scored by the softmax. (CPC writes the bound as $\log N$ with $N$ total candidates; we count negatives throughout this chapter, hence $N = K+1$.)
 
 \textbf{Interpretation}: Minimizing InfoNCE maximizes a lower bound on mutual information between different views of the same data.
 
@@ -816,7 +813,7 @@ Quick decision: (1) CNN backbone? $\to$ SimCLR/MoCo or BYOL. (2) ViT backbone, c
 
 \textit{Hypothesis 2: Capacity saturation.} The model may be too small to benefit from more data. A ViT-Base that saturates at 1M images might need scaling to ViT-Large to absorb 10M images' worth of information. Check by plotting linear probe accuracy vs.\ model size at each data scale.
 
-\textit{Hypothesis 3: Training duration.} SSL methods often need hundreds of epochs. With 10$\times$ more data, you may need to maintain the same number of gradient steps (not epochs), meaning 10$\times$ fewer epochs but the same wall-clock compute. If you kept epochs constant, you effectively trained 10$\times$ longer but with diminishing returns.
+\textit{Hypothesis 3: Training duration.} SSL methods often need hundreds of epochs, so check what was actually held constant across the two runs. At a fixed step budget (same wall-clock compute), 10$\times$ more data means 10$\times$ fewer passes over each example---the model may simply be under-trained relative to the larger dataset. If instead epochs were held constant, the 10M run used 10$\times$ the compute, and the comparison conflates data scale with compute scale. Check: compare runs at matched compute and verify the pre-training loss curves have converged; if the 10M-image loss is still decreasing, the plateau is under-training, not a data limit.
 
 \textit{Hypothesis 4: Data quality.} The new 9M images may be lower quality, out of domain, or too homogeneous. Duplicate or near-duplicate images inflate dataset size without adding information. Check: run deduplication, verify domain alignment, and evaluate a stratified subset.
 
@@ -850,7 +847,7 @@ Quick decision: (1) CNN backbone? $\to$ SimCLR/MoCo or BYOL. (2) ViT backbone, c
 
 \textit{Context access.} BERT sees both left and right context for every masked position, giving it richer understanding of each token. GPT sees only left context, which is more restrictive but naturally matches the generation task.
 
-\textit{Training signal density.} MLM provides a gradient signal for only 15\% of tokens per forward pass---the masked ones. CLM provides a signal for every token (100\%). This means GPT extracts $\sim$6.7$\times$ more training signal per sequence, making it more data-efficient per token processed.
+\textit{Training signal density.} MLM provides a gradient signal for only 15\% of tokens per forward pass---the masked ones. CLM provides a signal for every token (100\%), so GPT computes $\sim$6.7$\times$ more loss terms per sequence. Be careful not to oversell this as data efficiency: loss coverage is not sample efficiency. At matched scale, MLM-family models were \emph{more} sample-efficient on NLU benchmarks (RoBERTa vs.\ GPT-2), and masking rates well above 15\% can work better (Wettig et al., ``Should You Mask 15\%?''). The defensible claim is more loss terms per FLOP, which compounds with the interface and scaling advantages below.
 
 \textit{Task alignment.} MLM naturally aligns with understanding tasks (classification, NER, QA) because the model learns bidirectional representations. CLM naturally aligns with generation because it directly models $p(x_t | x_{<t})$, which is exactly what we sample during inference. This is why BERT dominates NLU benchmarks while GPT dominates generation.
 
@@ -884,7 +881,7 @@ Quick decision: (1) CNN backbone? $\to$ SimCLR/MoCo or BYOL. (2) ViT backbone, c
 
 \stronganswer BERT-base has 110M parameters. I'll estimate the total FLOPs and translate to GPU-hours.
 
-\textit{Data size.} 16GB of text at $\sim$4 bytes/token (BPE) $\approx$ 4B tokens. With sequence length 512 and 15\% masking, training processes 4B tokens over $\sim$40 epochs (1M steps $\times$ 256 batch size $\times$ 512 seq length $\approx$ 131B total tokens processed, which is $\sim$33 epochs over 4B tokens).
+\textit{Data size.} 16GB of text at $\sim$4 bytes/token (BPE) $\approx$ 4B tokens. With sequence length 512, training processes 1M steps $\times$ 256 batch size $\times$ 512 seq length $\approx$ 131B total tokens, which is $\sim$33 epochs over the 4B-token corpus.
 
 \textit{FLOPs per token.} The standard approximation is $6 \times P$ FLOPs per token for a forward + backward pass, where $P$ is parameter count. For BERT-base: $6 \times 110\text{M} = 660\text{M}$ FLOPs/token.
 
@@ -892,7 +889,7 @@ Quick decision: (1) CNN backbone? $\to$ SimCLR/MoCo or BYOL. (2) ViT backbone, c
 
 \textit{GPU-hours.} An A100 delivers $\sim$312 TFLOPS (BF16). At $\sim$50\% MFU (Model FLOPs Utilization): effective throughput $\approx$ 156 TFLOPS. Time: $8.6 \times 10^{19} / (156 \times 10^{12}) \approx 5.5 \times 10^5$ seconds $\approx$ 153 GPU-hours. With 8 A100s: $\sim$19 hours wall-clock.
 
-\textit{Sanity check.} The original BERT paper trained on 16 TPUv3 chips for $\sim$4 days. TPUv3 is roughly similar to V100 in FLOPS. 16 $\times$ 96 hours = 1536 GPU-hours, which is higher than my estimate---likely because the original training used FP32 and less efficient implementations. My A100 BF16 estimate is reasonable for modern hardware.
+\textit{Sanity check.} The original BERT paper trained on 16 TPUv3 chips for $\sim$4 days. TPUv3 is roughly similar to V100 in FLOPS. 16 $\times$ 96 hours = 1536 GPU-hours, which is higher than my estimate---attributable to older-generation chips with lower peak throughput and a 2018-era training stack achieving well below 50\% MFU. My A100 BF16 estimate is reasonable for modern hardware.
 
 \redflags
 \begin{itemize}
@@ -922,7 +919,7 @@ Quick decision: (1) CNN backbone? $\to$ SimCLR/MoCo or BYOL. (2) ViT backbone, c
 
 \textit{Task alignment.} Autoregressive models directly model $p(x_t | x_{<t})$, which is exactly what we sample during generation. This means the training objective and the inference procedure are perfectly aligned---no gap. BERT's MLM objective trains the model to fill in blanks, which is a classification task at each masked position. To generate text with BERT, you'd need iterative unmasking, which is unnatural and leads to incoherent outputs. The autoregressive formulation naturally produces coherent, left-to-right text.
 
-\textit{Scaling properties.} Three aspects: (1) Training signal density---CLM uses 100\% of tokens vs.\ MLM's 15\%, making autoregressive training $\sim$6.7$\times$ more efficient per sequence. (2) The loss function provides a natural scaling metric (perplexity) that correlates smoothly with model capability. (3) Emergent abilities---in-context learning, chain-of-thought reasoning---appear in large autoregressive models but not in encoders, because these capabilities require the sequential generation interface.
+\textit{Scaling properties.} Three aspects: (1) Training signal density---CLM computes a loss term for 100\% of tokens vs.\ MLM's 15\%, roughly $6.7\times$ more loss terms per sequence; note this is loss coverage rather than settled sample efficiency (MLM models were more sample-efficient on NLU at matched scale, and higher masking rates or UL2-style mixtures narrow the gap). (2) The loss function provides a natural scaling metric (perplexity) that correlates smoothly with model capability. (3) Emergent abilities---in-context learning, chain-of-thought reasoning---appear in large autoregressive models but not in encoders, because these capabilities require the sequential generation interface.
 
 \textit{Interface universality.} The ``prompt in, completion out'' interface of autoregressive models can express any NLP task: classification (``Is this positive or negative? Answer:''), translation, summarization, reasoning, code generation, and more. BERT's interface is ``fill in [MASK]''---powerful for specific tasks but not a universal interface. This universality means one autoregressive model replaces dozens of task-specific encoder models.
 
@@ -963,7 +960,7 @@ Quick decision: (1) CNN backbone? $\to$ SimCLR/MoCo or BYOL. (2) ViT backbone, c
 
 \textit{Momentum dynamics.} The target network is an exponential moving average (EMA) of the online network ($m = 0.996$). This creates a slowly evolving target. For collapse to occur, both networks would need to converge to the same constant simultaneously, but the momentum dynamics resist this: any perturbation in the online network only slowly propagates to the target.
 
-\textit{Implicit regularization from batch statistics.} BatchNorm (used in the projector/predictor) provides implicit variance regularization across the batch, preventing dimensional collapse where representations span only a low-dimensional subspace.
+\textit{Implicit regularization from batch statistics.} BatchNorm (used in the projector/predictor) provides implicit variance regularization across the batch, and early analyses hypothesized it acted as an implicit contrastive term. However, the BYOL authors' follow-up showed this is \emph{not} load-bearing: BYOL trains successfully with GroupNorm + weight standardization, which uses no batch statistics at all. BatchNorm mainly aids optimization/initialization robustness; the predictor + stop-gradient/EMA dynamics are the essential collapse-prevention mechanism.
 
 SimSiam showed that the predictor + stop-gradient alone is sufficient (no momentum needed), framing SSL as alternating optimization: the predictor optimizes to match the current targets, while the encoder optimizes to produce targets that are predictable from augmented views.
 
@@ -1031,9 +1028,9 @@ Expected gain: In medical imaging with limited labels, SSL pre-training typicall
 
 $$\loss_{\text{InfoNCE}} = -\log \frac{\exp(\text{sim}(z_i, z_j)/\tau)}{\sum_{k=1}^{K+1} \exp(\text{sim}(z_i, z_k)/\tau)}$$
 
-\textit{Connection to mutual information.} Oord et al.\ (CPC, 2018) showed that minimizing InfoNCE maximizes a lower bound on mutual information: $I(X; Y) \geq \log(K) - \loss_{\text{InfoNCE}}$. Intuitively, if the model can reliably identify the positive among $K$ negatives, the representations must capture shared information between views. With more negatives, the bound becomes tighter, explaining why larger batch sizes help contrastive methods.
+\textit{Connection to mutual information.} Oord et al.\ (CPC, 2018) showed that minimizing InfoNCE maximizes a lower bound on mutual information: with $K$ negatives, i.e.\ $K+1$ candidates in the denominator, $I(X; Y) \geq \log(K+1) - \loss_{\text{InfoNCE}}$. (CPC states the bound as $\log N$ with $N$ total candidates; under this chapter's convention of counting negatives, $N = K+1$.) Intuitively, if the model can reliably identify the positive among $K$ negatives, the representations must capture shared information between views. With more negatives, the bound becomes tighter, explaining why larger batch sizes help contrastive methods.
 
-\textit{Why collapse gives non-minimal loss.} If all representations collapse to a constant, every pair has similarity 1, so the loss becomes $\log(K+1)$---the maximum possible value. The minimum is 0 (positive similarity $\gg$ all negative similarities). This is why contrastive methods naturally resist collapse.
+\textit{Why collapse gives non-minimal loss.} If all representations collapse to a constant, every pair has similarity 1, so the softmax is uniform over the $K+1$ candidates and the loss becomes $\log(K+1)$---the chance-level value, far from the minimum of 0 (positive similarity $\gg$ all negative similarities). Note this is not the maximum: the loss is unbounded above, since negatives scoring higher than the positive push it beyond $\log(K+1)$. Collapse is therefore a mediocre solution rather than the worst one, and the negatives ensure it is never a minimum---this is why contrastive methods naturally resist collapse.
 
 \textit{Temperature $\tau$.} Temperature controls the concentration of the softmax distribution. Low $\tau$ ($\sim$0.07): distribution is peaked, gradients are dominated by hard negatives (most similar to the positive). High $\tau$ ($\sim$1.0): distribution is uniform, all negatives contribute equally. The optimal $\tau$ balances two concerns: too low and training is unstable (dominated by a few hard negatives that might be false negatives); too high and the model doesn't learn fine-grained distinctions. In practice, $\tau = 0.07$--$0.1$ works well for vision, while CLIP uses a learnable temperature.
 

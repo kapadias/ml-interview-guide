@@ -139,7 +139,7 @@ All modern activations solve dying ReLU through the same principle: ensuring \te
 \begin{itemize}
     \item \badgeLfive{L5} Explains the problem clearly (zero gradient for negative inputs prevents recovery), names 2--3 solutions, and can diagnose it in practice.
     \item \badgeLsix{L6} Connects to initialization theory (He initialization was designed to keep pre-activations balanced around zero for ReLU), explains the cascade effect in deep networks, and discusses the interaction with normalization (LayerNorm re-centers activations, reducing the probability of dying neurons).
-    \item \badgeLseven{L7} Discusses the representation capacity implications---dead neurons reduce the effective width of the network, and the relationship between dead neuron fraction and model quality follows a phase transition-like curve. Connects to the lottery ticket hypothesis (sparse networks with many ``dead'' neurons can still work if the right neurons survive).
+    \item \badgeLseven{L7} Discusses the representation capacity implications---dead neurons reduce the effective width of the network. Connects to the lottery ticket hypothesis (sparse networks with many ``dead'' neurons can still work if the right neurons survive).
 \end{itemize}
 
 \followups{``How does He initialization specifically address dying ReLU?'' ``Can a dead ReLU neuron ever recover?'' ``What is the relationship between activation sparsity and model quality?''}
@@ -241,7 +241,7 @@ The cost is an extra weight matrix ($\mV$), so to keep parameter count constant,
 \midrule
 CNN (general) & ReLU & LeakyReLU \\
 BERT-style encoder & GELU & ReLU \\
-GPT-style decoder & GELU & SwiGLU \\
+GPT-style decoder & SwiGLU (or GEGLU) & GELU (legacy, GPT-2 era) \\
 Modern LLMs & SwiGLU & GELU \\
 Output (classification) & Softmax & Sigmoid (multi-label) \\
 Output (regression) & None (linear) & ReLU (non-negative) \\
@@ -256,11 +256,13 @@ Output (regression) & None (linear) & ReLU (non-negative) \\
 
 \subsection{Why Normalization?}
 
-\textbf{Internal covariate shift}: Distribution of layer inputs changes during training, making optimization harder.
+\textbf{The historical story (contested): internal covariate shift.} BatchNorm was originally motivated by \textit{internal covariate shift} (Ioffe and Szegedy, 2015)---the idea that layer-input distributions shift as earlier layers update, making optimization harder. Treat this as history, not mechanism: Santurkar et al.\ (2018) showed BatchNorm helps even when internal covariate shift is artificially \textit{increased}, so ICS cannot be the explanation.
+
+\textbf{The current understanding: loss-landscape smoothing.} Normalization improves the Lipschitzness of the loss and its gradients---gradients become more predictive, so larger learning rates are stable and training is less sensitive to initialization. In interviews, reciting the ICS story uncritically is itself a red flag; ``is the internal-covariate-shift explanation actually true?'' is a deliberate follow-up.
 
 \textbf{Normalization benefits}:
 \begin{itemize}
-    \item Stabilizes training
+    \item Stabilizes training (smoother loss landscape, more predictive gradients)
     \item Enables higher learning rates
     \item Reduces sensitivity to initialization
     \item Acts as regularization
@@ -367,7 +369,7 @@ y_i &= \gamma_i \hat{x}_i + \beta_i
 
 BatchNorm computes statistics across the batch dimension for each feature channel: $\mu_c = \frac{1}{BT}\sum_{b,t} x_{b,t,c}$ where $B$ is batch size and $T$ is sequence length. This creates several fundamental incompatibilities with Transformers.
 
-First, \textbf{variable sequence lengths} mean that different positions in the batch are padding tokens. BatchNorm statistics mix real tokens with padding, polluting the normalization. You could mask padding, but this makes the effective batch size position-dependent---positions near the end of sequences see fewer real tokens, leading to noisy statistics for those positions.
+First, \textbf{variable sequence lengths} mean that some positions in the batch are padding tokens. Standard BatchNorm averages over both the batch and time dimensions, so its statistics mix real tokens with padding, polluting the normalization. Masking the padding fixes the pollution but makes the effective sample count depend on batch composition (how much padding each batch happens to contain), keeping the statistics noisy. Only a per-position BatchNorm variant---separate statistics for each position $t$---has the sharper failure that positions near the maximum length see very few real tokens.
 
 Second, \textbf{autoregressive generation} processes one token at a time (batch size = 1). BatchNorm's running statistics from training (where sequences are packed) don't match this inference regime. The distribution of activations at generation time---conditioned on partial sequences---differs from the training-time distribution computed over full sequences.
 
@@ -413,11 +415,11 @@ Then normalizes: $\hat{x}_{b,t,j} = (x_{b,t,j} - \mu_j)/\sqrt{\sigma_j^2 + \epsi
 
 \textbf{Problem 1: Token heterogeneity.} In CNNs, feature $j$ at spatial position $(h,w)$ across different images measures a consistent quantity (e.g., edge presence). Averaging across the batch is meaningful. In Transformers, feature $j$ at position $t=1$ might represent the beginning-of-sequence token, while at $t=100$ it represents a content word. Averaging across both batch and time conflates semantically different tokens. The statistics $\mu_j$ and $\sigma_j^2$ are averages over a mixture of distributions, not a single coherent distribution.
 
-\textbf{Problem 2: Padding corruption.} With variable-length sequences, shorter sequences are padded. If padding tokens are included in the BatchNorm computation, they corrupt the statistics. If excluded (masked BatchNorm), the effective sample count varies per position---positions near the maximum length have very few real tokens, leading to high-variance statistics.
+\textbf{Problem 2: Padding corruption.} With variable-length sequences, shorter sequences are padded. If padding tokens are included in the BatchNorm computation, they corrupt the statistics. If excluded (masked BatchNorm), the effective sample count depends on how much padding each batch contains, so the statistics stay noisy; a per-position variant (separate statistics per $t$) is worse still, since positions near the maximum length see very few real tokens.
 
 \textbf{Problem 3: Autoregressive inference.} At generation time, the model processes one token at a time with batch size 1. BatchNorm must use running statistics from training. But training statistics were computed over \textit{full sequences} (including future tokens), while inference sees only \textit{partial sequences}. The activation distribution conditioned on ``sequence so far'' differs from the training distribution conditioned on ``all tokens.'' This is a fundamental distribution shift.
 
-\textbf{Problem 4: Gradient coupling.} BatchNorm creates a dependency between samples in the batch through the shared statistics. The gradient $\partial \loss / \partial x_{b,t,j}$ depends on all other samples in the batch via $\mu_j$ and $\sigma_j^2$. In Transformers, this batch-level coupling conflicts with the per-token processing paradigm and can introduce noise into gradients.
+\textbf{Problem 4: Gradient coupling.} BatchNorm creates a dependency between samples in the batch through the shared statistics. The gradient $\partial \loss / \partial x_{b,t,j}$ depends on all other samples in the batch via $\mu_j$ and $\sigma_j^2$. Be precise here: this coupling is \textit{not} Transformer-specific---CNNs with BatchNorm have exactly the same property. It is a general cost of batch-statistic normalization (noisier gradients, batch-composition dependence, samples no longer independent at inference); the honest framing is that Transformers have no reason to pay this cost, since per-token normalization works at least as well for them.
 
 \textbf{LayerNorm resolves all four issues} by computing statistics across features within each token: $\mu_{b,t} = \frac{1}{d}\sum_{j=1}^d x_{b,t,j}$. Each token is normalized independently. No batch dependence, no padding issues, no train/inference mismatch, no gradient coupling between samples.
 
@@ -444,7 +446,7 @@ Then normalizes: $\hat{x}_{b,t,j} = (x_{b,t,j} - \mu_j)/\sqrt{\sigma_j^2 + \epsi
 
 \begin{mathresult}{RMSNorm}
 \begin{equation}
-\text{RMSNorm}(\vx) = \frac{\vx}{\text{RMS}(\vx)} \odot \bm{\gamma}, \quad \text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_{i=1}^d x_i^2}
+\text{RMSNorm}(\vx) = \frac{\vx}{\text{RMS}(\vx)} \odot \bm{\gamma}, \quad \text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_{i=1}^d x_i^2 + \epsilon}
 \end{equation}
 \end{mathresult}
 
@@ -453,7 +455,7 @@ Then normalizes: $\hat{x}_{b,t,j} = (x_{b,t,j} - \mu_j)/\sqrt{\sigma_j^2 + \epsi
     \item No mean centering (only scale normalization)
     \item No bias term $\beta$
     \item Empirically similar performance
-    \item 10-15\% faster
+    \item Speed: the norm \textit{op} itself is 10--15\% cheaper, but norm layers are only $\sim$1\% of end-to-end compute on modern fused stacks---the real appeal is simplicity and fewer parameters
 \end{itemize}
 
 \textbf{Used in}: LLaMA, Mistral, most modern LLMs
@@ -467,15 +469,15 @@ Then normalizes: $\hat{x}_{b,t,j} = (x_{b,t,j} - \mu_j)/\sqrt{\sigma_j^2 + \epsi
 
 \stronganswer
 
-LayerNorm normalizes by centering (subtracting mean) and scaling (dividing by standard deviation): $\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}$, then applies learned affine: $y_i = \gamma_i \hat{x}_i + \beta_i$. RMSNorm drops the mean-centering step entirely: $\hat{x}_i = \frac{x_i}{\text{RMS}(\vx)} \cdot \gamma_i$, where $\text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_j x_j^2}$.
+LayerNorm normalizes by centering (subtracting mean) and scaling (dividing by standard deviation): $\hat{x}_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}}$, then applies learned affine: $y_i = \gamma_i \hat{x}_i + \beta_i$. RMSNorm drops the mean-centering step entirely: $\hat{x}_i = \frac{x_i}{\text{RMS}(\vx)} \cdot \gamma_i$, where $\text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_j x_j^2 + \epsilon}$.
 
-\textbf{Choose RMSNorm when:} (1) Training modern LLMs where every percentage of compute matters---RMSNorm saves 10--15\% wall-clock time on the normalization operation by eliminating the mean computation and the bias parameter. (2) The architecture uses pre-norm placement, where the re-centering property of LayerNorm is less critical because the residual stream preserves the mean. (3) You want a simpler implementation (fewer parameters: no $\beta$).
+\textbf{Choose RMSNorm when:} (1) Training modern LLMs---the normalization op itself is 10--15\% cheaper (no mean computation, no bias parameter), though norm layers account for only $\sim$1\% of end-to-end compute on fused stacks, so the honest motivation is simplicity and fewer parameters rather than material wall-clock savings. (2) The architecture uses pre-norm placement, where the re-centering property of LayerNorm is less critical because the residual stream preserves the mean. (3) You want a simpler implementation (fewer parameters: no $\beta$).
 
 \textbf{Choose LayerNorm when:} (1) Working with encoder-only models like BERT where the original architecture uses LayerNorm and swapping may require re-tuning. (2) Post-norm architectures, where the mean-centering provides additional stability. (3) Tasks where the mean of activations carries important information---removing it may slightly hurt in some settings. (4) When using well-established codebases that default to LayerNorm and switching offers marginal gains.
 
 The empirical insight from Zhang and Sennrich (2019) is that mean-centering contributes negligibly to LayerNorm's effectiveness---the scale normalization (preventing activations from growing or shrinking) does the heavy lifting. This is why RMSNorm achieves comparable quality: it preserves the essential re-scaling while being cheaper to compute.
 
-In practice, the quality difference between LayerNorm and RMSNorm is within noise for most tasks. The choice is primarily driven by compute efficiency, and for any new LLM project, RMSNorm is the default recommendation.
+In practice, the quality difference between LayerNorm and RMSNorm is within noise for most tasks. The choice is driven by simplicity and convention more than by end-to-end speed, and for any new LLM project, RMSNorm is the default recommendation.
 
 \redflags
 \begin{itemize}
@@ -571,7 +573,7 @@ Reparameterize weights: $\vw = g \frac{\vv}{\|\vv\|}$
 \textbf{Pre-norm advantages}:
 \begin{itemize}
     \item More stable training (gradient flows through residual directly)
-    \item No learning rate warmup needed
+    \item Greatly reduces warmup sensitivity---but does not eliminate it; modern LLM recipes still use learning rate warmup
     \item Standard in modern LLMs
 \end{itemize}
 
@@ -587,7 +589,7 @@ Reparameterize weights: $\vw = g \frac{\vv}{\|\vv\|}$
 CNN (large batch) & BatchNorm & Proven, effective \\
 CNN (small batch) & GroupNorm & Batch-independent \\
 Transformer & LayerNorm & Sequence-friendly \\
-Modern LLM & RMSNorm & Faster, similar quality \\
+Modern LLM & RMSNorm & Simpler, similar quality; speedup is op-level only ($\sim$1\% end-to-end) \\
 Style transfer & InstanceNorm & Per-image normalization \\
 GAN discriminator & SpectralNorm & Stabilizes training \\
 \bottomrule

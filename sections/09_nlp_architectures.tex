@@ -230,8 +230,10 @@ ELECTRA & Replaced token detection (more efficient) & 4× sample efficient & 14M
 \end{enumerate}
 
 \begin{equation}
-\mathcal{L}_{ELECTRA} = \sum_{i=1}^{n} -\mathbb{1}[x_i^{corrupt} \neq x_i^{original}] \log D(x_i) - \mathbb{1}[x_i^{corrupt} = x_i^{original}] \log(1 - D(x_i))
+\mathcal{L}_{ELECTRA} = \sum_{i=1}^{n} -\mathbb{1}[x_i^{corrupt} = x_i^{original}] \log D(x_i) - \mathbb{1}[x_i^{corrupt} \neq x_i^{original}] \log(1 - D(x_i))
 \end{equation}
+
+where $D(x_i) \in (0, 1)$ is the discriminator's predicted probability that token $i$ is \emph{original} (i.e., was not replaced by the generator), following the paper's convention.
 
 \textbf{Result}: Matches BERT performance with 1/4 the compute.
 
@@ -334,13 +336,15 @@ Falcon & 7-180B & 2K & TII & Multi-query attention \\
     \item \textbf{GQA} (LLaMA 2): Grouped-query attention for efficiency
 \end{enumerate}
 
-\subsubsection{Mistral Innovations}
+\subsubsection{Mistral Innovations (v0.1)}
 
 \begin{enumerate}
-    \item \textbf{Sliding window attention}: Each layer attends to window of 4096 tokens
+    \item \textbf{Sliding window attention (SWA)}: Each layer attends to a window of 4096 tokens
     \item \textbf{Rolling buffer cache}: Fixed memory regardless of sequence length
     \item \textbf{Pre-fill and chunking}: Efficient handling of long prompts
 \end{enumerate}
+
+Note: Mistral dropped SWA after v0.1---later versions use full attention over longer contexts. SWA survives as one point in the sparse-attention design space, notably in interleaved local--global hybrid form (e.g., Gemma 2/3 alternate sliding-window and full-attention layers).
 
 \subsection{In-Context Learning}
 
@@ -644,7 +648,7 @@ Similar to BPE but uses likelihood-based merging:
 
 Merge pair that maximizes likelihood of training data.
 
-\textbf{Used in}: BERT, DistilBERT
+\textbf{Used in}: BERT, mBERT, DistilBERT
 
 \textbf{Notation}: Continuations marked with \#\# (e.g., ``playing'' → ``play'', ``\#\#ing'')
 
@@ -669,7 +673,7 @@ Merge pair that maximizes likelihood of training data.
     \item Handles any script (CJK, emoji, etc.)
 \end{itemize}
 
-\textbf{Used in}: LLaMA, T5, mBERT
+\textbf{Used in}: LLaMA-1/2, T5, mT5
 
 \subsection{Comparison}
 
@@ -751,7 +755,7 @@ Output: [one-sentence summary]
     \draw[->] (rm) -- (ppo) node[midway, above, font=\small] {Score};
 \end{tikzpicture}
 \caption{RLHF training pipeline.}
-\label{fig:rlhf_pipeline}
+\label{fig:rlhf_pipeline_overview}
 \end{figure}
 
 \subsubsection{Stage 1: Supervised Fine-Tuning (SFT)}
@@ -772,12 +776,12 @@ where $y_w$ is preferred over $y_l$.
 
 \subsubsection{Stage 3: RL Fine-Tuning}
 
-Optimize policy using PPO:
+The policy is trained to \emph{maximize} the KL-regularized reward objective:
 \begin{equation}
-\mathcal{L}_{PPO} = \E\left[r(x, y) - \beta \cdot \text{KL}(\pi_\theta(y|x) \| \pi_{ref}(y|x))\right]
+J(\theta) = \E\left[r(x, y) - \beta \cdot \text{KL}(\pi_\theta(y|x) \| \pi_{ref}(y|x))\right]
 \end{equation}
 
-KL penalty prevents diverging too far from SFT model.
+The KL penalty prevents the policy from diverging too far from the SFT model. Note that this is the objective, not the PPO loss itself: in practice, PPO---a clipped surrogate loss on importance ratios, paired with a learned value model for advantage estimation---is the mechanism used to ascend $J(\theta)$.
 
 \subsection{Direct Preference Optimization (DPO)}
 
@@ -884,7 +888,7 @@ Don't assume bigger models are always better for your task. A fine-tuned BERT-ba
 
 \textit{Theory 2: Attention as mesa-optimization.} Akyurek et al.\ (2023) and Von Oswald et al.\ (2023) showed that transformer attention layers can implement a single step of gradient descent on the in-context examples. The key-value pairs act as ``training data'' and the attention operation computes something equivalent to a linear regression update. Multi-layer transformers implement multi-step optimization. This is ``learning to learn'' at a mechanistic level.
 
-\textit{Theory 3: Task retrieval, not task learning.} The model doesn't learn new tasks from the prompt---it retrieves a pre-existing capability. The demonstrations serve as a ``task descriptor'' that activates the right circuit. Evidence: ICL works even when labels are random (the model matches the format but ignores the content), and performance correlates with how well the task was represented in pre-training data.
+\textit{Theory 3: Task retrieval, not task learning.} The model doesn't learn new tasks from the prompt---it retrieves a pre-existing capability. The demonstrations serve as a ``task descriptor'' that activates the right circuit. Evidence: in earlier/smaller models, ICL performance was surprisingly robust to randomized demonstration labels (Min et al., 2022)---format seemed to matter more than content---and performance correlates with how well the task was represented in pre-training data. However, this result needs nuance: Wei et al.\ (2023) showed that larger models \emph{are} sensitive to label correctness and can even learn flipped label mappings from the prompt, overriding their semantic priors. So pure task retrieval cannot be the whole story at scale---large models genuinely use the input--label mappings in context.
 
 \textit{When ICL breaks:} Tasks very different from pre-training distribution, tasks requiring novel reasoning not seen during training, and tasks where the label space is unfamiliar. ICL also has a strong recency bias (later examples in the prompt influence the output more) and is sensitive to example ordering.
 
@@ -918,9 +922,9 @@ Don't assume bigger models are always better for your task. A fine-tuned BERT-ba
 
 \textit{BPE (Byte Pair Encoding):} Starts with characters, iteratively merges the most frequent adjacent pair. Deterministic tokenization. Vocabulary: 30K--50K. Strengths: good balance between compression (short sequences) and coverage (handles unseen words via subwords). Weaknesses: greedy algorithm, no probabilistic model, and purely frequency-based merges may not capture linguistic structure. Used by GPT-2/3.
 
-\textit{Byte-level BPE:} Variant that starts from 256 byte values instead of characters. Guarantees complete coverage of any input (no UNK tokens ever) without needing an explicit UNK token. Used by GPT-2, LLaMA, and most modern LLMs. Slight downside: some non-English scripts get inefficient tokenization (one character may become 2--4 tokens).
+\textit{Byte-level BPE:} Variant that starts from 256 byte values instead of characters. Guarantees complete coverage of any input (no UNK tokens ever) without needing an explicit UNK token. Used by GPT-2/3 and Llama 3 (tiktoken-style vocabulary), and most current LLMs. Note that LLaMA-1/2 is \emph{not} byte-level BPE---it uses SentencePiece BPE with byte \emph{fallback}, where bytes are used only for characters missing from the vocabulary. Slight downside of byte-level: some non-English scripts get inefficient tokenization (one character may become 2--4 tokens).
 
-\textit{SentencePiece:} Language-agnostic framework that treats input as raw bytes (no pre-tokenization). Implements both BPE and Unigram internally. Handles any script (CJK, Arabic, emoji) without language-specific preprocessing. The Unigram model starts with a large vocabulary and prunes tokens that least affect likelihood---this gives a probabilistic model that can output multiple tokenizations with probabilities. Used by T5, LLaMA (via BPE mode), mBERT.
+\textit{SentencePiece:} Language-agnostic framework that treats input as raw bytes (no pre-tokenization). Implements both BPE and Unigram internally. Handles any script (CJK, Arabic, emoji) without language-specific preprocessing. The Unigram model starts with a large vocabulary and prunes tokens that least affect likelihood---this gives a probabilistic model that can output multiple tokenizations with probabilities. Used by T5 (Unigram mode) and LLaMA-1/2 (BPE mode with byte fallback).
 
 \textit{Character-level:} Each character is a token. Vocabulary is tiny (256 for bytes), no OOV issues, but sequences become 3--5$\times$ longer, dramatically increasing compute cost (attention is $O(n^2)$). Works well for character-level tasks (spelling, morphology) but impractical for long-document processing. Used in some specialized models (ByT5).
 
@@ -952,7 +956,7 @@ Don't assume bigger models are always better for your task. A fine-tuned BERT-ba
 
 \stronganswer This is a crucial architectural question. Encoder-decoder models have a structural advantage for conditioned generation---the encoder can bidirectionally understand the input while the decoder generates the output. Yet decoder-only models (GPT, LLaMA, Claude) dominate. The reasons are primarily about scaling efficiency and interface design, not modeling capability.
 
-\textit{Training efficiency.} In an encoder-decoder model, the encoder parameters only receive gradients from the decoder's cross-attention. The decoder must split its capacity between self-attention and cross-attention. A decoder-only model uses all its parameters for a single, unified objective. This means a decoder-only model with $N$ parameters uses compute more efficiently than an encoder-decoder with $N$ total parameters ($N/2$ in each).
+\textit{Training efficiency.} In an encoder-decoder model, the encoder parameters only receive gradients from the decoder's cross-attention. The decoder must split its capacity between self-attention and cross-attention. A decoder-only model uses all its parameters for a single, unified objective. Be careful not to overstate this, though: controlled comparisons from the T5/UL2 era show encoder-decoder models are compute-competitive at matched FLOPs on many tasks, so ``decoder-only uses compute more efficiently'' is not a settled fact. The robust advantages are the ones that follow---interface, data format, and infrastructure.
 
 \textit{Interface universality.} The ``text in, text out'' interface of decoder-only models handles every task through prompting: classification, translation, summarization, reasoning, code generation, and conversation. Encoder-decoder models work best for structured input-output tasks but are awkward for open-ended generation or conversation. One decoder-only model replaces dozens of specialized encoder-decoder models.
 
@@ -1114,9 +1118,9 @@ $$\loss_{\text{DPO}} = -\E_{(x, y_w, y_l)}\left[\log \sigma\left(\beta \log \fra
 
 \textit{Learned embeddings (BERT, GPT-2):} A trainable embedding lookup table, one vector per position. Advantage: maximum flexibility---the model learns whatever positional patterns are useful. Disadvantage: hard limit at the maximum training length (position 512 for BERT). Cannot generalize to longer sequences at all. The embedding table also adds parameters linear in context length.
 
-\textit{RoPE (Rotary Position Embeddings, Su et al., 2021):} Encodes position by rotating the query and key vectors in 2D subspaces. The rotation angle is proportional to position, so the dot product $q_i^T k_j$ depends only on the relative position $(i - j)$. This gives: (1) \textbf{Relative position awareness}: attention naturally captures relative distances. (2) \textbf{Length extrapolation}: because only relative position matters, the model can handle longer sequences than seen during training (with some degradation). (3) \textbf{No extra parameters}: rotations are computed analytically, not learned. (4) \textbf{Decaying long-range dependency}: inner products naturally decay with distance, providing an implicit locality bias.
+\textit{RoPE (Rotary Position Embeddings, Su et al., 2021):} Encodes position by rotating the query and key vectors in 2D subspaces. The rotation angle is proportional to position, so the dot product $q_i^T k_j$ depends only on the relative position $(i - j)$. This gives: (1) \textbf{Relative position awareness}: attention naturally captures relative distances. (2) \textbf{Length extension}: because only relative position matters, trained models can be extended to longer sequences---though zero-shot extrapolation degrades quickly, so in practice extension relies on position interpolation or base-frequency rescaling. (3) \textbf{No extra parameters}: rotations are computed analytically, not learned. (4) \textbf{Decaying long-range dependency}: the paper motivates the design with an upper bound showing inner products decay with relative distance (an implicit locality bias); treat this as the paper's motivation rather than a robust empirical property.
 
-\textit{Why RoPE won:} It combines the generalization of sinusoidal encodings with the relative-position awareness that learned embeddings lack, while adding zero parameters. For modern LLMs that need long-context support (8K--128K+), RoPE's ability to extrapolate (especially with NTK-aware scaling or YaRN) is essential. ALiBi is an alternative that adds linear bias to attention scores, but RoPE has become more popular due to better empirical performance at very long contexts.
+\textit{Why RoPE won:} It combines the generalization of sinusoidal encodings with the relative-position awareness that learned embeddings lack, while adding zero parameters. ALiBi, which replaces position embeddings with a linear distance penalty on attention scores, actually \emph{extrapolates better} to unseen lengths with no tuning. RoPE won anyway on three fronts: better quality at trained lengths, cheap post-hoc context extension (position interpolation, NTK-aware scaling, YaRN, base-frequency rescaling as in Llama 3.1)---which made ALiBi's untuned extrapolation advantage less decisive---and ecosystem momentum once LLaMA standardized it. For modern LLMs with 8K--128K+ contexts, it is RoPE-plus-extension-tricks, not raw RoPE extrapolation, that delivers long context.
 
 \redflags
 \begin{itemize}

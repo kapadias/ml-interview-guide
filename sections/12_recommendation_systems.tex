@@ -219,6 +219,7 @@ Separate encoders for users and items:
 \textbf{Training}:
 \begin{itemize}
     \item Softmax cross-entropy or InfoNCE with in-batch negatives
+    \item Caveat: in-batch negatives are drawn in proportion to item popularity, which systematically over-penalizes popular items on skewed catalogs; the standard fix is the logQ correction (subtract $\log Q(\text{item})$, the item's sampling probability, from its logit; Yi et al., 2019)
     \item Additional hard negative sampling
 \end{itemize}
 
@@ -568,7 +569,7 @@ where $f_i(\vx)$ is the output of expert $i$, $g_k^{(i)}(\vx)$ is the gating wei
 p(\text{conversion} | \text{impression}) = p(\text{click} | \text{impression}) \times p(\text{conversion} | \text{click, impression})
 \end{equation}
 
-The CTR task ($p(\text{click}|\text{impression})$) and CTCVR task ($p(\text{conversion}|\text{impression})$) are both trained on the \textit{entire} impression space, eliminating the selection bias. The CVR prediction is obtained implicitly as the ratio CTCVR/CTR. Both towers share an embedding layer and are trained jointly.
+The CTR task ($p(\text{click}|\text{impression})$) and CTCVR task ($p(\text{conversion}|\text{impression})$) are both trained on the \textit{entire} impression space, eliminating the selection bias. pCVR is the output of a \textit{dedicated tower}, supervised only implicitly through the product $\text{pCTCVR} = \text{pCTR} \times \text{pCVR}$---the CTCVR loss backpropagates through both towers. The paper explicitly rejects the alternative of computing CVR as the ratio $\text{pCTCVR}/\text{pCTR}$: the division is numerically unstable and can produce pCVR $> 1$. Both towers share an embedding layer and are trained jointly.
 
 \begin{figure}[H]
 \centering
@@ -747,11 +748,11 @@ Apply BERT-style masked prediction to sequences:
 
 \subsection{Stage 4: Auction}
 
-\textbf{How ads are ranked for display.} The auction combines model predictions with advertiser bids. In a standard second-price auction with expected-value bidding:
+\textbf{How ads are ranked for display.} The auction combines model predictions with advertiser bids. In the textbook second-price auction with expected-value bidding:
 \begin{equation}
 \text{Ad rank score} = \text{pCTR} \times \text{bid}
 \end{equation}
-The ad with the highest rank score wins the impression. The winner pays the minimum bid that would have won (second-price mechanism). For conversion-optimized campaigns, the formula extends to $\text{pCTR} \times \text{pCVR} \times \text{bid}$.
+The ad with the highest rank score wins the impression; in a second-price mechanism the winner pays the minimum bid that would have won. Two caveats keep this current: second-price is no longer ``the standard''---much of the industry migrated to \textit{first-price} auctions (display exchanges by 2019--2021, Google Ad Manager in 2019), where the winner pays their own bid and bid shading becomes the bidder's problem---and production rank scores are quality-adjusted (pCTR $\times$ bid plus ad-quality/user-experience terms, as in Google's Ad Rank), not the raw product alone. For conversion-optimized campaigns, the formula extends to $\text{pCTR} \times \text{pCVR} \times \text{bid}$.
 
 \begin{keyinsight}[Why the Pipeline is Funnel-Shaped]
 Each stage trades precision for speed. Candidate generation uses a simple model (dot product) but covers the entire corpus. Full ranking uses a complex model (hundreds of features, attention mechanisms) but only on $\sim$100 items. This funnel shape is necessary because the total latency budget (typically $<$100ms end-to-end) is fixed, while the compute cost per item increases by orders of magnitude at each stage. The pre-ranking stage is the ``bridge'' that makes this economically feasible---without it, you either use a weak model on all candidates (poor quality) or a strong model on too few candidates (poor recall).
@@ -1422,7 +1423,7 @@ The 50ms budget for 100 candidates shapes every architectural decision. Let me d
 \begin{itemize}
     \item \textbf{Storage}: 10 TB/day $\times$ 14-day training window $= 140$ TB of active training data. Stored in a distributed file system (HDFS, GCS, S3).
     \item \textbf{Training throughput}: To train on one full day's data in 4 hours (quarter of the data freshness target), the training pipeline needs to process $10$ TB / 4 hours $\approx$ 700 MB/s of sustained data throughput across the training cluster.
-    \item \textbf{Training compute}: At $\sim$10K floating point operations per impression (for a DLRM forward + backward), $1\text{B} \times 10\text{K} = 10^{13}$ FLOPs per epoch. A single A100 at 300 TFLOPS processes this in $\sim$33 seconds---the bottleneck is data I/O and embedding lookups, not compute.
+    \item \textbf{Training compute}: A realistic DLRM's dense layers (MLPs + interaction) hold $\sim$10--30M parameters, and forward + backward costs $\sim$6 FLOPs per parameter per example, so budget $\sim$50--100 MFLOPs per impression---not thousands. $1\text{B} \times 10^{8} \approx 10^{17}$ FLOPs per epoch over the day's data. A single A100 at $\sim$300 TFLOPS peak would need $10^{17} / (3 \times 10^{14}) \approx 5$--$6$ minutes at full utilization, realistically tens of minutes at production MFU---so a small cluster absorbs the dense compute easily, and the bottleneck is data I/O and embedding lookups, not dense FLOPs.
     \item \textbf{Feature engineering pipeline}: Features must be computed and joined in near-real-time. This requires a streaming pipeline (Kafka + Flink/Spark Streaming) that processes raw events into feature-enriched training examples.
 \end{itemize}
 
@@ -1652,13 +1653,13 @@ Additionally, the clicked impression set is much smaller than the full impressio
 p(\text{conversion} | \text{impression}) = \underbrace{p(\text{click} | \text{impression})}_{\text{CTR task}} \times \underbrace{p(\text{conversion} | \text{click, impression})}_{\text{CVR task (implicit)}}
 \end{equation}
 
-Both the CTR task and the CTCVR task ($p(\text{conversion} | \text{impression})$) are trained on the \textit{entire impression space}. The CTR labels are available for all impressions (click or no click). The CTCVR labels are also available for all impressions (conversion or no conversion). The CVR prediction is never trained directly---it is obtained implicitly as CTCVR / CTR.
+Both the CTR task and the CTCVR task ($p(\text{conversion} | \text{impression})$) are trained on the \textit{entire impression space}. The CTR labels are available for all impressions (click or no click). The CTCVR labels are also available for all impressions (conversion or no conversion). The CVR head is a \textit{dedicated tower} whose output is never supervised directly: it receives gradients only through the product $\text{pCTCVR} = \text{pCTR} \times \text{pCVR}$. Crucially, ESMM does \textit{not} compute pCVR as the ratio $\text{pCTCVR}/\text{pCTR}$---the paper explicitly rejects that division estimator because it is numerically unstable and can produce pCVR $> 1$ when the two separately fitted probabilities are inconsistent.
 
 \textbf{Why this works.}
 \begin{itemize}
     \item Both tasks use the entire impression space, eliminating selection bias.
     \item The CTR task provides a transfer learning signal to the shared embedding layer, improving representations for the sparser CTCVR task.
-    \item The multiplicative structure guarantees that $0 \leq p(\text{CVR}) \leq 1$ and that the relationship between CTR, CVR, and CTCVR is consistent.
+    \item Because pCVR is the sigmoid output of its own tower (rather than a ratio estimator, which can exceed 1), $0 \leq \text{pCVR} \leq 1$ holds by construction, and the multiplicative structure keeps the relationship between CTR, CVR, and CTCVR consistent.
 \end{itemize}
 
 \redflags
