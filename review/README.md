@@ -30,3 +30,15 @@ All re-checked by hand before publication — see `chapter-findings.md` for the 
 - `main.tex` include order (…16, 20, 21–24, 17–19) — compiled chapter numbers contradict filenames and README
 
 Review date: 2026-08-27.
+
+## v2 additions (2026-08-27, second fan-out)
+
+| File | What it holds |
+|---|---|
+| `nlp-volume/chapter-findings.md` | Per-chapter review of all 13 NLP-volume chapters + appendix, each with a verified overlap analysis against the DL volume (degree, stronger treatment, canonical-home recommendation) |
+| `search-recsys/vector-retrieval-digest.md` | Full digest of Bruch, *Foundations of Vector Retrieval* (arXiv 2401.09350, 203 pp.): topic map, interview-relevant extractions with whiteboard versions and numbers, gap map vs existing ANN/vector-DB sections, 12 new interview questions |
+| `search-recsys/applied-search-track.md` | The applied search-ranking chapter design (query understanding, BM25 internals, click models, LTR, hybrid, judgments, evaluation, RAG-era search), the ~68 h Search/RecSys track, and the ten search fumble tests |
+| `program/conventional-ml-spec.md` | Ideal Conventional-ML volume spec (8 chapters with derivations, questions, red flags, page weights) + the diff checklist to run against the user's own document on arrival |
+| `program/unified-program-architecture.md` | The four-volume + spine program architecture, dedup treaty (canonical home per overlap zone), round coverage map, and revised Phase A–E master plan |
+
+Cross-volume drift confirmed and queued for Phase A: GPT-2 norm placement (DL-05 wrong), ELECTRA loss sign (DL-09 wrong), the o1=PRM+MCTS misattribution (three locations across both volumes), NLP-12 vs DL-22 serving-number drift, NLP-01/02 duplicate LaTeX labels, NLP appendix indexing ~96/128 questions with three phantom rows.
