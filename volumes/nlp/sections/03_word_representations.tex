@@ -1,0 +1,1696 @@
+% ============================================================================
+% CHAPTER 3: WORD REPRESENTATIONS AND EMBEDDINGS
+% The foundation of all modern NLP --- from one-hot vectors to contextual
+% embeddings.  Understanding this evolution is tested in every NLP interview.
+% ============================================================================
+
+\chapter{Word Representations and Embeddings}
+\label{chap:word_representations}
+
+\begin{tldr}
+Word representations are the foundation of modern NLP---the quality of your
+embeddings determines the ceiling of your system's performance.  This chapter
+traces the evolution from one-hot vectors through Word2Vec, GloVe, and FastText
+to contextual embeddings (ELMo) and modern sentence embeddings (SBERT, E5).
+Understanding this evolution is critical for interviews because it explains
+\emph{why} each subsequent approach was developed, what problem it solved, and
+what limitations remained.  Every FAANG NLP interview will test at least one
+concept from this chapter, and candidates who can derive the Word2Vec objective
+and explain the distributional hypothesis from first principles earn
+significantly stronger signals than those who jump straight to ``just use
+BERT.''
+\end{tldr}
+
+\bigskip
+
+% ============================================================================
+% SECTION 1: THE REPRESENTATION PROBLEM
+% ============================================================================
+\section{The Representation Problem}
+\label{sec:representation_problem}
+
+Before any machine learning model can process text, words must be converted
+into numerical representations.  The quality and structure of these
+representations fundamentally constrain what the model can learn.  This section
+examines why the naive approach fails and how the field arrived at
+distributional representations.
+
+\subsection{One-Hot Encoding: The Naive Baseline}
+
+The simplest representation assigns each word in the vocabulary a unique index
+and encodes it as a vector with a single 1 in that position and 0s everywhere
+else.  For a vocabulary of size $V$:
+\[
+    \text{``cat''} = [0, 0, \ldots, 1, \ldots, 0]^\top \in \R^V
+\]
+
+One-hot encoding has three fatal flaws:
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{No notion of similarity.}  For any two distinct words $w_i$
+    and $w_j$, the inner product of their one-hot vectors is zero:
+    $\inner{\ve_{w_i}}{\ve_{w_j}} = 0$.  ``Cat'' is equally distant from
+    ``kitten'' as it is from ``refrigerator.''
+
+    \item \textbf{Dimensionality explosion.}  Production vocabularies range from
+    30K to 250K tokens.  Representing each word as a 100K-dimensional sparse
+    vector is wasteful and computationally expensive for downstream models.
+
+    \item \textbf{No generalization.}  A model that learns something about
+    ``cat'' gains no information about ``kitten,'' because the representations
+    share no structure.  Every word is an island.
+\end{enumerate}
+
+The fundamental insight that unlocked progress was that we do not need to
+represent words as atomic symbols.  Instead, we can represent them as
+\emph{dense, low-dimensional vectors} in which geometric proximity encodes
+semantic similarity.
+
+\subsection{The Distributional Hypothesis}
+
+\begin{keyinsight}[The Foundation of All Embeddings]
+\emph{``A word is characterized by the company it keeps.''}
+--- J.~R.~Firth, 1957
+
+The distributional hypothesis states that words appearing in similar contexts
+tend to have similar meanings.  This single idea is the theoretical foundation
+for \emph{every} word embedding method---from count-based approaches (PMI, SVD)
+to predictive models (Word2Vec, GloVe) to contextual embeddings (ELMo, BERT).
+If an interviewer asks ``why do word embeddings work?'' this is the answer.
+\end{keyinsight}
+
+The hypothesis is operationalized differently across methods, but the core
+principle is always the same: extract statistical patterns from word
+co-occurrences in large corpora, and use those patterns to define the
+representation.
+
+\subsection{Count-Based Methods: Co-occurrence and PMI}
+
+Before neural embeddings, researchers built word representations from
+co-occurrence statistics.
+
+\paragraph{Co-occurrence Matrix.}
+Given a corpus, define a window size $L$ and count how often each pair of words
+$(w_i, w_j)$ appears within $L$ tokens of each other.  This produces a
+$V \times V$ matrix $\mX$ where $X_{ij}$ is the co-occurrence count.
+
+\paragraph{Pointwise Mutual Information (PMI).}
+Raw counts are dominated by frequent words.  PMI re-weights co-occurrences:
+\[
+    \text{PMI}(w_i, w_j)
+    = \log \frac{P(w_i, w_j)}{P(w_i)\, P(w_j)}
+    = \log \frac{X_{ij} \cdot N}{X_{i*}\, X_{*j}}
+\]
+where $N = \sum_{i,j} X_{ij}$ is the total count, $X_{i*} = \sum_j X_{ij}$,
+and $X_{*j} = \sum_i X_{ij}$.  In practice, negative values are clipped to
+zero (\textbf{Positive PMI} or PPMI), since negative PMI is unreliable for
+rare events.
+
+\paragraph{Dimensionality Reduction via SVD.}
+The PPMI matrix is $V \times V$ and sparse.  Applying truncated Singular Value
+Decomposition (SVD) to retain the top $d$ singular values produces dense
+$d$-dimensional word vectors:
+\[
+    \mX_{\text{PPMI}} \approx \mU_d \bm{\Sigma}_d \mV_d^\top
+\]
+The rows of $\mU_d \bm{\Sigma}_d^{1/2}$ (or simply $\mU_d$) serve as word
+vectors.  Levy and Goldberg (2014) showed that this count-based approach
+produces embeddings competitive with Word2Vec, establishing the deep connection
+between count-based and predictive methods.
+
+\begin{warningbox}
+A common interview mistake is treating count-based methods as ``ancient
+history'' unrelated to modern embeddings.  In fact, GloVe explicitly bridges
+count-based and predictive approaches, and understanding this connection
+demonstrates genuine depth.  Interviewers at Google and Meta have been known
+to ask: ``Can you explain how SVD on a PPMI matrix relates to Word2Vec?''
+\end{warningbox}
+
+
+% ============================================================================
+% SECTION 2: WORD2VEC
+% ============================================================================
+\section{Word2Vec --- Know This Cold}
+\label{sec:word2vec}
+
+Word2Vec (Mikolov et al., 2013) transformed NLP by showing that simple neural
+networks trained on large text corpora produce word vectors with remarkable
+properties, including the now-famous linear analogy structure.  It remains one
+of the most frequently tested topics in NLP interviews because it tests
+mathematical reasoning, optimization understanding, and awareness of practical
+training tricks.
+
+\subsection{Skip-Gram: Predict Context from Center Word}
+
+The Skip-gram model defines the following task: given a center word $w_I$,
+predict each context word $w_O$ within a window of size $L$.
+
+\paragraph{Architecture.}
+Each word $w$ has two learned vectors: an \emph{input embedding}
+$\vw_w \in \R^d$ (used when $w$ is the center word) and an \emph{output
+embedding} $\vw'_w \in \R^d$ (used when $w$ is a context word).  The model
+has no hidden layers---it is a shallow architecture with a single projection.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm and 2.5cm,
+    box/.style={rectangle, draw=deepblue, fill=lightblue, minimum width=2.0cm,
+                minimum height=0.7cm, font=\small\sffamily, rounded corners=2pt,
+                thick},
+    vec/.style={rectangle, draw=deepblue!60, fill=white, minimum width=1.4cm,
+                minimum height=0.7cm, font=\small\sffamily, rounded corners=2pt},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!80},
+    lbl/.style={font=\scriptsize\sffamily, text=gray!70!black}
+]
+
+% Input
+\node[box] (input) {$w_I$};
+\node[lbl, below=0.1cm of input] {Center word};
+
+% Projection
+\node[box, right=2.5cm of input, fill=deepblue!12] (proj) {$\vw_{w_I} \in \R^d$};
+\node[lbl, below=0.1cm of proj] {Projection (lookup)};
+
+% Output words
+\node[vec, right=2.5cm of proj, yshift=1.8cm]  (o1) {$w_{-L}$};
+\node[vec, right=2.5cm of proj, yshift=0.6cm]  (o2) {$w_{-1}$};
+\node[vec, right=2.5cm of proj, yshift=-0.6cm] (o3) {$w_{+1}$};
+\node[vec, right=2.5cm of proj, yshift=-1.8cm] (o4) {$w_{+L}$};
+
+% Dots
+\node[font=\large, text=gray] at ($(o2)!0.5!(o3)$) {$\vdots$};
+
+\node[lbl, below=0.1cm of o4] {Context words};
+
+% Arrows
+\draw[arr] (input) -- (proj) node[midway, above, lbl] {$\mW \in \R^{V \times d}$};
+\draw[arr] (proj) -- (o1) node[midway, above, lbl, sloped] {$\softmax$};
+\draw[arr] (proj) -- (o2);
+\draw[arr] (proj) -- (o3);
+\draw[arr] (proj) -- (o4) node[midway, below, lbl, sloped] {$\softmax$};
+
+\end{tikzpicture}
+\caption{Skip-gram architecture.  The center word is projected to a
+$d$-dimensional embedding, and the model predicts each context word within a
+window of size $L$ independently.}
+\label{fig:skipgram}
+\end{figure}
+
+\paragraph{Probability Model.}
+The probability of observing context word $w_O$ given center word $w_I$ is
+defined via the softmax over the entire vocabulary:
+
+\begin{mathresult}{Skip-Gram Softmax Objective}
+\[
+    P(w_O \given w_I)
+    = \frac{\exp\!\bigl(\vw'_{w_O}{}^\top \vw_{w_I}\bigr)}
+           {\displaystyle\sum_{w=1}^{V}
+            \exp\!\bigl(\vw'_{w}{}^\top \vw_{w_I}\bigr)}
+\]
+where $\vw_{w_I} \in \R^d$ is the input embedding of center word $w_I$,
+$\vw'_{w_O} \in \R^d$ is the output embedding of context word $w_O$, and
+$V$ is the vocabulary size.
+\end{mathresult}
+
+\paragraph{Training Objective.}
+Given a corpus of words $w_1, w_2, \ldots, w_T$, maximize the average
+log-probability of context words:
+\[
+    \loss_{\text{skip-gram}}
+    = \frac{1}{T} \sum_{t=1}^{T}
+      \sum_{\substack{-L \leq j \leq L \\ j \neq 0}}
+      \log P(w_{t+j} \given w_t)
+\]
+
+The summation over $j$ iterates over all context positions within the window.
+The full softmax requires computing the partition function (denominator) over
+all $V$ words, which is $O(V)$ per training example---prohibitively expensive
+for vocabularies of 100K+ words.
+
+\subsection{CBOW: Predict Center from Context}
+
+The Continuous Bag-of-Words (CBOW) model reverses the prediction direction:
+given all context words within the window, predict the center word.  The
+context is represented as the average of context word embeddings:
+\[
+    \bar{\vw} = \frac{1}{2L} \sum_{\substack{-L \leq j \leq L \\ j \neq 0}}
+                \vw_{w_{t+j}}
+\]
+\[
+    P(w_t \given \text{context})
+    = \frac{\exp(\vw'_{w_t}{}^\top \bar{\vw})}
+           {\sum_{w=1}^{V} \exp(\vw'_w{}^\top \bar{\vw})}
+\]
+
+\paragraph{CBOW vs.\ Skip-gram in Practice.}
+\begin{itemize}
+    \item \textbf{CBOW} is faster to train (one prediction per window, not
+    $2L$) and produces better embeddings for \emph{frequent} words (averages
+    context, smoothing out noise).
+    \item \textbf{Skip-gram} produces better embeddings for \emph{rare} words
+    and smaller datasets (each context word provides a separate training
+    signal, so rare words get more updates).
+\end{itemize}
+
+In practice, Skip-gram with negative sampling became the dominant choice and
+is the version interviewers expect you to know in detail.
+
+\subsection{Negative Sampling: Making Training Tractable}
+
+The full softmax is $O(V)$ per example.  Negative sampling reformulates the
+problem from a $V$-class classification to a set of binary classifications.
+
+\paragraph{Core Idea.}
+Instead of predicting the correct context word from the entire vocabulary,
+train a binary classifier to distinguish \emph{real} (center, context) pairs
+from \emph{noise} pairs where the context word is drawn from a noise
+distribution.
+
+\begin{mathresult}{Negative Sampling (NEG) Objective}
+\[
+    \loss_{\text{NEG}}
+    = -\log \sigma\!\bigl(\vw'_{w_O}{}^\top \vw_{w_I}\bigr)
+      - \sum_{i=1}^{k} \E_{w_i \sim P_n(w)} \Bigl[
+        \log \sigma\!\bigl(-\vw'_{w_i}{}^\top \vw_{w_I}\bigr)
+      \Bigr]
+\]
+where $\sigma(x) = 1/(1+e^{-x})$ is the sigmoid function, $k$ is the number
+of negative samples, and $P_n(w)$ is the noise distribution.
+\end{mathresult}
+
+\paragraph{Why This Works.}
+The first term pushes the dot product of the true (center, context) pair
+toward $+\infty$ (high similarity).  The second term pushes the dot products
+of the noise pairs toward $-\infty$ (low similarity).  NEG is a
+simplification of noise-contrastive estimation (NCE): unlike NCE, it does
+\emph{not} recover the full softmax gradient, and it should not be confused
+with the mutual-information bound maximized by InfoNCE (Oord et al., 2018).
+What NEG actually optimizes is characterized by Levy and Goldberg (2014):
+at its optimum, it implicitly factorizes a shifted pointwise mutual
+information matrix (see the shifted-PMI result later in this section).
+
+\paragraph{Noise Distribution.}
+The choice of $P_n(w)$ matters significantly.  Mikolov et al.\ found that the
+\emph{unigram distribution raised to the 3/4 power} works best:
+\[
+    P_n(w) = \frac{f(w)^{3/4}}{\sum_{w'} f(w')^{3/4}}
+\]
+where $f(w)$ is the frequency of word $w$.  The 3/4 exponent smooths the
+distribution, increasing the probability of sampling moderately rare words
+relative to the raw unigram distribution.  This makes the negative samples
+more challenging and informative.
+
+\paragraph{Number of Negative Samples.}
+Mikolov et al.\ recommend $k = 5$--$20$ for small datasets and $k = 2$--$5$
+for large ones.  More negatives provide a better approximation of the full
+softmax but increase computation.
+
+\subsection{Subsampling Frequent Words}
+
+Extremely frequent words like ``the,'' ``a,'' and ``is'' provide little
+information---co-occurring with ``the'' tells you almost nothing about a
+word's meaning.  Subsampling randomly discards occurrences of frequent words
+during training with probability:
+\[
+    P(\text{discard } w) = 1 - \sqrt{\frac{t}{f(w)}}
+\]
+where $f(w)$ is the word's frequency and $t$ is a threshold (typically
+$10^{-5}$).  Words with frequency above $t$ are increasingly likely to be
+discarded.  This both speeds up training and improves embedding quality for
+rare words.
+
+\subsection{Properties of Word2Vec Embeddings}
+
+The most celebrated property is \textbf{linear analogy structure}:
+\[
+    \vw_{\text{king}} - \vw_{\text{man}} + \vw_{\text{woman}}
+    \approx \vw_{\text{queen}}
+\]
+
+More precisely, the analogy ``man is to king as woman is to ?'' is solved by:
+\[
+    \argmax_{w} \cos(\vw_w, \;\vw_{\text{king}} - \vw_{\text{man}}
+                               + \vw_{\text{woman}})
+\]
+
+This linear structure arises because the training objective implicitly
+factorizes a shifted PMI matrix (Levy and Goldberg, 2014):
+\[
+    \vw_{w_I}{}^\top \vw'_{w_O}
+    \approx \text{PMI}(w_I, w_O) - \log k
+\]
+where $k$ is the number of negative samples.
+
+Other important properties:
+\begin{itemize}
+    \item \textbf{Semantic clusters:} Similar words cluster together
+    (countries, animals, professions form coherent regions).
+    \item \textbf{Syntactic regularities:} ``walking'' $-$ ``walked'' $+$
+    ``swimming'' $\approx$ ``swam'' (tense analogies).
+    \item \textbf{Compositionality (limited):} Simple vector addition
+    sometimes captures phrase meaning, but this breaks down for complex
+    constructions.
+\end{itemize}
+
+\subsection{Hyperparameter Guide}
+
+\begin{table}[H]
+\centering
+\caption{Word2Vec hyperparameters and their effects.}
+\label{tab:w2v_hyperparams}
+\begin{tabularx}{\textwidth}{l l X}
+\toprule
+\textbf{Hyperparameter} & \textbf{Typical Range} & \textbf{Effect} \\
+\midrule
+Dimension $d$ & 100--300 & Higher $d$ captures more nuance but
+    requires more data to train well. 300 is a common default. \\
+Window size $L$ & 2--10 & Smaller windows ($\leq 3$) capture syntactic
+    relationships (POS, morphology). Larger windows ($\geq 5$) capture
+    topical/semantic relationships. \\
+Negative samples $k$ & 2--20 & More negatives = better softmax
+    approximation but slower training. 5 is a standard choice. \\
+Min count & 5--100 & Discard words appearing fewer than this many times.
+    Reduces vocabulary and noise from rare words. \\
+Subsampling $t$ & $10^{-5}$--$10^{-3}$ & Lower = more aggressive
+    downsampling of frequent words. \\
+Learning rate & 0.01--0.025 & Linearly decayed during training. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Limitations of Word2Vec}
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Static representations.}  Each word has exactly one vector
+    regardless of context.  ``Bank'' in ``river bank'' and ``bank account''
+    maps to the same point---a fundamental limitation that contextual
+    embeddings (Section~\ref{sec:contextual_embeddings}) address.
+
+    \item \textbf{Out-of-vocabulary (OOV) words.}  Any word not seen during
+    training has no representation.  This is a serious problem for
+    morphologically rich languages and specialized domains.  FastText
+    (Section~\ref{sec:fasttext}) solves this.
+
+    \item \textbf{No subword information.}  Word2Vec treats each word as an
+    atomic unit.  It cannot exploit the fact that ``unhappiness,''
+    ``unhappy,'' and ``happiness'' share morphemes.
+
+    \item \textbf{Frequency bias.}  Despite subsampling, rare words have
+    lower-quality embeddings because they receive fewer training updates.
+
+    \item \textbf{No sentence-level representation.}  Word2Vec produces
+    word vectors, not sentence or document vectors (though averaging provides
+    a surprisingly decent baseline).
+\end{enumerate}
+
+\begin{warningbox}
+Candidates often describe Word2Vec as ``just a lookup table'' or dismiss it as
+``replaced by BERT.''  This is a red flag.  Interviewers expect you to know
+the training objective, explain negative sampling, derive the connection to
+PMI, and discuss the hyperparameter tradeoffs.  Word2Vec's ideas (projection
+layers, contrastive training, subsampling) are directly ancestral to modern
+approaches.
+\end{warningbox}
+
+
+% ============================================================================
+% SECTION 3: GLOVE
+% ============================================================================
+\section{GloVe --- Global Vectors for Word Representation}
+\label{sec:glove}
+
+GloVe (Pennington et al., 2014) was designed to bridge the gap between
+count-based methods (SVD on co-occurrence matrices) and predictive methods
+(Word2Vec).  Its key insight is that the \emph{ratios} of co-occurrence
+probabilities encode meaning more directly than raw probabilities.
+
+\subsection{Motivation: Co-occurrence Ratios}
+
+Consider three words: ``ice,'' ``steam,'' and ``solid.''  Let
+$P(k \given w)$ denote the probability that word $k$ appears in the context
+of word $w$.  The ratio $P(k \given \text{ice}) / P(k \given \text{steam})$
+is revealing:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{$k$ = solid} & \textbf{$k$ = gas} & \textbf{$k$ = water}
+& \textbf{$k$ = fashion} \\
+\midrule
+$P(k \given \text{ice})$ & Large & Small & Large & Small \\
+$P(k \given \text{steam})$ & Small & Large & Large & Small \\
+\textbf{Ratio} & \textbf{Large} & \textbf{Small} & $\approx 1$ & $\approx 1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Words that discriminate between ``ice'' and ``steam'' (like ``solid'' and
+``gas'') produce extreme ratios, while words related to both (``water'') or
+neither (``fashion'') produce ratios near 1.  GloVe's objective is designed
+so that the learned vectors capture these ratio patterns.
+
+\subsection{The GloVe Objective}
+
+GloVe seeks word vectors such that their dot product approximates the
+logarithm of the co-occurrence count:
+
+\begin{mathresult}{GloVe Objective}
+\[
+    \loss_{\text{GloVe}}
+    = \sum_{i,j=1}^{V} f(X_{ij})\,
+      \bigl(\vw_i^\top \vw'_j + b_i + b'_j - \log X_{ij}\bigr)^2
+\]
+where $X_{ij}$ is the co-occurrence count between words $i$ and $j$,
+$\vw_i, \vw'_j \in \R^d$ are word vectors, $b_i, b'_j$ are scalar biases,
+and $f(\cdot)$ is a weighting function.
+\end{mathresult}
+
+\paragraph{The Weighting Function $f(x)$.}
+The weighting function prevents extremely frequent co-occurrences from
+dominating the loss:
+\[
+    f(x) = \begin{cases}
+        (x / x_{\max})^\alpha & \text{if } x < x_{\max} \\
+        1 & \text{otherwise}
+    \end{cases}
+\]
+Pennington et al.\ use $x_{\max} = 100$ and $\alpha = 3/4$.  This ensures
+that (a) zero co-occurrences are not penalized (since $f(0) = 0$), and (b)
+very high co-occurrences are capped at weight 1.
+
+\subsection{Why GloVe Works}
+
+The objective can be derived from the requirement that the dot product of word
+vectors encode co-occurrence probability ratios.  Starting from the
+desideratum:
+\[
+    F\bigl((\vw_i - \vw_j)^\top \vw'_k\bigr)
+    = \frac{P(k \given i)}{P(k \given j)}
+\]
+and requiring $F$ to be an exponential (to map addition in vector space to
+multiplication in probability space), one arrives at:
+\[
+    \vw_i^\top \vw'_k = \log P(k \given i) = \log X_{ik} - \log X_i
+\]
+The bias terms absorb the $\log X_i$ normalization, yielding the objective
+above.
+
+\subsection{GloVe vs.\ Word2Vec}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of Word2Vec and GloVe.}
+\label{tab:w2v_vs_glove}
+\begin{tabularx}{\textwidth}{l X X}
+\toprule
+\textbf{Aspect} & \textbf{Word2Vec (Skip-gram + NEG)} & \textbf{GloVe} \\
+\midrule
+Training data & Local context windows (online, streaming) &
+    Global co-occurrence matrix (requires pre-computation) \\
+Objective & Predictive (maximize log-probability of context words) &
+    Reconstructive (minimize weighted squared error on log counts) \\
+Global statistics & Implicitly captured through many passes over data &
+    Explicitly captured in the co-occurrence matrix \\
+Scalability & Streams data; handles very large corpora &
+    Requires $O(V^2)$ co-occurrence matrix (sparse, but large) \\
+Performance & Comparable on analogy tasks &
+    Comparable on analogy tasks; sometimes better on similarity \\
+Connection & Implicitly factorizes a shifted PMI matrix &
+    Explicitly optimizes a log co-occurrence factorization \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[The Unification of Count-Based and Predictive Methods]
+Levy and Goldberg (2014) showed that Word2Vec's Skip-gram with negative
+sampling implicitly factorizes a shifted PMI matrix.  GloVe directly optimizes
+a weighted factorization of the log co-occurrence matrix.  Both are
+fundamentally performing matrix factorization on co-occurrence statistics---the
+difference is in \emph{how} they weight different entries and \emph{how} they
+optimize.  This insight, frequently tested in research-track interviews,
+shows that the predictive vs.\ count-based distinction is less fundamental
+than it appears.
+\end{keyinsight}
+
+
+% ============================================================================
+% SECTION 4: FASTTEXT
+% ============================================================================
+\section{FastText --- Subword Embeddings}
+\label{sec:fasttext}
+
+FastText (Bojanowski et al., 2017) extends Word2Vec by representing each word
+as a \emph{bag of character n-grams}, enabling the model to capture
+morphological structure and handle out-of-vocabulary words.
+
+\subsection{Subword Representation}
+
+Each word $w$ is decomposed into a set of character n-grams $\mathcal{G}_w$
+(typically $n = 3$ to $6$), plus special boundary markers \texttt{<} and
+\texttt{>} and the word itself:
+
+\paragraph{Example.}
+For the word ``where'' with $n \in \{3, 4, 5\}$:
+\[
+    \mathcal{G}_{\text{where}} = \{\texttt{<wh},\; \texttt{whe},\;
+    \texttt{her},\; \texttt{ere},\; \texttt{re>},\; \texttt{<whe},\;
+    \texttt{wher},\; \texttt{here},\; \texttt{ere>},\; \texttt{<wher},\;
+    \texttt{where},\; \texttt{here>},\; \texttt{<where>}\}
+\]
+
+The word's embedding is the sum of its n-gram embeddings plus a dedicated
+whole-word vector (if the word appeared in training):
+\[
+    \vw_w = \vw_w^{(\text{word})} + \sum_{g \in \mathcal{G}_w} \vw_g
+\]
+
+\subsection{Handling Out-of-Vocabulary Words}
+
+FastText's key advantage over Word2Vec: for any unseen word, decompose it into
+character n-grams and sum the corresponding vectors.  As long as the n-grams
+were observed during training (which is almost always the case), the model
+produces a meaningful representation.
+
+This is especially valuable for:
+\begin{itemize}
+    \item \textbf{Morphologically rich languages} (Turkish, Finnish, German):
+    compound words and agglutination create enormous vocabularies.
+    ``Donaudampfschifffahrtsgesellschaft'' (German: Danube steamship company)
+    is handled naturally by its constituent n-grams.
+    \item \textbf{Misspellings and typos:} ``teh'' shares most n-grams with
+    ``the,'' so its vector is close.
+    \item \textbf{Domain-specific terms:} Medical or legal terminology often
+    follows morphological patterns (``-itis,'' ``-ectomy'') that n-grams
+    capture.
+\end{itemize}
+
+\subsection{FastText in Production}
+
+FastText remains widely used in production systems for several reasons:
+\begin{enumerate}
+    \item \textbf{Speed:} Training and inference are extremely fast---embedding
+    lookup is a simple sum of pre-computed vectors.
+    \item \textbf{Lightweight:} No GPU required for inference.
+    \item \textbf{Supervised mode:} FastText includes a supervised
+    classification mode that is competitive with deep learning for simple text
+    classification tasks at a fraction of the compute cost.
+    \item \textbf{Multilingual:} Pre-trained vectors are available for 157
+    languages.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of static embedding methods.}
+\label{tab:static_embeddings}
+\begin{tabularx}{\textwidth}{l c c c X}
+\toprule
+\textbf{Method} & \textbf{Year} & \textbf{OOV} & \textbf{Morphology}
+& \textbf{Key Innovation} \\
+\midrule
+Word2Vec & 2013 & No & No & Scalable predictive embeddings; negative sampling \\
+GloVe & 2014 & No & No & Weighted factorization of global co-occurrence \\
+FastText & 2017 & Yes & Yes & Character n-gram decomposition \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+
+% ============================================================================
+% SECTION 5: CONTEXTUAL EMBEDDINGS
+% ============================================================================
+\section{Contextual Embeddings --- The Bridge to Modern NLP}
+\label{sec:contextual_embeddings}
+
+Static embeddings assign one fixed vector per word.  Contextual embeddings
+assign a \emph{different} vector depending on the surrounding context.  This
+section covers ELMo, the pivotal model that demonstrated the power of
+pre-trained contextual representations and directly paved the way for BERT.
+
+\subsection{Why Context Matters: The Polysemy Problem}
+
+Consider the word ``bank'' in two sentences:
+\begin{enumerate}
+    \item ``I deposited money at the \textbf{bank}.''
+    \item ``We sat on the river \textbf{bank}.''
+\end{enumerate}
+
+Word2Vec, GloVe, and FastText all produce the \emph{same} vector for ``bank''
+in both sentences---an average of its financial and geographical senses,
+which accurately represents neither.  A contextual embedding model produces
+\emph{different} vectors: one near ``finance'' and ``deposit,'' the other near
+``river'' and ``shore.''
+
+\subsection{ELMo: Embeddings from Language Models}
+
+ELMo (Peters et al., 2018) generates contextual embeddings using a
+\emph{bidirectional language model} (biLM).
+
+\paragraph{Architecture.}
+ELMo trains a two-layer bidirectional LSTM language model:
+\begin{itemize}
+    \item \textbf{Forward LM:} Predicts the next token given the left context:
+    $P(w_t \given w_1, \ldots, w_{t-1})$.
+    \item \textbf{Backward LM:} Predicts the previous token given the right
+    context: $P(w_t \given w_{t+1}, \ldots, w_T)$.
+    \item The forward and backward LMs share the token embedding layer
+    (character CNN) but have separate LSTM parameters.
+\end{itemize}
+
+\paragraph{Generating Contextual Representations.}
+For a given token $w_t$ in context, ELMo computes $2L + 1$ representations
+(where $L$ is the number of LSTM layers):
+\begin{itemize}
+    \item Layer 0: the context-independent character-based embedding
+    (from a character CNN)
+    \item Layers 1 through $L$: the concatenation of forward and backward LSTM
+    hidden states at each layer:
+    $\vh_t^{(\ell)} = [\overrightarrow{\vh}_t^{(\ell)} \,;\,
+                       \overleftarrow{\vh}_t^{(\ell)}]$
+\end{itemize}
+
+The final ELMo representation is a \emph{task-specific weighted sum} across
+layers:
+\[
+    \text{ELMo}_t = \gamma \sum_{\ell=0}^{L} s_\ell \, \vh_t^{(\ell)}
+\]
+where $s_\ell$ are learned softmax-normalized weights and $\gamma$ is a
+scalar scaling factor.  Both are learned by the \emph{downstream task model}
+while the biLM itself stays \emph{frozen}---ELMo is feature-based transfer,
+not fine-tuning.
+
+\subsection{What Different Layers Capture}
+
+A key finding from Peters et al.\ is that different layers of the biLM
+capture different types of linguistic information:
+
+\begin{table}[H]
+\centering
+\caption{Information captured at different ELMo layers.}
+\label{tab:elmo_layers}
+\begin{tabularx}{\textwidth}{l X X}
+\toprule
+\textbf{Layer} & \textbf{Information Type} & \textbf{Evidence} \\
+\midrule
+Layer 0 (char CNN) & Morphological, orthographic &
+    Good for POS tagging; captures word shape \\
+Layer 1 (lower LSTM) & Syntactic &
+    Best for tasks like POS tagging, constituency parsing \\
+Layer 2 (upper LSTM) & Semantic, word sense disambiguation &
+    Best for tasks like NER, sentiment, textual entailment \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+This finding---that lower layers capture syntax and upper layers capture
+semantics---has been consistently replicated in Transformer models (BERT,
+GPT) and is a frequently asked interview question.
+
+\begin{keyinsight}[ELMo: The Proof of Concept for Pre-training]
+ELMo demonstrated three things that shaped all subsequent NLP research:
+(1)~pre-training on unlabeled text produces representations useful for many
+downstream tasks, (2)~different layers of a deep model capture different
+linguistic phenomena, and (3)~contextual representations dramatically
+outperform static embeddings.  BERT built on all three insights, replacing
+the LSTM with a Transformer and the feature-based approach with fine-tuning.
+\end{keyinsight}
+
+
+% ============================================================================
+% SECTION 6: SENTENCE AND DOCUMENT EMBEDDINGS
+% ============================================================================
+\section{Sentence and Document Embeddings}
+\label{sec:sentence_embeddings}
+
+While word embeddings represent individual tokens, many NLP applications
+require fixed-size representations of sentences, paragraphs, or entire
+documents.  This section covers the methods from simple baselines to modern
+production embedding models.
+
+\subsection{Simple Baselines (Surprisingly Strong)}
+
+\paragraph{Average Word Embeddings.}
+The simplest approach: average the word vectors of all tokens in a sentence.
+\[
+    \vw_{\text{sent}} = \frac{1}{n} \sum_{i=1}^{n} \vw_{w_i}
+\]
+Despite its simplicity, this often outperforms more complex unsupervised
+methods.  Arora et al.\ (2017) showed that computing a \emph{weighted}
+average (by smooth inverse frequency, SIF) followed by removing the first
+principal component yields competitive results on semantic similarity tasks.
+
+\paragraph{TF-IDF Weighted Average.}
+Weight each word's contribution by its TF-IDF score, giving more influence to
+discriminative terms:
+\[
+    \vw_{\text{sent}} = \frac{\sum_{i=1}^{n}
+                               \text{tfidf}(w_i) \cdot \vw_{w_i}}
+                              {\sum_{i=1}^{n} \text{tfidf}(w_i)}
+\]
+
+\subsection{Sentence-BERT (SBERT)}
+
+Reimers and Gurevych (2019) introduced Sentence-BERT, which fine-tunes BERT
+using a \emph{siamese/triplet network} to produce semantically meaningful
+sentence embeddings.
+
+\paragraph{Architecture.}
+Two identical BERT encoders (shared weights) process two sentences
+independently.  Mean pooling over token outputs produces fixed-size
+sentence embeddings.  The objective depends on the training data:
+
+\begin{itemize}
+    \item \textbf{NLI training (classification):}  For sentence pairs with
+    labels (entailment, contradiction, neutral), concatenate embeddings
+    $[\mathbf{u}; \mathbf{v}; |\mathbf{u} - \mathbf{v}|]$ and pass through a
+    softmax classifier.
+    \item \textbf{STS training (regression):}  For sentence pairs with
+    similarity scores, minimize MSE between cosine similarity and the target
+    score.
+\end{itemize}
+
+\paragraph{Why SBERT Matters.}
+BERT alone is impractical for large-scale semantic search: computing the
+similarity of 10,000 sentences requires $\binom{10000}{2} \approx 50$M
+cross-encoder forward passes.  SBERT produces pre-computed embeddings,
+reducing this to 10,000 forward passes plus simple cosine similarity lookups.
+
+\subsection{SimCSE: Contrastive Learning for Sentence Embeddings}
+
+Gao et al.\ (2021) proposed SimCSE, which uses contrastive learning to produce
+high-quality sentence embeddings with a remarkably simple technique.
+
+\paragraph{Unsupervised SimCSE.}
+Pass the \emph{same} sentence through the encoder \emph{twice} with different
+dropout masks.  The two outputs form a positive pair.  Other sentences in the
+mini-batch form negatives.  The loss is InfoNCE:
+
+\begin{mathresult}{SimCSE Unsupervised Contrastive Loss}
+\[
+    \loss = -\log \frac{e^{\text{sim}(\vh_i, \vh_i^+)/\tau}}
+                       {\sum_{j=1}^{N} e^{\text{sim}(\vh_i, \vh_j^+)/\tau}}
+\]
+where $\vh_i$ and $\vh_i^+$ are embeddings of the same sentence with
+different dropout masks, $\text{sim}$ is cosine similarity, $\tau$ is the
+temperature, and $N$ is the batch size.
+\end{mathresult}
+
+\paragraph{Why Dropout Works as Augmentation.}
+Dropout randomly zeroes a fraction of hidden units at each forward pass.  Two
+passes of the same input produce \emph{slightly different} representations
+that are natural ``positive pairs''---semantically identical but numerically
+distinct.  This is a minimal data augmentation that avoids the pitfalls of
+text-specific augmentations (e.g., synonym replacement can change meaning).
+
+\paragraph{Supervised SimCSE.}
+Uses NLI data: entailment pairs are positives, contradiction pairs are hard
+negatives.  This consistently outperforms the unsupervised variant.
+
+\subsection{Modern Embedding Models}
+
+The current generation of sentence embedding models builds on the insights
+from SBERT and SimCSE, scaled with more data, better training recipes, and
+instruction tuning.
+
+\begin{table}[H]
+\centering
+\caption{Modern sentence embedding models.}
+\label{tab:modern_embeddings}
+\begin{tabularx}{\textwidth}{l l l X}
+\toprule
+\textbf{Model} & \textbf{Org} & \textbf{Year} & \textbf{Key Innovation} \\
+\midrule
+E5 & Microsoft & 2022 & ``query:'' and ``passage:'' prefixes; trained
+    with contrastive loss on diverse paired data \\
+BGE & BAAI & 2023 & Instruction-tuned embeddings; strong MTEB
+    performance \\
+GTE & Alibaba & 2023 & Multi-stage contrastive training; competitive
+    at small model sizes \\
+Nomic Embed & Nomic AI & 2024 & Long-context (8192 tokens); open-source;
+    Matryoshka training \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Matryoshka Embeddings}
+
+Kusupati et al.\ (2022) introduced Matryoshka Representation Learning (MRL),
+where a single model is trained to produce useful embeddings at \emph{multiple}
+dimensions simultaneously.  The training loss sums over multiple truncation
+points:
+\[
+    \loss_{\text{MRL}} = \sum_{d \in \mathcal{D}}
+                         \loss_{\text{task}}(\vw_{[:d]})
+\]
+where $\mathcal{D} = \{32, 64, 128, 256, 512, 768\}$ (for example) and
+$\vw_{[:d]}$ is the first $d$ dimensions of the embedding.
+
+This is valuable in production: you can use 64-dimensional embeddings for
+coarse filtering (fast ANN search) and full 768-dimensional embeddings for
+fine-grained re-ranking, all from a single model.
+
+\subsection{Training Objectives for Embedding Models}
+
+\paragraph{Contrastive Loss (InfoNCE / NT-Xent).}
+The standard loss for embedding models:
+\[
+    \loss = -\frac{1}{N} \sum_{i=1}^{N} \log
+    \frac{e^{\text{sim}(\vh_i, \vh_i^+)/\tau}}
+         {\sum_{j=1}^{N}\bigl(
+           e^{\text{sim}(\vh_i, \vh_j^+)/\tau}
+           + e^{\text{sim}(\vh_i, \vh_j^-)/\tau}\bigr)}
+\]
+
+\paragraph{Hard Negative Mining.}
+The quality of negatives is critical for embedding models.  Strategies include:
+\begin{itemize}
+    \item \textbf{In-batch negatives:} Other examples in the mini-batch serve
+    as negatives.  Simple but effective; requires large batch sizes.
+    \item \textbf{BM25 negatives:} Documents that score highly on BM25 but
+    are not relevant---lexically similar but semantically different.
+    \item \textbf{Cross-encoder mined negatives:} Use a cross-encoder to find
+    passages that a bi-encoder incorrectly scores highly.  Most effective but
+    expensive.
+\end{itemize}
+
+\begin{keyinsight}[Sentence Embeddings Are the Backbone of RAG]
+Modern Retrieval-Augmented Generation (RAG) systems depend entirely on the
+quality of their embedding model.  The embedding model determines what gets
+retrieved, and what gets retrieved determines the quality of the generated
+answer.  When an interviewer asks about RAG, they are implicitly testing
+whether you understand embedding quality, similarity search, and the
+tradeoffs between different embedding approaches.
+\end{keyinsight}
+
+
+% ============================================================================
+% SECTION 7: EMBEDDING EVALUATION
+% ============================================================================
+\section{Embedding Evaluation}
+\label{sec:embedding_evaluation}
+
+Evaluating embedding quality is non-trivial and is a common interview topic
+because it tests whether a candidate thinks critically about measurement.
+
+\subsection{Intrinsic Evaluation}
+
+Intrinsic methods evaluate embeddings in isolation, without a downstream task.
+
+\paragraph{Word Similarity.}
+Compute cosine similarity between word pairs and correlate with human
+judgments.  Standard datasets include:
+\begin{itemize}
+    \item \textbf{WordSim-353} (Finkelstein et al., 2001): 353 word pairs
+    rated for similarity.
+    \item \textbf{SimLex-999} (Hill et al., 2015): 999 pairs rated for
+    \emph{genuine similarity} (not just relatedness---``car'' and ``road''
+    are related but not similar).
+    \item \textbf{MEN} (Bruni et al., 2014): 3,000 pairs rated for
+    relatedness.
+\end{itemize}
+Evaluation metric: Spearman's rank correlation $\rho$ between model scores
+and human judgments.
+
+\paragraph{Analogy Tasks.}
+Test whether the embedding space encodes relational structure.  The Google
+analogy dataset contains 19,544 questions of the form ``$a$ is to $b$ as $c$
+is to ?''  covering semantic (``Athens'' : ``Greece'' :: ``Oslo'' : ?) and
+syntactic (``walk'' : ``walked'' :: ``run'' : ?) categories.
+
+\paragraph{Clustering.}
+Embed words and apply k-means or hierarchical clustering.  Inspect whether
+resulting clusters correspond to meaningful categories (animals, countries,
+verbs of motion).
+
+\subsection{Extrinsic Evaluation}
+
+Extrinsic methods evaluate embeddings by using them in a downstream task and
+measuring task performance.  This is generally more informative than intrinsic
+evaluation because it tests what actually matters---utility for a real
+application.
+
+\begin{warningbox}
+Good intrinsic scores do not guarantee good extrinsic performance, and vice
+versa.  A model that excels at word analogy tasks may perform poorly on NER
+or sentiment analysis.  Always prefer extrinsic evaluation when the target
+application is known.
+\end{warningbox}
+
+\subsection{MTEB: The Modern Benchmark}
+
+The Massive Text Embedding Benchmark (Muennighoff et al., 2023) evaluates
+sentence embeddings across 8 task categories and 58 datasets:
+\begin{enumerate}
+    \item Classification (e.g., sentiment, topic)
+    \item Clustering (e.g., Reddit, arXiv)
+    \item Pair Classification (e.g., duplicate detection)
+    \item Re-ranking
+    \item Retrieval (e.g., MS MARCO, NQ)
+    \item Semantic Textual Similarity
+    \item Summarization
+    \item Bitext Mining (parallel sentence alignment)
+\end{enumerate}
+
+MTEB is now the standard benchmark for evaluating general-purpose embedding
+models and is hosted as a public leaderboard on Hugging Face.
+
+\subsection{Comparison of Embedding Methods}
+
+\begin{table}[H]
+\centering
+\caption{Summary comparison of embedding methods across key dimensions.}
+\label{tab:embedding_comparison}
+\begin{tabularx}{\textwidth}{l c c c c c}
+\toprule
+\textbf{Method} & \textbf{Contextual} & \textbf{OOV} &
+\textbf{GPU Needed} & \textbf{Typical $d$} & \textbf{Quality} \\
+\midrule
+One-hot       & No  & No  & No  & $V$ (sparse)  & Minimal \\
+Word2Vec      & No  & No  & No  & 100--300      & Good \\
+GloVe         & No  & No  & No  & 100--300      & Good \\
+FastText      & No  & Yes & No  & 100--300      & Good+ \\
+ELMo          & Yes & Yes & Yes & 512--1024     & Very Good \\
+SBERT         & Yes & Yes & Yes & 384--768      & Excellent \\
+E5/BGE/GTE    & Yes & Yes & Yes & 384--1024     & State-of-art \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+
+% ============================================================================
+% SECTION 8: INTERVIEW QUESTIONS
+% ============================================================================
+\section{Interview Questions}
+\label{sec:embedding_interview}
+
+\begin{interviewq}
+\textbf{Q: Explain the Word2Vec Skip-gram model. What is the training
+objective? What is negative sampling and why is it needed?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Word2Vec Skip-gram learns word embeddings by training a model to predict
+context words given a center word.  Each word $w$ has two vectors: an input
+embedding $\vw_w$ and an output embedding $\vw'_w$.  Given center word $w_I$,
+the probability of observing context word $w_O$ is:
+\[
+    P(w_O \given w_I)
+    = \frac{\exp(\vw'_{w_O}{}^\top \vw_{w_I})}
+           {\sum_{w=1}^{V} \exp(\vw'_w{}^\top \vw_{w_I})}
+\]
+The training objective maximizes the sum of $\log P(\text{context} \given
+\text{center})$ over all (center, context) pairs in the corpus.
+
+The problem is the denominator: it sums over the entire vocabulary $V$ (often
+100K+ words) for every training example.  Negative sampling replaces this
+expensive softmax with a binary classification task.  For each true
+(center, context) pair, we sample $k$ noise words and train a binary
+classifier to distinguish real pairs from noise.  The loss becomes:
+\[
+    \loss = -\log\sigma(\vw'_{w_O}{}^\top \vw_{w_I})
+            - \sum_{i=1}^{k} \E_{w_i \sim P_n}\bigl[
+              \log\sigma(-\vw'_{w_i}{}^\top \vw_{w_I})\bigr]
+\]
+The noise distribution is the unigram distribution raised to the 3/4 power,
+which smooths the distribution and makes negative samples more informative.
+This reduces training from $O(V)$ to $O(k)$ per example.
+
+\redflags
+\begin{itemize}
+    \item Not knowing that Skip-gram has two sets of embeddings (input and
+    output).
+    \item Saying ``negative sampling samples wrong words'' without explaining
+    the binary classification formulation.
+    \item Being unable to explain why the 3/4 exponent on the noise
+    distribution helps.
+    \item Confusing Skip-gram (predict context from center) with CBOW
+    (predict center from context).
+\end{itemize}
+
+\interviewtest{Mathematical depth, understanding of computational bottlenecks,
+ability to explain optimization tricks and \emph{why} they work.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: States the objective, explains negative sampling as
+    binary classification, gives the noise distribution formula.
+    \item \badgeLsix{L6}: Explains the connection to PMI (Levy and Goldberg,
+    2014), discusses the effect of the number of negative samples, and
+    mentions subsampling of frequent words.
+    \item \badgeLseven{L7}: Derives that Skip-gram with negative sampling
+    implicitly factorizes a shifted PMI matrix, connects to GloVe's
+    explicit matrix factorization, discusses implications for embedding
+    geometry and how this understanding informs modern contrastive learning
+    objectives.
+\end{itemize}
+
+\followups{What is the connection between Word2Vec and PMI? How do you choose
+the number of negative samples? What is subsampling and why does it help?
+How does window size affect the type of relationships captured?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 2 ---
+\begin{interviewq}
+\textbf{Q: What are the differences between Word2Vec, GloVe, and FastText?
+When would you choose each one?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+All three produce static word embeddings but differ in their training approach
+and capabilities.
+
+\textbf{Word2Vec} (Mikolov et al., 2013) trains a shallow neural network on
+local context windows.  Skip-gram predicts context from center word; CBOW
+predicts center from context.  Training is online (streaming) and scales to
+very large corpora.  Limitation: treats words as atomic units, no OOV
+handling.
+
+\textbf{GloVe} (Pennington et al., 2014) first computes a global
+co-occurrence matrix, then optimizes a weighted least-squares objective so
+that word vector dot products approximate the log co-occurrence count.  It
+explicitly captures global statistics that Word2Vec's local windows might
+miss, but requires pre-computing the co-occurrence matrix ($O(V^2)$ space,
+though sparse in practice).
+
+\textbf{FastText} (Bojanowski et al., 2017) extends Word2Vec by representing
+each word as a bag of character n-grams.  A word's vector is the sum of its
+n-gram vectors.  This enables OOV handling (decompose unseen words into known
+n-grams), captures morphological structure, and produces better embeddings
+for morphologically rich languages.
+
+\textbf{When to choose each:}
+\begin{itemize}
+    \item \emph{Word2Vec:} General-purpose embeddings, very large corpora,
+    when morphology is not a concern (e.g., English for well-curated text).
+    \item \emph{GloVe:} When you want pre-trained vectors (Stanford provides
+    high-quality pre-trained GloVe), or when you specifically need embeddings
+    that capture global co-occurrence patterns.
+    \item \emph{FastText:} Morphologically rich languages, noisy text
+    (social media, user-generated content with typos), specialized domains
+    with many OOV terms.  Also when you need fast supervised classification
+    (FastText's supervised mode).
+\end{itemize}
+
+In practice, for most modern systems, the choice between these three matters
+less than whether to use them at all versus a contextual model.  But for
+low-resource, low-latency, or edge-deployment scenarios, FastText remains a
+strong choice.
+
+\redflags
+\begin{itemize}
+    \item Saying ``they are all the same, just use BERT.''
+    \item Not knowing that GloVe uses a global co-occurrence matrix while
+    Word2Vec uses local windows.
+    \item Not knowing that FastText handles OOV via character n-grams.
+    \item Being unable to articulate when static embeddings are preferred
+    over contextual ones.
+\end{itemize}
+
+\interviewtest{Breadth of knowledge across embedding methods, understanding
+of tradeoffs, ability to make principled engineering decisions.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes all three methods correctly, gives a
+    reasonable decision framework.
+    \item \badgeLsix{L6}: Discusses the theoretical connection (all implicitly
+    factorize co-occurrence statistics), mentions Levy and Goldberg's
+    unification result, and discusses production considerations (latency,
+    model size, OOV rates).
+    \item \badgeLseven{L7}: Compares with modern subword tokenizers (BPE
+    handles some of the same OOV issues FastText addresses), discusses
+    hybrid approaches (FastText features in conjunction with contextual
+    models), and explains how static embeddings are still used as components
+    of larger systems.
+\end{itemize}
+
+\followups{How does Levy and Goldberg's result connect Word2Vec to SVD on
+a PMI matrix? When would you use static embeddings in a modern system?
+How does FastText's approach differ from BPE tokenization?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 3 ---
+\begin{interviewq}
+\textbf{Q: Why are contextual embeddings better than static embeddings?
+Give a concrete example of when static embeddings fail.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Static embeddings (Word2Vec, GloVe, FastText) assign a single fixed vector to
+each word regardless of context.  Contextual embeddings (ELMo, BERT) assign
+\emph{different} vectors depending on the surrounding words.
+
+The fundamental failure mode of static embeddings is \textbf{polysemy}.
+Consider the word ``crane'':
+\begin{itemize}
+    \item ``The \textbf{crane} lifted the steel beam.'' (construction
+    equipment)
+    \item ``We observed a \textbf{crane} at the lake.'' (bird)
+    \item ``She had to \textbf{crane} her neck to see.'' (verb: to stretch)
+\end{itemize}
+A static embedding places all three senses at a single point---a compromise
+that accurately represents none of them.  A contextual model produces three
+distinct vectors, each appropriate for its context.
+
+Beyond polysemy, contextual embeddings capture:
+\begin{itemize}
+    \item \textbf{Word sense disambiguation} (automatically, without explicit
+    sense inventories).
+    \item \textbf{Syntactic role} (``running'' as noun vs.\ verb gets
+    different representations).
+    \item \textbf{Sentence-level semantics} (negation, quantification,
+    conditionals affect word representations).
+\end{itemize}
+
+Quantitatively, the shift from static to contextual embeddings produced
+massive improvements: BERT improved GLUE benchmark scores by 7+ points over
+ELMo (which itself improved significantly over static embeddings).
+
+\redflags
+\begin{itemize}
+    \item Giving only ``contextual is better because BERT is better'' without
+    explaining the polysemy problem.
+    \item Not being able to give a concrete example.
+    \item Saying static embeddings are ``useless'' (they are still useful
+    for efficiency, baselines, and as components of larger systems).
+\end{itemize}
+
+\interviewtest{Understanding of \emph{why} the paradigm shifted, not just
+\emph{that} it did.  Ability to reason about failure modes and design
+implications.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Explains polysemy with a clear example,
+    mentions ELMo and BERT as contextual models.
+    \item \badgeLsix{L6}: Discusses what different layers capture (syntax
+    vs.\ semantics in ELMo/BERT), explains the practical tradeoff (static
+    embeddings are fast, contextual requires GPU inference), and mentions
+    scenarios where static embeddings still win.
+    \item \badgeLseven{L7}: Discusses the emergence of word senses in
+    BERT's embedding space (Wiedemann et al., 2019), explains how
+    contextual embeddings enable transfer learning (pre-train once, adapt to
+    many tasks), and connects to the broader pre-training paradigm.
+\end{itemize}
+
+\followups{What does ELMo capture at different layers? How does BERT create
+contextual embeddings differently from ELMo? When would you still use static
+embeddings in a modern system?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 4 ---
+\begin{interviewq}
+\textbf{Q: How would you evaluate the quality of word or sentence embeddings?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Embedding evaluation has two categories: \textbf{intrinsic} and
+\textbf{extrinsic}.
+
+\textbf{Intrinsic evaluation} measures embedding properties in isolation:
+\begin{itemize}
+    \item \emph{Word similarity:} Compute cosine similarity for word pairs
+    and measure Spearman correlation with human ratings (WordSim-353,
+    SimLex-999).
+    \item \emph{Analogy tasks:} Test $\vw_a - \vw_b + \vw_c \approx \vw_d$
+    (Google analogy dataset).
+    \item \emph{Clustering:} Check whether embeddings cluster by meaningful
+    categories.
+\end{itemize}
+
+\textbf{Extrinsic evaluation} uses embeddings in a downstream task and
+measures task metrics---this is generally more informative because it tests
+what actually matters.  For sentence embeddings, the MTEB benchmark
+evaluates across 8 task categories and 58 datasets.
+
+\textbf{Critically}, good intrinsic scores do not guarantee good extrinsic
+performance.  An embedding space with perfect analogy structure might still
+perform poorly on NER or retrieval.  I would always prioritize evaluation
+on the target task---if I am building a retrieval system, I evaluate with
+retrieval metrics (Recall@K, NDCG), not word similarity scores.
+
+\redflags
+\begin{itemize}
+    \item Only mentioning intrinsic evaluation.
+    \item Not knowing specific benchmarks (WordSim-353, SimLex-999, MTEB).
+    \item Saying ``just look at the nearest neighbors'' without quantitative
+    metrics.
+\end{itemize}
+
+\interviewtest{Critical thinking about evaluation, awareness that proxies can
+mislead, practical measurement discipline.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes both intrinsic and extrinsic evaluation
+    with specific examples.
+    \item \badgeLsix{L6}: Discusses the disconnect between intrinsic and
+    extrinsic metrics, mentions MTEB, and explains how to set up a
+    task-specific evaluation pipeline.
+    \item \badgeLseven{L7}: Discusses embedding space geometry (anisotropy,
+    uniformity---Ethayarajh, 2019), explains how to detect and correct
+    representation degeneration, and designs an evaluation strategy that
+    combines multiple signals for high-stakes deployment decisions.
+\end{itemize}
+
+\followups{What is the MTEB benchmark? What is embedding anisotropy and why
+is it a problem? How would you compare two embedding models for a production
+search system?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 5 ---
+\begin{interviewq}
+\textbf{Q: What is the distributional hypothesis and why is it foundational
+to all word embedding methods?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+The distributional hypothesis, articulated by J.~R.~Firth in 1957, states
+that ``a word is characterized by the company it keeps''---words appearing in
+similar contexts tend to have similar meanings.
+
+This is the theoretical foundation for \emph{every} word embedding method:
+\begin{itemize}
+    \item \emph{Count-based methods} (PMI, SVD) directly model co-occurrence
+    statistics in context windows.
+    \item \emph{Word2Vec} trains to predict context words, implicitly
+    learning to encode distributional patterns.
+    \item \emph{GloVe} optimizes over the global co-occurrence matrix.
+    \item \emph{Contextual models} (ELMo, BERT) predict masked or next tokens
+    from context, learning representations that capture the full range of
+    distributional patterns.
+\end{itemize}
+
+The hypothesis operationalizes ``meaning'' as something computable from
+observable data (text corpora) rather than requiring formal semantic
+definitions.  This is why unsupervised training on raw text works: the
+distributional signal IS the semantic signal.
+
+The hypothesis has limitations: distributional similarity does not capture all
+aspects of meaning.  ``Dog'' and ``cat'' are distributionally similar
+(similar contexts) but semantically distinct.  Antonyms like ``hot'' and
+``cold'' appear in nearly identical contexts but have opposite meanings.
+Grounded or experiential meaning (what ``red'' looks like) cannot be
+captured from text distribution alone.
+
+\redflags
+\begin{itemize}
+    \item Not attributing the hypothesis or knowing where it comes from.
+    \item Treating it as a curiosity rather than the foundation of the field.
+    \item Not acknowledging its limitations (antonyms, grounding).
+\end{itemize}
+
+\interviewtest{Depth of understanding of \emph{why} embeddings work, not just
+\emph{how}.  Awareness of theoretical foundations.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: States the hypothesis correctly, connects it to
+    at least two embedding methods.
+    \item \badgeLsix{L6}: Discusses limitations (antonyms, grounding),
+    explains how all embedding methods operationalize the hypothesis
+    differently.
+    \item \badgeLseven{L7}: Discusses Harris (1954) and Firth (1957) in
+    historical context, connects to modern probing studies that show
+    contextual models capture distributional patterns beyond simple
+    co-occurrence, and discusses the ``meaning-from-text'' debate
+    (Bender and Koller, 2020).
+\end{itemize}
+
+\followups{Can distributional methods capture antonym relationships? What
+aspects of meaning are NOT captured by distributional methods? How does the
+distributional hypothesis relate to BERT's masked language modeling?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 6 ---
+\begin{interviewq}
+\textbf{Q: How does FastText handle out-of-vocabulary words? Why is this
+an improvement over Word2Vec?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+FastText represents each word as the sum of its character n-gram embeddings
+(typically $n = 3$ to $6$) plus a whole-word embedding.  For example,
+``where'' with $n=3$ is decomposed into the n-grams
+$\{\texttt{<wh}, \texttt{whe}, \texttt{her}, \texttt{ere},
+\texttt{re>}\}$ plus the whole-word token $\texttt{<where>}$.
+
+For an OOV word, FastText decomposes it into character n-grams and sums the
+vectors of those n-grams that were observed during training.  Since the
+n-gram vocabulary is far smaller than the word vocabulary and covers
+almost all possible character sequences, FastText virtually eliminates the
+OOV problem.
+
+This is a significant improvement over Word2Vec, which has zero representation
+for OOV words---the model simply cannot process them.  This improvement
+matters most for:
+\begin{itemize}
+    \item Morphologically rich languages where compound words and
+    agglutination create enormous vocabularies.
+    \item Noisy text with typos and misspellings.
+    \item Domain-specific terminology with productive morphology.
+\end{itemize}
+
+Additionally, FastText produces better embeddings even for in-vocabulary
+words, because morphologically related words (``happy,'' ``unhappy,''
+``happiness'') share n-grams and therefore have related vectors.
+
+\redflags
+\begin{itemize}
+    \item Saying ``FastText just uses character-level embeddings'' (it uses
+    n-grams, not individual characters).
+    \item Not knowing that the word vector is the \emph{sum} of n-gram
+    vectors.
+    \item Confusing FastText's subword approach with BPE tokenization (they
+    solve different problems in different ways).
+\end{itemize}
+
+\interviewtest{Understanding of practical engineering considerations in NLP,
+awareness of the OOV problem and its solutions.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Explains the n-gram decomposition and summation
+    correctly, gives an example.
+    \item \badgeLsix{L6}: Discusses trade-offs (larger n-gram vocabulary,
+    increased memory), compares with BPE tokenization (FastText is at the
+    embedding level; BPE is at the tokenization level), and gives
+    language-specific examples.
+    \item \badgeLseven{L7}: Discusses how modern subword tokenizers (BPE,
+    SentencePiece) have partly superseded FastText's approach to OOV
+    handling, and explains the remaining niche where FastText's approach
+    is advantageous (e.g., extremely fast inference without neural network
+    forward pass, cross-lingual alignment via shared n-grams).
+\end{itemize}
+
+\followups{How does FastText's approach compare to BPE tokenization for
+handling OOV? When would you choose FastText over a transformer-based model
+in production? How does the n-gram range affect quality?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 7 ---
+\begin{interviewq}
+\textbf{Q: Explain SimCSE. How does using dropout as data augmentation
+create meaningful positive pairs for contrastive learning?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+SimCSE (Gao et al., 2021) is a contrastive learning framework for sentence
+embeddings.  The unsupervised version uses a remarkably simple trick: pass the
+same sentence through the encoder \emph{twice}, with different dropout masks
+applied in each forward pass.  The two resulting embeddings form a
+\emph{positive pair}.  Other sentences in the batch serve as negatives.  The
+model is trained with an InfoNCE loss to bring positive pairs closer and push
+negatives apart.
+
+\textbf{Why dropout works as augmentation.}  Standard dropout randomly zeroes
+a fraction of hidden units during each forward pass.  When the same input
+passes through the network twice, dropout produces two \emph{slightly
+different} internal representations---the same semantic content processed
+through two different ``sub-networks'' of the transformer.  The key insight is
+that this is a \emph{minimal perturbation} that preserves semantics: unlike
+text-level augmentations (synonym replacement, back-translation, word
+deletion), dropout cannot change the meaning of the input because the
+\emph{input is identical} in both passes.
+
+The supervised variant uses NLI data: entailment pairs as positives and
+contradiction pairs as hard negatives, consistently outperforming the
+unsupervised version.
+
+SimCSE also addressed a key problem in sentence embedding spaces:
+\emph{anisotropy}---the tendency for BERT sentence embeddings to occupy a
+narrow cone in the vector space, making cosine similarity unreliable.
+Contrastive learning produces more uniform, isotropic representations.
+
+\redflags
+\begin{itemize}
+    \item Not understanding that the positive pair uses the \emph{same}
+    input sentence (just different dropout masks).
+    \item Conflating SimCSE with generic data augmentation approaches.
+    \item Not knowing about the anisotropy problem that SimCSE addresses.
+\end{itemize}
+
+\interviewtest{Understanding of contrastive learning, creative approaches to
+data augmentation, and practical knowledge of sentence embedding methods.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Explains the mechanism correctly, states that
+    dropout creates the positive pairs.
+    \item \badgeLsix{L6}: Explains why dropout works (minimal semantic
+    perturbation, different ``sub-networks''), discusses the
+    anisotropy problem, and compares unsupervised vs.\ supervised
+    variants.
+    \item \badgeLseven{L7}: Discusses the connection to the
+    uniformity-alignment framework (Wang and Isola, 2020), explains how
+    contrastive learning corrects representation degeneration, and connects
+    to modern embedding training pipelines that build on SimCSE's
+    insights (E5, BGE use similar contrastive objectives at scale).
+\end{itemize}
+
+\followups{What is the anisotropy problem in BERT embeddings? How does
+contrastive learning produce more isotropic representations? How does
+SimCSE compare to SBERT? What is the uniformity-alignment framework?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 8 ---
+\begin{interviewq}
+\textbf{Q: How would you choose an embedding model for a production semantic
+search system?}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Choosing an embedding model for production semantic search requires balancing
+quality, latency, cost, and operational complexity.  I would evaluate along
+these dimensions:
+
+\textbf{1.\ Quality on the target domain.}  Evaluate candidate models on
+a held-out set of queries and relevant documents from the target domain.
+MTEB scores give a general signal, but domain-specific evaluation is
+essential.  An embedding model trained on academic text may perform poorly
+on e-commerce queries.
+
+\textbf{2.\ Latency budget.}  Embedding models range from FastText
+(sub-millisecond CPU inference) to large transformer encoders (10--50ms
+on GPU).  For real-time search with strict latency SLAs, smaller models
+(MiniLM, E5-small) or pre-computed embeddings with ANN search are necessary.
+
+\textbf{3.\ Dimensionality and storage.}  Each document embedding must be
+stored in the vector index.  For 100M documents at 768 dimensions in
+float32, that is $\sim$300GB.  Matryoshka embeddings allow truncation to
+128 or 256 dimensions with modest quality loss, reducing storage by 3--6x.
+Quantization (scalar, product quantization) further reduces storage.
+
+\textbf{4.\ Multilingual requirements.}  If the system serves multiple
+languages, a multilingual model (E5-multilingual, BGE-m3) is needed.  Be
+aware of the ``tokenizer tax''---non-Latin scripts produce more tokens,
+reducing effective context length and increasing latency.
+
+\textbf{5.\ Fine-tuning potential.}  If you have domain-specific labeled
+data (query-document relevance pairs), fine-tuning a general embedding model
+typically improves quality by 5--15\%.  Consider whether the model supports
+efficient fine-tuning (LoRA, continued contrastive training).
+
+\textbf{6.\ Hybrid architecture.}  In most production systems, dense
+embeddings are combined with sparse retrieval (BM25) in a hybrid
+architecture.  The embedding model handles semantic matching; BM25 handles
+exact lexical matching.  A cross-encoder re-ranker then scores the top
+candidates.  The embedding model should be evaluated as part of this full
+pipeline, not in isolation.
+
+\redflags
+\begin{itemize}
+    \item Choosing based solely on MTEB leaderboard ranking without
+    domain-specific evaluation.
+    \item Ignoring latency, storage, and cost constraints.
+    \item Not mentioning hybrid retrieval (dense + sparse).
+    \item Proposing a cross-encoder for first-stage retrieval (does not
+    scale).
+\end{itemize}
+
+\interviewtest{Systems thinking, production awareness, ability to balance
+competing constraints, understanding of the full retrieval pipeline.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Identifies key dimensions (quality, latency, cost)
+    and names specific models.
+    \item \badgeLsix{L6}: Discusses hybrid retrieval, Matryoshka embeddings,
+    domain-specific fine-tuning, and the full retrieval pipeline including
+    re-ranking.
+    \item \badgeLseven{L7}: Discusses quantization strategies for the vector
+    index, multi-stage retrieval design (coarse ANN $\to$ re-rank $\to$
+    cross-encoder), monitoring embedding quality drift over time, and the
+    decision framework for when to fine-tune vs.\ use off-the-shelf models
+    including cost-benefit analysis.
+\end{itemize}
+
+\followups{How would you handle embedding drift as your data distribution
+changes? How would you evaluate retrieval quality end-to-end? What is the
+tradeoff between Matryoshka dimension truncation and quality?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 9 ---
+\begin{interviewq}
+\textbf{Q: Explain the connection between Word2Vec, GloVe, and matrix
+factorization on co-occurrence statistics. Why does this connection matter?}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Levy and Goldberg (2014) proved a remarkable result: Word2Vec Skip-gram with
+negative sampling is implicitly factorizing a shifted pointwise mutual
+information (PMI) matrix.  Specifically, the inner product of the learned
+embeddings converges to:
+\[
+    \vw_i^\top \vw'_j = \text{PMI}(i, j) - \log k
+\]
+where $k$ is the number of negative samples.  This means Skip-gram is
+performing a weighted, low-rank factorization of the word-context PMI matrix.
+
+GloVe, by contrast, \emph{explicitly} optimizes a weighted factorization of
+the log co-occurrence matrix:
+$\vw_i^\top \vw'_j + b_i + b'_j \approx \log X_{ij}$.
+
+The classical SVD approach directly factorizes the PPMI matrix using truncated
+SVD.
+
+All three methods are fundamentally doing the same thing: factorizing a
+matrix derived from co-occurrence statistics into low-dimensional word
+vectors.  They differ in the weighting scheme, the specific matrix being
+factorized (PPMI vs.\ log counts vs.\ implicitly shifted PMI), and the
+optimization procedure (SGD on local windows vs.\ batch optimization on the
+full matrix vs.\ SVD).
+
+This connection matters because it: (1)~explains why all three methods produce
+similar-quality embeddings despite very different formulations; (2)~shows that
+``predictive'' and ``count-based'' are not fundamentally different paradigms;
+and (3)~provides theoretical grounding for why these methods work---they
+capture the statistical structure of language as encoded in co-occurrence
+patterns.
+
+\redflags
+\begin{itemize}
+    \item Treating Word2Vec as ``completely different'' from count-based
+    methods.
+    \item Not knowing the Levy and Goldberg result.
+    \item Being unable to state what matrix Word2Vec implicitly factorizes.
+\end{itemize}
+
+\interviewtest{Depth of theoretical understanding, ability to see unifying
+principles across seemingly different methods, research literacy.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: States that Word2Vec and GloVe both relate to
+    co-occurrence statistics.
+    \item \badgeLsix{L6}: Cites Levy and Goldberg, states the specific
+    shifted PMI result, and explains how GloVe's objective relates.
+    \item \badgeLseven{L7}: Discusses the implications for hyperparameter
+    choices (window size controls the co-occurrence matrix, negative
+    samples control the PMI shift), connects to modern contrastive learning
+    (which also performs implicit spectral decomposition), and discusses
+    how this understanding informed the design of subsequent methods.
+\end{itemize}
+
+\followups{What matrix does Word2Vec implicitly factorize? How does the
+number of negative samples affect this factorization? Does this unification
+extend to contextual embeddings like BERT?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 10 ---
+\begin{interviewq}
+\textbf{Q: Walk me through how you would build a text similarity system
+for a product with 50 million documents, starting from embedding selection
+to serving.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+I would design this as a multi-stage pipeline.
+
+\textbf{Stage 1: Embedding Model Selection.}  Evaluate candidate models
+(E5-large, BGE-large, a domain-fine-tuned variant) on a representative sample
+of document pairs with similarity labels.  Measure Spearman correlation for
+similarity and Recall@K for retrieval.  Choose based on quality-latency
+tradeoff---for 50M documents, a model producing 384--768 dimensional
+embeddings is practical.  If quality is critical, use Matryoshka-trained
+embeddings to enable dimension truncation for candidate generation.
+
+\textbf{Stage 2: Offline Embedding Generation.}  Embed all 50M documents in a
+batch pipeline.  At 768 dimensions in float32, the index is approximately
+150GB.  Apply scalar quantization (float32 $\to$ int8) to reduce to
+$\sim$37GB.  Store in a vector database (Pinecone, Weaviate, Qdrant, or
+self-hosted FAISS/ScaNN).
+
+\textbf{Stage 3: Index Construction.}  Build an ANN (Approximate Nearest
+Neighbor) index.  HNSW is the standard choice for production systems: good
+recall at sub-millisecond latency.  IVF-PQ is an alternative when memory is
+constrained.  Tune recall-latency tradeoff on the evaluation set.
+
+\textbf{Stage 4: Query Pipeline.}  At query time: embed the query (10--30ms
+on GPU), search the ANN index for top-100 candidates ($<$5ms), then re-rank
+with a cross-encoder for the top-20 ($\sim$50ms).  Total latency: $<$100ms.
+
+\textbf{Stage 5: Monitoring.}  Track embedding quality over time.  Set up
+golden evaluation sets, monitor retrieval metrics weekly, and detect
+distribution drift.  Periodically refresh embeddings as the document corpus
+evolves.
+
+\redflags
+\begin{itemize}
+    \item Proposing brute-force cosine similarity over 50M documents
+    (does not scale).
+    \item Not mentioning ANN search or vector databases.
+    \item Ignoring the re-ranking stage.
+    \item Not considering storage and quantization.
+\end{itemize}
+
+\interviewtest{End-to-end systems thinking, production awareness, ability to
+design a complete pipeline with concrete numbers for latency, storage, and
+throughput.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Describes embedding + ANN search + re-ranking at
+    a high level.
+    \item \badgeLsix{L6}: Provides concrete latency and storage estimates,
+    discusses quantization, names specific ANN algorithms and vector
+    databases, and includes a hybrid retrieval component.
+    \item \badgeLseven{L7}: Designs for incremental index updates, discusses
+    sharding and replication for availability, addresses cold-start for new
+    documents, considers A/B testing frameworks for comparing embedding
+    models, and designs the monitoring and retraining pipeline.
+\end{itemize}
+
+\followups{How would you handle incremental updates when new documents
+arrive? How would you A/B test two different embedding models in production?
+What ANN algorithm would you choose and why?}
+\end{interviewq}

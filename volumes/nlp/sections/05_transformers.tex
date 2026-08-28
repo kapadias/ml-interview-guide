@@ -1,0 +1,1727 @@
+% ============================================================================
+% CHAPTER 5: TRANSFORMERS AND MODERN ARCHITECTURES
+% The single most important chapter for NLP interviews.
+% ============================================================================
+
+\chapter{Transformers and Modern Architectures}
+\label{chap:transformers}
+
+\begin{tldr}
+The Transformer architecture (Vaswani et al., 2017) revolutionized NLP by replacing
+recurrence with \emph{self-attention}, enabling full parallelism over the input sequence
+and providing direct paths between any two positions.  This chapter derives
+self-attention from first principles, builds up multi-head attention, positional
+encoding, and the complete encoder--decoder architecture, then surveys the three
+dominant variants---encoder-only (BERT), decoder-only (GPT), and encoder--decoder
+(T5)---and modern efficiency improvements (Flash Attention, GQA, sliding window).
+Transformers are the \textbf{\#1 most-tested topic in NLP interviews}: every
+FAANG-level ML interview will probe your understanding of the math, the design
+choices, and the production implications.
+\end{tldr}
+
+\bigskip
+
+% ============================================================================
+% SECTION 1: SELF-ATTENTION
+% ============================================================================
+\section{Self-Attention from First Principles}
+\label{sec:self-attention}
+
+\subsection{Motivation}
+
+Recurrent models process tokens sequentially: to connect the first and last
+tokens in a length-$n$ sequence, information must pass through $O(n)$
+intermediate hidden states.  This sequential bottleneck causes two problems:
+
+\begin{enumerate}
+    \item \textbf{Training is slow.}  Backpropagation through time cannot be
+          parallelized across positions; each step depends on the previous one.
+    \item \textbf{Long-range dependencies are hard to learn.}  Even with LSTM
+          gating, gradient signals attenuate over many steps, making it
+          difficult to capture dependencies spanning hundreds of tokens.
+\end{enumerate}
+
+Self-attention solves both problems by computing \emph{direct} pairwise
+interactions between all positions in a single operation, reducing the path
+length between any two tokens to $O(1)$ and enabling full parallelism.
+
+\subsection{Deriving Self-Attention Step by Step}
+
+Suppose we have a sequence of $n$ token representations, each of dimension $d$,
+stacked into a matrix:
+\[
+    \mX \in \R^{n \times d}
+\]
+where row $\mX_i$ is the representation of the $i$-th token.
+
+\paragraph{Step 1: Project into Query, Key, and Value spaces.}
+We learn three separate linear projections:
+\[
+    \mQ = \mX \mW_Q, \qquad
+    \mK = \mX \mW_K, \qquad
+    \mV = \mX \mW_V
+\]
+where $\mW_Q, \mW_K \in \R^{d \times d_k}$ and $\mW_V \in \R^{d \times d_v}$.
+
+\paragraph{Step 2: Compute attention scores.}
+For every pair of positions $(i,j)$, compute a compatibility score between
+query $i$ and key $j$ via a scaled dot product:
+\[
+    e_{ij} = \frac{\vq_i^\top \vk_j}{\sqrt{d_k}}
+\]
+
+\paragraph{Step 3: Normalize into attention weights.}
+Apply $\softmax$ row-wise so that each query's weights sum to one:
+\[
+    \alpha_{ij} = \frac{\exp(e_{ij})}{\sum_{l=1}^{n} \exp(e_{il})}
+\]
+
+\paragraph{Step 4: Compute weighted sum of values.}
+The output for position $i$ is the attention-weighted combination of all values:
+\[
+    \text{output}_i = \sum_{j=1}^{n} \alpha_{ij}\, \mathbf{v}_j
+\]
+
+In full matrix form, this gives the celebrated attention equation:
+
+\begin{mathresult}{Scaled Dot-Product Attention}
+\[
+    \text{Attention}(\mQ, \mK, \mV)
+    = \softmax\!\left(\frac{\mQ \mK^\top}{\sqrt{d_k}}\right) \mV
+\]
+where $\mQ \in \R^{n \times d_k}$, $\mK \in \R^{n \times d_k}$,
+$\mV \in \R^{n \times d_v}$, and $\softmax$ is applied row-wise.
+\end{mathresult}
+
+\subsection{Why Separate Q, K, V Projections?}
+
+A common interview follow-up is: \emph{why not just use $\mX$ directly for the
+dot products?}
+
+Without separate projections, the attention score between positions $i$ and $j$
+would be $\vx_i^\top \vx_j$---a simple input similarity measure.  This is
+degenerate: for representations of approximately equal norm, every token
+would attend most strongly to itself (Cauchy--Schwarz gives
+$\vx_i^\top \vx_j \leq \norm{\vx_i}\,\norm{\vx_j} \approx \norm{\vx_i}^2
+= \vx_i^\top \vx_i$, with equality only when $\vx_j$ is parallel to
+$\vx_i$).
+
+Separate projections decouple three distinct \emph{roles}:
+\begin{itemize}
+    \item $\mQ$: \textbf{``What am I looking for?''} --- the query's
+          information need.
+    \item $\mK$: \textbf{``What do I advertise?''} --- what each position
+          offers as a potential match.
+    \item $\mV$: \textbf{``What do I provide if selected?''} --- the content
+          actually transmitted.
+\end{itemize}
+
+This separation allows the model to attend based on one aspect of the
+representation (e.g., syntactic role via Q/K) while retrieving a different
+aspect (e.g., semantic content via V).
+
+\begin{keyinsight}[Attention as Soft Dictionary Lookup]
+Self-attention is a \emph{soft dictionary lookup}.  The queries search over
+keys to produce a probability distribution, then retrieve a weighted mixture
+of the associated values.  Unlike a hard lookup (which returns a single
+entry), this soft version is differentiable and can blend information from
+multiple positions simultaneously.  This analogy is directly useful for
+understanding the KV-cache during inference, where keys and values from
+previously generated tokens are stored for reuse.
+\end{keyinsight}
+
+\subsection{Why Scale by $\sqrt{d_k}$?}
+\label{sec:sqrt-scaling}
+
+This is one of the most commonly asked interview questions.  The answer
+requires a simple variance analysis.
+
+Assume each component of $\vq$ and $\vk$ is drawn i.i.d.\ with mean 0 and
+variance 1.  The dot product is:
+\[
+    \vq^\top \vk = \sum_{i=1}^{d_k} q_i \, k_i
+\]
+
+Since $q_i$ and $k_i$ are independent, $\E[q_i k_i] = 0$ and
+$\Var(q_i k_i) = \E[q_i^2]\,\E[k_i^2] = 1$.  By independence of the summands:
+
+\begin{mathresult}{Variance of the Dot Product}
+\[
+    \Var(\vq^\top \vk) = \sum_{i=1}^{d_k} \Var(q_i\, k_i) = d_k
+\]
+\end{mathresult}
+
+So the standard deviation of the raw dot product grows as $\sqrt{d_k}$.  For
+typical $d_k = 64$ or $128$, the dot products range over $\pm 16$ or more.
+The $\softmax$ function saturates in this regime: its outputs approach a one-hot
+vector, gradients vanish, and the model cannot learn.
+
+Dividing by $\sqrt{d_k}$ normalizes the variance to 1 regardless of the
+dimension, keeping the $\softmax$ in its ``useful'' regime where gradients
+flow meaningfully.
+
+\begin{warningbox}
+Candidates frequently state ``we divide by $\sqrt{d_k}$ to normalize'' without
+being able to derive \emph{why} $\sqrt{d_k}$.  Be prepared to walk through the
+variance calculation above---interviewers will push on it.
+\end{warningbox}
+
+\subsection{Computational Complexity}
+
+The matrix product $\mQ \mK^\top$ produces an $n \times n$ matrix, where $n$
+is the sequence length.  This yields:
+
+\begin{itemize}
+    \item \textbf{Compute:} $O(n^2 d)$ for the QK and attention-value products.
+    \item \textbf{Memory:} $O(n^2)$ for the attention matrix (plus $O(nd)$
+          for Q, K, V).
+\end{itemize}
+
+For $n = 4096$ and 32 heads, the attention matrix alone is
+$32 \times 4096^2 \times 2\text{ bytes} \approx 1$\,GB in \texttt{float16}.
+This quadratic scaling is the fundamental bottleneck driving all efficiency
+research (Flash Attention, sparse attention, linear attention, SSMs).
+
+\subsection{TikZ: Scaled Dot-Product Attention}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.0cm and 1.6cm,
+    box/.style={rectangle, draw=deepblue, fill=lightblue, minimum width=2.0cm,
+                minimum height=0.7cm, font=\small\sffamily, rounded corners=2pt,
+                thick},
+    opbox/.style={circle, draw=deepblue, fill=deepblue!12, minimum size=0.7cm,
+                  font=\small\sffamily, thick},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!80},
+    lbl/.style={font=\scriptsize\sffamily, text=deepblue!80}
+]
+
+% Input matrices
+\node[box] (Q) {$\mQ$};
+\node[box, right=1.8cm of Q] (K) {$\mK$};
+\node[box, right=1.8cm of K] (V) {$\mV$};
+
+% MatMul QK^T
+\node[opbox, below=1.0cm of $(Q)!0.5!(K)$] (mm1) {$\times$};
+\node[lbl, right=2pt of mm1] {$\mQ\mK^\top$};
+
+% Scale
+\node[box, below=0.8cm of mm1] (scale) {Scale $\div\!\sqrt{d_k}$};
+
+% Mask (optional)
+\node[box, below=0.8cm of scale, dashed, draw=gray] (mask) {Mask (opt.)};
+
+% Softmax
+\node[box, below=0.8cm of mask] (sm) {Softmax};
+
+% MatMul with V
+\node[opbox, below=0.8cm of $(sm)!0.5!(sm-|V)$] (mm2) {$\times$};
+
+% Output
+\node[box, below=0.8cm of mm2, fill=deepblue!15] (out) {Output};
+
+% Arrows
+\draw[arr] (Q) |- (mm1);
+\draw[arr] (K) |- (mm1);
+\draw[arr] (mm1) -- (scale);
+\draw[arr] (scale) -- (mask);
+\draw[arr] (mask) -- (sm);
+\draw[arr] (sm) -- (mm2);
+\draw[arr] (V) |- (mm2);
+\draw[arr] (mm2) -- (out);
+
+% Transpose label
+\node[lbl, above left=0.1cm and -0.2cm of mm1] {$^\top$};
+
+\end{tikzpicture}
+\caption{Scaled dot-product attention.  Queries and keys interact via a scaled
+dot product, optionally masked (for causal decoding), then normalized by
+$\softmax$ to produce attention weights applied to values.}
+\label{fig:sdp-attention}
+\end{figure}
+
+
+% ============================================================================
+% SECTION 2: MULTI-HEAD ATTENTION
+% ============================================================================
+\section{Multi-Head Attention}
+\label{sec:multi-head}
+
+A single attention head captures one ``type'' of relationship (e.g., syntactic
+adjacency).  \textbf{Multi-head attention} runs $h$ independent attention heads
+in parallel, each with its own learned projections, then concatenates and
+linearly combines the results.
+
+\begin{mathresult}{Multi-Head Attention}
+\begin{align*}
+    \text{MultiHead}(\mQ, \mK, \mV) &= \text{Concat}(\text{head}_1, \ldots, \text{head}_h)\,\mW_O \\[4pt]
+    \text{head}_i &= \text{Attention}(\mQ\mW_Q^{(i)},\; \mK\mW_K^{(i)},\; \mV\mW_V^{(i)})
+\end{align*}
+where $\mW_Q^{(i)}, \mW_K^{(i)} \in \R^{d_{\text{model}} \times d_k}$,\;
+$\mW_V^{(i)} \in \R^{d_{\text{model}} \times d_v}$,\;
+$\mW_O \in \R^{hd_v \times d_{\text{model}}}$, and
+$d_k = d_v = d_{\text{model}} / h$.
+\end{mathresult}
+
+\paragraph{Why multiple heads?}
+\begin{enumerate}
+    \item \textbf{Diverse attention patterns.}  Different heads learn to focus
+          on different relationship types---empirical studies show heads
+          specializing in syntactic heads, positional neighbors, rare tokens,
+          and semantic roles.
+    \item \textbf{Subspace richness.}  Each head operates in its own
+          $d_k$-dimensional subspace, allowing the model to attend based on
+          multiple criteria simultaneously.
+    \item \textbf{Ensemble effect.}  Multiple heads act as an ensemble within
+          a single layer, increasing robustness.
+\end{enumerate}
+
+\paragraph{What happens with a single head?}
+With one head at full dimension $d_k = d_{\text{model}}$, the model can
+represent only \emph{one} attention pattern per layer.  Empirically,
+single-head attention performs significantly worse, especially on tasks
+requiring both syntactic and semantic reasoning.  The output projection
+$\mW_O$ is also critical: it allows cross-head information mixing that a
+single head cannot provide.
+
+\paragraph{Computational cost.}
+Multi-head attention has the \emph{same} total cost as single-head attention
+at full dimension.  Each head uses $d_k = d_{\text{model}}/h$, so the total
+parameter count and FLOPs remain $O(d_{\text{model}}^2)$ per layer---the
+parallelism over heads is ``free.''
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm and 0.7cm,
+    box/.style={rectangle, draw=deepblue, fill=lightblue, minimum width=1.4cm,
+                minimum height=0.6cm, font=\scriptsize\sffamily, rounded corners=2pt,
+                thick},
+    headbox/.style={rectangle, draw=deepblue!70, fill=blue!6,
+                    minimum width=1.3cm, minimum height=0.55cm,
+                    font=\scriptsize\sffamily, rounded corners=2pt},
+    arr/.style={-{Stealth[length=4pt]}, thick, deepblue!70},
+    lbl/.style={font=\tiny\sffamily, text=deepblue!70}
+]
+
+% Input
+\node[box, minimum width=5.2cm] (input) {Input: $\mX \in \R^{n \times d}$};
+
+% Linear projections
+\node[box, below=0.8cm of input, xshift=-2.0cm] (lq) {$\mW_Q^{(i)}$};
+\node[box, below=0.8cm of input] (lk) {$\mW_K^{(i)}$};
+\node[box, below=0.8cm of input, xshift=2.0cm] (lv) {$\mW_V^{(i)}$};
+
+% Heads
+\node[headbox, below=0.7cm of lq, xshift=-0.8cm] (h1) {Head 1};
+\node[headbox, below=0.7cm of lk] (h2) {Head 2};
+\node[lbl, right=0.15cm of h2] {$\cdots$};
+\node[headbox, below=0.7cm of lv, xshift=0.8cm] (hh) {Head $h$};
+
+% Concat
+\node[box, below=0.7cm of h2, minimum width=5.2cm] (concat) {Concat};
+
+% Output projection
+\node[box, below=0.6cm of concat, minimum width=5.2cm, fill=deepblue!15] (wo) {Linear $\mW_O$};
+
+% Output
+\node[box, below=0.6cm of wo, minimum width=5.2cm, fill=deepblue!20] (out)
+     {Output: $\R^{n \times d}$};
+
+% Arrows
+\draw[arr] (input) -- (lq);
+\draw[arr] (input) -- (lk);
+\draw[arr] (input) -- (lv);
+
+\draw[arr] (lq) -- (h1);
+\draw[arr] (lk) -- (h2);
+\draw[arr] (lv) -- (hh);
+
+\draw[arr] (h1) -- (concat);
+\draw[arr] (h2) -- (concat);
+\draw[arr] (hh) -- (concat);
+
+\draw[arr] (concat) -- (wo);
+\draw[arr] (wo) -- (out);
+
+% Annotation
+\node[lbl, left=0.3cm of h1] {$d_k = d/h$};
+
+\end{tikzpicture}
+\caption{Multi-head attention.  Input is projected $h$ times into lower-dimensional
+subspaces, attention is computed independently per head, and results are
+concatenated and linearly projected back to $d_{\text{model}}$ dimensions.}
+\label{fig:multi-head}
+\end{figure}
+
+
+% ============================================================================
+% SECTION 3: FEED-FORWARD NETWORK
+% ============================================================================
+\section{Position-Wise Feed-Forward Network}
+\label{sec:ffn}
+
+Each transformer layer contains a \emph{position-wise} feed-forward network
+(FFN) applied identically and independently to every position.  Unlike
+attention, the FFN involves \emph{no} cross-position interaction---it
+transforms each token's representation in isolation.
+
+\subsection{Standard FFN}
+
+The original Transformer uses a two-layer MLP with a ReLU activation:
+\[
+    \text{FFN}(\vx) = \relu(\vx \mW_1 + \vb_1)\,\mW_2 + \vb_2
+\]
+where $\mW_1 \in \R^{d \times d_{ff}}$, $\mW_2 \in \R^{d_{ff} \times d}$,
+and $d_{ff} = 4d$ is the standard expansion ratio.  Modern models often use
+$\gelu$ instead of $\relu$ (used in BERT, GPT-2).
+
+\subsection{Gated Linear Units: SwiGLU and GeGLU}
+
+Most modern LLMs (LLaMA, Mistral, Gemma, PaLM) replace the standard FFN with
+a \textbf{gated linear unit} variant:
+\[
+    \text{SwiGLU}(\vx) = \bigl(\text{Swish}(\vx \mW_1) \odot (\vx \mW_3)\bigr)\,\mW_2
+\]
+where $\text{Swish}(x) = x \cdot \sigmoid(x)$, $\odot$ is element-wise
+multiplication, and $\mW_3 \in \R^{d \times d_{ff}}$ is the gate projection.
+The gating mechanism allows the network to selectively pass or suppress
+features, empirically improving performance for a given parameter count.
+
+\paragraph{Why the expansion then compression?}
+The FFN expands to $d_{ff} = 4d$ (or $\tfrac{8}{3}d$ in gated variants to
+match parameter counts), then compresses back to $d$.  The high-dimensional
+intermediate representation allows the network to project inputs into a space
+where complex nonlinear transformations become easier, then distill the result
+back to the model dimension.
+
+\begin{keyinsight}[FFN as Key-Value Memory]
+Geva et al.\ (2021) showed that FFN layers can be interpreted as
+\emph{key-value memories}: the rows of $\mW_1$ are ``keys'' (pattern
+detectors), the activation determines which patterns are triggered, and the
+corresponding columns of $\mW_2$ are ``values'' (stored information retrieved
+when the pattern matches).  This explains why scaling the FFN width improves
+factual knowledge capacity and why knowledge editing techniques target FFN
+layers specifically.
+\end{keyinsight}
+
+\paragraph{Attention vs.\ FFN: complementary roles.}
+\begin{itemize}
+    \item \textbf{Attention} = \emph{token mixing} (cross-position
+          interaction, determines which positions to combine).
+    \item \textbf{FFN} = \emph{feature mixing} (per-position transformation,
+          applies nonlinear computations to each token's representation).
+\end{itemize}
+
+A transformer layer interleaves both: first attention combines information
+across positions, then the FFN transforms each resulting representation.
+
+
+% ============================================================================
+% SECTION 4: POSITIONAL ENCODING
+% ============================================================================
+\section{Positional Encoding}
+\label{sec:positional-encoding}
+
+\subsection{Why Positional Information Is Needed}
+
+Self-attention is \textbf{permutation-equivariant}: if we reorder the input
+tokens, the output is reordered in exactly the same way, with the same values.
+Formally, for any permutation $\pi$:
+\[
+    \text{Attention}(\mX_\pi) = \text{Attention}(\mX)_\pi
+\]
+This means the model has \emph{no innate notion of position}---``The cat sat
+on the mat'' and ``mat the on sat cat The'' would produce identical attention
+patterns.  Positional encoding injects position information to break this
+symmetry.
+
+\subsection{Sinusoidal Positional Encoding (Original Transformer)}
+
+Vaswani et al.\ (2017) proposed a deterministic, parameter-free encoding using
+sinusoids of varying frequencies:
+
+\begin{mathresult}{Sinusoidal Positional Encoding}
+\begin{align*}
+    \text{PE}(pos, 2i) &= \sin\!\left(\frac{pos}{10000^{2i/d}}\right) \\[4pt]
+    \text{PE}(pos, 2i+1) &= \cos\!\left(\frac{pos}{10000^{2i/d}}\right)
+\end{align*}
+where $pos$ is the position index and $i$ is the dimension index
+($0 \leq i < d/2$).
+\end{mathresult}
+
+The key property: for any fixed offset $k$, $\text{PE}(pos + k)$ can be
+expressed as a linear function of $\text{PE}(pos)$, enabling the model to
+learn relative position attention.  The wavelengths form a geometric
+progression from $2\pi$ to $10000 \cdot 2\pi$, covering fine-grained to
+coarse-grained positional information.
+
+\subsection{Learned Absolute Position Embeddings}
+
+BERT, GPT-2, and many early models simply learn a position embedding table
+$\mW_P \in \R^{L_{\max} \times d}$ and add $\mW_P[pos]$ to each token
+embedding.
+
+\textbf{Pros:} Simple, effective, can capture complex position-dependent patterns.\\
+\textbf{Cons:} Fixed maximum length $L_{\max}$---cannot generalize to longer
+sequences at inference time (no length extrapolation).
+
+\subsection{Relative Position Encoding (Shaw et al., 2018)}
+
+Instead of absolute positions, encode the \emph{relative distance} between
+positions directly in the attention computation:
+\[
+    e_{ij} = \frac{\vq_i^\top(\vk_j + \va_{ij}^K)}{\sqrt{d_k}}
+\]
+where $\va_{ij}^K$ is a learned embedding for relative position $(i - j)$,
+clipped to a maximum distance.  This naturally captures that ``two tokens apart''
+matters more than ``at positions 57 and 59 specifically.''
+
+\subsection{RoPE: Rotary Position Embedding}
+\label{sec:rope}
+
+Rotary Position Embedding (Su et al., 2021) encodes position by
+\emph{rotating} query and key vectors in 2D subspaces:
+
+\begin{mathresult}{Rotary Position Embedding (RoPE)}
+For position $m$ and dimension pair $(2i, 2i+1)$:
+\[
+    \text{RoPE}(\vx, m) = \begin{pmatrix} x_{2i} \cos m\theta_i - x_{2i+1} \sin m\theta_i \\
+                                           x_{2i} \sin m\theta_i + x_{2i+1} \cos m\theta_i \end{pmatrix}
+\]
+where $\theta_i = 10000^{-2i/d}$.  The inner product of rotated queries and
+keys depends only on relative position:
+\[
+    \text{RoPE}(\vq, m)^\top \text{RoPE}(\vk, n) = f(\vq, \vk, m - n)
+\]
+\end{mathresult}
+
+\textbf{Why RoPE is widely adopted} (LLaMA, Mistral, GPT-NeoX, Qwen, DeepSeek):
+\begin{enumerate}
+    \item Encodes \emph{relative} position through an \emph{absolute}
+          mechanism---no separate relative position lookup.
+    \item Decays naturally with distance: inner products decrease for faraway
+          positions, providing an implicit recency bias.
+    \item Supports length extrapolation through frequency scaling (NTK-aware
+          scaling, YaRN, Dynamic NTK).
+    \item No additional parameters beyond the base frequencies.
+\end{enumerate}
+
+\subsection{ALiBi: Attention with Linear Biases}
+
+ALiBi (Press et al., 2022) takes an even simpler approach: subtract a linear
+penalty from attention scores based on distance, with a different slope per head:
+\[
+    \text{score}_{ij} = \vq_i^\top \vk_j - m \cdot |i - j|
+\]
+where $m$ is a head-specific slope (set geometrically, not learned).  ALiBi
+requires no position embeddings at all and achieves strong length extrapolation.
+
+\subsection{Comparison of Positional Encoding Methods}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Method} & \textbf{Params} & \textbf{Relative?} & \textbf{Extrapolation} & \textbf{Used In} \\
+\midrule
+Sinusoidal         & None    & Indirect & Limited  & Original Transformer \\
+Learned Absolute   & $O(Ld)$ & No       & None     & BERT, GPT-2 \\
+Relative (Shaw)    & $O(Kd)$ & Yes      & By clip  & Shaw et al.\ (2018); Transformer-XL, T5, DeBERTa use related but distinct relative schemes \\
+RoPE               & None    & Yes      & Good (w/ scaling) & LLaMA, Mistral, Qwen \\
+ALiBi              & None    & Yes      & Strong   & BLOOM, MPT \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of positional encoding methods.  $L$ = max sequence length,
+$K$ = max clipping distance, $d$ = model dimension.}
+\label{tab:pos-encoding}
+\end{table}
+
+\begin{warningbox}
+Interviewers frequently ask ``What happens if you give a Transformer no
+positional encoding at all?''  The answer: for encoder-only models, the output
+is permutation-equivariant and loses all word-order information.  For
+causal (decoder-only) models, the causal mask provides \emph{partial}
+positional information---the model knows the relative ordering but not the
+absolute distance.  Some research (NoPE) has shown surprisingly reasonable
+performance with causal masking alone, but this is not standard practice.
+\end{warningbox}
+
+
+% ============================================================================
+% SECTION 5: FULL TRANSFORMER ARCHITECTURE
+% ============================================================================
+\section{The Full Transformer Architecture}
+\label{sec:full-arch}
+
+\subsection{Layer Normalization}
+
+Transformers use \textbf{layer normalization} (Ba et al., 2016) rather than
+batch normalization, because sequence lengths vary and batch statistics are
+unreliable for autoregressive generation.
+
+\[
+    \text{LayerNorm}(\vx) = \frac{\vx - \mu}{\sqrt{\sigma^2 + \epsilon}} \odot \bm{\gamma} + \bm{\beta}
+\]
+where $\mu$ and $\sigma^2$ are computed across the feature dimension for a
+single position.
+
+\paragraph{Pre-norm vs.\ Post-norm.}
+\begin{itemize}
+    \item \textbf{Post-norm (original):} $\text{LN}(\vx + \text{Sublayer}(\vx))$
+          ---apply the sublayer first, add the residual, then normalize.
+    \item \textbf{Pre-norm (modern standard):}
+          $\vx + \text{Sublayer}(\text{LN}(\vx))$---normalize first, apply
+          the sublayer, then add the residual.
+\end{itemize}
+
+Pre-norm is now the dominant choice because it produces more stable gradients
+at initialization (the residual stream passes through unchanged), greatly
+reduces sensitivity to learning rate warmup (though production LLMs still
+use warmup), and enables training much deeper transformers.
+
+\paragraph{RMSNorm.}
+Many modern LLMs (LLaMA, Mistral, Gemma) replace LayerNorm with
+\textbf{RMSNorm}, which omits the mean subtraction:
+\[
+    \text{RMSNorm}(\vx) = \frac{\vx}{\text{RMS}(\vx)} \odot \bm{\gamma},
+    \qquad
+    \text{RMS}(\vx) = \sqrt{\frac{1}{d}\sum_{i=1}^{d} x_i^2}
+\]
+RMSNorm is simpler, slightly faster, and performs comparably to full LayerNorm.
+
+\subsection{Residual Connections}
+
+Every sublayer (attention and FFN) uses a residual (skip) connection:
+$\vx + \text{Sublayer}(\vx)$.  Residual connections serve two purposes:
+\begin{enumerate}
+    \item \textbf{Gradient flow:} Provide a direct gradient path from the loss
+          to every layer, preventing vanishing gradients in deep networks.
+    \item \textbf{Identity initialization:} At initialization, when sublayer
+          outputs are near-zero, the network approximates the identity function,
+          making optimization easier.
+\end{enumerate}
+
+\subsection{Encoder Block}
+
+A single encoder layer consists of:
+
+\begin{mathresult}{Transformer Encoder Block (Pre-Norm)}
+\begin{align*}
+    \vh' &= \vx + \text{MultiHead}\bigl(\text{LN}(\vx),\; \text{LN}(\vx),\; \text{LN}(\vx)\bigr) \\[3pt]
+    \vh'' &= \vh' + \text{FFN}\bigl(\text{LN}(\vh')\bigr)
+\end{align*}
+Both self-attention inputs (Q, K, V) come from the \emph{same} source.
+\end{mathresult}
+
+\subsection{Decoder Block}
+
+A decoder layer adds two features: \textbf{causal masking} in self-attention
+(preventing positions from attending to future tokens) and \textbf{cross-attention}
+over the encoder output.
+
+\begin{mathresult}{Transformer Decoder Block (Pre-Norm)}
+\begin{align*}
+    \vh^{(1)} &= \vy + \text{MaskedMultiHead}\bigl(\text{LN}(\vy),\; \text{LN}(\vy),\; \text{LN}(\vy)\bigr) \\[3pt]
+    \vh^{(2)} &= \vh^{(1)} + \text{MultiHead}\bigl(\text{LN}(\vh^{(1)}),\; \mH_{\text{enc}},\; \mH_{\text{enc}}\bigr) \\[3pt]
+    \vh^{(3)} &= \vh^{(2)} + \text{FFN}\bigl(\text{LN}(\vh^{(2)})\bigr)
+\end{align*}
+In cross-attention, queries come from the decoder while keys and values come
+from the encoder output $\mH_{\text{enc}}$.  Note that only the
+\emph{decoder} stream is normalized inside the block: in standard pre-norm
+encoder--decoders (e.g., T5), $\mH_{\text{enc}}$ is the encoder output after
+a single final LayerNorm at the top of the encoder stack, not re-normalized
+inside every decoder layer.
+\end{mathresult}
+
+The \textbf{causal mask} is a lower-triangular matrix applied to the attention
+scores (setting future positions to $-\infty$ before $\softmax$), ensuring that
+each position can only attend to itself and earlier positions.
+
+\subsection{TikZ: Full Transformer Encoder-Decoder}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.55cm,
+    block/.style={rectangle, draw=deepblue, fill=lightblue,
+                  minimum width=3.0cm, minimum height=0.55cm,
+                  font=\scriptsize\sffamily, rounded corners=2pt, thick},
+    normblock/.style={rectangle, draw=gray!60, fill=gray!8,
+                      minimum width=3.0cm, minimum height=0.4cm,
+                      font=\scriptsize\sffamily, rounded corners=1pt},
+    arr/.style={-{Stealth[length=4pt]}, thick, deepblue!70},
+    brace/.style={decorate, decoration={brace, amplitude=6pt, raise=4pt},
+                  thick, deepblue!60},
+    lbl/.style={font=\tiny\sffamily, text=deepblue!70}
+]
+
+% === ENCODER (left) ===
+\node[block] (einp) {Input Embedding + PE};
+
+\node[normblock, above=0.45cm of einp] (eln1) {Layer Norm};
+\node[block, above=0.35cm of eln1] (emha) {Multi-Head Self-Attention};
+\node[lbl, above right=-0.12cm and 0.05cm of emha] {Add \& Norm};
+
+\node[normblock, above=0.45cm of emha] (eln2) {Layer Norm};
+\node[block, above=0.35cm of eln2] (effn) {Feed-Forward Network};
+\node[lbl, above right=-0.12cm and 0.05cm of effn] {Add \& Norm};
+
+\node[block, above=0.6cm of effn, fill=deepblue!15] (eout) {Encoder Output};
+
+% Encoder arrows
+\draw[arr] (einp) -- (eln1);
+\draw[arr] (eln1) -- (emha);
+\draw[arr] (emha) -- (eln2);
+\draw[arr] (eln2) -- (effn);
+\draw[arr] (effn) -- (eout);
+
+% Residual connections (encoder)
+\draw[arr, gray!50, dashed] (einp.west) -- ++(-0.35,0) |- (emha.west);
+\draw[arr, gray!50, dashed] (emha.east) -- ++(0.35,0) |- (effn.east);
+
+% Encoder brace
+\draw[brace] ([xshift=-0.6cm]eln1.south west) -- ([xshift=-0.6cm]effn.north west)
+    node[midway, left=0.45cm, rotate=90, font=\scriptsize\sffamily\bfseries,
+         text=deepblue!60] {$\times N$};
+
+% === DECODER (right) ===
+\node[block, right=3.5cm of einp] (dinp) {Output Embedding + PE};
+
+\node[normblock, above=0.45cm of dinp] (dln1) {Layer Norm};
+\node[block, above=0.35cm of dln1] (dmha) {Masked Self-Attention};
+
+\node[normblock, above=0.45cm of dmha] (dln2) {Layer Norm};
+\node[block, above=0.35cm of dln2] (dca) {Cross-Attention};
+
+\node[normblock, above=0.45cm of dca] (dln3) {Layer Norm};
+\node[block, above=0.35cm of dln3] (dffn) {Feed-Forward Network};
+
+\node[block, above=0.6cm of dffn, fill=deepblue!15] (dout) {Linear + Softmax};
+
+% Decoder arrows
+\draw[arr] (dinp) -- (dln1);
+\draw[arr] (dln1) -- (dmha);
+\draw[arr] (dmha) -- (dln2);
+\draw[arr] (dln2) -- (dca);
+\draw[arr] (dca) -- (dln3);
+\draw[arr] (dln3) -- (dffn);
+\draw[arr] (dffn) -- (dout);
+
+% Cross-attention from encoder
+\draw[arr, deepgreen!70, thick] (eout.east) -- ++(0.6,0) |- (dca.west);
+\node[lbl, text=deepgreen!70] at ([xshift=0.8cm, yshift=0.3cm]eout.east) {K, V};
+
+% Residual connections (decoder)
+\draw[arr, gray!50, dashed] (dinp.west) -- ++(-0.25,0) |- (dmha.west);
+\draw[arr, gray!50, dashed] (dmha.east) -- ++(0.25,0) |- (dca.east);
+\draw[arr, gray!50, dashed] (dca.west) -- ++(-0.25,0) |- (dffn.west);
+
+% Decoder brace
+\draw[brace] ([xshift=3.55cm]dln1.south east) -- ([xshift=3.55cm]dffn.north east)
+    node[midway, right=0.45cm, rotate=-90, font=\scriptsize\sffamily\bfseries,
+         text=deepblue!60] {$\times N$};
+
+% Labels
+\node[font=\small\sffamily\bfseries, text=deepblue, above=0.15cm of eout] {Encoder};
+\node[font=\small\sffamily\bfseries, text=deepblue, above=0.15cm of dout] {Decoder};
+
+\end{tikzpicture}
+\caption{Full Transformer encoder--decoder architecture (pre-norm variant).
+Residual connections (dashed) and layer normalization are applied around each
+sublayer.  The encoder stack is repeated $N$ times; the decoder stack similarly
+$N$ times, with cross-attention connecting decoder queries to encoder keys and
+values.}
+\label{fig:transformer-arch}
+\end{figure}
+
+
+% ============================================================================
+% SECTION 6: ARCHITECTURE VARIANTS
+% ============================================================================
+\section{Architecture Variants}
+\label{sec:arch-variants}
+
+The original Transformer is an encoder--decoder model, but three distinct
+architectural families have emerged, each dominant for different NLP tasks.
+
+\subsection{Encoder-Only (BERT Family)}
+
+\begin{itemize}
+    \item \textbf{Attention:} Bidirectional (every token attends to every other
+          token, no masking).
+    \item \textbf{Pretraining:} Masked Language Modeling (MLM)---predict masked
+          tokens from full bidirectional context.
+    \item \textbf{Strengths:} Rich, bidirectional representations ideal for
+          understanding tasks.
+    \item \textbf{Use cases:} Classification, NER, extractive QA, semantic
+          similarity, retrieval (bi-encoders).
+    \item \textbf{Examples:} BERT, RoBERTa, DeBERTa, ELECTRA, ALBERT.
+\end{itemize}
+
+\subsection{Decoder-Only (GPT Family)}
+
+\begin{itemize}
+    \item \textbf{Attention:} Causal (lower-triangular mask; each token attends
+          only to itself and previous tokens).
+    \item \textbf{Pretraining:} Causal Language Modeling (CLM)---predict the
+          next token given all preceding tokens.
+    \item \textbf{Strengths:} Natural generation, in-context learning emerges
+          at scale, simple architecture.
+    \item \textbf{Use cases:} Text generation, chat, code generation, reasoning,
+          general-purpose via prompting.
+    \item \textbf{Examples:} GPT-2/3/4, LLaMA, Mistral, Claude, Gemini.
+\end{itemize}
+
+\subsection{Encoder-Decoder (T5 Family)}
+
+\begin{itemize}
+    \item \textbf{Attention:} Bidirectional encoder + causal decoder with
+          cross-attention.
+    \item \textbf{Pretraining:} Span corruption (mask contiguous spans, decode
+          them) or other denoising objectives.
+    \item \textbf{Strengths:} Explicit separation of input understanding and
+          output generation; strong for structured input-to-output tasks.
+    \item \textbf{Use cases:} Translation, summarization, structured output,
+          sequence-to-sequence tasks.
+    \item \textbf{Examples:} T5, Flan-T5, BART, mBART, UL2.
+\end{itemize}
+
+\subsection{Comparison Table}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Property} & \textbf{Encoder-Only} & \textbf{Decoder-Only} & \textbf{Enc-Dec} & \textbf{Notes} \\
+\midrule
+Attention dir.      & Bidirectional & Causal      & Both          & --- \\
+Pretraining         & MLM           & CLM         & Span corrupt. & --- \\
+In-context learning & Weak          & Strong      & Moderate      & Emerges at scale in CLM \\
+Generation          & Poor          & Native      & Good          & Encoder-only needs hacks \\
+Understanding       & Excellent     & Good        & Excellent     & Bidirectional helps \\
+KV-cache            & N/A           & Efficient   & Partial       & Decoder-only benefits most \\
+Scaling trend       & Plateaued     & Dominant    & Niche         & Decoder-only won 2023+ \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of the three transformer architecture families.}
+\label{tab:arch-comparison}
+\end{table}
+
+\begin{keyinsight}[Why Decoder-Only Dominated]
+The LLM era converged on decoder-only architectures for several reinforcing
+reasons: (1)~\textbf{Simplicity}---one stack instead of two reduces
+engineering and optimization complexity. (2)~\textbf{Autoregressive scaling}---CLM
+naturally benefits from more data (the entire internet is a training corpus).
+(3)~\textbf{In-context learning}---the ability to perform tasks from examples in
+the prompt emerged specifically in large autoregressive models.
+(4)~\textbf{KV-cache efficiency}---causal masking means previously computed
+keys and values never change, enabling efficient caching for generation.
+Encoder--decoder models remain strong for specific structured tasks
+(translation, summarization) but the flexibility of decoder-only models proved
+decisive at scale.
+\end{keyinsight}
+
+
+% ============================================================================
+% SECTION 7: BERT DEEP DIVE
+% ============================================================================
+\section{BERT: A Deep Dive}
+\label{sec:bert}
+
+BERT (Devlin et al., NAACL 2019) was the first model to demonstrate that
+\emph{bidirectional} pretraining followed by task-specific fine-tuning could
+achieve state-of-the-art results across a wide range of NLP tasks.
+
+\subsection{Masked Language Modeling (MLM)}
+
+BERT randomly selects 15\% of input tokens for prediction.  Of these selected
+tokens:
+
+\begin{itemize}
+    \item \textbf{80\% replaced with \texttt{[MASK]}}---the standard masking
+          signal.
+    \item \textbf{10\% replaced with a random token}---forces the model to
+          maintain distributional representations for all positions, not just
+          masked ones.  If only \texttt{[MASK]} were used, the model would
+          learn that unmasked positions need not be represented well.
+    \item \textbf{10\% kept unchanged}---biases the model toward the actual
+          observed distribution.  Without this, the model would learn that any
+          unmodified token is definitely correct, creating a training-inference
+          mismatch.
+\end{itemize}
+
+\begin{warningbox}
+A common interview mistake is saying ``15\% of tokens are replaced with
+\texttt{[MASK]}.''  Only 80\% of the selected 15\% become \texttt{[MASK]}
+(i.e., 12\% of all tokens).  Knowing the exact breakdown and \emph{why each
+fraction exists} signals depth.
+\end{warningbox}
+
+\subsection{Next Sentence Prediction (NSP)}
+
+BERT was also trained to predict whether sentence B follows sentence A (50\%
+real next sentences, 50\% random).  The \texttt{[CLS]} token's representation
+was used for this binary classification.
+
+RoBERTa (Liu et al., 2019) showed that NSP \emph{hurts} performance by
+contaminating the MLM signal, and removed it.  The likely reason: NSP is too
+easy---topic detection suffices---and the model wastes capacity on this trivial
+signal.
+
+\subsection{Fine-Tuning BERT}
+
+\begin{itemize}
+    \item \textbf{Classification:} Add linear head on \texttt{[CLS]} output.
+    \item \textbf{NER / Token classification:} Add linear head per token output.
+    \item \textbf{Extractive QA:} Predict start and end token positions from
+          the token-level outputs over the passage.
+    \item \textbf{Sentence similarity:} Siamese BERT (Sentence-BERT) with
+          contrastive or cosine loss on \texttt{[CLS]} pooling.
+\end{itemize}
+
+\subsection{BERT Variants and Improvements}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Model} & \textbf{Key Change} & \textbf{Why It Matters} \\
+\midrule
+RoBERTa     & No NSP, dynamic masking, more data, larger batches
+            & Showed BERT was severely undertrained; became the practical default \\
+DeBERTa     & Disentangled attention (separate content \& position)
+            & SOTA on SuperGLUE; better fine-grained position-content interaction \\
+ELECTRA     & Replaced Token Detection (RTD) instead of MLM
+            & All tokens provide training signal (not just 15\%); far more efficient \\
+SpanBERT    & Mask contiguous spans + span boundary objective
+            & Better for span-based tasks (QA, NER, coreference) \\
+ALBERT      & Factorized embedding + cross-layer parameter sharing
+            & 18$\times$ fewer params with minimal quality drop \\
+DistilBERT  & Knowledge distillation from BERT-base
+            & 60\% of params, 97\% of performance, 60\% faster \\
+\bottomrule
+\end{tabularx}
+\caption{Key BERT variants and their contributions.}
+\label{tab:bert-variants}
+\end{table}
+
+\paragraph{ELECTRA in detail.}  Instead of masking tokens, ELECTRA uses a
+small generator to \emph{replace} tokens, then trains the main model as a
+\textbf{discriminator} to detect which tokens were replaced.  Since \emph{every}
+token receives a training signal (binary: real or replaced), ELECTRA is
+dramatically more sample-efficient than MLM, which only trains on the 15\%
+that are masked.
+
+
+% ============================================================================
+% SECTION 8: GPT FAMILY
+% ============================================================================
+\section{The GPT Family}
+\label{sec:gpt}
+
+The GPT (Generative Pre-trained Transformer) line from OpenAI traces the
+evolution from ``pretraining helps'' to ``scale is all you need'' to
+``alignment makes models useful.''
+
+\subsection{The Evolution}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l c l X@{}}
+\toprule
+\textbf{Model} & \textbf{Year} & \textbf{Params} & \textbf{Key Insight} \\
+\midrule
+GPT-1    & 2018 & 117M  & Unsupervised pretraining + supervised fine-tuning works for NLP \\
+GPT-2    & 2019 & 1.5B  & Scale improves zero-shot; language models are multi-task learners \\
+GPT-3    & 2020 & 175B  & In-context learning emerges: few-shot via prompt, no gradient updates \\
+InstructGPT & 2022 & 175B & SFT + RLHF: alignment makes models follow instructions safely \\
+GPT-4    & 2023 & MoE$^*$ & Multimodal (text + vision), dramatically better reasoning \\
+\bottomrule
+\end{tabularx}
+\caption{GPT family evolution.  $^*$Architecture not officially confirmed but
+widely believed to be Mixture of Experts.}
+\label{tab:gpt-family}
+\end{table}
+
+\subsection{Key Architectural Decisions}
+
+All GPT models use:
+\begin{itemize}
+    \item \textbf{Decoder-only} architecture with causal masking.
+    \item \textbf{Pre-norm} layer normalization (starting from GPT-2).
+    \item \textbf{Byte-level BPE} tokenization (GPT-2 onward), ensuring no
+          out-of-vocabulary tokens for any language or script.
+    \item \textbf{Autoregressive training}: minimize
+          $\loss = -\sum_{t=1}^{T} \log P(x_t \mid x_1, \ldots, x_{t-1})$.
+\end{itemize}
+
+\subsection{Why Autoregressive Pretraining Enables Few-Shot}
+
+In-context learning (ICL) is the ability to perform a task from examples in
+the prompt without any parameter updates.  Why does it emerge?
+
+\begin{enumerate}
+    \item \textbf{Implicit task learning during pretraining:} The internet
+          contains countless instances of implicit input-output patterns
+          (Q\&A forums, translation pairs, code comments).  The model learns
+          to recognize and continue these patterns.
+    \item \textbf{Induction heads (mechanistic explanation):} Olsson et al.\
+          (2022) identified specific attention head circuits that perform
+          pattern-matching---they find a previous occurrence of a pattern and
+          copy the token that followed it.  This two-head circuit (prefix head
+          + induction head) is a mechanism for ICL.
+    \item \textbf{Scale is necessary:} ICL emerges reliably only beyond a
+          certain scale (roughly $>$1B parameters), suggesting it requires
+          sufficient capacity to encode the meta-learning circuits.
+\end{enumerate}
+
+
+% ============================================================================
+% SECTION 9: ATTENTION EFFICIENCY
+% ============================================================================
+\section{Attention Efficiency and Modern Variants}
+\label{sec:attention-efficiency}
+
+The $O(n^2)$ cost of self-attention becomes prohibitive for long sequences.
+Modern systems address this through several orthogonal strategies.
+
+\subsection{Multi-Query Attention (MQA)}
+
+Shazeer (2019) observed that the KV-cache---not compute---is the primary
+bottleneck during autoregressive inference.  MQA uses a \textbf{single shared}
+key and value head across all query heads:
+\[
+    \text{head}_i = \text{Attention}(\mQ \mW_Q^{(i)},\; \mK \mW_K,\; \mV \mW_V)
+\]
+This reduces KV-cache size by a factor of $h$ (number of heads), dramatically
+improving inference throughput for memory-bound generation.  PaLM and
+Falcon-7B use MQA (Falcon-40B instead uses grouped attention with 8 KV
+heads, a GQA-style configuration).
+
+\subsection{Grouped-Query Attention (GQA)}
+
+Ainslie et al.\ (2023) proposed a middle ground: instead of one KV head
+(MQA) or $h$ KV heads (standard MHA), use $g$ groups of KV heads, where each
+group is shared by $h/g$ query heads.  GQA with $g = 1$ reduces to MQA;
+$g = h$ is standard MHA.
+
+\textbf{Why GQA won:} It preserves most of MQA's memory savings ($h/g$ fold
+reduction in KV-cache) while recovering almost all of MHA's quality.  LLaMA~2
+70B and Mistral use GQA with $g = 8$.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Method} & \textbf{Query Heads} & \textbf{KV Heads} & \textbf{KV-Cache} & \textbf{Used In} \\
+\midrule
+MHA (standard)   & $h$  & $h$  & $1\times$                & BERT, GPT-3, GPT-4 \\
+MQA              & $h$  & $1$  & $1/h$                    & PaLM, Falcon-7B \\
+GQA              & $h$  & $g$  & $g/h$                    & LLaMA 2 70B, Mistral \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of attention variants.  KV-cache size relative to standard MHA.}
+\label{tab:attention-variants}
+\end{table}
+
+\subsection{Flash Attention}
+
+Flash Attention (Dao et al., NeurIPS 2022) is not an \emph{approximation}---it
+computes \textbf{exact standard attention} but restructures the computation to
+minimize memory reads/writes to GPU high-bandwidth memory (HBM).
+
+\paragraph{The core insight.}
+Standard attention materializes the full $n \times n$ attention matrix in HBM,
+then reads it back to compute the weighted sum.  These HBM reads are the
+bottleneck---not the arithmetic.  Flash Attention uses \textbf{tiling}: it
+processes the attention matrix in blocks that fit in fast SRAM, computing
+partial softmax results and accumulating them without ever materializing the
+full matrix.
+
+\paragraph{Key results:}
+\begin{itemize}
+    \item \textbf{Memory:} $O(n)$ instead of $O(n^2)$---the full attention
+          matrix is never stored.
+    \item \textbf{Speed:} 2--4$\times$ faster training due to reduced HBM
+          I/O.
+    \item \textbf{Quality:} Identical to standard attention (no approximation).
+\end{itemize}
+
+Flash Attention is now the de facto standard in nearly all transformer
+training and inference frameworks.
+
+\begin{keyinsight}[Flash Attention Is About I/O, Not Math]
+Flash Attention does not change the attention \emph{computation}---it changes
+where the computation \emph{happens}.  By keeping data in fast SRAM and never
+writing the full attention matrix to slow HBM, it achieves wall-clock speedups
+despite performing the same number of floating-point operations.  This is a
+systems optimization, not an algorithmic approximation, which is why it
+produces \emph{exact} results.
+\end{keyinsight}
+
+\subsection{Sliding Window Attention}
+
+Mistral (Jiang et al., 2023) combines Flash Attention with a \textbf{sliding
+window} of size $w$: each token attends only to the $w$ most recent tokens
+within the same layer.  However, because information propagates through layers,
+a token at layer $l$ has an effective receptive field of $l \times w$ tokens,
+meaning the full context is accessible through multi-layer stacking.
+
+This reduces per-layer complexity to $O(n \cdot w)$ and KV-cache to
+$O(w \cdot d)$ per layer, enabling efficient processing of long sequences.
+
+\subsection{Summary: Efficiency Techniques}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l c c X@{}}
+\toprule
+\textbf{Technique} & \textbf{Mechanism} & \textbf{Exact?} & \textbf{Speedup} & \textbf{Used In} \\
+\midrule
+Flash Attention  & IO-aware tiling in SRAM  & Yes & 2--4$\times$ & Nearly all modern training \\
+MQA              & Shared K/V              & Yes & 1.5--2$\times$ (inference) & PaLM, Falcon-7B \\
+GQA              & Grouped K/V             & Yes & 1.3--1.8$\times$ (inference) & LLaMA 2, Mistral \\
+Sliding Window   & Local attention window   & No$^\dagger$ & $O(nw)$ vs.\ $O(n^2)$ & Mistral \\
+Sparse Attention & Structured sparsity     & No  & 2--5$\times$ & BigBird, Longformer \\
+Linear Attention & Kernel approximation    & No  & $O(n)$ & Research models \\
+\bottomrule
+\end{tabularx}
+\caption{Summary of attention efficiency techniques.  $^\dagger$Sliding window is
+exact within the window but does not compute global attention in a single layer.}
+\label{tab:efficiency-summary}
+\end{table}
+
+
+% ============================================================================
+% SECTION 10: INTERVIEW QUESTIONS
+% ============================================================================
+\section{Interview Questions}
+\label{sec:transformer-questions}
+
+%% QUESTION 1 %%
+\begin{interviewq}
+\textbf{Q: Explain self-attention step by step, including the math.}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Given input $\mX \in \R^{n \times d}$, we compute three projections:
+$\mQ = \mX\mW_Q$, $\mK = \mX\mW_K$, $\mV = \mX\mW_V$.  The attention output
+is $\softmax(\mQ\mK^\top / \sqrt{d_k})\,\mV$.  The QK dot product computes
+pairwise compatibility scores.  We scale by $\sqrt{d_k}$ because the dot
+product variance grows with $d_k$, which would saturate the softmax.  After
+softmax normalization (row-wise), each position gets a weighted combination of
+all value vectors, where the weights reflect relevance.  Separate Q/K/V
+projections allow attending based on one aspect while retrieving another.
+Complexity is $O(n^2 d)$ compute and $O(n^2)$ memory for the attention matrix.
+
+\redflags
+\begin{itemize}
+    \item Cannot write the attention formula
+    \item Confuses self-attention with cross-attention
+    \item Forgets to mention the scaling factor or cannot explain why it exists
+    \item Says ``attention is just a weighted average'' without explaining how
+          weights are computed
+\end{itemize}
+
+\interviewtest{Whether the candidate can derive the core transformer mechanism
+from first principles, not just recite it.  Can they explain \emph{why} each
+component (Q/K/V, scaling, softmax) is there?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the formula correctly, explains Q/K/V roles,
+          mentions complexity
+    \item \badgeLsix{L6} Derives the $\sqrt{d_k}$ scaling from the variance
+          argument, discusses the attention-as-soft-lookup analogy, connects to
+          KV-cache
+    \item \badgeLseven{L7} Discusses attention as kernel smoothing, connects to
+          Hopfield networks or associative memory, analyzes what information
+          different layers capture
+\end{itemize}
+
+\followups{How does causal masking change the computation?  What is the
+relationship between attention and convolution?  How do you compute attention
+gradients efficiently?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 2 %%
+\begin{interviewq}
+\textbf{Q: Why do we scale by $\sqrt{d_k}$? Derive the variance argument.}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Assume $q_i, k_i \sim \mathcal{N}(0, 1)$ i.i.d.  The dot product
+$\vq^\top\vk = \sum_{i=1}^{d_k} q_i k_i$ has mean 0 and variance
+$\Var(\vq^\top\vk) = \sum_i \Var(q_i k_i) = \sum_i \E[q_i^2]\E[k_i^2] = d_k$.
+So the standard deviation is $\sqrt{d_k}$.  For $d_k = 64$, raw dot products
+have std $\approx 8$.  The softmax of values in range $[-24, 24]$ is
+essentially one-hot, producing vanishing gradients.  Dividing by $\sqrt{d_k}$
+normalizes the variance back to 1, keeping softmax in its sensitive region.
+
+\redflags
+\begin{itemize}
+    \item ``It normalizes the values'' without quantitative reasoning
+    \item Cannot derive that the variance equals $d_k$
+    \item Confuses this with layer normalization
+\end{itemize}
+
+\interviewtest{Mathematical rigor and ability to reason about distributions.
+Can the candidate do a simple variance calculation under pressure?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly derives variance = $d_k$, explains softmax
+          saturation
+    \item \badgeLsix{L6} Discusses the connection to temperature in softmax,
+          notes that this is equivalent to attention temperature $\tau = \sqrt{d_k}$
+    \item \badgeLseven{L7} Connects to the entropy of the attention distribution
+          and discusses how scaling affects the effective number of tokens attended to
+\end{itemize}
+
+\followups{What happens if you use a different scaling factor?  What is the
+relationship between scaling and softmax temperature?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 3 %%
+\begin{interviewq}
+\textbf{Q: Why do we need multiple attention heads? What happens with just one head?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+A single head can capture only one attention pattern per layer.  Multiple heads
+allow parallel attention in different representation subspaces: one head might
+track syntactic dependencies (subject-verb), another positional adjacency,
+another semantic similarity.  Each head projects into $d_k = d/h$ dimensions
+with independent $\mW_Q^{(i)}, \mW_K^{(i)}, \mW_V^{(i)}$.  The output
+projection $\mW_O$ mixes information across heads.  Computationally, multi-head
+costs the same as single-head at full dimension because the total dimension is
+split across heads.  Empirically, single-head attention at full dimension
+performs significantly worse, especially on tasks requiring diverse reasoning.
+
+\redflags
+\begin{itemize}
+    \item Cannot explain what ``different subspaces'' means concretely
+    \item Thinks multi-head attention is more expensive than single-head
+    \item Does not mention the output projection $\mW_O$ and its role
+\end{itemize}
+
+\interviewtest{Understanding of how multi-head attention provides model capacity
+without additional cost, and whether the candidate can reason about what
+different heads learn.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains subspace decomposition and the diversity argument
+    \item \badgeLsix{L6} References empirical analysis of head behaviors (Voita et al.,
+          2019), discusses head pruning experiments that show many heads are redundant
+    \item \badgeLseven{L7} Discusses the relationship to mixture-of-experts, the
+          lottery ticket hypothesis applied to attention heads, and recent work on
+          head importance metrics
+\end{itemize}
+
+\followups{How would you determine which heads are important? Can you prune
+attention heads?  What is the effect of head dimension on performance?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 4 %%
+\begin{interviewq}
+\textbf{Q: Compare encoder-only, decoder-only, and encoder-decoder transformers.
+Why did decoder-only dominate the LLM era?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+\textbf{Encoder-only} (BERT): bidirectional attention, trained with MLM, excels
+at understanding/classification tasks but cannot generate text natively.
+\textbf{Decoder-only} (GPT): causal attention, trained autoregressively,
+natural for generation and showed emergent in-context learning at scale.
+\textbf{Encoder-decoder} (T5): bidirectional encoder feeds into causal decoder
+via cross-attention, strong for structured input-output tasks like translation.
+
+Decoder-only dominated because: (1)~architectural simplicity---one stack, not
+two; (2)~CLM scales naturally with internet-scale data; (3)~in-context learning
+emerged, eliminating the need for task-specific fine-tuning; (4)~KV-cache
+works cleanly for causal models---previously computed KVs never change.
+Encoder-decoder still wins for some structured tasks but decoder-only's
+flexibility and scaling properties proved decisive.
+
+\redflags
+\begin{itemize}
+    \item Cannot articulate the attention masking difference
+    \item Says ``GPT is better than BERT'' without nuance
+    \item Does not mention in-context learning as a key factor
+    \item Confuses training objectives (MLM vs.\ CLM)
+\end{itemize}
+
+\interviewtest{Depth of understanding of architectural tradeoffs and ability to
+reason about why the field evolved in a particular direction---not just what
+happened but why.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes all three, gives examples and use cases
+    \item \badgeLsix{L6} Discusses how the training objective (MLM vs.\ CLM) shapes
+          capabilities, explains the KV-cache argument in detail
+    \item \badgeLseven{L7} Considers hybrid approaches (PrefixLM, UL2), discusses
+          whether encoder-decoder could return with the right training recipe, and
+          connects to efficiency (FLOPs-per-token vs.\ FLOPs-per-parameter)
+\end{itemize}
+
+\followups{When would you still choose BERT over an LLM?  What is prefix
+language modeling?  Could encoder-decoder make a comeback?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 5 %%
+\begin{interviewq}
+\textbf{Q: What is the computational complexity of self-attention? Why is it a problem?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+The $\mQ\mK^\top$ product is $\R^{n \times d_k} \cdot \R^{d_k \times n} = \R^{n \times n}$,
+requiring $O(n^2 d_k)$ FLOPs.  The subsequent multiplication with $\mV$ is also
+$O(n^2 d_v)$.  Total: $O(n^2 d)$ compute and $O(n^2 + nd)$ memory.  For a
+128K-token context with 32 heads, the attention matrix alone is
+$32 \times 128\text{K}^2 \times 2$ bytes $\approx$ 1\,TB in float16---clearly
+impractical without optimizations like Flash Attention (which reduces memory to
+$O(n)$ without approximation) or architectural changes like sliding window
+attention ($O(nw)$) or linear attention ($O(nd)$).  The quadratic scaling means
+doubling context length quadruples both compute and memory, fundamentally
+limiting the sequences transformers can process.
+
+\redflags
+\begin{itemize}
+    \item Says ``linear complexity'' or cannot state $O(n^2)$
+    \item Confuses compute complexity with memory complexity
+    \item Does not connect to practical implications (context length limits)
+\end{itemize}
+
+\interviewtest{Whether the candidate understands the fundamental bottleneck of
+transformers and can reason quantitatively about computational costs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States $O(n^2 d)$ compute and $O(n^2)$ memory, explains
+          why this limits context length
+    \item \badgeLsix{L6} Distinguishes between training (Flash Attention helps) and
+          inference (KV-cache, MQA/GQA help), discusses the I/O vs.\ compute tradeoff
+    \item \badgeLseven{L7} Discusses sub-quadratic alternatives (Mamba, linear attention),
+          their tradeoffs vs.\ full attention, and when approximations are acceptable
+\end{itemize}
+
+\followups{How does Flash Attention achieve $O(n)$ memory?  What are the
+tradeoffs of linear attention?  How does Mamba compare?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 6 %%
+\begin{interviewq}
+\textbf{Q: Explain RoPE (Rotary Position Embedding). Why is it better than
+learned absolute positions for long sequences?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+RoPE encodes position by rotating query and key vectors in 2D subspaces: for
+position $m$ and dimension pair $(2i, 2i{+}1)$, the vector is rotated by angle
+$m\theta_i$ where $\theta_i = 10000^{-2i/d}$.  The critical property is that
+the inner product of rotated Q and K depends only on the \emph{relative}
+position $m - n$: $\text{RoPE}(\vq, m)^\top \text{RoPE}(\vk, n) = f(\vq, \vk, m{-}n)$.
+So RoPE achieves relative position encoding through an absolute mechanism,
+requiring no extra parameters.  For long sequences, it beats learned absolute
+positions because: (1)~no fixed max length---the rotation is defined for any
+position; (2)~natural distance decay---inner products decrease with distance;
+(3)~length extrapolation via frequency scaling (NTK-aware, YaRN) lets models
+trained on 4K context extend to 32K+ by adjusting the base frequency.
+
+\redflags
+\begin{itemize}
+    \item Cannot explain the rotation mechanism at any level of detail
+    \item Confuses RoPE with sinusoidal encoding
+    \item Cannot articulate \emph{why} it enables length extrapolation
+\end{itemize}
+
+\interviewtest{Whether the candidate understands modern LLM architectural
+choices beyond surface level.  RoPE is used in most production LLMs and
+understanding it signals genuine depth.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes RoPE as rotating Q/K vectors, mentions relative
+          position property
+    \item \badgeLsix{L6} Explains the rotation formula, derives the relative position
+          property from the inner product, discusses NTK-aware scaling
+    \item \badgeLseven{L7} Discusses the connection between RoPE and complex
+          exponentials, position interpolation methods (PI, NTK, YaRN), and the
+          frequency spectrum interpretation
+\end{itemize}
+
+\followups{How does NTK-aware scaling work?  What is YaRN?  How do you extend a
+model trained on 4K context to 128K?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 7 %%
+\begin{interviewq}
+\textbf{Q: What does the FFN layer do in a transformer? Is there evidence it
+stores factual knowledge?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+The FFN is a position-wise two-layer MLP applied independently to each token.
+Unlike attention, which mixes tokens, FFN transforms each token's
+representation without cross-position interaction.  It expands to $4d$ dimensions
+then compresses back, applying nonlinear transformations.  Geva et al.\ (2021)
+provided evidence that FFN layers act as key-value memories: rows of $\mW_1$
+serve as keys detecting input patterns, and corresponding columns of $\mW_2$
+store associated information retrieved when patterns match.  This is supported
+by: (1)~knowledge editing techniques like ROME and MEMIT successfully modify
+factual associations by editing specific FFN weights; (2)~larger FFNs
+(wider or more layers) correlate with better factual recall; (3)~probing
+experiments show factual information localizable to specific FFN neurons.
+Attention does the routing; FFN stores and processes knowledge.
+
+\redflags
+\begin{itemize}
+    \item Dismisses FFN as ``just a nonlinearity''
+    \item Cannot distinguish FFN's role from attention's role
+    \item Unaware of the key-value memory interpretation or knowledge editing work
+\end{itemize}
+
+\interviewtest{Whether the candidate understands transformer internals beyond
+the attention mechanism.  Most candidates focus on attention and neglect FFN---
+knowing the key-value memory interpretation is a strong signal.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes the expand-compress architecture and says FFN
+          applies per position
+    \item \badgeLsix{L6} Explains the key-value memory interpretation with Geva
+          et al., mentions knowledge editing (ROME/MEMIT)
+    \item \badgeLseven{L7} Discusses SwiGLU, the relationship between FFN width
+          and knowledge capacity, MoE as a way to increase FFN capacity efficiently,
+          and the open question of how knowledge is distributed across layers
+\end{itemize}
+
+\followups{How does ROME work?  What is the difference between editing
+attention vs.\ FFN weights?  How does MoE relate to FFN capacity?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 8 %%
+\begin{interviewq}
+\textbf{Q: Explain BERT's pretraining objectives. Why was NSP removed in
+RoBERTa?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+BERT uses two pretraining objectives: (1)~\textbf{MLM}: 15\% of tokens are
+selected; of those, 80\% become \texttt{[MASK]}, 10\% random, 10\% unchanged.
+The model predicts original tokens from bidirectional context.  The 80/10/10
+split prevents mismatch between pretraining (where \texttt{[MASK]} appears)
+and fine-tuning (where it does not).  (2)~\textbf{NSP}: binary prediction of
+whether two sentences are consecutive.  RoBERTa showed NSP hurts by removing
+it and achieving consistently better results.  The likely reasons: NSP is a
+trivially easy task (topic matching suffices), it wastes model capacity on a
+useless signal, and the ``random sentence'' negatives are too easy (different
+documents = different topics).  RoBERTa also found that dynamic masking
+(re-masking each epoch), larger batch sizes, and much more training data
+(160GB vs.\ 16GB) significantly improved results---BERT was simply
+undertrained.
+
+\redflags
+\begin{itemize}
+    \item Says ``15\% of tokens become \texttt{[MASK]}'' (only 12\% actually do)
+    \item Cannot explain the rationale for the 80/10/10 split
+    \item Does not know that RoBERTa removed NSP or cannot say why
+\end{itemize}
+
+\interviewtest{Detailed understanding of a foundational model.  The 80/10/10
+rationale and NSP critique are shibboleths for genuine NLP depth.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly explains both objectives with the 80/10/10
+          split and NSP removal rationale
+    \item \badgeLsix{L6} Discusses alternative objectives (ELECTRA's RTD,
+          SpanBERT's span masking) and why they improve on MLM
+    \item \badgeLseven{L7} Compares MLM and CLM as pretraining objectives from
+          an information-theoretic perspective, discusses bidirectional vs.\
+          unidirectional context and the implications for downstream tasks
+\end{itemize}
+
+\followups{What is ELECTRA and why is it more efficient?  Why does masking
+ratio of 15\% work?  What happens if you mask 50\%?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 9 %%
+\begin{interviewq}
+\textbf{Q: What is Flash Attention? Why does it help if it computes the same
+result as standard attention?}
+
+\badgeLsix{L6} \quad \badgetype{Systems} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Flash Attention computes \emph{exact} standard attention but restructures the
+computation to minimize HBM (high-bandwidth memory) I/O.  Standard attention
+materializes the full $n \times n$ attention matrix in HBM, requiring $O(n^2)$
+reads and writes.  Modern GPUs are memory-bandwidth-bound, not compute-bound,
+for attention.  Flash Attention uses \textbf{tiling}: it processes Q, K, V in
+blocks that fit in fast on-chip SRAM, computes partial softmax results using
+the log-sum-exp trick for numerical stability, and accumulates without ever
+writing the full matrix to HBM.  Result: $O(n)$ memory (no materialized
+attention matrix), 2--4$\times$ wall-clock speedup, and identical output.
+Flash Attention 2 further improved by reducing non-matmul FLOPs and better
+work partitioning.  It is now the default in virtually all transformer
+training and serving frameworks.
+
+\redflags
+\begin{itemize}
+    \item Thinks Flash Attention is an approximation (it is exact)
+    \item Cannot explain the HBM vs.\ SRAM distinction
+    \item Does not know what ``IO-aware'' means in this context
+\end{itemize}
+
+\interviewtest{Understanding of the hardware-software co-design that makes
+modern LLMs practical.  This separates candidates who only think at the
+algorithm level from those who understand systems.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows Flash Attention is exact and reduces memory; mentions
+          tiling
+    \item \badgeLsix{L6} Explains the HBM vs.\ SRAM bottleneck, describes the tiling
+          strategy, and mentions the online softmax trick
+    \item \badgeLseven{L7} Discusses Flash Attention 2/3 improvements, the roofline
+          model for analyzing attention performance, and how Flash Attention
+          interacts with tensor parallelism across GPUs
+\end{itemize}
+
+\followups{How does the online softmax trick work?  What changed in Flash
+Attention 2?  How does Flash Attention interact with GQA?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 10 %%
+\begin{interviewq}
+\textbf{Q: Compare Multi-Query Attention, Grouped-Query Attention, and standard
+Multi-Head Attention. When would you use each?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{MHA:} Each head has its own Q, K, V projections ($h$ sets of K/V).
+Highest quality, but KV-cache scales as $O(h \cdot n \cdot d_k)$ per layer---
+the main bottleneck for inference with long sequences or large batches.
+\textbf{MQA:} All $h$ query heads share a single K and V head.  Reduces
+KV-cache by $h\times$ (e.g., $32\times$ for a 32-head model), dramatically
+improving inference throughput.  Quality drops 1--2\% on some benchmarks.
+\textbf{GQA:} A middle ground with $g$ KV head groups.  Each group is shared
+by $h/g$ query heads.  With $g = 8$ on a 32-head model, KV-cache is $4\times$
+smaller than MHA while recovering most quality.  GQA is the current
+best practice.
+
+\textbf{When to use each:} MHA when quality is paramount and inference is
+not memory-bound (short sequences, small batches, or training only).  MQA for
+maximum throughput in long-context serving.  GQA as the default for production
+LLMs (quality close to MHA, memory close to MQA).
+
+\redflags
+\begin{itemize}
+    \item Cannot explain how GQA interpolates between MHA and MQA
+    \item Does not connect to KV-cache memory as the motivation
+    \item Thinks these only matter for training (they primarily help inference)
+\end{itemize}
+
+\interviewtest{Whether the candidate understands the inference bottleneck
+(memory bandwidth, not compute) and can reason about production deployment
+tradeoffs for LLMs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes all three variants and their KV-cache
+          implications
+    \item \badgeLsix{L6} Quantifies the KV-cache savings, discusses uptraining
+          from MHA to GQA, mentions which production models use which variant
+    \item \badgeLseven{L7} Discusses Multi-Head Latent Attention (DeepSeek-V2),
+          the relationship between attention variants and tensor parallelism
+          strategies, and how KV-cache compression interacts with quantization
+\end{itemize}
+
+\followups{How would you convert an MHA model to GQA after training?  What is
+the KV-cache size for a 70B model with 128K context?  How does KV-cache
+quantization work?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 11 %%
+\begin{interviewq}
+\textbf{Q: Explain pre-norm vs.\ post-norm in transformers. Why did pre-norm become
+the standard?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{Post-norm} (original Transformer): $\text{LN}(\vx + \text{Sublayer}(\vx))$---the
+residual and sublayer output are added, then normalized.  \textbf{Pre-norm}
+(GPT-2 and all modern LLMs): $\vx + \text{Sublayer}(\text{LN}(\vx))$---input
+is normalized before the sublayer, then the (unnormalized) sublayer output is
+added to the residual.  Pre-norm won because: (1)~the residual stream passes
+through without any transformation, providing a clean gradient highway from
+loss to any layer; (2)~gradients at initialization are well-behaved (sublayer
+outputs are near-zero, so the network starts as approximate identity);
+(3)~learning rate warmup becomes less critical---post-norm is notoriously
+sensitive to warmup schedule; (4)~enables training much deeper models
+(100+ layers) without stability issues.  The tradeoff: some evidence suggests
+post-norm can achieve slightly higher final performance if properly trained,
+but pre-norm's training stability advantage overwhelmingly dominates in practice.
+
+\redflags
+\begin{itemize}
+    \item Cannot state the difference in formula
+    \item Does not explain \emph{why} pre-norm is more stable
+    \item Confuses layer normalization with batch normalization
+\end{itemize}
+
+\interviewtest{Understanding of training dynamics and the subtle but critical
+architectural choices that make deep transformers trainable.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly states both formulas and the stability argument
+    \item \badgeLsix{L6} Discusses the gradient flow analysis, mentions RMSNorm
+          as a further simplification, and knows which models use which variant
+    \item \badgeLseven{L7} Discusses DeepNorm, the signal propagation theory of
+          pre-norm, and emerging work on normalization-free architectures
+\end{itemize}
+
+\followups{What is RMSNorm?  Why does post-norm need learning rate warmup?
+What is the gradient flow difference mathematically?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 12 %%
+\begin{interviewq}
+\textbf{Q: You need to build a production NLP system that classifies customer
+support tickets into 50 categories. Would you use BERT or GPT-4? Justify your
+choice.}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+For this task, a \textbf{fine-tuned BERT} (or RoBERTa/DeBERTa) is almost
+certainly the right choice.  Reasoning: (1)~\textbf{Latency}: a fine-tuned
+BERT-base processes a ticket in $\sim$2ms on GPU vs.\ 500ms+ for GPT-4 API.
+(2)~\textbf{Cost}: BERT inference is $\sim$1000$\times$ cheaper than GPT-4 API
+calls at scale.  (3)~\textbf{Quality}: with 1000+ labeled examples per class,
+a fine-tuned encoder model will match or exceed GPT-4 few-shot on a well-defined
+classification task.  (4)~\textbf{Control}: you own the model, data stays
+private, no API dependency.  (5)~\textbf{Consistency}: fine-tuned classifiers
+produce deterministic outputs; LLMs are stochastic and may format outputs
+inconsistently.
+
+GPT-4 would be preferred only if: (a)~you have near-zero labeled data
+(cold-start), (b)~categories change frequently and retraining is impractical,
+or (c)~you need explanations alongside classifications.  The answer is not about
+which model is ``better'' in isolation---it is about matching the solution to
+the constraints.
+
+\redflags
+\begin{itemize}
+    \item Reflexively says ``use GPT-4 for everything''
+    \item Cannot reason about cost, latency, or deployment constraints
+    \item Does not consider the labeled data regime
+\end{itemize}
+
+\interviewtest{Production thinking and resistance to hype.  Can the candidate
+make pragmatic engineering decisions rather than defaulting to the most powerful
+model?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Recommends BERT with clear cost/latency/quality reasoning
+    \item \badgeLsix{L6} Discusses the labeled data regime, considers a hybrid
+          approach (GPT-4 for labeling seed data, BERT for serving), and mentions
+          distillation from LLM to smaller model
+    \item \badgeLseven{L7} Designs a full system: LLM for cold-start and edge
+          cases, distilled classifier for the head, active learning loop for
+          continuous improvement, monitoring for distribution shift
+\end{itemize}
+
+\followups{How would you handle a cold-start with zero labeled data?  How would
+you detect when categories shift?  How would you monitor classifier quality in
+production?}
+\end{interviewq}
+
+
+% ============================================================================
+% CHAPTER SUMMARY
+% ============================================================================
+\section*{Chapter Summary}
+
+\begin{enumerate}
+    \item \textbf{Self-attention} computes $\softmax(\mQ\mK^\top/\sqrt{d_k})\mV$,
+          enabling direct interaction between all positions in $O(n^2 d)$ time.
+          The scaling factor $\sqrt{d_k}$ prevents softmax saturation.
+
+    \item \textbf{Multi-head attention} runs $h$ parallel attention heads in
+          different subspaces, capturing diverse relationships at no extra cost.
+
+    \item \textbf{FFN layers} transform each position independently, acting as
+          key-value memories that store factual knowledge.  Modern variants
+          (SwiGLU, GeGLU) use gating for improved performance.
+
+    \item \textbf{Positional encoding} is necessary because attention is
+          permutation-equivariant.  RoPE is the current standard, encoding
+          relative position through rotation of Q/K vectors.
+
+    \item \textbf{The full architecture} combines multi-head attention, FFN,
+          residual connections, and layer normalization.  Pre-norm with RMSNorm
+          is the modern standard.
+
+    \item \textbf{Three families} emerged: encoder-only (BERT, for understanding),
+          decoder-only (GPT, for generation and in-context learning), and
+          encoder--decoder (T5, for structured tasks).  Decoder-only dominates
+          the LLM era.
+
+    \item \textbf{BERT} introduced bidirectional pretraining with MLM (80/10/10
+          masking).  RoBERTa showed it was undertrained and NSP was harmful.
+          ELECTRA improved efficiency via replaced token detection.
+
+    \item \textbf{GPT} models showed that scale enables zero-shot and few-shot
+          capabilities through in-context learning, and that alignment (RLHF)
+          makes models practically useful.
+
+    \item \textbf{Efficiency improvements}---Flash Attention (IO-aware tiling),
+          GQA (grouped key-value heads), and sliding window attention---make
+          transformers practical for long sequences and production serving.
+\end{enumerate}

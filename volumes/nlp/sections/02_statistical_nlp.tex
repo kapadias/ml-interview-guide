@@ -1,0 +1,1800 @@
+% ============================================================================
+% CHAPTER 2: STATISTICAL NLP AND PROBABILISTIC MODELS
+% ============================================================================
+% Covers n-gram language models, perplexity, HMMs, CRFs, topic models,
+% and statistical machine translation.  The probabilistic backbone of NLP.
+% ============================================================================
+
+\chapter{Statistical NLP and Probabilistic Models}
+\label{chap:statistical_nlp}
+
+\begin{tldr}
+Statistical NLP models---n-gram language models, Hidden Markov Models, and
+Conditional Random Fields---form the probabilistic backbone of natural language
+processing.  These are not historical curiosities: CRF layers still appear on
+top of BERT for NER, perplexity remains the primary language model evaluation
+metric, and understanding these models demonstrates the probabilistic thinking
+that interviewers value.  This chapter covers language modeling, sequence
+labeling, and topic models with the mathematical rigor expected at L5+ levels.
+If you can derive the forward algorithm, explain Kneser-Ney smoothing, and
+articulate why CRFs capture label dependencies that softmax classifiers miss,
+you signal genuine depth that sets you apart from candidates who only know the
+API layer.
+\end{tldr}
+
+\bigskip
+
+% ============================================================================
+% SECTION 1: N-GRAM LANGUAGE MODELS
+% ============================================================================
+\section{N-gram Language Models}
+\label{sec:ngram_lm}
+
+A \textbf{language model} assigns a probability to a sequence of words.  Given
+a sentence $W = w_1, w_2, \ldots, w_N$, a language model computes
+$P(w_1, w_2, \ldots, w_N)$.  This is the single most fundamental concept in
+NLP: every spell-checker, speech recognizer, machine translation system, and
+large language model is, at its core, a language model.
+
+\subsection{The Chain Rule Decomposition}
+
+By the chain rule of probability, any joint distribution over a sequence can
+be decomposed exactly as:
+
+\begin{mathresult}{Chain Rule for Language Modeling}
+\begin{equation}
+P(w_1, w_2, \ldots, w_N) = \prod_{t=1}^{N} P(w_t \given w_1, w_2, \ldots, w_{t-1})
+\label{eq:chain_rule}
+\end{equation}
+This is \emph{exact}---no assumptions have been made.  The entire history of
+language modeling is about how to estimate each conditional factor
+$P(w_t \given w_1, \ldots, w_{t-1})$.
+\end{mathresult}
+
+The problem is immediately apparent: estimating $P(w_t \given w_1, \ldots, w_{t-1})$
+requires conditioning on the \emph{entire} preceding context, which grows
+without bound.  For a vocabulary of size $V$ and context length $t-1$, there
+are $V^{t-1}$ possible contexts---a number that explodes far beyond any
+dataset size.
+
+\subsection{The Markov Assumption}
+
+The n-gram approach makes a simplifying \textbf{Markov assumption}: the
+probability of the next word depends only on the preceding $n-1$ words, not
+the full history.
+
+\begin{mathresult}{N-gram Markov Assumption}
+\begin{equation}
+P(w_t \given w_1, \ldots, w_{t-1}) \approx P(w_t \given w_{t-n+1}, \ldots, w_{t-1})
+\label{eq:markov}
+\end{equation}
+For a bigram model ($n=2$): $P(w_t \given w_1, \ldots, w_{t-1}) \approx P(w_t \given w_{t-1})$.\\
+For a trigram model ($n=3$): $P(w_t \given w_1, \ldots, w_{t-1}) \approx P(w_t \given w_{t-2}, w_{t-1})$.
+\end{mathresult}
+
+The tradeoff is fundamental: larger $n$ captures more context but requires
+exponentially more data to estimate ($V^n$ possible n-grams).  In practice,
+$n = 3$ to $5$ was typical for statistical systems, with trigram models being
+the dominant workhorse for decades.
+
+\subsection{Maximum Likelihood Estimation}
+
+N-gram probabilities are estimated from corpus counts using maximum likelihood
+estimation (MLE):
+
+\begin{mathresult}{N-gram MLE}
+\begin{equation}
+P_{\text{MLE}}(w_t \given w_{t-n+1}, \ldots, w_{t-1})
+= \frac{C(w_{t-n+1}, \ldots, w_t)}{C(w_{t-n+1}, \ldots, w_{t-1})}
+\label{eq:ngram_mle}
+\end{equation}
+where $C(\cdot)$ denotes the count of an n-gram or $(n{-}1)$-gram in the
+training corpus.
+\end{mathresult}
+
+\paragraph{Bigram example.}
+Consider a training corpus: ``I like cats. I like dogs. I hate rain.''
+\begin{align*}
+P(\text{like} \given \text{I}) &= \frac{C(\text{I like})}{C(\text{I})} = \frac{2}{3} \\[4pt]
+P(\text{hate} \given \text{I}) &= \frac{C(\text{I hate})}{C(\text{I})} = \frac{1}{3} \\[4pt]
+P(\text{dogs} \given \text{like}) &= \frac{C(\text{like dogs})}{C(\text{like})} = \frac{1}{2}
+\end{align*}
+
+\subsection{The Zero-Probability Problem}
+
+MLE has a fatal flaw: any n-gram not observed in the training corpus receives
+probability \emph{zero}.  Since language is productive---speakers constantly
+produce novel combinations of words---this is catastrophic.  A single unseen
+n-gram in a test sentence makes the entire sentence probability zero:
+\[
+P(w_1, \ldots, w_N) = \prod_{t=1}^{N} P(w_t \given \ldots) = 0
+\quad\text{if any factor is zero.}
+\]
+
+\begin{warningbox}
+The zero-probability problem is not just a theoretical nuisance.  In speech
+recognition, a zero-probability path means the recognizer will \emph{never}
+produce that word sequence, regardless of how clear the acoustic evidence.
+In machine translation, it means valid translations are unreachable.
+Smoothing is not optional---it is essential for any n-gram model deployed in
+practice.
+\end{warningbox}
+
+\subsection{Smoothing Techniques}
+
+Smoothing methods redistribute probability mass from observed n-grams to
+unobserved ones, ensuring that no event has zero probability.
+
+\subsubsection{Laplace (Add-1) Smoothing}
+
+The simplest approach: add 1 to every n-gram count.
+
+\begin{mathresult}{Laplace Smoothing}
+\begin{equation}
+P_{\text{Laplace}}(w_t \given w_{t-1})
+= \frac{C(w_{t-1}, w_t) + 1}{C(w_{t-1}) + V}
+\label{eq:laplace}
+\end{equation}
+where $V$ is the vocabulary size.  Adding $V$ to the denominator ensures the
+distribution sums to 1 over the vocabulary.
+\end{mathresult}
+
+\paragraph{Why Laplace is bad.}
+For a vocabulary of $V = 100{,}000$ and a context seen $10$ times, Laplace
+smoothing assigns $1/100{,}010 \approx 10^{-5}$ to each unseen bigram.
+Since there are approximately $V$ unseen continuations, this steals nearly
+\emph{all} the probability mass from observed events.  In practice, Laplace
+smoothing wastes so much mass that it significantly degrades perplexity.
+
+\subsubsection{Add-$k$ Smoothing}
+
+A minor improvement: add $k < 1$ instead of $1$.
+\begin{equation}
+P_{\text{add-}k}(w_t \given w_{t-1})
+= \frac{C(w_{t-1}, w_t) + k}{C(w_{t-1}) + kV}
+\label{eq:addk}
+\end{equation}
+This wastes less mass but introduces a hyperparameter $k$ that must be tuned.
+Still not competitive with more sophisticated methods.
+
+\subsubsection{Interpolation and Backoff}
+
+Rather than relying on a single n-gram order, combine multiple orders:
+
+\paragraph{Linear interpolation.}
+\begin{equation}
+P_{\text{interp}}(w_t \given w_{t-2}, w_{t-1})
+= \lambda_3\, P_3(w_t \given w_{t-2}, w_{t-1})
++ \lambda_2\, P_2(w_t \given w_{t-1})
++ \lambda_1\, P_1(w_t)
+\label{eq:interpolation}
+\end{equation}
+where $\lambda_1 + \lambda_2 + \lambda_3 = 1$ and $\lambda_i \geq 0$.  The
+weights $\lambda_i$ are tuned on held-out data, often via the EM algorithm.
+Interpolation always has non-zero probability (because the unigram $P_1(w_t) > 0$
+for all words in the vocabulary).
+
+\paragraph{Backoff.}
+Stupid backoff (Brants et al., 2007) is even simpler: use the highest-order
+n-gram that has sufficient counts; if the trigram count is zero, ``back off''
+to the bigram, and if that is zero, to the unigram.  Stupid backoff does not
+produce normalized probabilities but works well at web scale.  Backoff is not
+inherently unnormalized, however: Katz backoff (Katz, 1987) discounts observed
+n-gram counts via Good-Turing estimation and redistributes the freed mass to
+the lower-order distribution, yielding a properly normalized model.
+
+\subsubsection{Kneser-Ney Smoothing: The Gold Standard}
+
+Kneser-Ney smoothing (Kneser \& Ney, 1995; Chen \& Goodman, 1999) is the
+best-performing n-gram smoothing method.  Its key insight is that the
+lower-order distribution used for backing off should not be the standard
+unigram, but rather a \textbf{continuation probability}---the probability
+that a word appears as a novel continuation in a new context.
+
+\paragraph{Motivation.}
+Consider the word ``Francisco.''  It is frequent in a corpus about San
+Francisco, so its unigram probability $P_{\text{ML}}(\text{Francisco})$ is
+high.  But Francisco almost always follows ``San''---it rarely continues
+\emph{new} bigram contexts.  The continuation probability captures this:
+$P_{\text{cont}}(\text{Francisco})$ is low because Francisco appears after
+very few distinct words.
+
+\begin{mathresult}{Kneser-Ney Smoothing}
+\begin{align}
+P_{\text{KN}}(w_t \given w_{t-1})
+&= \frac{\max\bigl(C(w_{t-1}, w_t) - d,\; 0\bigr)}{C(w_{t-1})}
+  + \lambda(w_{t-1})\, P_{\text{cont}}(w_t)
+\label{eq:kneser_ney} \\[6pt]
+P_{\text{cont}}(w_t)
+&= \frac{\bigl|\{w' : C(w', w_t) > 0\}\bigr|}
+        {\bigl|\{(w', w'') : C(w', w'') > 0\}\bigr|}
+\label{eq:continuation}
+\end{align}
+where $d \in [0, 1]$ is the \textbf{absolute discount} (typically $\approx 0.75$),
+and $\lambda(w_{t-1})$ is a normalizing weight that distributes the discounted
+mass:
+\begin{equation}
+\lambda(w_{t-1}) = \frac{d}{C(w_{t-1})} \cdot \bigl|\{w : C(w_{t-1}, w) > 0\}\bigr|
+\label{eq:kn_lambda}
+\end{equation}
+\end{mathresult}
+
+\paragraph{Unpacking the formula.}
+\begin{itemize}
+    \item The first term $\frac{\max(C(w_{t-1}, w_t) - d, 0)}{C(w_{t-1})}$
+          is a discounted MLE: we subtract $d$ from each observed count.
+    \item The discount $d$ frees up a small amount of probability mass from
+          every observed bigram.
+    \item The freed mass is redistributed via $\lambda(w_{t-1}) \cdot P_{\text{cont}}(w_t)$,
+          which favors words that appear in many distinct contexts (versatile words)
+          over words that are frequent but context-restricted.
+    \item Modified Kneser-Ney (Chen \& Goodman, 1999) uses three different discount
+          values for counts of 1, 2, and $\geq 3$, yielding further improvements.
+\end{itemize}
+
+\begin{keyinsight}[Why Kneser-Ney Beats Everything Else]
+The genius of Kneser-Ney is the continuation probability.  Standard backoff
+uses the unigram $P(w)$ as the lower-order estimate, which rewards \emph{frequent}
+words.  Kneser-Ney uses $P_{\text{cont}}(w)$, which rewards \emph{versatile}
+words---those that appear after many different predecessors.  This distinction
+is precisely what makes it the best n-gram smoothing method: it correctly
+models the distribution of words in contexts where the higher-order n-gram
+has insufficient data.
+\end{keyinsight}
+
+
+% ============================================================================
+% SECTION 2: PERPLEXITY AND EVALUATION
+% ============================================================================
+\section{Perplexity and Language Model Evaluation}
+\label{sec:perplexity}
+
+How do we measure whether a language model is good?  The standard metric is
+\textbf{perplexity}, which has been the primary evaluation metric for language
+models from n-grams through GPT-4.
+
+\subsection{Cross-Entropy}
+
+Given a test corpus $W = w_1, w_2, \ldots, w_N$, the \textbf{cross-entropy}
+of the model with respect to the data is:
+
+\begin{mathresult}{Cross-Entropy of a Language Model}
+\begin{equation}
+H(W) = -\frac{1}{N} \sum_{t=1}^{N} \log_2 P(w_t \given w_1, \ldots, w_{t-1})
+\label{eq:cross_entropy_lm}
+\end{equation}
+Cross-entropy measures the average number of bits needed to encode each word
+under the model's probability distribution.  Lower cross-entropy means the
+model assigns higher probability to the actual words that appeared.
+\end{mathresult}
+
+\subsection{Perplexity}
+
+Perplexity is simply the exponentiation of cross-entropy:
+
+\begin{mathresult}{Perplexity}
+\begin{equation}
+\text{PP}(W) = 2^{H(W)}
+= P(w_1, w_2, \ldots, w_N)^{-1/N}
+= \exp\!\left(-\frac{1}{N}\sum_{t=1}^{N} \ln P(w_t \given w_1, \ldots, w_{t-1})\right)
+\label{eq:perplexity}
+\end{equation}
+where the last form uses the natural logarithm (as is standard in neural LM
+evaluation).  Lower perplexity indicates a better model.
+
+A note on base conventions: the logarithm and the exponentiation must use the
+\emph{same} base.  With cross-entropy in bits (base-2 logarithms),
+$\text{PP} = 2^{H}$; with cross-entropy in nats (natural logarithms),
+$\text{PP} = e^{H}$.  Both conventions yield the identical perplexity value.
+\end{mathresult}
+
+\paragraph{Derivation of the equivalence.}
+Starting from the definition:
+\begin{align*}
+\text{PP}(W) &= P(w_1, \ldots, w_N)^{-1/N} \\
+&= \left(\prod_{t=1}^{N} P(w_t \given w_1, \ldots, w_{t-1})\right)^{-1/N} \\
+&= \exp\!\left(-\frac{1}{N}\sum_{t=1}^{N} \ln P(w_t \given w_1, \ldots, w_{t-1})\right) \\
+&= 2^{H(W)} \quad\text{(when using $\log_2$)}
+\end{align*}
+
+\subsection{Intuition: Weighted Average Branching Factor}
+
+\begin{keyinsight}[What Perplexity Really Means]
+Perplexity can be interpreted as the \textbf{weighted average number of
+equally likely next words} the model considers at each position.  A perplexity
+of 100 means the model is, on average, as uncertain as if it had to choose
+uniformly among 100 candidates at every step.  A perfect model that always
+predicts the correct next word with probability 1 has perplexity 1.  For
+English text, Kneser-Ney n-gram models trained on very large corpora can reach
+perplexities around 50--100, though on the small Penn Treebank benchmark a
+Kneser-Ney 5-gram sits closer to 140; modern neural LMs achieve 10--30 on
+standard benchmarks.  Perplexity numbers are only comparable when the training
+corpus, test set, and tokenization are held fixed.
+\end{keyinsight}
+
+\paragraph{Concrete example.}
+A unigram model with vocabulary $V = 10{,}000$ that assigns uniform
+probability to all words has perplexity $= 10{,}000$.  A bigram model might
+reduce this to $250$.  A well-trained trigram with Kneser-Ney smoothing might
+achieve $80$.  GPT-2 (1.5B, evaluated zero-shot; Radford et al., 2019)
+reported perplexity $35.8$ on Penn Treebank and $17.5$ on WikiText-103.
+
+\subsection{Limitations of Perplexity}
+
+Perplexity is useful but incomplete.  Interviewers will probe whether you
+understand its limitations:
+
+\begin{enumerate}
+    \item \textbf{Vocabulary dependence.}  Perplexity is not comparable across
+    models with different vocabularies.  A model with a larger vocabulary faces
+    a harder prediction task, inflating perplexity.  Subword tokenization
+    (BPE, WordPiece) further complicates comparison: a model that uses more
+    tokens per word will have a different perplexity even on the same text.
+    Normalize by computing \emph{per-character} or \emph{bits-per-byte}
+    perplexity for fair comparison.
+
+    \item \textbf{No fluency or coherence measure.}  A model can have low
+    perplexity by assigning high probability to each next word \emph{locally}
+    while generating globally incoherent text.  Perplexity measures
+    next-token prediction, not long-range coherence.
+
+    \item \textbf{No factuality guarantee.}  A model that confidently generates
+    false statements can still have low perplexity if those statements
+    resemble the training distribution.
+
+    \item \textbf{Domain sensitivity.}  Perplexity is measured on a specific
+    test set.  A model with excellent perplexity on news text may perform
+    poorly on medical text.  Always report the domain.
+
+    \item \textbf{Not a task metric.}  Low perplexity does not guarantee good
+    downstream task performance.  Two models with identical perplexity can
+    differ substantially on summarization, QA, or code generation.
+\end{enumerate}
+
+\begin{warningbox}
+A common interview mistake: saying ``perplexity measures how good a language
+model is'' without qualification.  Strong candidates immediately add: ``it
+measures next-token prediction quality on a specific test set, but it
+doesn't capture fluency, coherence, or factuality, and it's not comparable
+across different vocabularies.''
+\end{warningbox}
+
+
+% ============================================================================
+% SECTION 3: HIDDEN MARKOV MODELS
+% ============================================================================
+\section{Hidden Markov Models (HMMs)}
+\label{sec:hmm}
+
+Hidden Markov Models are \textbf{generative} probabilistic models for
+sequential data where the underlying state sequence is unobserved (hidden).
+For decades, HMMs were the dominant approach to part-of-speech tagging and
+speech recognition (for named entity recognition---formalized only with MUC-6
+in 1995---discriminative models displaced them within a few years), and they
+remain the standard introduction to probabilistic sequence modeling.
+
+\subsection{Model Specification}
+
+An HMM is defined by:
+
+\begin{itemize}
+    \item A set of $K$ hidden states $\mathcal{S} = \{s_1, s_2, \ldots, s_K\}$.
+    \item A vocabulary of $V$ possible observations $\mathcal{O} = \{o_1, o_2, \ldots, o_V\}$.
+    \item \textbf{Transition probabilities} $\mA \in \R^{K \times K}$:
+          $a_{ij} = P(y_t = s_j \given y_{t-1} = s_i)$.
+    \item \textbf{Emission probabilities} $\mB \in \R^{K \times V}$:
+          $b_j(o) = P(x_t = o \given y_t = s_j)$.
+    \item \textbf{Initial state distribution} $\bm{\pi} \in \R^K$:
+          $\pi_i = P(y_1 = s_i)$.
+\end{itemize}
+
+The model assumes two key \textbf{independence properties}:
+\begin{enumerate}
+    \item \textbf{Markov property:} The current state depends only on the
+          previous state: $P(y_t \given y_1, \ldots, y_{t-1}) = P(y_t \given y_{t-1})$.
+    \item \textbf{Output independence:} The observation at time $t$ depends
+          only on the current state: $P(x_t \given y_1, \ldots, y_t, x_1, \ldots, x_{t-1}) = P(x_t \given y_t)$.
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    state/.style={circle, draw=deepblue, fill=lightblue, thick,
+                  minimum size=1.2cm, font=\small\sffamily},
+    obs/.style={rectangle, draw=deepblue!70, fill=blue!5, thick,
+                minimum size=1cm, font=\small\sffamily},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!70},
+    lbl/.style={font=\scriptsize\sffamily, deepblue!70}
+]
+% Hidden states
+\node[state] (y1) at (0,0) {$y_1$};
+\node[state] (y2) at (3,0) {$y_2$};
+\node[state] (y3) at (6,0) {$y_3$};
+\node[state] (y4) at (9,0) {$y_4$};
+
+% Observations
+\node[obs] (x1) at (0,-2) {$x_1$};
+\node[obs] (x2) at (3,-2) {$x_2$};
+\node[obs] (x3) at (6,-2) {$x_3$};
+\node[obs] (x4) at (9,-2) {$x_4$};
+
+% Transitions
+\draw[arr] (y1) -- node[above, lbl]{$a_{ij}$} (y2);
+\draw[arr] (y2) -- node[above, lbl]{$a_{ij}$} (y3);
+\draw[arr] (y3) -- node[above, lbl]{$a_{ij}$} (y4);
+
+% Emissions
+\draw[arr] (y1) -- node[right, lbl]{$b_j(o)$} (x1);
+\draw[arr] (y2) -- node[right, lbl]{$b_j(o)$} (x2);
+\draw[arr] (y3) -- node[right, lbl]{$b_j(o)$} (x3);
+\draw[arr] (y4) -- node[right, lbl]{$b_j(o)$} (x4);
+
+% Initial
+\node[left=0.8cm of y1, lbl, font=\small\sffamily] (pi) {$\bm{\pi}$};
+\draw[arr] (pi) -- (y1);
+
+% Labels
+\node[above=0.3cm of y2, font=\scriptsize\sffamily\color{gray}]
+    {Hidden states (POS tags)};
+\node[below=0.3cm of x2, font=\scriptsize\sffamily\color{gray}]
+    {Observed words};
+\end{tikzpicture}
+\caption{Graphical model for an HMM.  Hidden states (top) form a first-order
+Markov chain; each state emits an observation (bottom) independently.  For POS
+tagging: states are tags (DET, NOUN, VERB, \ldots), observations are words.}
+\label{fig:hmm_graphical}
+\end{figure}
+
+\paragraph{Joint probability of a state-observation sequence.}
+Given a state sequence $\vy = (y_1, \ldots, y_T)$ and observation sequence
+$\vx = (x_1, \ldots, x_T)$:
+\begin{equation}
+P(\vx, \vy) = \pi_{y_1} \cdot b_{y_1}(x_1) \cdot \prod_{t=2}^{T} a_{y_{t-1}, y_t} \cdot b_{y_t}(x_t)
+\label{eq:hmm_joint}
+\end{equation}
+
+\subsection{The Three Fundamental HMM Problems}
+
+Every HMM textbook organizes the theory around three problems.  Interviewers
+expect you to know all three and be able to derive at least Problem 2
+(Viterbi).
+
+\subsubsection{Problem 1: Likelihood --- The Forward Algorithm}
+
+\textbf{Given:} observation sequence $\vx = (x_1, \ldots, x_T)$ and model
+parameters $(\mA, \mB, \bm{\pi})$.\\
+\textbf{Find:} $P(\vx) = \sum_{\vy} P(\vx, \vy)$.
+
+\paragraph{Naive approach.}
+Enumerate all $K^T$ possible state sequences and sum.  This is
+$O(K^T)$---completely intractable for even moderate $T$.
+
+\paragraph{The forward algorithm.}
+Define the \textbf{forward variable}:
+\[
+\alpha_t(j) = P(x_1, \ldots, x_t,\; y_t = s_j)
+\]
+This is the probability of observing the first $t$ observations \emph{and}
+being in state $s_j$ at time $t$.
+
+\begin{mathresult}{Forward Algorithm}
+\textbf{Initialization} ($t = 1$):
+\begin{equation}
+\alpha_1(j) = \pi_j \cdot b_j(x_1), \qquad j = 1, \ldots, K
+\label{eq:forward_init}
+\end{equation}
+
+\textbf{Recursion} ($t = 2, \ldots, T$):
+\begin{equation}
+\alpha_t(j) = \left[\sum_{i=1}^{K} \alpha_{t-1}(i) \cdot a_{ij}\right] \cdot b_j(x_t)
+\label{eq:forward_recursion}
+\end{equation}
+
+\textbf{Termination:}
+\begin{equation}
+P(\vx) = \sum_{j=1}^{K} \alpha_T(j)
+\label{eq:forward_termination}
+\end{equation}
+
+\textbf{Complexity:} $O(T \cdot K^2)$ time, $O(T \cdot K)$ space.
+\end{mathresult}
+
+\paragraph{Intuition.}  The recursion in Eq.~\eqref{eq:forward_recursion}
+says: to compute the probability of being in state $j$ at time $t$, sum
+over all states $i$ that could have preceded it, multiplying by the
+transition probability $a_{ij}$ and the emission probability $b_j(x_t)$.
+This is the fundamental dynamic programming insight: rather than enumerating
+all paths, we accumulate probabilities incrementally.
+
+\subsubsection{Problem 2: Decoding --- The Viterbi Algorithm}
+
+\textbf{Given:} observation sequence $\vx$ and model parameters.\\
+\textbf{Find:} the most likely state sequence
+$\vy^* = \argmax_{\vy} P(\vy \given \vx)$.
+
+The Viterbi algorithm is structurally identical to the forward algorithm,
+but replaces \emph{summation} with \emph{maximization} and tracks the
+argmax via backpointers.
+
+\begin{mathresult}{Viterbi Algorithm}
+Define $\delta_t(j) = \max_{y_1, \ldots, y_{t-1}} P(y_1, \ldots, y_{t-1}, y_t = s_j, x_1, \ldots, x_t)$.
+
+\textbf{Initialization} ($t = 1$):
+\begin{equation}
+\delta_1(j) = \pi_j \cdot b_j(x_1), \qquad \psi_1(j) = 0
+\end{equation}
+
+\textbf{Recursion} ($t = 2, \ldots, T$):
+\begin{align}
+\delta_t(j) &= \max_{1 \leq i \leq K} \bigl[\delta_{t-1}(i) \cdot a_{ij}\bigr] \cdot b_j(x_t) \label{eq:viterbi_recursion} \\
+\psi_t(j) &= \argmax_{1 \leq i \leq K} \bigl[\delta_{t-1}(i) \cdot a_{ij}\bigr] \label{eq:viterbi_backpointer}
+\end{align}
+
+\textbf{Termination:}
+\begin{align}
+y_T^* &= \argmax_{1 \leq j \leq K} \delta_T(j) \\
+y_t^* &= \psi_{t+1}(y_{t+1}^*), \qquad t = T{-}1, \ldots, 1
+\end{align}
+
+\textbf{Complexity:} $O(T \cdot K^2)$ time, $O(T \cdot K)$ space.
+\end{mathresult}
+
+\paragraph{Viterbi worked example.}
+Consider a tiny POS-tagging HMM with $K = 2$ states: $\{D, N\}$
+(Determiner, Noun) and an observation sequence: ``the dog.''
+
+\begin{itemize}
+    \item Parameters: $\bm{\pi} = (0.6, 0.4)$, \;
+          $a_{DD} = 0.3$, $a_{DN} = 0.7$, $a_{ND} = 0.4$, $a_{NN} = 0.6$.
+    \item Emissions: $b_D(\text{the}) = 0.5$, $b_D(\text{dog}) = 0.1$,
+          $b_N(\text{the}) = 0.1$, $b_N(\text{dog}) = 0.5$.
+\end{itemize}
+
+\textbf{Step 1: Initialization ($t=1$, word = ``the'').}
+\begin{align*}
+\delta_1(D) &= \pi_D \cdot b_D(\text{the}) = 0.6 \times 0.5 = 0.30 \\
+\delta_1(N) &= \pi_N \cdot b_N(\text{the}) = 0.4 \times 0.1 = 0.04
+\end{align*}
+
+\textbf{Step 2: Recursion ($t=2$, word = ``dog'').}
+\begin{align*}
+\delta_2(D) &= \max\bigl(\delta_1(D) \cdot a_{DD},\; \delta_1(N) \cdot a_{ND}\bigr) \cdot b_D(\text{dog}) \\
+            &= \max(0.30 \times 0.3,\; 0.04 \times 0.4) \times 0.1 \\
+            &= \max(0.090, 0.016) \times 0.1 = 0.0090, \quad \psi_2(D) = D \\[4pt]
+\delta_2(N) &= \max\bigl(\delta_1(D) \cdot a_{DN},\; \delta_1(N) \cdot a_{NN}\bigr) \cdot b_N(\text{dog}) \\
+            &= \max(0.30 \times 0.7,\; 0.04 \times 0.6) \times 0.5 \\
+            &= \max(0.210, 0.024) \times 0.5 = 0.1050, \quad \psi_2(N) = D
+\end{align*}
+
+\textbf{Step 3: Termination.}
+$y_2^* = N$ (since $\delta_2(N) = 0.1050 > \delta_2(D) = 0.0090$),
+then backtrack: $y_1^* = \psi_2(N) = D$.
+
+\textbf{Result:} the $\to$ DET, dog $\to$ NOUN.  Exactly what we expect.
+
+\subsubsection{Problem 3: Learning --- The Baum-Welch Algorithm}
+
+\textbf{Given:} observation sequences (no state labels).\\
+\textbf{Find:} parameters $(\mA, \mB, \bm{\pi})$ that maximize the data
+likelihood.
+
+Baum-Welch is an instance of the \textbf{Expectation-Maximization (EM)}
+algorithm:
+\begin{enumerate}
+    \item \textbf{E-step:} Using the current parameters and both the forward
+    ($\alpha$) and backward ($\beta$) variables, compute the expected counts
+    of transitions and emissions.  Define:
+    \[
+    \gamma_t(i) = P(y_t = s_i \given \vx), \qquad
+    \xi_t(i,j) = P(y_t = s_i, y_{t+1} = s_j \given \vx)
+    \]
+
+    \item \textbf{M-step:} Re-estimate parameters using expected counts:
+    \begin{align}
+    \hat{a}_{ij} &= \frac{\sum_{t=1}^{T-1} \xi_t(i,j)}{\sum_{t=1}^{T-1} \gamma_t(i)} \label{eq:bw_transition} \\[4pt]
+    \hat{b}_j(o) &= \frac{\sum_{t : x_t = o} \gamma_t(j)}{\sum_{t=1}^{T} \gamma_t(j)} \label{eq:bw_emission}
+    \end{align}
+
+    \item Repeat until convergence.  Baum-Welch guarantees monotonic increase
+    of the data likelihood (as a consequence of the EM convergence theorem).
+\end{enumerate}
+
+\paragraph{Practical note.}  In modern NLP, Baum-Welch is rarely used because
+supervised data for POS tagging and NER is available, so parameters are
+estimated directly from labeled sequences via MLE counts.  However,
+understanding Baum-Welch demonstrates knowledge of EM, which is tested
+independently in ML interviews.
+
+\subsection{HMMs for POS Tagging}
+
+The classic application: states are POS tags (DET, NOUN, VERB, ADJ, \ldots),
+observations are words.
+
+\begin{itemize}
+    \item \textbf{Transition probabilities} capture syntactic patterns:
+          $P(\text{NOUN} \given \text{DET})$ is high; $P(\text{DET} \given \text{DET})$
+          is low.
+    \item \textbf{Emission probabilities} capture lexical associations:
+          $P(\text{``runs''} \given \text{VERB})$ is high;
+          $P(\text{``runs''} \given \text{DET})$ is near zero.
+    \item \textbf{Decoding:} Viterbi finds the globally optimal tag sequence
+          $\vy^* = \argmax_{\vy} P(\vy \given \vx)$, not just the locally
+          optimal tag per position.
+\end{itemize}
+
+\subsection{Limitations of HMMs}
+
+\begin{enumerate}
+    \item \textbf{Generative model assumption.}  HMMs model the joint
+    $P(\vx, \vy)$, requiring strong independence assumptions about how
+    observations are generated.  They cannot easily incorporate arbitrary
+    overlapping features of the input.
+
+    \item \textbf{First-order Markov assumption.}  The current tag depends
+    only on the previous tag.  Richer dependencies (e.g., the tag two
+    positions back, or the capitalization of the current word) are not
+    naturally captured.
+
+    \item \textbf{Output independence.}  Each word depends only on its own
+    tag, not on neighboring words.  In reality, the identity of surrounding
+    words is highly informative for tagging.
+
+    \item \textbf{Discrete observations.}  Standard HMMs require discrete
+    observations.  Continuous features (embeddings, character shapes) require
+    extensions like Gaussian HMMs.
+\end{enumerate}
+
+These limitations directly motivate the move to Conditional Random Fields.
+
+
+% ============================================================================
+% SECTION 4: CONDITIONAL RANDOM FIELDS
+% ============================================================================
+\section{Conditional Random Fields (CRFs)}
+\label{sec:crf}
+
+Conditional Random Fields (Lafferty, McCallum, \& Pereira, 2001) are
+\textbf{discriminative} structured prediction models that directly model
+$P(\vy \given \vx)$ without requiring generative assumptions about the input.
+CRFs address every limitation of HMMs listed above, and the CRF concept
+remains actively relevant today: the \textbf{BiLSTM-CRF} (Lample et al.,
+2016) and \textbf{BERT-CRF} architectures for NER use a CRF output layer
+on top of neural features.
+
+\begin{keyinsight}[Why CRFs Are a Critical Interview Topic]
+The question ``Why add a CRF layer on top of BERT for NER?'' appears in a
+large fraction of NLP interviews.  The answer tests whether you understand
+the difference between independent per-token classification (softmax) and
+structured prediction (CRF), and whether you grasp that the CRF captures
+\emph{output dependencies}---constraints on valid label sequences---that the
+neural encoder does not model.  This section gives you the mathematical
+foundation to answer this question precisely.
+\end{keyinsight}
+
+\subsection{Generative vs.\ Discriminative: HMM vs.\ CRF}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    state/.style={circle, draw=deepblue, fill=lightblue, thick,
+                  minimum size=1.1cm, font=\small\sffamily},
+    obs/.style={rectangle, draw=deepblue!70, fill=blue!5, thick,
+                minimum size=0.9cm, font=\small\sffamily},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!70},
+    uarr/.style={thick, deepblue!70},
+    lbl/.style={font=\scriptsize\sffamily, deepblue!70}
+]
+% --- HMM (left) ---
+\node[font=\bfseries\sffamily\color{deepblue}] at (1.5, 1.8) {HMM (Generative)};
+
+\node[state] (hy1) at (0,0) {$y_1$};
+\node[state] (hy2) at (3,0) {$y_2$};
+\node[obs]   (hx1) at (0,-2) {$x_1$};
+\node[obs]   (hx2) at (3,-2) {$x_2$};
+
+\draw[arr] (hy1) -- (hy2);
+\draw[arr] (hy1) -- (hx1);
+\draw[arr] (hy2) -- (hx2);
+
+\node[lbl] at (1.5, 0.4) {$P(y_t \given y_{t-1})$};
+\node[lbl] at (-1.1, -1) {$P(x_t \given y_t)$};
+
+% --- CRF (right) ---
+\node[font=\bfseries\sffamily\color{deepblue}] at (8.5, 1.8) {CRF (Discriminative)};
+
+\node[state] (cy1) at (7,0) {$y_1$};
+\node[state] (cy2) at (10,0) {$y_2$};
+\node[obs]   (cx1) at (7,-2) {$x_1$};
+\node[obs]   (cx2) at (10,-2) {$x_2$};
+
+\draw[uarr] (cy1) -- (cy2);
+\draw[uarr] (cy1) -- (cx1);
+\draw[uarr] (cy2) -- (cx2);
+% CRF: x also connects to all y (global conditioning)
+\draw[uarr, dashed, gray] (cx1) -- (cy2);
+\draw[uarr, dashed, gray] (cx2) -- (cy1);
+
+\node[lbl] at (8.5, 0.4) {$\psi(y_t, y_{t-1})$};
+\node[lbl] at (11.2, -1) {$\psi(y_t, \vx)$};
+\end{tikzpicture}
+\caption{HMM vs.\ CRF graphical models.  The HMM uses directed edges (arrows)
+representing generative assumptions: states generate observations.  The CRF
+uses undirected edges representing compatibility functions.  Crucially, in the
+CRF, each label $y_t$ can depend on the \emph{entire} input sequence $\vx$
+(dashed lines), not just the local observation $x_t$.}
+\label{fig:hmm_vs_crf}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Systematic comparison of HMMs and CRFs.}
+\label{tab:hmm_vs_crf}
+\begin{tabularx}{\textwidth}{>{\bfseries}l X X}
+\toprule
+& \textbf{HMM} & \textbf{CRF} \\
+\midrule
+Type & Generative & Discriminative \\
+Models & $P(\vx, \vy) = P(\vy) P(\vx \given \vy)$ & $P(\vy \given \vx)$ directly \\
+Features & Only current observation $x_t$ & Arbitrary features of \emph{entire} input $\vx$ \\
+Independence & Strong: output independence, first-order Markov & Only Markov on labels; input features are global \\
+Feature overlap & Cannot use overlapping features & Naturally handles overlapping, correlated features \\
+Training & MLE from counts (easy), or Baum-Welch & Gradient-based optimization (log-likelihood) \\
+Decoding & Viterbi $O(TK^2)$ & Viterbi $O(TK^2)$ \\
+Strengths & Simple, fast training, works with little data & Higher accuracy, flexible features, handles rich inputs \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Linear-Chain CRF Formulation}
+
+A linear-chain CRF defines a conditional probability over the label sequence
+$\vy = (y_1, \ldots, y_T)$ given the full input sequence
+$\vx = (x_1, \ldots, x_T)$:
+
+\begin{mathresult}{Linear-Chain CRF}
+\begin{equation}
+P(\vy \given \vx) = \frac{1}{Z(\vx)} \exp\!\left(\sum_{t=1}^{T} \sum_{k} \lambda_k f_k(y_t, y_{t-1}, \vx, t)\right)
+\label{eq:crf}
+\end{equation}
+where:
+\begin{itemize}
+    \item $f_k(y_t, y_{t-1}, \vx, t)$ are \textbf{feature functions} that
+          examine the current label, previous label, entire input, and position.
+    \item $\lambda_k$ are learned weights.
+    \item $Z(\vx)$ is the \textbf{partition function} that ensures normalization.
+\end{itemize}
+\end{mathresult}
+
+\paragraph{Feature functions.}
+Feature functions are binary or real-valued functions that capture patterns.
+For a CRF used in NER, typical features include:
+
+\begin{itemize}
+    \item \textbf{Emission features:} ``current word is `London' and label is
+          B-LOC'' $\to f_k = 1$.
+    \item \textbf{Transition features:} ``previous label is B-PER and current
+          label is I-PER'' $\to f_k = 1$.
+    \item \textbf{Context features:} ``previous word is `in' and current label
+          is B-LOC'' $\to f_k = 1$.
+    \item \textbf{Orthographic features:} ``current word starts with uppercase
+          and label is B-PER'' $\to f_k = 1$.
+\end{itemize}
+
+In the neural CRF setting (BiLSTM-CRF, BERT-CRF), the emission features are
+replaced by neural network outputs, and only the \emph{transition matrix}
+remains as a CRF component.
+
+\subsection{The Partition Function}
+
+The partition function $Z(\vx)$ sums over \emph{all possible label sequences}:
+
+\begin{mathresult}{CRF Partition Function}
+\begin{equation}
+Z(\vx) = \sum_{\vy' \in \mathcal{S}^T}
+\exp\!\left(\sum_{t=1}^{T} \sum_{k} \lambda_k f_k(y'_t, y'_{t-1}, \vx, t)\right)
+\label{eq:partition}
+\end{equation}
+There are $K^T$ possible label sequences, so naive summation is intractable.
+The partition function is computed efficiently using the \textbf{forward
+algorithm} for CRFs, which is structurally identical to the HMM forward
+algorithm but operates in log-space with scores instead of probabilities.
+Complexity: $O(T \cdot K^2)$.
+\end{mathresult}
+
+\paragraph{Why the partition function matters.}
+The partition function is what makes CRFs a proper probabilistic model: it
+ensures $\sum_{\vy} P(\vy \given \vx) = 1$.  During training, we maximize the
+log-likelihood:
+\begin{equation}
+\log P(\vy \given \vx) = \sum_{t=1}^{T} \sum_{k} \lambda_k f_k(y_t, y_{t-1}, \vx, t) - \log Z(\vx)
+\label{eq:crf_loglik}
+\end{equation}
+
+The gradient with respect to $\lambda_k$ has the elegant form:
+\begin{equation}
+\frac{\partial \log P(\vy \given \vx)}{\partial \lambda_k}
+= \underbrace{\sum_t f_k(y_t, y_{t-1}, \vx, t)}_{\text{observed feature count}}
+- \underbrace{\E_{\vy' \sim P(\vy' | \vx)}\!\left[\sum_t f_k(y'_t, y'_{t-1}, \vx, t)\right]}_{\text{expected feature count}}
+\label{eq:crf_gradient}
+\end{equation}
+
+The expected feature count requires the marginals $P(y_t, y_{t-1} \given \vx)$,
+which are computed by the forward-backward algorithm for CRFs.
+
+\subsection{Viterbi Decoding for CRFs}
+
+Decoding in a CRF---finding $\vy^* = \argmax_{\vy} P(\vy \given \vx)$---uses
+the Viterbi algorithm, just as in HMMs.  Since $Z(\vx)$ is constant for a
+given input, the argmax depends only on the score (numerator):
+\begin{equation}
+\vy^* = \argmax_{\vy} \sum_{t=1}^{T} \sum_{k} \lambda_k f_k(y_t, y_{t-1}, \vx, t)
+\end{equation}
+
+The algorithm proceeds identically to the HMM Viterbi, replacing
+probabilities with scores.  Complexity remains $O(T \cdot K^2)$.
+
+\subsection{The Neural CRF: BiLSTM-CRF and BERT-CRF}
+\label{sec:neural_crf}
+
+The breakthrough of Lample et al.\ (2016) and Ma \& Hovy (2016) was combining
+neural feature extractors with a CRF output layer.
+
+\paragraph{Architecture.}
+\begin{enumerate}
+    \item \textbf{Feature extraction:} A BiLSTM (or BERT) processes the input
+    sequence and produces a score vector $\vh_t \in \R^K$ for each position,
+    where $K$ is the number of labels.  The $j$-th component $h_t^{(j)}$
+    is the \emph{emission score} for label $j$ at position $t$.
+
+    \item \textbf{Transition matrix:} A learnable matrix $\mA \in \R^{K \times K}$
+    where $A_{ij}$ is the score for transitioning from label $i$ to label $j$.
+    This is the CRF component.
+
+    \item \textbf{Sequence score:}
+    \begin{equation}
+    s(\vx, \vy) = \sum_{t=1}^{T} h_t^{(y_t)} + \sum_{t=2}^{T} A_{y_{t-1}, y_t}
+    \label{eq:neural_crf_score}
+    \end{equation}
+
+    \item \textbf{Probability:}
+    \begin{equation}
+    P(\vy \given \vx) = \frac{\exp\bigl(s(\vx, \vy)\bigr)}{\sum_{\vy'} \exp\bigl(s(\vx, \vy')\bigr)}
+    = \frac{\exp\bigl(s(\vx, \vy)\bigr)}{Z(\vx)}
+    \label{eq:neural_crf_prob}
+    \end{equation}
+\end{enumerate}
+
+\paragraph{Training.}  Maximize $\log P(\vy \given \vx) = s(\vx, \vy) - \log Z(\vx)$.
+The score of the gold sequence $s(\vx, \vy)$ is trivial to compute.  The
+log-partition function $\log Z(\vx)$ is computed by the forward algorithm in
+$O(T \cdot K^2)$.  Backpropagation flows through both the CRF layer \emph{and}
+the neural encoder, enabling end-to-end training.
+
+\paragraph{Decoding.}  Viterbi finds the best label sequence in $O(T \cdot K^2)$.
+
+\begin{keyinsight}[Why Add CRF on Top of BERT?]
+BERT captures rich \emph{input-side} dependencies: each token's representation
+is informed by the entire input sequence via self-attention.  But a softmax
+classifier on top of BERT makes \emph{independent} predictions for each
+token---it does not model dependencies between \emph{output} labels.  The CRF
+layer adds a transition matrix that models label-label constraints: for
+example, it learns that I-PER should follow B-PER but not B-ORG, and that
+O should not directly follow I-PER without a B-PER preceding it.  This is
+especially valuable in low-data settings and for entity types with multi-token
+spans.  In high-data settings with large models, the benefit is smaller
+because the model learns to make consistent predictions implicitly, but the
+CRF still provides a guarantee of structural validity.
+\end{keyinsight}
+
+
+% ============================================================================
+% SECTION 5: TOPIC MODELS
+% ============================================================================
+\section{Topic Models: Latent Dirichlet Allocation}
+\label{sec:topic_models}
+
+\textbf{Latent Dirichlet Allocation} (LDA; Blei, Ng, \& Jordan, 2003) is
+a generative probabilistic model that discovers latent ``topics'' in a
+collection of documents.  While LDA has been largely superseded by neural
+methods for many tasks, it remains important for interviews because:
+(a) it tests understanding of generative models and Bayesian inference,
+(b) it is still used in production for interpretable topic discovery and
+feature engineering, and (c) modern approaches like BERTopic build on the
+same conceptual framework.
+
+\subsection{The Generative Process}
+
+LDA posits the following generative story for a corpus of $D$ documents,
+each with $N_d$ words, using $K$ topics:
+
+\begin{enumerate}
+    \item For each topic $k \in \{1, \ldots, K\}$:
+    \begin{itemize}
+        \item Draw a word distribution $\bm{\phi}_k \sim \text{Dir}(\bm{\beta})$
+    \end{itemize}
+    \item For each document $d \in \{1, \ldots, D\}$:
+    \begin{itemize}
+        \item Draw a topic mixture $\bm{\theta}_d \sim \text{Dir}(\bm{\alpha})$
+        \item For each word position $n \in \{1, \ldots, N_d\}$:
+        \begin{enumerate}
+            \item Draw a topic assignment $z_{dn} \sim \text{Mult}(\bm{\theta}_d)$
+            \item Draw a word $w_{dn} \sim \text{Mult}(\bm{\phi}_{z_{dn}})$
+        \end{enumerate}
+    \end{itemize}
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    param/.style={circle, draw=deepblue, thick,
+                  minimum size=0.9cm, font=\small},
+    latent/.style={circle, draw=deepblue, fill=lightblue, thick,
+                   minimum size=0.9cm, font=\small},
+    observed/.style={circle, draw=deepblue, fill=gray!30, thick,
+                     minimum size=0.9cm, font=\small},
+    hyper/.style={circle, draw=deepblue!60, thick,
+                  minimum size=0.7cm, font=\small},
+    plate/.style={draw=deepblue!60, thick, rounded corners=3pt,
+                  inner sep=10pt},
+    arr/.style={-{Stealth[length=4pt]}, thick, deepblue!70}
+]
+% Hyperparameters
+\node[hyper] (alpha) at (0, 0) {$\bm{\alpha}$};
+\node[hyper] (beta) at (8, 0) {$\bm{\beta}$};
+
+% Document-level
+\node[latent] (theta) at (2, 0) {$\bm{\theta}_d$};
+\node[latent] (z) at (4, 0) {$z_{dn}$};
+\node[observed] (w) at (4, -1.8) {$w_{dn}$};
+
+% Topic-level
+\node[latent] (phi) at (6, 0) {$\bm{\phi}_k$};
+
+% Arrows
+\draw[arr] (alpha) -- (theta);
+\draw[arr] (theta) -- (z);
+\draw[arr] (z) -- (w);
+\draw[arr] (phi) -- (w);
+\draw[arr] (beta) -- (phi);
+
+% Plates
+\node[plate, fit=(z)(w), label={[font=\scriptsize\sffamily, deepblue!70]below right:$N_d$}] {};
+\node[plate, fit=(theta)(z)(w), label={[font=\scriptsize\sffamily, deepblue!70]below right:$D$},
+      inner sep=16pt] {};
+\node[plate, fit=(phi), label={[font=\scriptsize\sffamily, deepblue!70]below right:$K$}] {};
+
+% Legend
+\node[font=\scriptsize\sffamily, gray] at (4, -3.5)
+    {Shaded = observed \quad Unshaded = latent \quad Plates = replication};
+\end{tikzpicture}
+\caption{Plate notation for Latent Dirichlet Allocation.  Each document $d$
+draws a topic mixture $\bm{\theta}_d$; each word position draws a topic $z_{dn}$,
+then a word $w_{dn}$ from the corresponding topic's word distribution
+$\bm{\phi}_k$.  Only the words $w_{dn}$ are observed.}
+\label{fig:lda_plate}
+\end{figure}
+
+\subsection{Key Quantities}
+
+\begin{itemize}
+    \item $\bm{\theta}_d \in \R^K$: document $d$'s topic mixture.
+          $\theta_{dk}$ is the proportion of document $d$ devoted to topic $k$.
+    \item $\bm{\phi}_k \in \R^V$: topic $k$'s word distribution.
+          $\phi_{kv}$ is the probability that topic $k$ generates word $v$.
+    \item $\bm{\alpha} \in \R^K$: Dirichlet prior on topic mixtures.
+          Low $\alpha$ encourages documents to focus on few topics (sparse);
+          high $\alpha$ encourages uniform mixtures.
+    \item $\bm{\beta} \in \R^V$: Dirichlet prior on word distributions.
+          Low $\beta$ encourages topics to be concentrated on few words.
+\end{itemize}
+
+\subsection{Inference}
+
+The posterior $P(\bm{\theta}, \bm{\phi}, \mathbf{z} \given \mathbf{w}, \bm{\alpha}, \bm{\beta})$
+is intractable because the partition function involves a sum over all possible
+topic assignments for all words.  Two main approximation methods are used:
+
+\paragraph{Collapsed Gibbs sampling.}
+Integrate out $\bm{\theta}$ and $\bm{\phi}$ analytically (possible because the
+Dirichlet is conjugate to the multinomial), then iteratively sample each
+$z_{dn}$ conditioned on all other assignments:
+\begin{equation}
+P(z_{dn} = k \given \mathbf{z}_{-dn}, \mathbf{w})
+\propto \frac{n_{dk}^{-dn} + \alpha_k}{\sum_{k'} (n_{dk'}^{-dn} + \alpha_{k'})}
+\cdot \frac{n_{kv}^{-dn} + \beta_v}{\sum_{v'} (n_{kv'}^{-dn} + \beta_{v'})}
+\label{eq:gibbs_lda}
+\end{equation}
+where $n_{dk}^{-dn}$ is the count of words in document $d$ assigned to topic
+$k$ (excluding position $n$), and $n_{kv}^{-dn}$ is the count of word $v$
+assigned to topic $k$ (excluding position $n$).
+
+\paragraph{Variational inference.}
+Approximate the posterior with a factored variational distribution and
+optimize the Evidence Lower Bound (ELBO).  Faster than Gibbs for large
+corpora and amenable to online/stochastic updates.
+
+\subsection{Modern Relevance: BERTopic}
+
+Classical LDA represents documents as bags of words, losing all semantic and
+contextual information.  \textbf{BERTopic} (Grootendorst, 2022) modernizes
+topic modeling:
+
+\begin{enumerate}
+    \item Embed documents using a pretrained sentence encoder (e.g., all-MiniLM).
+    \item Reduce dimensionality with UMAP.
+    \item Cluster with HDBSCAN (density-based, discovers variable numbers of topics).
+    \item Extract topic representations using class-based TF-IDF (c-TF-IDF).
+\end{enumerate}
+
+BERTopic produces more coherent topics than LDA on most benchmarks, handles
+short texts better (no bag-of-words sparsity), and does not require specifying
+$K$ in advance.  However, LDA remains preferred when interpretable generative
+assumptions are needed or when Bayesian posterior inference over topics is
+required.
+
+
+% ============================================================================
+% SECTION 6: STATISTICAL MACHINE TRANSLATION
+% ============================================================================
+\section{Statistical Machine Translation}
+\label{sec:smt}
+
+Before neural machine translation (NMT), the dominant paradigm was
+\textbf{statistical machine translation (SMT)}.  Understanding SMT is
+valuable not because it is used in production today, but because:
+(a) it introduces the noisy channel model, a foundational concept in
+probabilistic NLP; (b) it contextualizes why the shift to neural MT was
+revolutionary; and (c) interviewers at companies with translation products
+(Google, Meta, Apple, Amazon) sometimes ask about the history.
+
+\subsection{The Noisy Channel Model}
+
+The central idea: treat translation as a decoding problem.  Given a source
+sentence $\mathbf{f}$ (foreign), find the target sentence $\mathbf{e}$
+(English) that maximizes:
+
+\begin{mathresult}{Noisy Channel for Translation}
+\begin{equation}
+\mathbf{e}^* = \argmax_{\mathbf{e}}\; P(\mathbf{e} \given \mathbf{f})
+= \argmax_{\mathbf{e}}\; \underbrace{P(\mathbf{f} \given \mathbf{e})}_{\text{translation model}} \cdot \underbrace{P(\mathbf{e})}_{\text{language model}}
+\label{eq:noisy_channel}
+\end{equation}
+The equality follows from Bayes' theorem; $P(\mathbf{f})$ is constant and
+drops from the argmax.
+\end{mathresult}
+
+\paragraph{Why decompose this way?}
+\begin{itemize}
+    \item The \textbf{language model} $P(\mathbf{e})$ ensures fluency---it
+    prefers grammatically correct English, and can be trained on large
+    monolingual corpora.
+    \item The \textbf{translation model} $P(\mathbf{f} \given \mathbf{e})$
+    ensures adequacy---it models word-level and phrase-level translation
+    equivalences.  It is trained on parallel (bilingual) corpora.
+    \item Separating the two allows each to be improved independently.
+\end{itemize}
+
+\subsection{Alignment and IBM Models}
+
+The translation model requires modeling \textbf{word alignment}: which source
+words correspond to which target words.  The IBM Models (Brown et al., 1993)
+define a series of increasingly complex alignment models:
+
+\begin{itemize}
+    \item \textbf{IBM Model 1:} Uniform alignment probabilities.  All alignments
+    equally likely.  Only learns word-level translation probabilities $t(f \given e)$.
+    Tractable via EM.
+    \item \textbf{IBM Model 2:} Adds position-dependent alignment probabilities
+    $a(i \given j, l_e, l_f)$.
+    \item \textbf{IBM Models 3--5:} Add fertility (one English word can generate
+    multiple foreign words), distortion, and more complex alignment structures.
+\end{itemize}
+
+\paragraph{Phrase-based SMT.}
+The practical workhorse (Koehn et al., 2003) extended word-level alignment
+to \textbf{phrase pairs}: contiguous sequences of words that translate
+together.  A phrase table stores translation probabilities for millions of
+phrase pairs, and a log-linear model combines the phrase translation
+probability, language model score, reordering model, and word penalty.
+Beam search decodes the best translation.
+
+\subsection{Why Neural MT Replaced SMT}
+
+The transition from SMT to NMT (Sutskever et al., 2014; Bahdanau et al., 2015)
+was driven by several factors:
+
+\begin{enumerate}
+    \item \textbf{End-to-end training.}  NMT trains a single model end-to-end,
+    while SMT requires separately training a translation model, language model,
+    reordering model, and then combining them with a log-linear model.
+
+    \item \textbf{Fluency.}  NMT generates more fluent output because it
+    models the full target-side context, not just n-gram language model
+    scores over independently selected phrases.
+
+    \item \textbf{Handling of long-range dependencies.}  SMT reordering models
+    are local; NMT attention mechanisms can capture long-distance dependencies.
+
+    \item \textbf{Morphological richness.}  SMT struggles with morphologically
+    complex languages because phrase tables become enormous.  NMT with subword
+    tokenization handles this naturally.
+
+    \item \textbf{Simplicity.}  A single encoder-decoder model replaces an
+    elaborate pipeline of components.
+\end{enumerate}
+
+\begin{warningbox}
+Do not dismiss SMT entirely in an interview.  If asked ``why did NMT replace
+SMT?'' a strong candidate explains the specific advantages (end-to-end,
+fluency, long-range dependencies) rather than just saying ``neural is better.''
+Showing respect for the engineering of SMT systems---which served billions of
+translations at Google, Microsoft, and others for over a decade---signals
+intellectual maturity.
+\end{warningbox}
+
+
+% ============================================================================
+% SECTION 7: INTERVIEW QUESTIONS
+% ============================================================================
+\section{Interview Questions}
+\label{sec:stat_nlp_questions}
+
+\begin{interviewq}
+\textbf{Q: Explain the Viterbi algorithm.  What is its time complexity?
+Trace through a small example.}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+The Viterbi algorithm finds the most likely sequence of hidden states given a
+sequence of observations in a probabilistic sequence model (HMM or CRF).  It
+is a dynamic programming algorithm that replaces the naive enumeration of all
+$K^T$ state sequences with an efficient recursion.
+
+The key idea is to define $\delta_t(j)$ as the probability of the most likely
+path ending in state $j$ at time $t$.  The recursion is:
+$\delta_t(j) = \max_i [\delta_{t-1}(i) \cdot a_{ij}] \cdot b_j(x_t)$, where
+$a_{ij}$ is the transition probability and $b_j(x_t)$ is the emission probability.
+We also store backpointers $\psi_t(j) = \argmax_i [\delta_{t-1}(i) \cdot a_{ij}]$
+to recover the optimal path by tracing back from the best final state.
+
+The time complexity is $O(T \cdot K^2)$: at each of $T$ positions, we consider
+$K$ current states, and for each we maximize over $K$ predecessor states.
+Space is $O(T \cdot K)$ for the backpointer table.
+
+\emph{[Candidate should then trace through a 2-state, 2-observation example
+as shown in Section~\ref{sec:hmm}, computing $\delta$ values and backpointers
+step by step.]}
+
+\redflags
+\begin{itemize}
+    \item Confusing Viterbi (max, gives best path) with the forward algorithm
+          (sum, gives total probability).
+    \item Stating the complexity as $O(T \cdot K)$ instead of $O(T \cdot K^2)$.
+    \item Inability to trace through a concrete example.
+    \item Forgetting the backpointer step---just computing $\delta_T$ without
+          explaining how to recover the path.
+\end{itemize}
+
+\interviewtest{Whether the candidate understands dynamic programming, can
+distinguish between computing the best path and the total probability, and can
+apply the algorithm concretely.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Correctly states the algorithm, complexity, and traces
+          through an example.  Mentions that it applies to both HMMs and CRFs.
+    \item \badgeLsix{L6}: Discusses numerical issues (working in log-space to
+          avoid underflow), relationship to the forward algorithm, and how
+          Viterbi is used in the BiLSTM-CRF decoding pipeline.
+    \item \badgeLseven{L7}: Connects to beam search as an approximate
+          alternative for models where exact Viterbi is intractable, discusses
+          the Viterbi algorithm for higher-order CRFs ($O(T \cdot K^{n+1})$
+          for $n$-th order), and mentions A* search variants.
+\end{itemize}
+
+\followups{What is the forward algorithm and how does it differ from Viterbi?
+How do you handle numerical underflow?  How is Viterbi used in CRFs?
+What happens to the complexity for a second-order model?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: Why use a CRF layer on top of BERT for NER instead of just a
+softmax classifier?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+A softmax classifier on top of BERT makes \emph{independent} predictions for
+each token.  At position $t$, it computes
+$P(y_t \given \vx) = \softmax(\mW \vh_t + \vb)$, where $\vh_t$ is BERT's
+contextualized representation.  This means the prediction at position $t$
+does not consider what labels were assigned to neighboring positions.
+
+A CRF layer adds a transition score matrix $\mA \in \R^{K \times K}$ that
+models the compatibility between adjacent labels.  The probability of the
+entire sequence becomes
+$P(\vy \given \vx) \propto \exp(\sum_t h_t^{(y_t)} + \sum_t A_{y_{t-1}, y_t})$.
+
+This captures output-side dependencies: the CRF learns that I-PER should
+follow B-PER but not B-ORG, that O cannot directly follow an I- tag without a
+preceding B- tag, and so on.  Without the CRF, a softmax classifier might
+produce invalid label sequences like ``O I-PER I-ORG,'' which the CRF
+transition matrix would prevent.
+
+The benefit is most pronounced in: (a) low-data regimes where the model has
+not seen enough examples to learn consistent labeling patterns implicitly;
+(b) tasks with many entity types and complex tag schemes (BIOES); (c) when
+the model is smaller or less capable.
+
+\redflags
+\begin{itemize}
+    \item Saying ``BERT already captures dependencies, so CRF is unnecessary''
+          without distinguishing input-side from output-side dependencies.
+    \item Not knowing what a CRF transition matrix does.
+    \item Being unable to explain what ``invalid label sequences'' means.
+    \item Saying the CRF always helps---in practice, for large fine-tuned BERT
+          models with abundant data, the improvement is often marginal.
+\end{itemize}
+
+\interviewtest{Whether the candidate understands structured prediction,
+distinguishes input-side from output-side modeling, and can reason about when
+additional model complexity is justified.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Clearly explains the independent-vs-structured
+          distinction, gives examples of invalid sequences.
+    \item \badgeLsix{L6}: Explains the training procedure (forward algorithm
+          for $\log Z$, Viterbi for decoding), discusses when CRF helps vs.\
+          when softmax suffices, and mentions computational overhead ($O(TK^2)$
+          per training example for the CRF forward pass).
+    \item \badgeLseven{L7}: Discusses span-based NER as an alternative to
+          sequence labeling entirely, nested NER, the label bias problem in
+          MEMMs that CRFs avoid, and production tradeoffs (CRF adds latency
+          during inference via Viterbi).
+\end{itemize}
+
+\followups{How is the CRF layer trained end-to-end with BERT?  What is the
+partition function and how is it computed?  When does CRF not help?
+What is the label bias problem?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: What is perplexity?  How does it relate to cross-entropy?
+What are its limitations as an evaluation metric?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Perplexity measures how well a probabilistic language model predicts a test
+set.  It is defined as:
+$\text{PP}(W) = \exp\!\bigl(-\frac{1}{N}\sum_{t=1}^{N} \ln P(w_t \given w_1, \ldots, w_{t-1})\bigr)$,
+which equals $2^{H(W)}$ where $H(W)$ is the cross-entropy per word.
+
+Cross-entropy $H(W) = -\frac{1}{N}\sum_t \log_2 P(w_t \given \text{context})$
+measures the average number of bits needed to encode each word under the model.
+Perplexity is the exponentiation of this quantity, giving it an intuitive
+interpretation as the weighted average number of equally likely next words the
+model considers at each step.  Lower perplexity means the model is more certain
+and assigns higher probability to the actual words.
+
+Limitations: (1) Perplexity is vocabulary-dependent---models with different
+tokenizations are not directly comparable (use bits-per-byte for fair
+comparison).  (2) It only measures local next-token prediction, not global
+coherence or factual correctness.  (3) It is domain-specific---a model can
+have excellent perplexity on news but poor perplexity on medical text.  (4) It
+does not predict downstream task performance: two models with similar perplexity
+can differ substantially on QA or summarization.
+
+\redflags
+\begin{itemize}
+    \item Not knowing the formula or the connection to cross-entropy.
+    \item Saying ``lower perplexity is always better'' without qualification.
+    \item Claiming perplexity measures fluency, coherence, or factuality.
+    \item Not knowing that perplexity is not comparable across different
+          vocabularies or tokenizers.
+\end{itemize}
+
+\interviewtest{Mathematical precision, understanding of information-theoretic
+foundations, and awareness that metrics have limitations.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: States the formula, gives the branching factor
+          interpretation, lists 2--3 limitations.
+    \item \badgeLsix{L6}: Derives the relationship between cross-entropy and
+          perplexity, discusses bits-per-byte for fair comparison, connects to
+          the KL divergence between the true distribution and the model.
+    \item \badgeLseven{L7}: Discusses perplexity in the context of LLM
+          evaluation (why labs report perplexity alongside benchmark scores),
+          the gap between perplexity and human preference rankings, and
+          alternative metrics like calibration and task-specific evaluations.
+\end{itemize}
+
+\followups{What is the perplexity of a uniform model over vocabulary $V$?
+How do you compute perplexity for subword models?  Why does GPT-4's
+perplexity not tell us how good it is at reasoning?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: Compare generative and discriminative sequence models.  Why are
+CRFs generally preferred over HMMs for sequence labeling?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+An HMM is a \emph{generative} model: it models the joint probability
+$P(\vx, \vy) = P(\vy) \cdot P(\vx \given \vy)$ by specifying how hidden states
+generate observations.  This requires strong independence assumptions: each
+observation depends only on its own hidden state (output independence), and
+the transition structure is first-order Markov.
+
+A CRF is a \emph{discriminative} model: it directly models the conditional
+$P(\vy \given \vx)$ without making assumptions about how the inputs were
+generated.  This has three key advantages:
+
+First, CRFs can use \emph{arbitrary, overlapping features} of the entire input.
+In NER, useful features include the current word, its capitalization, the
+previous and next words, prefix/suffix patterns, and gazetteer membership.  An
+HMM cannot naturally incorporate such features because its emission model is
+$P(\text{word} \given \text{tag})$---a single discrete distribution.
+
+Second, CRFs avoid the \emph{label bias problem} that affects Maximum Entropy
+Markov Models (MEMMs), which are locally normalized.  CRFs are globally
+normalized via the partition function $Z(\vx)$, ensuring that all paths
+compete on equal footing.
+
+Third, CRFs consistently achieve higher accuracy on sequence labeling
+benchmarks because they model $P(\vy \given \vx)$ directly, optimizing what
+we actually care about, rather than allocating modeling capacity to the input
+distribution $P(\vx)$.
+
+CRFs are preferred in practice, but HMMs retain advantages in: (a) unsupervised
+settings (Baum-Welch enables learning without labels), (b) very low-data
+scenarios (generative models can be more data-efficient), and (c) when you
+need to generate observations (HMMs are generative; CRFs are not).
+
+\redflags
+\begin{itemize}
+    \item Not knowing the distinction between generative and discriminative.
+    \item Saying ``HMMs are obsolete''---they are still the foundation of
+          understanding sequence models.
+    \item Not mentioning the feature flexibility advantage of CRFs.
+    \item Confusing MEMMs with CRFs.
+\end{itemize}
+
+\interviewtest{Whether the candidate understands the generative/discriminative
+distinction at a fundamental level and can reason about when each paradigm
+is appropriate.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Clearly states the distinction, gives the feature
+          flexibility argument, and mentions CRFs' higher accuracy.
+    \item \badgeLsix{L6}: Explains the label bias problem, discusses global
+          vs.\ local normalization, and connects to the Ng \& Jordan (2001)
+          result on generative vs.\ discriminative classifiers.
+    \item \badgeLseven{L7}: Discusses how the same generative/discriminative
+          dichotomy appears in modern NLP (e.g., masked language models as
+          generative feature extractors, discriminative fine-tuning), and
+          when hybrid approaches work.
+\end{itemize}
+
+\followups{What is the label bias problem?  Why does global normalization help?
+When would you prefer a generative model?  How does this distinction relate to
+BERT vs.\ GPT?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: Explain Kneser-Ney smoothing.  Why is it better than add-1
+(Laplace) smoothing?}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqlow}
+
+\stronganswer
+The core problem with n-gram language models is that any n-gram not seen in
+training gets zero probability under MLE.  Smoothing redistributes probability
+mass from observed to unobserved events.
+
+Laplace (add-1) smoothing adds 1 to every count:
+$P(w \given h) = (C(h, w) + 1) / (C(h) + V)$.  The problem is that for
+large vocabularies ($V \approx 100{,}000$), this steals enormous probability
+mass from observed events and distributes it uniformly.  It treats all unseen
+n-grams as equally likely, which is wrong.
+
+Kneser-Ney smoothing improves on this with two innovations.  First,
+\emph{absolute discounting}: instead of adding pseudocounts, it subtracts a
+fixed discount $d \approx 0.75$ from each observed count, freeing a controlled
+amount of mass.  Second, and more importantly, the \emph{continuation
+probability}: the lower-order distribution used for backoff is not the standard
+unigram $P(w) = C(w)/N$ but
+$P_{\text{cont}}(w) = |\{v : C(v, w) > 0\}| / |\{(v, v') : C(v, v') > 0\}|$,
+which measures how many distinct contexts the word continues.
+
+The classic example: ``Francisco'' is frequent but almost always follows
+``San.''  Standard unigram would give it high probability as a backoff.
+But $P_{\text{cont}}(\text{Francisco})$ is low because it appears after very
+few distinct predecessors.  Kneser-Ney correctly assigns low probability to
+``Francisco'' appearing after a novel context.
+
+Modified Kneser-Ney (Chen \& Goodman, 1999) uses three different discount
+values for counts of 1, 2, and $\geq 3$, and is the best-performing n-gram
+smoothing method known.
+
+\redflags
+\begin{itemize}
+    \item Not knowing what continuation probability is.
+    \item Confusing Kneser-Ney with simple interpolation or backoff.
+    \item Saying ``Kneser-Ney just subtracts a discount'' without explaining
+          the continuation probability, which is the key innovation.
+    \item Not being able to give an example like ``Francisco.''
+\end{itemize}
+
+\interviewtest{Depth of statistical NLP knowledge, ability to explain why
+a sophisticated method works better than a simple one, and whether the
+candidate has studied classical NLP beyond surface level.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Explains absolute discounting and continuation
+          probability with an example.
+    \item \badgeLsix{L6}: Writes the formulas for both terms, explains how
+          the discount $d$ is estimated, and discusses modified Kneser-Ney.
+    \item \badgeLseven{L7}: Connects to the information-theoretic perspective
+          (smoothing as prior), discusses how Kneser-Ney relates to Bayesian
+          n-gram models (Pitman-Yor processes), and notes that neural LMs
+          implicitly smooth via continuous representations.
+\end{itemize}
+
+\followups{What is absolute discounting?  How is the discount $d$ typically
+chosen?  What is modified Kneser-Ney?  How do neural language models handle
+the zero-probability problem differently?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: Explain LDA's generative process.  What are the latent variables
+and how is inference performed?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqlow}
+
+\stronganswer
+LDA (Latent Dirichlet Allocation) is a generative probabilistic model for
+discovering topics in a document corpus.  The generative process is:
+
+For each topic $k$, draw a word distribution $\bm{\phi}_k$ from a Dirichlet
+prior $\text{Dir}(\bm{\beta})$.  For each document $d$, draw a topic mixture
+$\bm{\theta}_d$ from $\text{Dir}(\bm{\alpha})$.  Then, for each word position
+in the document, first sample a topic $z$ from the multinomial
+$\text{Mult}(\bm{\theta}_d)$, then sample a word $w$ from
+$\text{Mult}(\bm{\phi}_z)$.
+
+The latent variables are: (1) the per-document topic mixtures $\bm{\theta}_d$,
+(2) the per-topic word distributions $\bm{\phi}_k$, and (3) the per-word topic
+assignments $z_{dn}$.  Only the words $w_{dn}$ are observed.
+
+The posterior is intractable because the partition function requires summing
+over all possible topic assignments for all words.  Two main inference methods
+are: (a) collapsed Gibbs sampling---integrate out $\bm{\theta}$ and
+$\bm{\phi}$ analytically, then iteratively sample each $z_{dn}$; and
+(b) variational inference---approximate the posterior with a factored
+distribution and optimize the ELBO.
+
+The hyperparameter $\alpha$ controls topic sparsity (low $\alpha$ means
+documents focus on few topics), and $\beta$ controls word sparsity within
+topics (low $\beta$ means topics are concentrated on few words).
+
+\redflags
+\begin{itemize}
+    \item Confusing the generative direction (topics generate words, not the
+          other way around).
+    \item Not knowing the role of the Dirichlet distribution.
+    \item Saying ``LDA uses backpropagation'' (it does not---it predates
+          deep learning).
+    \item Not distinguishing observed from latent variables.
+\end{itemize}
+
+\interviewtest{Understanding of generative models, Bayesian reasoning,
+and approximate inference.  Tests whether the candidate can think beyond
+discriminative neural models.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Correctly describes the generative process and
+          identifies all latent variables.
+    \item \badgeLsix{L6}: Explains why the posterior is intractable, describes
+          Gibbs sampling or variational inference concretely, and discusses
+          hyperparameter effects.
+    \item \badgeLseven{L7}: Connects to modern topic modeling (BERTopic),
+          discusses limitations of the bag-of-words assumption, and mentions
+          extensions like the correlated topic model or dynamic topic models.
+\end{itemize}
+
+\followups{Why is the Dirichlet distribution used as the prior?  What happens
+if $\alpha$ is very large?  How does BERTopic differ from LDA?  When would you
+use LDA today?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: How do n-gram language models relate to modern neural language
+models?  What did each generation preserve and what did it change?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Both n-gram models and neural language models solve the same fundamental
+problem: estimating $P(w_t \given w_1, \ldots, w_{t-1})$, the probability of
+the next word given the context.  The chain rule decomposition is identical.
+What changes is how the conditional is parameterized.
+
+N-gram models use the Markov assumption to truncate context to $n{-}1$ words,
+then estimate probabilities via smoothed count ratios.  Neural LMs (Bengio
+et al., 2003) replaced the count table with a neural network that maps the
+context to a probability distribution over the vocabulary.
+
+The evolution preserves and extends:
+\begin{itemize}
+    \item \emph{Preserved:} The chain rule decomposition; the left-to-right
+    autoregressive factorization; perplexity as the evaluation metric;
+    the fundamental goal of next-word prediction.
+    \item \emph{Changed:} Fixed context window $\to$ unbounded context (RNNs,
+    then transformers); discrete count tables $\to$ continuous parameter
+    spaces; manual smoothing $\to$ implicit smoothing through continuous
+    representations; sparse features $\to$ dense embeddings.
+\end{itemize}
+
+The key insight is that neural LMs solved the \emph{curse of dimensionality}
+that plagues n-grams: for large $n$, most n-grams are never observed.
+By mapping words to continuous embeddings, neural LMs share statistical
+strength between similar words---seeing ``the cat sat on the mat'' helps
+predict ``the dog sat on the rug'' because ``cat'' and ``dog'' have similar
+embeddings.  N-gram models treat these as completely independent events.
+
+Modern LLMs (GPT, LLaMA, Claude) are still autoregressive language models,
+just with transformer architectures, massive scale, and alignment training.
+The intellectual lineage from n-gram LMs is direct and unbroken.
+
+\redflags
+\begin{itemize}
+    \item Saying ``n-gram models are completely different from neural LMs''
+          without seeing the shared foundation.
+    \item Not knowing the chain rule decomposition.
+    \item Being unable to articulate the curse of dimensionality that neural
+          models solve.
+    \item Treating the history as irrelevant rather than as a progression.
+\end{itemize}
+
+\interviewtest{Whether the candidate sees NLP as a coherent field with an
+intellectual arc, not just a collection of disconnected techniques.  Tests
+depth of understanding of language modeling as a concept.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Identifies the shared chain rule foundation and
+          the key differences (continuous representations, longer context).
+    \item \badgeLsix{L6}: Discusses Bengio (2003) as the bridge, explains the
+          curse of dimensionality, and connects smoothing to regularization in
+          neural models.
+    \item \badgeLseven{L7}: Discusses scaling laws showing that both n-gram
+          and neural LMs follow power-law improvements with data, connects
+          to the entropy rate of language as a fundamental limit, and discusses
+          how modern LLMs are still evaluated by perplexity.
+\end{itemize}
+
+\followups{What was the first neural language model?  Why did it take so long
+for neural LMs to dominate?  What is the entropy rate of English?
+Do modern LLMs still use the Markov assumption?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: What is the partition function in a CRF?  Why is it
+computationally challenging, and how is it computed efficiently?}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+The partition function $Z(\vx) = \sum_{\vy'} \exp(s(\vx, \vy'))$ normalizes
+the CRF distribution, ensuring $\sum_{\vy} P(\vy \given \vx) = 1$.  The sum
+is over all possible label sequences $\vy'$.
+
+The computational challenge is that there are $K^T$ possible sequences for $K$
+labels and $T$ positions.  For a typical NER task with $K = 17$ labels (BIOES
+for 4 entity types plus O) and $T = 100$ tokens, that is $17^{100}$
+sequences---an astronomically large number.  Naive enumeration is impossible.
+
+The solution is the \textbf{forward algorithm} for CRFs, which exploits the
+linear-chain structure.  Define forward scores
+$\alpha_t(j) = \log \sum_{\vy_{1:t}: y_t=j} \exp(s(\vx, \vy_{1:t}))$.
+The recursion is:
+$\alpha_t(j) = \text{logsumexp}_i[\alpha_{t-1}(i) + A_{ij}] + h_t^{(j)}$,
+where $A_{ij}$ is the transition score and $h_t^{(j)}$ is the emission score.
+Then $\log Z(\vx) = \text{logsumexp}_j[\alpha_T(j)]$.
+
+This runs in $O(T \cdot K^2)$ time, making the partition function tractable
+for any practical sequence length and label set.  The same algorithm is used
+during training (to compute $\log Z$ for the loss) and the forward-backward
+algorithm extends it to compute the marginals needed for the gradient.
+
+\redflags
+\begin{itemize}
+    \item Not knowing what the partition function is or why it is needed.
+    \item Saying the complexity is $O(K^T)$ without knowing the dynamic
+          programming solution.
+    \item Confusing the forward algorithm (sum, for $Z$) with Viterbi
+          (max, for decoding).
+    \item Not mentioning that computations are done in log-space to avoid
+          numerical underflow.
+\end{itemize}
+
+\interviewtest{Mathematical maturity, understanding of structured prediction
+and dynamic programming, and familiarity with the training mechanics of
+CRF-based models.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: States the definition, explains why naive computation
+          is intractable, and describes the forward algorithm at a high level.
+    \item \badgeLsix{L6}: Writes the forward recursion explicitly, explains
+          log-space computation (logsumexp trick), and connects to the gradient
+          computation (observed minus expected feature counts).
+    \item \badgeLseven{L7}: Discusses generalizations---partition functions in
+          higher-order CRFs, semi-Markov CRFs (for segment-level models),
+          approximate methods when exact computation is intractable (e.g.,
+          belief propagation in general CRFs), and connections to the
+          partition function in statistical physics.
+\end{itemize}
+
+\followups{How does the gradient of the CRF log-likelihood relate to the
+partition function?  What is the forward-backward algorithm?
+What happens to the complexity for a second-order CRF?  How does this
+relate to the partition function in energy-based models?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: Explain the noisy channel model for machine translation.  Why
+was it eventually replaced by neural MT?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqlow}
+
+\stronganswer
+The noisy channel model frames translation as Bayesian inference.  To
+translate a foreign sentence $\mathbf{f}$ to English, we find:
+$\mathbf{e}^* = \argmax_{\mathbf{e}} P(\mathbf{f} \given \mathbf{e}) \cdot P(\mathbf{e})$,
+via Bayes' theorem.
+
+This decomposes into two independently trainable components: a
+\emph{translation model} $P(\mathbf{f} \given \mathbf{e})$ that captures
+word and phrase correspondence (trained on parallel corpora), and a
+\emph{language model} $P(\mathbf{e})$ that ensures fluent output (trained on
+large monolingual corpora).  Decoding uses beam search over the combined
+objective.
+
+SMT was replaced by neural MT because: (1) NMT is end-to-end---a single
+encoder-decoder model replaces the complex SMT pipeline of alignment models,
+phrase tables, reordering models, and feature-weight tuning.  (2) NMT produces
+more fluent output by modeling the full target-side context, not just n-gram
+language model scores.  (3) NMT handles long-range reordering naturally via
+attention, while SMT reordering models are local.  (4) Subword tokenization
+in NMT handles morphologically rich languages without exploding phrase tables.
+
+\redflags
+\begin{itemize}
+    \item Not knowing the Bayesian decomposition or why $P(\mathbf{f})$ drops
+          out of the argmax.
+    \item Saying ``SMT was bad'' without articulating specific limitations.
+    \item Not knowing what a phrase table is or what alignment means.
+\end{itemize}
+
+\interviewtest{Historical knowledge of NLP, understanding of Bayesian
+reasoning, and ability to articulate why paradigm shifts happen.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Explains the decomposition clearly, gives 2--3
+          reasons for the shift to NMT.
+    \item \badgeLsix{L6}: Discusses IBM alignment models, phrase-based SMT,
+          and the log-linear model that combined features.  Explains
+          BLEU score as the evaluation metric developed for SMT.
+    \item \badgeLseven{L7}: Connects the noisy channel model to other
+          applications (speech recognition, spelling correction), discusses
+          how modern LLMs can be viewed as implicit language models replacing
+          both components, and notes that the noisy channel idea has been
+          revived in some neural approaches (channel models for domain
+          adaptation).
+\end{itemize}
+
+\followups{What are IBM alignment models?  What is phrase-based SMT?  How
+does the noisy channel model appear in speech recognition?  Has the noisy
+channel idea been used with neural models?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+\begin{interviewq}
+\textbf{Q: You are building a named entity recognizer for a new domain
+(e.g., legal documents) with only 500 labeled sentences.  Walk me through
+your approach.}
+
+\badgeLfive{L5} \quad \badgetype{Applied} \quad \badgefreq{\freqmed}
+
+\stronganswer
+With only 500 labeled sentences, data efficiency is the primary concern.
+My approach:
+
+\textbf{Step 1: Start with a strong pretrained model.}  Use a domain-relevant
+pretrained language model (e.g., Legal-BERT or a general BERT/RoBERTa model)
+as the feature extractor.  Pretraining provides rich representations that
+compensate for limited task-specific data.
+
+\textbf{Step 2: Add a CRF layer.}  With limited data, the CRF transition
+matrix is especially valuable because it enforces structural constraints on
+label sequences that the model cannot learn from sparse examples.  A
+BERT-CRF architecture should outperform BERT-softmax in this low-data regime.
+
+\textbf{Step 3: Data augmentation.}  Apply entity-preserving augmentation:
+synonym replacement for non-entity tokens, entity swapping (replace entity
+mentions with other entities of the same type), and sentence-level paraphrasing
+using an LLM.
+
+\textbf{Step 4: Active learning.}  Use the initial model to identify
+unlabeled sentences where it is most uncertain, and prioritize those for
+annotation.  This maximizes the value of each labeled example.
+
+\textbf{Step 5: Few-shot with LLMs as augmentation.}  Use GPT-4 or a similar
+model with few-shot prompting to generate additional labeled examples.  These
+silver-label examples can supplement the gold data, especially for common
+entity types.
+
+\textbf{Step 6: Evaluation.}  Use entity-level F1 (not token-level) as the
+primary metric.  Split the 500 sentences into train/dev/test (e.g.,
+350/75/75), and use cross-validation to get reliable estimates given the
+small size.
+
+\redflags
+\begin{itemize}
+    \item Proposing to train a model from scratch---with 500 examples, you
+          must use transfer learning.
+    \item Not mentioning the CRF layer, which is most valuable in low-data
+          settings.
+    \item Ignoring data augmentation or active learning strategies.
+    \item Using accuracy instead of entity-level F1 for evaluation.
+\end{itemize}
+
+\interviewtest{Practical NLP engineering skills, ability to reason about
+data efficiency, and knowledge of the full toolkit from pretrained models
+to data augmentation to active learning.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Proposes fine-tuning a pretrained model with CRF,
+          mentions data augmentation.
+    \item \badgeLsix{L6}: Discusses specific augmentation strategies, active
+          learning, few-shot LLM labeling, and evaluation methodology for
+          small datasets (cross-validation, confidence intervals).
+    \item \badgeLseven{L7}: Discusses continued pretraining on domain text
+          before fine-tuning, curriculum learning, the tradeoff between model
+          complexity and data availability, and how to set up a human-in-the-loop
+          annotation pipeline for iterative improvement.
+\end{itemize}
+
+\followups{How do you handle class imbalance in NER?  What entity-level F1
+metric do you use (strict vs.\ partial matching)?  How would you decide
+between a CRF-based approach and an LLM prompting approach?}
+\end{interviewq}

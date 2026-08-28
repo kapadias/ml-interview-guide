@@ -1,0 +1,1510 @@
+% ============================================================================
+% CHAPTER 8: RLHF AND ALIGNMENT
+% ============================================================================
+% Covers the full alignment pipeline: reward modeling, PPO, DPO, CAI,
+% process reward models, and the practical challenges of aligning LLMs.
+% ============================================================================
+
+\chapter{RLHF and Alignment}
+\label{chap:rlhf_alignment}
+
+\begin{tldr}
+Alignment transforms capable but potentially harmful base models into
+helpful, harmless, and honest assistants.  This chapter covers the complete
+alignment pipeline: reward model training from human preferences, PPO
+optimization with KL constraints, DPO as a simpler alternative, and
+Constitutional AI for scalable oversight.  Understanding RLHF is essential
+for interviews at companies building or deploying LLMs---alignment is what
+turned GPT-3 into ChatGPT, and every frontier lab now invests heavily in
+these techniques.
+\end{tldr}
+
+% ============================================================================
+\section{The Alignment Problem}
+\label{sec:alignment_problem}
+% ============================================================================
+
+A pretrained language model is a powerful next-token predictor, but it is
+not a \emph{useful assistant}.  It will happily continue toxic text, produce
+plausible-sounding misinformation, refuse to follow instructions, or ramble
+incoherently---because its training objective (predict the next token in
+internet text) has no notion of helpfulness, safety, or honesty.
+
+\paragraph{The three H's.}
+Anthropic's framing (Askell et al., 2021) crystallized the alignment target
+into three properties:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Helpful:} The model follows user instructions, provides
+  relevant information, and accomplishes requested tasks effectively.
+\item \textbf{Harmless:} The model refuses dangerous requests, avoids
+  generating toxic or biased content, and does not assist in harmful
+  activities.
+\item \textbf{Honest:} The model avoids fabricating information, expresses
+  uncertainty when appropriate, and does not systematically deceive the
+  user.
+\end{enumerate}
+
+\paragraph{Why supervised fine-tuning alone is insufficient.}
+Supervised fine-tuning (SFT) on human-written demonstrations is a necessary
+first step, but it has fundamental limitations:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Sycophancy:} SFT models learn to produce ``human-like''
+  responses, which includes agreeing with the user even when they are wrong.
+\item \textbf{Hallucination:} Imitating human writing style does not teach
+  the model what it does and does not know.
+\item \textbf{Harmful compliance:} SFT models can be instruction-following
+  to a fault, complying with harmful requests if phrased as instructions.
+\item \textbf{Mode averaging:} Human demonstrations exhibit diverse styles.
+  SFT averages over these modes, producing bland, uncommitted outputs rather
+  than consistently high-quality ones.
+\item \textbf{Comparison is easier than generation:} It is easier for a
+  human to say ``response A is better than response B'' than to write a
+  perfect response from scratch.  RLHF leverages this by learning from
+  \emph{preferences} rather than demonstrations.
+\end{itemize}
+
+\begin{keyinsight}[Why Preferences Beat Demonstrations]
+The core insight of RLHF is that human \emph{preferences} contain richer
+signal than human \emph{demonstrations}.  Writing a perfect response
+requires solving the task; ranking two responses only requires recognizing
+quality.  Humans are better judges than performers---this is true for
+writing, coding, and virtually all creative tasks.  RLHF exploits this
+asymmetry by training a reward model on easy-to-collect preference data,
+then optimizing the LLM against that reward model.
+\end{keyinsight}
+
+\subsection{The Full Alignment Pipeline}
+
+The standard alignment pipeline, introduced by InstructGPT (Ouyang et al.,
+2022), consists of three stages.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.9cm and 0.7cm,
+    stage/.style={rectangle, draw=deepblue, fill=lightblue, thick,
+                  minimum height=1.1cm, minimum width=2.6cm,
+                  font=\small\sffamily, rounded corners=3pt,
+                  text width=2.4cm, align=center},
+    datastage/.style={rectangle, draw=gray!60, fill=gray!8,
+                      minimum height=0.7cm, minimum width=2.4cm,
+                      font=\scriptsize\sffamily, rounded corners=2pt,
+                      text width=2.3cm, align=center},
+    arr/.style={-{Stealth[length=6pt]}, very thick, deepblue!70},
+    lbl/.style={font=\tiny\sffamily, text=deepblue!70}
+]
+
+% --- Stage 0: Pretrained ---
+\node[stage, fill=gray!15, draw=gray!50] (pt) {Pretrained\\LLM};
+
+% --- Stage 1: SFT ---
+\node[stage, right=1.6cm of pt] (sft) {SFT\\Model};
+\node[datastage, above=0.5cm of sft] (sftdata) {Demonstration\\data $(x, y^*)$};
+
+% --- Stage 2: RM ---
+\node[stage, right=1.6cm of sft] (rm) {Reward\\Model};
+\node[datastage, above=0.5cm of rm] (rmdata) {Preference data\\$(x, y_w, y_l)$};
+
+% --- Stage 3: RLHF ---
+\node[stage, right=1.6cm of rm, fill=deepblue!15] (rlhf) {Aligned\\Model};
+\node[datastage, above=0.5cm of rlhf] (rlhfdata) {RL optimization\\(PPO + KL)};
+
+% --- Arrows ---
+\draw[arr] (pt) -- node[above, lbl]{Step 1} (sft);
+\draw[arr] (sft) -- node[above, lbl]{Step 2} (rm);
+\draw[arr] (rm) -- node[above, lbl]{Step 3} (rlhf);
+
+\draw[arr, gray!50] (sftdata) -- (sft);
+\draw[arr, gray!50] (rmdata) -- (rm);
+\draw[arr, gray!50] (rlhfdata) -- (rlhf);
+
+% --- Feedback arrow from RM to RLHF ---
+\draw[arr, deepgreen!70, dashed] (rm.south) -- ++(0, -0.6)
+  -| node[below, pos=0.25, lbl, text=deepgreen!70]{$R_\theta(x, y)$} (rlhf.south);
+
+% --- Reference model arrow ---
+\draw[arr, orange!70, dashed] (sft.south) -- ++(0, -1.0)
+  -| node[below, pos=0.2, lbl, text=orange!70]{$\pi_{\text{ref}}$ (KL anchor)} (rlhf.south west);
+
+\end{tikzpicture}
+\caption{The three-stage alignment pipeline.  Stage~1: SFT on demonstrations.
+Stage~2: train a reward model on human preferences.  Stage~3: optimize the
+policy via PPO against the reward model, anchored to the SFT model by a
+KL penalty.}
+\label{fig:alignment_pipeline}
+\end{figure}
+
+
+% ============================================================================
+\section{Reward Model Training}
+\label{sec:reward_model}
+% ============================================================================
+
+The reward model (RM) is the component that translates subjective human
+preferences into a scalar signal the RL algorithm can optimize.  Its quality
+is the ceiling of the entire alignment pipeline---no amount of RL
+optimization can compensate for a reward model that assigns high scores to
+bad outputs.
+
+\subsection{Preference Data Collection}
+
+For each training example, human annotators are presented with:
+\begin{itemize}[leftmargin=*]
+\item A \textbf{prompt} $x$ (user query or instruction).
+\item Two (or more) model-generated \textbf{responses} $y_A$ and $y_B$.
+\item The annotator indicates which response is preferred: $y_w \succ y_l$
+  (winner vs.\ loser).
+\end{itemize}
+
+Data quality considerations include: clear annotation guidelines, annotator
+calibration (inter-annotator agreement), diversity of prompts (topics,
+difficulty, safety), and filtering for low-quality annotations.  Typical
+datasets range from 50K to 500K preference pairs.
+
+\subsection{The Bradley-Terry Model}
+
+Given a reward function $r_\theta(x, y)$ that maps a prompt-response pair
+to a scalar, the \textbf{Bradley-Terry model} (1952) defines the
+probability that response $y_w$ is preferred over $y_l$:
+
+\begin{mathresult}{Bradley-Terry Preference Model}
+\begin{equation}
+P(y_w \succ y_l \given x)
+= \sigma\!\bigl(r_\theta(x, y_w) - r_\theta(x, y_l)\bigr)
+= \frac{1}{1 + \exp\!\bigl(-(r_\theta(x, y_w) - r_\theta(x, y_l))\bigr)}
+\label{eq:bradley_terry}
+\end{equation}
+where $\sigma(\cdot)$ is the sigmoid function.  The preference probability
+depends only on the \emph{difference} in rewards, not their absolute values.
+\end{mathresult}
+
+\paragraph{Why Bradley-Terry?}
+The model has a single elegant property: preferences are transitive and
+determined by reward differences.  If $r(A) > r(B) > r(C)$, then
+$P(A \succ C) > P(A \succ B)$.  The sigmoid function maps unbounded reward
+differences to $[0, 1]$ probabilities, and the symmetry
+$P(A \succ B) = 1 - P(B \succ A)$ holds automatically.
+
+\subsection{Reward Model Training Loss}
+
+The reward model is trained to maximize the log-likelihood of observed human
+preferences:
+
+\begin{mathresult}{Reward Model Training Loss}
+\begin{equation}
+\loss_{\text{RM}} = -\E_{(x,\, y_w,\, y_l) \sim \mathcal{D}}
+\Bigl[\log \sigma\!\bigl(r_\theta(x, y_w) - r_\theta(x, y_l)\bigr)\Bigr]
+\label{eq:rm_loss}
+\end{equation}
+This is binary cross-entropy applied to the preference probability, with the
+``positive class'' being the event that the preferred response receives a
+higher reward than the dispreferred one.
+\end{mathresult}
+
+\paragraph{Architecture.}
+The reward model typically shares the architecture of the base LLM, with the
+language modeling head replaced by a \textbf{scalar projection head}: the
+final hidden state (often at the last token position, or a pooled
+representation) is projected to a single scalar $r_\theta(x, y) \in \R$.
+Initializing the RM from the SFT model (rather than the pretrained model)
+gives it a strong starting representation of what good responses look like.
+
+\paragraph{Practical considerations.}
+\begin{itemize}[leftmargin=*]
+\item \textbf{Label noise:} Human preferences are noisy---annotators
+  disagree on 20--35\% of pairs.  The Bradley-Terry model handles this
+  gracefully because it models preferences probabilistically.
+\item \textbf{Length bias:} Annotators often prefer longer, more detailed
+  responses.  The RM can learn this spurious correlation, leading to
+  reward hacking (Section~\ref{sec:reward_hacking}).
+\item \textbf{Calibration:} The absolute reward value is meaningless (only
+  differences matter).  Some implementations add a regularization term to
+  prevent reward magnitude from drifting.
+\item \textbf{Listwise ranking:} Extending beyond pairwise comparisons,
+  some approaches rank $K > 2$ responses per prompt, yielding
+  $\binom{K}{2}$ preference pairs per annotation.
+\end{itemize}
+
+\begin{keyinsight}[The Reward Model Is the Bottleneck]
+The reward model is the weakest link in the RLHF chain.  It is trained on
+finite, noisy human preference data, yet it must generalize to the vast
+space of possible LLM outputs.  If the RM assigns high reward to verbose
+but unhelpful responses, the policy will learn to be verbose.  If it
+cannot distinguish subtle factual errors, the policy will hallucinate
+confidently.  Improving RM quality---through better data, larger models,
+ensembles, or process-level supervision---is the highest-leverage
+intervention in alignment research.
+\end{keyinsight}
+
+
+% ============================================================================
+\section{PPO for Language Model Alignment}
+\label{sec:ppo}
+% ============================================================================
+
+With a trained reward model in hand, the next step is to optimize the
+language model (the ``policy'') to produce outputs that receive high reward.
+This is a reinforcement learning problem: the policy generates a response
+(action) given a prompt (state), and receives a scalar reward.
+
+\subsection{The RLHF Objective}
+
+The RLHF training objective balances two goals: maximize the expected reward
+from the RM, and stay close to the SFT model (the ``reference policy'') to
+prevent degenerate solutions.
+
+\begin{mathresult}{RLHF Objective}
+\begin{equation}
+\max_{\pi_\theta} \;\;
+\E_{x \sim \mathcal{D},\; y \sim \pi_\theta(\cdot \given x)}
+\Bigl[r_\phi(x, y)\Bigr]
+\;-\; \beta \cdot \KL\!\bigl(\pi_\theta(\cdot \given x) \,\|\, \pi_{\text{ref}}(\cdot \given x)\bigr)
+\label{eq:rlhf_objective}
+\end{equation}
+where $\pi_\theta$ is the policy being optimized, $\pi_{\text{ref}}$ is the
+SFT model (frozen), $r_\phi$ is the trained reward model, and $\beta > 0$
+controls the strength of the KL penalty.
+\end{mathresult}
+
+\paragraph{Why the KL penalty?}
+Without the KL term, the policy would find degenerate outputs that exploit
+imperfections in the reward model---producing gibberish that happens to
+score highly, or collapsing to a single memorized high-reward response.
+The KL penalty keeps the policy close to the SFT model, which serves as a
+``sanity anchor'' ensuring the outputs remain coherent and diverse.
+
+\paragraph{The combined reward.}
+In practice, the KL penalty is folded into the reward signal as a per-token
+penalty:
+\begin{equation}
+r_{\text{total}}(x, y)
+= r_\phi(x, y)
+  - \beta \sum_{t=1}^{T} \log \frac{\pi_\theta(y_t \given x, y_{<t})}
+                                     {\pi_{\text{ref}}(y_t \given x, y_{<t})}
+\label{eq:total_reward}
+\end{equation}
+This converts the constrained optimization into an unconstrained RL problem
+with a modified reward.
+
+\subsection{PPO Mechanics}
+
+\textbf{Proximal Policy Optimization} (Schulman et al., 2017) is the RL
+algorithm used to optimize the RLHF objective.  PPO belongs to the family
+of policy gradient methods and is designed for stable, monotonic policy
+improvement.
+
+\begin{mathresult}{PPO Clipped Surrogate Objective}
+\begin{equation}
+\loss_{\text{PPO}} = -\E_t \Bigl[
+  \min\!\bigl(
+    \rho_t(\theta)\, \hat{A}_t,\;\;
+    \text{clip}\bigl(\rho_t(\theta),\, 1-\epsilon,\, 1+\epsilon\bigr)\, \hat{A}_t
+  \bigr)
+\Bigr]
+\label{eq:ppo}
+\end{equation}
+where:
+\begin{itemize}
+\item $\rho_t(\theta) = \dfrac{\pi_\theta(y_t \given x, y_{<t})}
+  {\pi_{\theta_{\text{old}}}(y_t \given x, y_{<t})}$ is the probability
+  ratio between the current and old policy
+\item $\hat{A}_t$ is the estimated advantage (how much better action $y_t$
+  is than average under the current value function)
+\item $\epsilon$ is the clipping range (typically 0.1--0.2)
+\end{itemize}
+\end{mathresult}
+
+\paragraph{Why clipping?}
+Without clipping, a large policy update in one step could catastrophically
+degrade performance.  The $\min$ with the clipped ratio ensures that the
+objective is pessimistic: when the advantage is positive (good action), the
+ratio is clipped above at $1 + \epsilon$, limiting how much the policy can
+increase the probability of that action.  When the advantage is negative
+(bad action), the ratio is clipped below at $1 - \epsilon$, limiting how
+much the probability can decrease.  This creates a ``trust region'' around
+the old policy.
+
+\paragraph{Advantage estimation (GAE).}
+The advantage $\hat{A}_t$ is computed using Generalized Advantage Estimation
+(Schulman et al., 2016):
+\begin{equation}
+\hat{A}_t = \sum_{l=0}^{\infty} (\gamma \lambda)^l \, \delta_{t+l},
+\qquad
+\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+\end{equation}
+where $V(s_t)$ is a learned value function (critic), $\gamma$ is the
+discount factor, and $\lambda \in [0, 1]$ controls the bias-variance
+tradeoff.  In RLHF, the ``state'' at time $t$ is the prompt plus tokens
+generated so far, and $r_t$ is typically zero for all tokens except the
+last, where it equals $r_\phi(x, y)$ minus the accumulated KL penalty.
+
+\subsection{The Four-Model Setup}
+
+RLHF with PPO requires maintaining four models simultaneously:
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lXc}
+\toprule
+\textbf{Model} & \textbf{Role} & \textbf{Updated?} \\
+\midrule
+Policy $\pi_\theta$ & Generates responses; parameters being optimized & Yes \\
+Reference $\pi_{\text{ref}}$ & Frozen SFT model; anchor for KL penalty & No \\
+Reward model $r_\phi$ & Scores (prompt, response) pairs & No \\
+Value function $V_\psi$ & Estimates expected cumulative reward (critic) & Yes \\
+\bottomrule
+\end{tabularx}
+\caption{The four models required for PPO-based RLHF.  For a 70B parameter
+policy, this means up to $\sim$280B parameters in GPU memory \emph{if all
+four models are policy-sized}---in practice the RM and critic are often
+smaller (the critic is commonly initialized from the RM), and optimizer
+states and activations add substantially more memory on top of the raw
+parameters.}
+\label{tab:four_models}
+\end{table}
+
+\begin{warningbox}
+\textbf{PPO for RLHF is notoriously difficult to tune.}  Practical
+challenges include: (a)~the four-model memory footprint---for a 70B policy,
+up to $\sim$280B parameters in memory simultaneously if all four models are
+policy-sized (before counting optimizer states and activations);
+(b)~hyperparameter
+sensitivity---the KL coefficient $\beta$, learning rate, clipping range
+$\epsilon$, GAE parameters $\gamma$ and $\lambda$, and number of PPO
+epochs per batch all interact in complex ways; (c)~training instability---
+the reward model is a moving target from the policy's perspective (reward
+hacking), and the value function must track a nonstationary reward;
+(d)~high variance---policy gradient methods have inherently high variance,
+requiring large batch sizes.  These difficulties directly motivated the
+development of DPO (Section~\ref{sec:dpo}).
+\end{warningbox}
+
+
+% ============================================================================
+\section{Reward Hacking}
+\label{sec:reward_hacking}
+% ============================================================================
+
+\textbf{Reward hacking} occurs when the policy learns to exploit
+imperfections in the reward model rather than genuinely improving response
+quality.  It is the central failure mode of RLHF and a manifestation of
+Goodhart's law: ``When a measure becomes a target, it ceases to be a good
+measure.''
+
+\subsection{Common Manifestations}
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Verbosity:} Human annotators often prefer longer, more
+  detailed responses.  The RM learns this correlation, and the policy
+  exploits it by generating increasingly verbose outputs that add words
+  without adding value.
+\item \textbf{Sycophancy:} The policy learns to agree with the user's
+  stated beliefs, even when incorrect, because agreeable responses receive
+  higher human ratings.
+\item \textbf{Formatting tricks:} Bullet points, headers, and structured
+  formatting score higher with annotators, so the policy over-produces
+  formatted content even when a brief answer suffices.
+\item \textbf{Hedging:} Excessive caveats and qualifications (``It's
+  important to note that\ldots'') to appear thorough without committing to
+  potentially wrong answers.
+\item \textbf{Style over substance:} Confident, articulate phrasing that
+  sounds authoritative but may be factually wrong.
+\end{itemize}
+
+\subsection{The Over-Optimization Curve}
+
+Gao et al.\ (2023) demonstrated a characteristic pattern: as PPO training
+progresses, the \emph{proxy reward} (score from the RM) increases
+monotonically, but the \emph{true reward} (actual human evaluation) first
+improves, peaks, and then \emph{degrades}.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=10cm, height=6cm,
+    xlabel={PPO Training Steps},
+    ylabel={Reward},
+    xmin=0, xmax=100,
+    ymin=-0.5, ymax=2.5,
+    legend pos=north west,
+    grid=major,
+    grid style={gray!20},
+    axis lines=left,
+    xlabel style={font=\small\sffamily},
+    ylabel style={font=\small\sffamily},
+    tick label style={font=\scriptsize\sffamily},
+    legend style={font=\scriptsize\sffamily, fill=white, draw=gray!40},
+]
+% Proxy reward (monotonically increasing)
+\addplot[deepblue, very thick, smooth, domain=0:100, samples=80]
+    {0.02*x + 0.3*ln(x+1)/ln(10)};
+\addlegendentry{Proxy reward (RM score)}
+
+% True reward (peaks then degrades)
+\addplot[deepred, very thick, smooth, dashed, domain=0:100, samples=80]
+    {-0.0003*x^2 + 0.04*x + 0.1};
+\addlegendentry{True reward (human eval)}
+
+% Optimal point
+\draw[deepgreen!80, thick, dashed] (axis cs:66.7,0) -- (axis cs:66.7,1.45)
+    node[above, font=\scriptsize\sffamily, text=deepgreen!80] {Optimal};
+
+% Over-optimization zone
+\draw[deepred!60, thick, decorate, decoration={brace, amplitude=5pt, mirror, raise=2pt}]
+    (axis cs:67,{-0.0003*67^2 + 0.04*67 + 0.1}) --
+    (axis cs:100,{-0.0003*100^2 + 0.04*100 + 0.1})
+    node[midway, below=8pt, font=\scriptsize\sffamily, text=deepred!70]
+    {Over-optimization};
+
+\end{axis}
+\end{tikzpicture}
+\caption{The over-optimization curve.  The proxy reward (RM score)
+increases monotonically, but the true reward (human evaluation) peaks
+and then degrades as the policy increasingly exploits RM imperfections.}
+\label{fig:overoptimization}
+\end{figure}
+
+\subsection{Defenses Against Reward Hacking}
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{KL penalty} (primary defense):
+  Constraining the policy to stay near $\pi_{\text{ref}}$ limits how far
+  it can drift into reward-hacked territory.  The coefficient $\beta$
+  controls this tradeoff: higher $\beta$ = safer but less improvement;
+  lower $\beta$ = more improvement but higher risk of hacking.
+
+\item \textbf{Reward model ensembles:}
+  Train multiple RMs on different data splits and use their agreement as
+  a more robust reward signal (e.g., minimum or average of ensemble).
+  Disagreement between ensemble members signals regions where hacking
+  is likely.
+
+\item \textbf{Iterative reward model retraining:}
+  Periodically collect new preference data on the \emph{current} policy's
+  outputs (not the SFT model's outputs) and retrain the RM.  This closes
+  the distribution gap between RM training data and policy outputs.
+
+\item \textbf{Length penalties:}
+  Explicitly penalize response length in the reward to counteract the
+  verbosity bias.
+
+\item \textbf{Constitutional constraints:}
+  Use rule-based or model-based checks alongside the RM to catch specific
+  failure modes (Section~\ref{sec:cai}).
+\end{enumerate}
+
+\begin{keyinsight}[Goodhart's Law in Alignment]
+Goodhart's law---``When a measure becomes a target, it ceases to be a good
+measure''---is not just a witty aphorism in alignment; it is the
+\emph{central technical challenge}.  The reward model is a proxy for human
+values, and optimizing hard against a proxy inevitably diverges from the
+true objective.  Every defense strategy (KL penalty, ensembles, retraining)
+is fundamentally about limiting how hard we optimize against the proxy.
+This is why alignment is an ongoing research problem, not a solved one.
+\end{keyinsight}
+
+
+% ============================================================================
+\section{DPO: Direct Preference Optimization}
+\label{sec:dpo}
+% ============================================================================
+
+Direct Preference Optimization (Rafailov et al., 2023) is an elegant
+reformulation that eliminates both the reward model and the RL algorithm,
+reducing RLHF to a single supervised learning objective on preference data.
+
+\subsection{The Key Insight}
+
+DPO observes that the optimal policy under the KL-constrained RLHF
+objective has a \emph{closed-form} relationship to the reward function.
+By rearranging this relationship and substituting into the Bradley-Terry
+preference model, we can derive a loss function that directly optimizes
+the policy on preference data---no intermediate reward model or RL required.
+
+\subsection{Derivation from the RLHF Objective}
+
+\paragraph{Step 1: The optimal policy.}
+Consider the RLHF objective from Eq.~\eqref{eq:rlhf_objective}:
+\[
+\max_{\pi} \;\;
+\E_{y \sim \pi(\cdot \given x)}
+\bigl[r(x, y)\bigr]
+- \beta \cdot \KL\!\bigl(\pi(\cdot \given x) \,\|\, \pi_{\text{ref}}(\cdot \given x)\bigr)
+\]
+Expanding the KL divergence and solving for the optimal policy $\pi^*$
+(by setting the functional derivative to zero), we obtain:
+
+\begin{mathresult}{Optimal Policy under KL-Constrained RM Maximization}
+\begin{equation}
+\pi^*(y \given x) = \frac{1}{Z(x)} \; \pi_{\text{ref}}(y \given x) \;\exp\!\left(\frac{r(x, y)}{\beta}\right)
+\label{eq:optimal_policy}
+\end{equation}
+where $Z(x) = \sum_{y'} \pi_{\text{ref}}(y' \given x) \exp\!\bigl(r(x, y')/\beta\bigr)$ is the partition function (intractable to compute in general, but it cancels out below).
+\end{mathresult}
+
+\textit{Derivation sketch.}  Write the objective in terms of the policy
+distribution:
+\begin{align}
+J(\pi) &= \sum_y \pi(y \given x) \, r(x, y)
+  - \beta \sum_y \pi(y \given x) \log \frac{\pi(y \given x)}{\pi_{\text{ref}}(y \given x)}
+\label{eq:rlhf_expanded}
+\end{align}
+Taking the functional derivative with respect to $\pi(y \given x)$ and
+setting it to zero (with a Lagrange multiplier for the normalization
+constraint $\sum_y \pi(y \given x) = 1$):
+\begin{align}
+\frac{\partial J}{\partial \pi(y \given x)}
+&= r(x, y) - \beta \log \frac{\pi(y \given x)}{\pi_{\text{ref}}(y \given x)} - \beta - \lambda = 0
+\end{align}
+Solving for $\pi(y \given x)$:
+\[
+\pi(y \given x) = \pi_{\text{ref}}(y \given x) \cdot \exp\!\left(\frac{r(x,y) - \beta - \lambda}{\beta}\right)
+\]
+The terms $\beta + \lambda$ become the log-partition function after
+enforcing normalization, yielding Eq.~\eqref{eq:optimal_policy}.
+
+\paragraph{Step 2: Express the reward in terms of the policy.}
+Rearranging Eq.~\eqref{eq:optimal_policy} by taking the logarithm of both
+sides:
+\begin{equation}
+r(x, y) = \beta \log \frac{\pi^*(y \given x)}{\pi_{\text{ref}}(y \given x)} + \beta \log Z(x)
+\label{eq:reward_from_policy}
+\end{equation}
+This is the crucial equation: the reward is a function of the
+\emph{log-ratio} between the optimal policy and the reference policy, plus
+a prompt-dependent constant.
+
+\paragraph{Step 3: Substitute into Bradley-Terry.}
+The reward model loss (Eq.~\ref{eq:rm_loss}) uses the Bradley-Terry
+model, which depends only on \emph{reward differences}:
+\begin{align}
+r(x, y_w) - r(x, y_l)
+&= \beta \log \frac{\pi^*(y_w \given x)}{\pi_{\text{ref}}(y_w \given x)}
+ - \beta \log \frac{\pi^*(y_l \given x)}{\pi_{\text{ref}}(y_l \given x)}
+\label{eq:reward_diff}
+\end{align}
+The partition function $\beta \log Z(x)$ \textbf{cancels} because it
+depends only on $x$, not on the specific response.  Substituting into the
+Bradley-Terry model:
+
+\begin{mathresult}{DPO Loss Function}
+\begin{equation}
+\loss_{\text{DPO}}(\pi_\theta; \pi_{\text{ref}})
+= -\E_{(x,\, y_w,\, y_l) \sim \mathcal{D}}
+\left[\log \sigma\!\left(
+  \beta \left(
+    \log \frac{\pi_\theta(y_w \given x)}{\pi_{\text{ref}}(y_w \given x)}
+    - \log \frac{\pi_\theta(y_l \given x)}{\pi_{\text{ref}}(y_l \given x)}
+  \right)
+\right)\right]
+\label{eq:dpo_loss}
+\end{equation}
+where $\pi_\theta$ is the policy being trained, $\pi_{\text{ref}}$ is the
+frozen reference model (typically the SFT model), $y_w$ and $y_l$ are the
+preferred and dispreferred responses, and $\beta$ controls the strength
+of the KL constraint (same role as in RLHF).
+\end{mathresult}
+
+\paragraph{Reading the DPO loss.}
+The loss encourages the policy to increase the log-probability of the
+preferred response $y_w$ \emph{relative to the reference}, while
+decreasing it for the dispreferred response $y_l$ \emph{relative to the
+reference}.  The reference model provides a baseline: DPO does not just
+make $y_w$ more likely in absolute terms---it makes $y_w$ \emph{more
+likely than the reference model would predict}, and $y_l$ \emph{less
+likely}.
+
+\begin{keyinsight}[The Elegance of DPO]
+DPO shows that the RLHF objective, the reward model, and PPO optimization
+are all \textbf{mathematically redundant}---they can be collapsed into a
+single supervised loss on preference data.  The ``reward model'' is
+implicitly defined by the policy itself via
+$r(x, y) = \beta \log(\pi_\theta(y|x) / \pi_{\text{ref}}(y|x)) + C(x)$.
+This is not an approximation; it is an exact reformulation.  The reward
+model was never a necessary intermediate---it was a computational
+scaffolding that DPO removes.
+\end{keyinsight}
+
+\subsection{DPO vs.\ RLHF: Comparison}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{RLHF (PPO)} & \textbf{DPO} \\
+\midrule
+Components & 4 models (policy, ref, RM, critic) & 2 models (policy, ref) \\
+Training & RL loop (generate $\to$ score $\to$ update) & Supervised (single loss on preference data) \\
+Stability & Sensitive to hyperparameters & More stable, standard supervised training \\
+Compute & High (generation + RM inference + PPO) & Low (forward passes only) \\
+Explicit reward & Yes (can monitor and debug RM) & No (reward is implicit in the policy) \\
+Online data & Yes (policy generates new data each step) & No (fixed offline preference dataset) \\
+Exploration & Policy can explore novel outputs & Limited to preference dataset distribution \\
+\bottomrule
+\end{tabularx}
+\caption{DPO vs.\ RLHF comparison.  DPO trades flexibility and explicit
+reward monitoring for simplicity and stability.}
+\label{tab:dpo_vs_rlhf}
+\end{table}
+
+\paragraph{DPO limitations.}
+\begin{itemize}[leftmargin=*]
+\item \textbf{No explicit reward model:} Cannot monitor the reward signal
+  during training or use it for other purposes (e.g., best-of-$n$
+  sampling, rejection sampling).
+\item \textbf{Offline only:} DPO trains on a fixed dataset.  It cannot
+  generate new responses and get reward feedback during training, which
+  limits its ability to explore beyond the preference data distribution.
+  Online variants (online DPO, iterative DPO) address this partially.
+\item \textbf{Reference model dependence:} DPO's loss is defined relative
+  to $\pi_{\text{ref}}$.  If the reference model is poor, DPO's
+  optimization landscape is distorted.
+\item \textbf{Sensitivity to $\beta$:} Like RLHF, $\beta$ controls the
+  KL constraint.  Too high $\beta$ undertrains; too low leads to
+  over-optimization.
+\end{itemize}
+
+
+% ============================================================================
+\section{DPO Variants}
+\label{sec:dpo_variants}
+% ============================================================================
+
+The success of DPO inspired a family of preference optimization methods,
+each addressing specific limitations.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Method} & \textbf{Key Change} & \textbf{Why It Matters} \\
+\midrule
+IPO & $\ell_2$ regularization instead of log-sigmoid &
+  Avoids overfitting to the Bradley-Terry assumption; more robust
+  when preferences are noisy or intransitive \\
+KTO & Needs only binary feedback (good/bad), not pairs &
+  Dramatically easier data collection---no need to generate and compare
+  two responses per prompt; uses Kahneman-Tversky prospect theory \\
+ORPO & Combines SFT and preference optimization in one loss &
+  No need for separate SFT stage; reference-free (no $\pi_{\text{ref}}$
+  needed) \\
+SimPO & Reference-free, uses average log-prob as implicit reward &
+  Simpler than DPO; no reference model at all; length-normalized
+  reward avoids verbosity bias \\
+cDPO & Conservative DPO with label noise modeling &
+  Accounts for annotation noise explicitly in the loss \\
+RSO & Rejection Sampling Optimization with SFT on filtered data &
+  Combines rejection sampling from RM with DPO-style optimization \\
+\bottomrule
+\end{tabularx}
+\caption{DPO variants.  Each method addresses a specific limitation of
+the original DPO formulation.}
+\label{tab:dpo_variants}
+\end{table}
+
+\paragraph{KTO in detail.}
+KTO (Ethayarajh et al., 2024) is notable because it requires only
+\emph{pointwise} feedback (thumbs up / thumbs down on individual responses)
+rather than \emph{pairwise} preferences.  This is a significant practical
+advantage: collecting pairwise comparisons requires generating two responses
+per prompt and asking annotators to compare them, while pointwise feedback
+can be collected passively from user interactions (upvotes, regeneration
+requests, thumbs-up buttons).
+
+The KTO loss uses a Kahneman-Tversky-inspired value function, which treats
+desirable and undesirable examples with \emph{opposite-signed} arguments and
+asymmetric weights, reflecting the empirical finding that humans are
+loss-averse:
+\begin{equation}
+\loss_{\text{KTO}} = \E_{(x,y)} \bigl[ \lambda_y - v(x, y) \bigr],
+\qquad
+v(x, y) =
+\begin{cases}
+  \lambda_D \, \sigma\!\bigl(\beta \, r_\theta(x, y) - z_{\text{ref}}\bigr)
+    & y \text{ desirable} \\[4pt]
+  \lambda_U \, \sigma\!\bigl(z_{\text{ref}} - \beta \, r_\theta(x, y)\bigr)
+    & y \text{ undesirable}
+\end{cases}
+\end{equation}
+where $r_\theta(x, y) = \log(\pi_\theta(y|x) / \pi_{\text{ref}}(y|x))$
+is the implicit reward, $z_{\text{ref}}$ is a reference point (an estimate
+of the KL divergence between policy and reference), and
+$\lambda_D, \lambda_U$ (with $\lambda_y \in \{\lambda_D, \lambda_U\}$)
+weight desirable and undesirable examples asymmetrically.  A desirable
+response is rewarded for exceeding the reference point; an undesirable
+response is penalized for not falling below it---collapsing the two cases
+into a single term would mis-train the undesirable examples.
+
+
+% ============================================================================
+\section{Constitutional AI}
+\label{sec:cai}
+% ============================================================================
+
+Constitutional AI (CAI), introduced by Anthropic (Bai et al., 2022),
+addresses a fundamental scaling challenge: human feedback is expensive
+and slow.  CAI uses the model itself to generate feedback, guided by a
+set of principles (the ``constitution'').
+
+\subsection{The CAI Pipeline}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm and 0.5cm,
+    stepbox/.style={rectangle, draw=deepblue, fill=lightblue, thick,
+                    minimum height=0.9cm, minimum width=3.2cm,
+                    font=\small\sffamily, rounded corners=3pt,
+                    text width=3.0cm, align=center},
+    prinbox/.style={rectangle, draw=orange!70, fill=yellow!8,
+                    minimum height=0.7cm, minimum width=2.6cm,
+                    font=\scriptsize\sffamily, rounded corners=2pt,
+                    text width=2.5cm, align=center},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!70},
+    lbl/.style={font=\tiny\sffamily, text=deepblue!70}
+]
+
+% SL-CAI (left column)
+\node[stepbox] (gen) {Generate\\initial response};
+\node[stepbox, below=0.9cm of gen] (crit) {Self-critique\\against constitution};
+\node[stepbox, below=0.9cm of crit] (rev) {Self-revision};
+\node[stepbox, below=0.9cm of rev, fill=deepblue!15] (sft) {Fine-tune on\\revised responses};
+
+% Constitution
+\node[prinbox, right=1.5cm of crit] (const) {Constitution\\(set of principles)};
+
+% RL-CAI (right column)
+\node[stepbox, right=3.5cm of gen] (gen2) {Generate\\response pairs};
+\node[stepbox, below=0.9cm of gen2] (aifb) {AI feedback\\(which is better?)};
+\node[stepbox, below=0.9cm of aifb] (rm2) {Train RM on\\AI preferences};
+\node[stepbox, below=0.9cm of rm2, fill=deepblue!15] (rlcai) {RLHF with\\AI-trained RM};
+
+% Arrows
+\draw[arr] (gen) -- (crit);
+\draw[arr] (crit) -- (rev);
+\draw[arr] (rev) -- (sft);
+\draw[arr, orange!70] (const) -- (crit);
+\draw[arr, orange!70] (const) |- (aifb);
+
+\draw[arr] (gen2) -- (aifb);
+\draw[arr] (aifb) -- (rm2);
+\draw[arr] (rm2) -- (rlcai);
+
+% Labels
+\node[font=\small\sffamily\bfseries, text=deepblue, above=0.2cm of gen]
+     {SL-CAI (Supervised)};
+\node[font=\small\sffamily\bfseries, text=deepblue, above=0.2cm of gen2]
+     {RL-CAI (Reinforcement)};
+
+% Connecting arrow
+\draw[arr, deepgreen!70, dashed, thick]
+  (sft.east) -- ++(0.5, 0) |- (gen2.west);
+\node[lbl, text=deepgreen!70] at (4.3, -1.1) {feeds into};
+
+\end{tikzpicture}
+\caption{Constitutional AI pipeline.  \textbf{SL-CAI} (left): the model
+critiques and revises its own outputs guided by constitutional principles,
+then is fine-tuned on the revised responses.  \textbf{RL-CAI} (right):
+the model generates AI preference labels (RLAIF), used to train a reward
+model for RLHF.}
+\label{fig:cai_pipeline}
+\end{figure}
+
+\subsection{SL-CAI: Supervised Learning from Self-Critique}
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Generate:} The model produces an initial response to a prompt
+  (which may be harmful or low-quality).
+\item \textbf{Critique:} The model is asked to critique its own response
+  against a specific constitutional principle (e.g., ``Identify ways in
+  which this response is harmful or unethical'').
+\item \textbf{Revise:} The model revises its response to address the
+  identified issues.
+\item \textbf{Fine-tune:} The model is fine-tuned on the (prompt, revised
+  response) pairs using standard supervised learning.
+\end{enumerate}
+
+The \textbf{constitution} is a set of natural language principles such as:
+\begin{itemize}[leftmargin=*]
+\item ``Choose the response that is least likely to be harmful or toxic.''
+\item ``Choose the response that is most honest and transparent.''
+\item ``Choose the response that is least likely to encourage illegal activity.''
+\end{itemize}
+
+\subsection{RL-CAI: RLAIF}
+
+In the reinforcement learning phase, \textbf{RLAIF} (RL from AI Feedback)
+replaces human annotators with the model itself:
+
+\begin{enumerate}[leftmargin=*]
+\item Generate two responses for each prompt.
+\item Ask the model which response better adheres to the constitutional
+  principles.
+\item Use these AI-generated preferences to train a reward model.
+\item Run standard RLHF (PPO) with this reward model.
+\end{enumerate}
+
+The surprising finding is that RLAIF produces alignment quality comparable
+to RLHF with human feedback, at a fraction of the cost and with much
+faster iteration cycles.
+
+\paragraph{Why CAI works.}
+The constitution provides \textbf{compositional, interpretable control}
+over model behavior.  Unlike a reward model (which is a black box that
+maps inputs to scores), the constitution is a readable set of rules that
+can be updated, debated, and audited.  The model's ability to follow these
+principles during self-critique leverages its instruction-following
+capability---an ability that improves with scale.
+
+
+% ============================================================================
+\section{Process Reward Models}
+\label{sec:process_rm}
+% ============================================================================
+
+Standard reward models provide \textbf{outcome-based} feedback: the entire
+response receives a single scalar reward.  \textbf{Process reward models}
+(PRMs) evaluate each \emph{step} of a reasoning chain, providing much
+finer-grained supervision.
+
+\subsection{Outcome vs.\ Process Supervision}
+
+\begin{table}[H]
+\centering
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Outcome RM (ORM)} & \textbf{Process RM (PRM)} \\
+\midrule
+Granularity & Single reward for entire response & Reward per reasoning step \\
+Training data & (prompt, response, quality) & (prompt, step$_i$, step correctness) \\
+Signal density & Sparse (one signal per response) & Dense (one signal per step) \\
+Credit assignment & Ambiguous (which step caused failure?) & Clear (exact step where error occurs) \\
+Data cost & Lower (one annotation per response) & Higher (annotation per step) \\
+Best for & General-purpose alignment & Math, code, multi-step reasoning \\
+\bottomrule
+\end{tabularx}
+\caption{Outcome vs.\ process reward models.}
+\label{tab:orm_vs_prm}
+\end{table}
+
+\subsection{Process Reward Models for Reasoning}
+
+Lightman et al.\ (2023) demonstrated that process supervision significantly
+outperforms outcome supervision for mathematical reasoning.  The PRM
+assigns a correctness score to each step of a chain-of-thought solution:
+
+\begin{enumerate}[leftmargin=*]
+\item The model generates a step-by-step solution.
+\item The PRM evaluates each step: is this step logically correct given the
+  previous steps?
+\item Steps are labeled as \textbf{positive} (correct), \textbf{negative}
+  (contains an error), or \textbf{neutral} (neither clearly correct nor
+  incorrect).
+\end{enumerate}
+
+\subsection{Search over Reasoning Paths}
+
+PRMs can be used to guide \textbf{search} over reasoning paths at
+inference time:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Generate:} The model produces multiple candidate next steps.
+\item \textbf{Evaluate:} The PRM scores each candidate step.
+\item \textbf{Select:} Use the PRM scores to guide search (beam search,
+  best-first search, or Monte Carlo Tree Search).
+\item \textbf{Backtrack:} If all candidate steps score poorly, backtrack
+  to a previous step and try alternative paths.
+\end{enumerate}
+
+This is one form of \textbf{test-time compute scaling}: spending more
+computation at inference to search for better reasoning paths, rather than
+relying solely on the model's one-shot generation.
+
+\begin{warningbox}
+Do not describe PRM-guided search as the mechanism behind reasoning models
+like o1 and o3---that was the leading 2023 hypothesis, and it is now
+superseded.  DeepSeek-R1, the one frontier reasoning model with a public
+training report, explicitly describes PRM- and MCTS-based approaches as
+unfruitful in its experiments; its reasoning capability came from
+reinforcement learning on \emph{outcome-based verifiable rewards} (answer
+checkers, unit tests).  In current practice, PRMs survive mainly as
+\textbf{test-time verifiers and rerankers}---scoring sampled candidate
+solutions for Best-of-N selection---rather than as the training mechanism
+of reasoning models.
+\end{warningbox}
+
+\begin{keyinsight}[Process vs.\ Outcome Supervision]
+Process supervision addresses the \textbf{credit assignment problem} that
+plagues outcome-based RLHF.  When a mathematical proof is wrong, outcome
+supervision says ``this proof is bad'' without indicating which step
+failed.  Process supervision pinpoints the exact error, providing a
+denser, more informative learning signal.  The tradeoff is data cost:
+step-level annotations are 5--10$\times$ more expensive than response-level
+annotations.  The field is moving toward \emph{automated} process
+supervision (using verifiers, code execution, and self-consistency) to
+reduce this cost.
+\end{keyinsight}
+
+
+% ============================================================================
+\section{Practical Alignment Engineering}
+\label{sec:practical_alignment}
+% ============================================================================
+
+\subsection{Choosing an Alignment Method}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Method} & \textbf{Data Needed} & \textbf{Compute} & \textbf{Complexity} & \textbf{Best For} \\
+\midrule
+SFT only         & Demonstrations & Low    & Low    & Quick baseline, cold start \\
+DPO              & Pairwise prefs & Medium & Low    & Most teams; default starting point \\
+KTO              & Binary ratings & Medium & Low    & When only thumbs up/down data exists \\
+RLHF (PPO)       & Pairwise prefs & High   & High   & Maximum control; frontier labs \\
+CAI / RLAIF      & Constitution   & High   & Medium & Scalable safety; reduces human cost \\
+Best-of-$n$ + RM & Pairwise prefs & High$^*$ & Medium & When RM exists; inference-time alignment \\
+\bottomrule
+\end{tabularx}
+\caption{Alignment method selection guide.  $^*$Compute is at inference
+time (generate $n$ candidates, score, return best).}
+\label{tab:alignment_choice}
+\end{table}
+
+\subsection{The Standard Alignment Recipe (2023--2024 Practice)}
+
+Most frontier labs have followed a recipe similar to:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{Pretraining:} Train the base model on trillions of tokens.
+\item \textbf{SFT:} Fine-tune on high-quality instruction-response pairs
+  (10K--100K examples). Quality matters far more than quantity (LIMA: ``Less
+  Is More for Alignment'').
+\item \textbf{Preference optimization:} Apply DPO or RLHF on 50K--500K
+  preference pairs.  Some labs do iterative rounds: collect preferences
+  on the current model's outputs, optimize, repeat.
+\item \textbf{Safety fine-tuning:} Additional alignment specifically
+  targeting safety (refusal of harmful requests, reducing bias), often
+  with targeted red-teaming data.
+\item \textbf{Constitutional / rule-based guardrails:} Deploy with input
+  and output safety classifiers as a final layer of defense.
+\end{enumerate}
+
+
+% ============================================================================
+\section{Interview Questions}
+\label{sec:alignment_interview}
+% ============================================================================
+
+% --- Question 1 ---
+\begin{interviewq}
+\textbf{Q: Walk me through the RLHF pipeline step by step.  What are the
+three stages?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad
+\badgefreq{\freqhigh}
+
+\stronganswer
+The RLHF pipeline has three stages.
+
+\textbf{Stage 1---SFT:} Fine-tune the pretrained model on high-quality
+demonstration data (instruction-response pairs) to teach it the format and
+style of helpful responses.  This produces the SFT model, which also serves
+as the reference policy $\pi_{\text{ref}}$ for subsequent stages.
+
+\textbf{Stage 2---Reward Model Training:} Collect human preferences: for
+each prompt, generate two (or more) responses, and have annotators indicate
+which is better.  Train a reward model using the Bradley-Terry framework:
+$\loss_{\text{RM}} = -\E[\log \sigma(r(x, y_w) - r(x, y_l))]$.
+The RM shares the base model architecture but replaces the LM head with a
+scalar output.
+
+\textbf{Stage 3---RL Optimization (PPO):} Optimize the policy to maximize
+$\E[r(x, y)] - \beta \cdot \KL(\pi_\theta \| \pi_{\text{ref}})$.  PPO
+uses a clipped surrogate objective for stable updates.  The KL penalty
+prevents reward hacking by keeping the policy close to the SFT model.
+This stage requires four models in memory: policy, reference, reward model,
+and value function (critic).
+
+\redflags
+\begin{itemize}
+\item Cannot name all three stages or gets the order wrong.
+\item Skips the reward model and jumps from SFT to RL.
+\item Does not mention the KL penalty or its purpose.
+\item Confuses the reward model with the value function.
+\end{itemize}
+
+\interviewtest{Whether you understand the complete pipeline that transforms
+a pretrained model into an aligned assistant.  This is foundational
+knowledge for anyone working with or deploying LLMs.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Correctly describes all three stages with the
+  key equations (RM loss, RLHF objective).  Explains why each stage
+  exists and what problem it solves.
+\item \badgeLsix{L6}: Discusses practical challenges (four-model memory
+  footprint, RM quality as bottleneck, PPO instability), and mentions
+  DPO as a simpler alternative that collapses stages 2 and 3.
+\item \badgeLseven{L7}: Discusses iterative RLHF (collecting new
+  preferences on the current policy), the relationship between RLHF
+  and Bayesian inference, and how Constitutional AI scales the pipeline.
+\end{itemize}
+
+\followups{How many models do you need in GPU memory during PPO?  What
+happens if the reward model is poor?  Why is the SFT model used as the
+reference rather than the pretrained model?}
+\end{interviewq}
+
+% --- Question 2 ---
+\begin{interviewq}
+\textbf{Q: What is reward hacking?  How does the KL penalty help?  When
+does it fail?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad
+\badgefreq{\freqhigh}
+
+\stronganswer
+Reward hacking occurs when the policy exploits imperfections in the reward
+model rather than genuinely improving response quality.  The RM is a
+proxy for human preferences trained on finite data, so it inevitably has
+blind spots.  Common examples: the RM gives higher scores to longer
+responses (verbosity hack), sycophantic agreement, or responses with
+impressive-sounding but vacuous formatting.
+
+The KL penalty $\beta \cdot \KL(\pi_\theta \| \pi_{\text{ref}})$ is the
+primary defense.  It constrains the policy to stay close to the SFT model,
+limiting how far it can drift into regions where the RM's predictions are
+unreliable.  Intuitively, the RM was trained on outputs from $\pi_{\text{ref}}$
+(or similar), so its predictions are most trustworthy near that distribution.
+
+The KL penalty fails when: (1)~the reward model has \emph{systematic} biases
+(e.g., always preferring longer responses)---the policy can hack these
+biases even within the KL budget; (2)~$\beta$ is set too low, giving the
+policy too much room to diverge; (3)~the reference model itself has
+problematic behaviors that the KL penalty preserves.
+
+\redflags
+\begin{itemize}
+\item Defines reward hacking vaguely as ``the model being wrong.''
+\item Does not connect the KL penalty to the RM's distribution shift.
+\item Claims the KL penalty fully solves reward hacking.
+\item Cannot give concrete examples of reward hacking.
+\end{itemize}
+
+\interviewtest{Understanding of Goodhart's law applied to alignment, and
+whether the candidate can reason about proxy optimization and its failure
+modes.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Defines reward hacking with concrete examples,
+  explains the KL penalty mechanism, identifies when it fails.
+\item \badgeLsix{L6}: Discusses the over-optimization curve (Gao et al.),
+  mentions RM ensembles and iterative RM retraining as additional defenses,
+  quantifies the $\beta$ tradeoff.
+\item \badgeLseven{L7}: Connects to Goodhart's law formally, discusses
+  the relationship between RM capacity and hackability, and considers
+  whether process reward models reduce reward hacking for reasoning tasks.
+\end{itemize}
+
+\followups{What is the over-optimization curve?  How would you detect
+reward hacking in practice?  How do RM ensembles help?}
+\end{interviewq}
+
+% --- Question 3 ---
+\begin{interviewq}
+\textbf{Q: Explain DPO.  How does it relate to RLHF?  What are its
+advantages and limitations?}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad
+\badgefreq{\freqhigh}
+
+\stronganswer
+DPO reformulates RLHF as a supervised learning problem.  The key insight
+is that the optimal policy under the KL-constrained RM maximization
+objective has a closed form:
+$\pi^*(y|x) \propto \pi_{\text{ref}}(y|x) \exp(r(x,y)/\beta)$.  Rearranging,
+the reward is a function of the policy:
+$r(x,y) = \beta \log(\pi^*(y|x)/\pi_{\text{ref}}(y|x)) + C(x)$.
+Substituting this into the Bradley-Terry model, the prompt-dependent
+constant $C(x)$ cancels in the reward \emph{difference}, yielding the DPO
+loss:
+$\loss_{\text{DPO}} = -\E[\log \sigma(\beta(\log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}))]$.
+
+This directly optimizes the policy on preference data without a separate
+reward model or RL algorithm.  Advantages: simpler (2 models vs.\ 4),
+more stable training (standard supervised loss), lower compute.
+Limitations: no explicit reward for monitoring or best-of-$n$ sampling,
+offline (no exploration during training), and reference model quality
+is critical.
+
+\redflags
+\begin{itemize}
+\item Cannot sketch the derivation or explain where the partition
+  function cancels.
+\item Treats DPO as ``just an alternative to RLHF'' without understanding
+  the mathematical connection.
+\item Claims DPO is always better than RLHF.
+\item Does not mention the offline limitation.
+\end{itemize}
+
+\interviewtest{Mathematical maturity and whether the candidate understands
+DPO at a principled level rather than as a black-box recipe.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Correctly states the DPO loss and explains that
+  it eliminates the need for RM and RL.  Gives advantages and limitations.
+\item \badgeLsix{L6}: Walks through the derivation (optimal policy $\to$
+  reward reparameterization $\to$ Bradley-Terry substitution $\to$
+  partition function cancellation).  Discusses the implicit reward
+  interpretation.
+\item \badgeLseven{L7}: Derives the DPO loss from scratch, discusses
+  the connection to contrastive learning, compares the gradient dynamics
+  of DPO vs.\ PPO, and evaluates when RLHF's online exploration
+  advantage matters most.
+\end{itemize}
+
+\followups{Derive the DPO loss from the RLHF objective.  What is the
+implicit reward in DPO?  When would you prefer RLHF over DPO?}
+\end{interviewq}
+
+% --- Question 4 ---
+\begin{interviewq}
+\textbf{Q: What is Constitutional AI?  How does self-critique enable
+alignment without human feedback at every step?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad
+\badgefreq{\freqmed}
+
+\stronganswer
+Constitutional AI uses the model itself to generate feedback, guided by a
+set of natural-language principles (the ``constitution'').  It has two
+phases.
+
+\textbf{SL-CAI:} The model generates an initial response, then critiques
+that response against specific constitutional principles (``Is this
+response harmful?''), then revises the response to address the critique.
+The revised responses become SFT training data.
+
+\textbf{RL-CAI (RLAIF):} The model generates preference labels (which of
+two responses better satisfies the constitution?), and these AI-generated
+preferences are used to train a reward model for standard RLHF.
+
+CAI works because: (1)~it leverages the model's existing instruction-following
+ability for self-evaluation, an ability that improves with scale;
+(2)~the constitution provides compositional, auditable control over behavior
+(unlike a black-box RM); (3)~AI feedback can be generated at any scale and
+iterated rapidly, removing the human annotation bottleneck.  The surprising
+finding is that RLAIF produces alignment quality comparable to human-feedback
+RLHF, suggesting that the model can serve as a reasonable proxy for human
+judgment when guided by explicit principles.
+
+\redflags
+\begin{itemize}
+\item Confuses CAI with general RLHF.
+\item Does not mention the constitution (the set of principles).
+\item Cannot explain the SL-CAI vs.\ RL-CAI distinction.
+\item Dismisses self-critique as ``the model grading its own homework.''
+\end{itemize}
+
+\interviewtest{Understanding of scalable oversight and whether the candidate
+recognizes the tension between the expense of human feedback and the need
+for alignment at scale.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Describes both phases and the role of the
+  constitution.  Explains why it reduces dependence on human annotations.
+\item \badgeLsix{L6}: Discusses the quality of RLAIF vs.\ RLHF,
+  the compositionality advantage of principles over a monolithic RM,
+  and how the constitution can be updated without retraining the RM.
+\item \badgeLseven{L7}: Connects to the broader scalable oversight
+  problem, discusses limitations (model may fail to catch its own
+  blind spots), and considers recursive reward modeling and debate as
+  alternative approaches.
+\end{itemize}
+
+\followups{How does RLAIF compare to RLHF in quality?  What are the
+limitations of self-critique?  What is the scalable oversight problem?}
+\end{interviewq}
+
+% --- Question 5 ---
+\begin{interviewq}
+\textbf{Q: Compare RLHF, DPO, and KTO.  When would you use each?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad
+\badgefreq{\freqmed}
+
+\stronganswer
+\textbf{RLHF (PPO):} The most general approach.  Requires a separate
+reward model and RL optimization.  Highest complexity (4 models) but
+provides an explicit reward signal for monitoring, enables online
+exploration, and gives the most control over the optimization process.
+Best for frontier labs with significant engineering resources where maximum
+alignment quality matters and the ability to monitor reward during training
+is valuable.
+
+\textbf{DPO:} Collapses the reward model and RL into a single supervised
+loss on pairwise preferences.  Simpler (2 models), more stable, lower
+compute.  Best default choice for most teams doing alignment---gets 90--95\%
+of RLHF quality with a fraction of the complexity.  Limited by its offline
+nature and lack of explicit reward monitoring.
+
+\textbf{KTO:} Only requires pointwise binary feedback (good/bad), not
+pairwise comparisons.  This is a major practical advantage: you can
+collect this data from production signals (user thumbs-up/down, regeneration
+clicks) rather than constructing explicit comparison tasks.  Best when
+pairwise preference data is unavailable or expensive to collect, but you
+have abundant implicit feedback signals.
+
+Decision framework: start with DPO (simplest effective method); move to
+RLHF if you need tighter control or online exploration; use KTO when you
+only have binary feedback data.
+
+\redflags
+\begin{itemize}
+\item Cannot articulate the data requirements of each method.
+\item Says ``DPO is always better because it is simpler.''
+\item Does not know what distinguishes KTO from DPO (pointwise vs.\ pairwise).
+\item Cannot describe a scenario where RLHF's complexity is justified.
+\end{itemize}
+
+\interviewtest{Whether the candidate can make nuanced engineering tradeoff
+decisions rather than defaulting to a single approach.  This tests practical
+judgment about alignment methods.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Correctly describes all three methods, their data
+  requirements, and when to use each.
+\item \badgeLsix{L6}: Discusses the online vs.\ offline distinction in
+  depth, mentions iterative DPO as a middle ground, and considers the
+  monitoring advantage of having an explicit reward model.
+\item \badgeLseven{L7}: Discusses the theoretical differences in
+  optimization landscape (DPO can have degenerate solutions), the
+  relationship between data scale and method choice, and how hybrid
+  approaches (DPO + rejection sampling) combine benefits.
+\end{itemize}
+
+\followups{What is iterative DPO?  When does RLHF's online nature matter
+most?  How would you collect KTO-style data from a production system?}
+\end{interviewq}
+
+% --- Question 6 ---
+\begin{interviewq}
+\textbf{Q: What makes a good reward model?  How do you evaluate it?}
+
+\badgeLfive{L5} \quad \badgetype{System Design} \quad
+\badgefreq{\freqmed}
+
+\stronganswer
+A good reward model should: (1)~have high \textbf{agreement} with human
+preferences on a held-out test set---the achievable ceiling is set by the
+dataset's inter-annotator agreement (often only 70--80\%), so accuracies of
+65--75\% are typical on noisy general-chat preference sets, while top RMs
+exceed this on cleaner modern preference benchmarks; (2)~\textbf{generalize}
+beyond its training distribution to novel prompts and response styles;
+(3)~be \textbf{robust} to surface-level features (length, formatting) that
+correlate with but do not cause quality; (4)~provide \textbf{calibrated}
+scores---the margin between good and bad responses should be meaningful.
+
+Evaluation metrics: (a)~pairwise accuracy on held-out preferences;
+(b)~correlation between RM score and human evaluation on a diverse test set;
+(c)~sensitivity analysis---does the RM prefer longer responses regardless
+of content? Does it prefer sycophantic responses?  (d)~distribution of
+scores---are scores well-spread or collapsed to a narrow range?
+(e)~performance on adversarial examples designed to test specific failure
+modes (verbosity, sycophancy, formatting bias).
+
+Practical improvements: train on diverse preference data across many topics
+and difficulty levels; use RM ensembles for robustness; periodically retrain
+on preferences from the \emph{current} policy (not just the SFT model);
+consider larger RM models (RM quality scales with model size).
+
+\redflags
+\begin{itemize}
+\item Only mentions accuracy without discussing generalization or robustness.
+\item Does not consider systematic biases (length, formatting).
+\item Cannot describe how to evaluate an RM beyond ``test accuracy.''
+\item Ignores the relationship between RM quality and downstream RLHF quality.
+\end{itemize}
+
+\interviewtest{Whether the candidate understands that the RM is the
+bottleneck of alignment and can think critically about evaluation beyond
+simple metrics.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Lists the key properties (accuracy, generalization,
+  robustness) with concrete evaluation strategies.
+\item \badgeLsix{L6}: Discusses bias analysis (length, sycophancy,
+  formatting), RM ensembles, the upper bound set by inter-annotator
+  agreement, and how RM errors propagate through PPO.
+\item \badgeLseven{L7}: Discusses reward model overoptimization bounds,
+  the relationship between RM size and hackability, and how process
+  reward models provide a different evaluation paradigm.
+\end{itemize}
+
+\followups{How does inter-annotator agreement limit RM quality?  How
+would you detect length bias in a reward model?  What is the effect of
+RM size on alignment quality?}
+\end{interviewq}
+
+% --- Question 7 ---
+\begin{interviewq}
+\textbf{Q: Derive the DPO loss from the RLHF objective.}
+
+\badgeLseven{L7} \quad \badgetype{Mathematical} \quad
+\badgefreq{\freqmed}
+
+\stronganswer
+Start with the KL-constrained objective:
+$\max_\pi \E_{y \sim \pi}[r(x,y)] - \beta \KL(\pi \| \pi_{\text{ref}})$.
+
+\textbf{Step 1:} Find the optimal policy.  Expanding the KL and taking the
+functional derivative with respect to $\pi(y|x)$:
+$r(x,y) - \beta \log(\pi(y|x)/\pi_{\text{ref}}(y|x)) - \beta = \lambda$
+(Lagrange multiplier for normalization).  Solving:
+$\pi^*(y|x) = \frac{1}{Z(x)} \pi_{\text{ref}}(y|x) \exp(r(x,y)/\beta)$
+where $Z(x)$ is the partition function.
+
+\textbf{Step 2:} Reparameterize the reward.  Take log:
+$r(x,y) = \beta \log(\pi^*(y|x)/\pi_{\text{ref}}(y|x)) + \beta \log Z(x)$.
+
+\textbf{Step 3:} Substitute into the Bradley-Terry preference model.  The
+RM loss uses $\sigma(r(x,y_w) - r(x,y_l))$.  Computing the reward
+difference: the $\beta \log Z(x)$ terms cancel (both are conditioned on
+the same $x$), giving:
+$r(x,y_w) - r(x,y_l) = \beta[\log(\pi^*(y_w|x)/\pi_{\text{ref}}(y_w|x)) -
+\log(\pi^*(y_l|x)/\pi_{\text{ref}}(y_l|x))]$.
+
+\textbf{Step 4:} Replace $\pi^*$ with the trainable policy $\pi_\theta$:
+$\loss_{\text{DPO}} = -\E[\log \sigma(\beta(\log \frac{\pi_\theta(y_w|x)}{\pi_{\text{ref}}(y_w|x)} - \log \frac{\pi_\theta(y_l|x)}{\pi_{\text{ref}}(y_l|x)}))]$.
+
+The critical steps are: the closed-form optimal policy (Step~1), the
+reward reparameterization (Step~2), and the cancellation of the partition
+function in the reward difference (Step~3).
+
+\redflags
+\begin{itemize}
+\item Cannot state the KL-constrained objective as the starting point.
+\item Does not derive the optimal policy (just states the DPO loss).
+\item Misses the partition function cancellation---the key trick.
+\item Cannot explain why replacing $\pi^*$ with $\pi_\theta$ is valid.
+\end{itemize}
+
+\interviewtest{Deep mathematical understanding of DPO.  This is a
+principal-level question that tests whether the candidate can derive
+results from first principles rather than memorizing final formulas.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: States the DPO loss and explains at a high level
+  that it comes from reparameterizing the reward.
+\item \badgeLsix{L6}: Walks through the four steps above with the key
+  equations, correctly identifies where $Z(x)$ cancels.
+\item \badgeLseven{L7}: Completes the full derivation including the
+  Lagrangian, discusses the relationship between $\beta$ in DPO and in
+  RLHF, analyzes the gradient of the DPO loss (which tokens get the
+  strongest gradient signal), and considers conditions under which the
+  DPO objective has non-unique solutions.
+\end{itemize}
+
+\followups{What does the gradient of the DPO loss look like?  Which
+tokens receive the strongest learning signal?  Under what conditions
+can DPO fail to converge to the optimal RLHF policy?}
+\end{interviewq}
+
+% --- Question 8 ---
+\begin{interviewq}
+\textbf{Q: What is the difference between process and outcome reward
+models?  When would you use each?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad
+\badgefreq{\freqmed}
+
+\stronganswer
+An \textbf{outcome reward model} (ORM) evaluates the complete response as a
+whole, assigning a single scalar reward to the entire output.  A
+\textbf{process reward model} (PRM) evaluates each step of a reasoning
+chain individually, scoring whether each step is correct given the
+preceding steps.
+
+The key advantage of PRMs is \textbf{credit assignment}: when a math
+solution is wrong, the ORM says ``this is bad'' without indicating which
+step failed.  The PRM pinpoints the exact error, providing denser and more
+informative supervision.  Lightman et al.\ (2023) showed that PRMs
+significantly outperform ORMs for mathematical reasoning tasks.
+
+PRMs also enable \textbf{search over reasoning paths}: the model generates
+multiple candidate next steps, the PRM scores each, and search algorithms
+(beam search, MCTS) select the most promising paths.  This is one way to
+spend test-time compute, but it is \emph{not} how o1/R1-class reasoning
+models were built: DeepSeek-R1's published report found PRM and MCTS
+unfruitful, and those models are instead trained with RL on
+outcome-verifiable rewards.  In practice PRMs today serve mainly as
+test-time verifiers and rerankers (Best-of-N selection).
+
+Use an ORM for general-purpose alignment (chat, instruction following)
+where there is no natural decomposition into steps.  Use a PRM when the
+task has verifiable intermediate steps (mathematics, multi-step
+reasoning, code generation) and when you want to enable test-time search.
+The main limitation of PRMs is data cost: step-level annotations are
+5--10$\times$ more expensive than response-level annotations, though
+automated verification (e.g., executing code to check intermediate results)
+can reduce this.
+
+\redflags
+\begin{itemize}
+\item Cannot define the difference between process and outcome supervision.
+\item Does not mention credit assignment as the key advantage.
+\item Thinks PRMs are always better without acknowledging the data cost.
+\item Cannot explain how PRMs enable test-time search.
+\end{itemize}
+
+\interviewtest{Awareness of cutting-edge alignment research (PRMs, test-time
+compute) and the ability to reason about when fine-grained supervision is
+worth the added cost.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Correctly distinguishes ORM and PRM, mentions
+  credit assignment and the data cost tradeoff.
+\item \badgeLsix{L6}: Discusses Lightman et al.'s results, explains
+  how PRMs enable tree search (beam search, MCTS over reasoning steps),
+  and considers automated process supervision.
+\item \badgeLseven{L7}: Connects to test-time compute scaling while noting
+  that current reasoning models were trained with RL on outcome-verifiable
+  rewards rather than PRM-guided search, discusses the relationship between
+  process supervision and formal verification, and considers how PRMs
+  change the scaling laws (trading training compute for inference compute).
+\end{itemize}
+
+\followups{How does test-time compute scaling work?  How would you
+collect process supervision data without human annotators?  What is the
+relationship between PRMs and MCTS?}
+\end{interviewq}
+
+\bigskip
+\begin{keyinsight}[Chapter Summary---What Interviewers Want]
+This chapter covered the techniques that transform powerful but unaligned
+base models into useful assistants.  The three most critical takeaways are:
+(1)~the \textbf{RLHF pipeline} (SFT $\to$ RM $\to$ PPO)---know every
+stage, why it exists, and what can go wrong; (2)~\textbf{DPO}'s
+mathematical derivation---this tests whether you understand alignment
+at a principled level, not just as a recipe; and (3)~\textbf{reward
+hacking} as the central failure mode---Goodhart's law applied to
+alignment is the deepest conceptual point in this chapter, and candidates
+who can discuss it with sophistication signal genuine understanding of
+why alignment is hard.  Interviewers at frontier labs increasingly test
+these topics, and candidates who treat alignment as ``just fine-tuning''
+reveal a gap in their understanding of modern NLP.
+\end{keyinsight}

@@ -1,0 +1,1708 @@
+% ============================================================================
+% CHAPTER 6: PRE-TRAINING, FINE-TUNING, AND TRANSFER LEARNING
+% The practical backbone of modern NLP: how to adapt foundation models.
+% ============================================================================
+
+\chapter{Pre-training, Fine-tuning, and Transfer Learning}
+\label{chap:pretraining_finetuning}
+
+\begin{tldr}
+The pre-train then fine-tune paradigm is the backbone of modern NLP.  This chapter
+covers pre-training objectives (MLM, CLM, span corruption, replaced token detection,
+denoising, contrastive), the pre-training data pipeline, full fine-tuning with
+catastrophic forgetting mitigation, and the critical PEFT landscape---LoRA (the most
+frequently asked topic), QLoRA, prefix tuning, adapters, and prompt tuning.
+Understanding \emph{when} and \emph{how} to adapt foundation models is one of the
+most practically relevant interview topics: every production NLP system built today
+either fine-tunes a pre-trained model or uses one directly, and interviewers want to
+know that you can reason about the full spectrum from pre-training data quality
+through parameter-efficient adaptation to supervised fine-tuning for alignment.
+\end{tldr}
+
+\bigskip
+
+% ============================================================================
+% SECTION 1: PRE-TRAINING OBJECTIVES
+% ============================================================================
+\section{Pre-training Objectives}
+\label{sec:pretraining-objectives}
+
+Pre-training teaches a model general language representations from massive
+unlabeled corpora before any task-specific supervision.  The choice of
+pre-training objective fundamentally shapes what the model is good at---
+understanding, generation, or both---and interviewers expect you to know
+several objectives in detail, not just the one used by BERT.
+
+\subsection{Masked Language Modeling (MLM)}
+
+MLM is the pre-training objective introduced by BERT (Devlin et al., NAACL
+2019).  The input sequence has tokens randomly selected for prediction, and
+the model uses \emph{bidirectional} context to reconstruct them.
+
+\paragraph{Masking procedure.}
+15\% of input tokens are selected.  Of those:
+\begin{itemize}
+    \item \textbf{80\% replaced with \texttt{[MASK]}}---the primary training
+          signal.
+    \item \textbf{10\% replaced with a random token}---forces the model to
+          maintain distributional representations for \emph{all} positions, not
+          only masked ones.  Without this, the model would learn to ignore
+          unmasked tokens entirely.
+    \item \textbf{10\% kept unchanged}---biases the model toward the actual
+          observed token distribution, reducing the train-inference mismatch
+          (since \texttt{[MASK]} never appears during fine-tuning).
+\end{itemize}
+
+\begin{mathresult}{Masked Language Modeling Loss}
+\[
+    \loss_{\text{MLM}} = - \sum_{i \in \mathcal{M}} \log P\bigl(x_i \mid \vx_{\setminus \mathcal{M}}\bigr)
+\]
+where $\mathcal{M}$ is the set of masked positions and $\vx_{\setminus \mathcal{M}}$
+denotes the corrupted input with masked, random, or unchanged tokens at positions in
+$\mathcal{M}$.
+\end{mathresult}
+
+\paragraph{Why bidirectional context matters.}
+Unlike autoregressive models that condition only on left context, MLM conditions
+on \emph{both} left and right context simultaneously.  For understanding tasks
+(classification, NER, extractive QA), this is strictly more informative:
+``The cat sat on the \texttt{[MASK]}'' vs.\ ``The cat sat on the
+\texttt{[MASK]} and purred'' yield very different predictions, and only
+bidirectional models can leverage the right context.
+
+\paragraph{Limitation.}
+Only 15\% of tokens provide a training signal per forward pass---the other
+85\% contribute to the contextual representation but generate no loss.  This
+makes MLM sample-inefficient relative to objectives that provide signal at
+every position.
+
+\subsection{Causal Language Modeling (CLM)}
+
+CLM is the objective used by all GPT-family models and the dominant LLM
+pre-training approach.  The model predicts each token given only the
+preceding tokens:
+
+\begin{mathresult}{Causal Language Modeling Loss}
+\[
+    \loss_{\text{CLM}} = - \sum_{t=1}^{T} \log P\bigl(x_t \mid x_1, x_2, \ldots, x_{t-1}\bigr)
+\]
+\end{mathresult}
+
+\paragraph{Why autoregressive enables generation.}
+CLM directly models the joint distribution $P(\vx) = \prod_t P(x_t \mid x_{<t})$
+via the chain rule of probability.  This factorization makes generation trivial:
+sample one token at a time from the conditional distribution.  Bidirectional
+models cannot do this because they condition on context that does not yet exist
+during generation.
+
+\paragraph{Every token provides signal.}
+Unlike MLM where only 15\% of tokens are predicted, CLM produces a loss at
+\emph{every} position, making it significantly more data-efficient per token
+processed.  This is a key reason CLM scales better to massive corpora.
+
+\paragraph{Limitation.}
+Unidirectional context means the model cannot condition on future tokens for
+understanding tasks, which is why encoder-only models (MLM) often outperform
+similarly sized decoder-only models (CLM) on classification benchmarks when
+both are fine-tuned.
+
+\subsection{Span Corruption (T5-style)}
+
+T5 (Raffel et al., JMLR 2020) introduced span corruption: randomly mask
+contiguous spans of varying length, replace each with a single sentinel token,
+and train the model to generate the masked spans in sequence.
+
+\paragraph{Procedure.}
+\begin{enumerate}
+    \item Select approximately 15\% of tokens, grouped into spans (average
+          span length $\approx 3$).
+    \item Replace each span with a unique sentinel token (\texttt{<extra\_id\_0>},
+          \texttt{<extra\_id\_1>}, etc.).
+    \item The target sequence consists of sentinel tokens followed by the
+          original text of each span.
+\end{enumerate}
+
+\paragraph{Advantages.}
+Span masking is more natural than single-token masking because it forces the
+model to generate coherent multi-token completions.  It works with an
+encoder-decoder architecture where the encoder processes the corrupted input
+bidirectionally and the decoder generates the spans autoregressively.  This
+naturally supports both understanding (encoder) and generation (decoder).
+
+\subsection{Replaced Token Detection (ELECTRA)}
+
+ELECTRA (Clark et al., ICLR 2020) replaces MLM with a discriminative objective
+that provides training signal at \emph{every} token position:
+
+\paragraph{Architecture.}
+\begin{enumerate}
+    \item A small \textbf{generator} (trained with MLM) produces plausible
+          replacement tokens for masked positions.
+    \item The main \textbf{discriminator} receives the corrupted sequence
+          (with generator outputs replacing masked tokens) and classifies
+          each token as ``real'' or ``replaced.''
+\end{enumerate}
+
+\begin{mathresult}{ELECTRA Replaced Token Detection Loss}
+\[
+    \loss_{\text{RTD}} = - \sum_{t=1}^{T} \Bigl[
+        y_t \log D(\tilde{x}_t) + (1 - y_t) \log\bigl(1 - D(\tilde{x}_t)\bigr)
+    \Bigr]
+\]
+where $y_t = \mathds{1}[\tilde{x}_t = x_t]$ indicates whether position $t$ contains
+the original token, $D$ is the discriminator, and $\tilde{\vx}$ is the sequence with
+generator replacements.
+\end{mathresult}
+
+\begin{keyinsight}[Why ELECTRA Is More Efficient Than MLM]
+MLM trains on 15\% of tokens per example.  ELECTRA trains on 100\%---every
+token is classified as real or replaced.  This 6--7$\times$ increase in
+training signal per example means ELECTRA matches BERT's performance with
+roughly 1/4 the compute, and significantly outperforms BERT given the same
+compute budget.  The key insight is that \emph{detection is easier than
+generation} (binary classification vs.\ vocabulary-sized softmax), so even a
+small discriminator can learn effectively from every position.
+\end{keyinsight}
+
+\subsection{Denoising Objectives (BART)}
+
+BART (Lewis et al., ACL 2020) generalizes denoising to multiple corruption
+strategies applied to an encoder-decoder architecture:
+
+\begin{itemize}
+    \item \textbf{Token masking:} Replace random tokens with \texttt{[MASK]}
+          (similar to MLM).
+    \item \textbf{Token deletion:} Remove random tokens without replacement
+          (the model must figure out \emph{where} tokens are missing).
+    \item \textbf{Text infilling:} Replace spans with a single \texttt{[MASK]}
+          token (the model must determine span length).
+    \item \textbf{Sentence permutation:} Shuffle sentence order within a document.
+    \item \textbf{Document rotation:} Rotate the document to start at a random
+          token.
+\end{itemize}
+
+The decoder must reconstruct the original, uncorrupted text.  Text infilling
+was found to be the most effective single strategy, combining the benefits
+of span masking with the challenge of length prediction.
+
+\subsection{Contrastive Pre-training (for Embeddings)}
+
+For models optimized to produce sentence or passage embeddings (used in
+retrieval and RAG), contrastive objectives train the model to bring
+semantically similar texts closer in embedding space while pushing
+dissimilar texts apart.
+
+\begin{mathresult}{InfoNCE Contrastive Loss}
+\[
+    \loss_{\text{InfoNCE}} = -\log \frac{\exp\bigl(\text{sim}(\vq, \vk^+) / \tau\bigr)}
+        {\sum_{i=0}^{N} \exp\bigl(\text{sim}(\vq, \vk_i) / \tau\bigr)}
+\]
+where $\vq$ is the query representation, $\vk^+$ is the positive (matching)
+key, $\{\vk_i\}$ includes the positive and $N$ negatives, $\tau$ is the
+temperature, and $\text{sim}$ is typically cosine similarity.
+\end{mathresult}
+
+Models like E5, BGE, and GTE use contrastive pre-training (often on
+large-scale web-mined text pairs) to produce high-quality embeddings
+for retrieval, semantic search, and RAG.
+
+\subsection{Comparison of Pre-training Objectives}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l c c c X@{}}
+\toprule
+\textbf{Objective} & \textbf{Architecture} & \textbf{Signal/Token} & \textbf{Bidirectional?} & \textbf{Best For} \\
+\midrule
+MLM (BERT)          & Encoder-only   & 15\%   & Yes & Understanding, classification \\
+CLM (GPT)           & Decoder-only   & 100\%  & No  & Generation, in-context learning \\
+Span Corruption (T5)& Enc-Dec        & 15\%   & Encoder: Yes & Seq2seq tasks, translation \\
+RTD (ELECTRA)       & Encoder-only   & 100\%  & Yes & Efficient understanding \\
+Denoising (BART)    & Enc-Dec        & 100\%  & Encoder: Yes & Summarization, infilling \\
+Contrastive         & Dual encoder   & 100\%  & Per-encoder & Retrieval, embeddings \\
+\bottomrule
+\end{tabularx}
+\caption{Comparison of pre-training objectives.  ``Signal/Token'' indicates the fraction
+of tokens that contribute a training signal per forward pass.}
+\label{tab:pretraining-objectives}
+\end{table}
+
+\subsection{Visual Comparison: MLM vs.\ CLM vs.\ Span Corruption}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.3cm and 0.2cm,
+    tok/.style={rectangle, draw=deepblue!50, fill=lightblue!60, minimum width=1.1cm,
+                minimum height=0.5cm, font=\scriptsize\sffamily, rounded corners=1pt},
+    masked/.style={rectangle, draw=deepred!60, fill=red!12, minimum width=1.1cm,
+                   minimum height=0.5cm, font=\scriptsize\sffamily\bfseries, rounded corners=1pt},
+    pred/.style={rectangle, draw=deepgreen!60, fill=green!10, minimum width=1.1cm,
+                 minimum height=0.5cm, font=\scriptsize\sffamily\itshape, rounded corners=1pt},
+    lbl/.style={font=\small\sffamily\bfseries, text=deepblue},
+    arr/.style={-{Stealth[length=3pt]}, thick, gray!60}
+]
+
+% === MLM ===
+\node[lbl] (mlm-lbl) at (0, 0) {MLM};
+\node[tok, right=0.6cm of mlm-lbl] (m1) {The};
+\node[tok, right=0.15cm of m1] (m2) {cat};
+\node[masked, right=0.15cm of m2] (m3) {[MASK]};
+\node[tok, right=0.15cm of m3] (m4) {on};
+\node[tok, right=0.15cm of m4] (m5) {the};
+\node[masked, right=0.15cm of m5] (m6) {[MASK]};
+\node[pred, below=0.15cm of m3] (mp3) {sat};
+\node[pred, below=0.15cm of m6] (mp6) {mat};
+\draw[arr] (m3) -- (mp3);
+\draw[arr] (m6) -- (mp6);
+
+% === CLM ===
+\node[lbl, below=1.2cm of mlm-lbl] (clm-lbl) {CLM};
+\node[tok, right=0.6cm of clm-lbl] (c1) {The};
+\node[tok, right=0.15cm of c1] (c2) {cat};
+\node[tok, right=0.15cm of c2] (c3) {sat};
+\node[tok, right=0.15cm of c3] (c4) {on};
+\node[tok, right=0.15cm of c4] (c5) {the};
+\node[pred, right=0.15cm of c5] (c6) {mat};
+\node[pred, below=0.15cm of c2] (cp2) {cat};
+\node[pred, below=0.15cm of c3] (cp3) {sat};
+\node[pred, below=0.15cm of c4] (cp4) {on};
+\node[pred, below=0.15cm of c5] (cp5) {the};
+\draw[arr] (c1.south) -- ++(0,-0.15) -| (cp2.north);
+\draw[arr] (c2.south) -- ++(0,-0.15) -| (cp3.north);
+\draw[arr] (c3.south) -- ++(0,-0.15) -| (cp4.north);
+\draw[arr] (c4.south) -- ++(0,-0.15) -| (cp5.north);
+
+% === Span Corruption ===
+\node[lbl, below=2.6cm of mlm-lbl] (span-lbl) {Span};
+\node[tok, right=0.6cm of span-lbl] (s1) {The};
+\node[masked, right=0.15cm of s1] (s2) {$\langle$X$\rangle$};
+\node[tok, right=0.15cm of s2] (s3) {on};
+\node[masked, right=0.15cm of s3] (s4) {$\langle$Y$\rangle$};
+\node[pred, below=0.2cm of s2, xshift=0.6cm] (sp1) {$\langle$X$\rangle$\,cat sat};
+\node[pred, below=0.2cm of s4, xshift=0.6cm] (sp2) {$\langle$Y$\rangle$\,the mat};
+\draw[arr] (s2) -- (sp1);
+\draw[arr] (s4) -- (sp2);
+
+\end{tikzpicture}
+\caption{Visual comparison of pre-training objectives.  \textbf{MLM}: predict masked
+tokens from bidirectional context.  \textbf{CLM}: predict the next token from left
+context at every position.  \textbf{Span Corruption}: replace variable-length spans
+with sentinels, decode the original spans.}
+\label{fig:pretraining-objectives}
+\end{figure}
+
+
+% ============================================================================
+% SECTION 2: PRE-TRAINING DATA PIPELINE
+% ============================================================================
+\section{Pre-training Data Pipeline}
+\label{sec:pretraining-data}
+
+The quality and composition of pre-training data determine what a model knows,
+what languages it speaks, and what biases it carries.  Interviewers increasingly
+test data pipeline knowledge because it is the most impactful---and most
+underappreciated---component of LLM development.
+
+\subsection{Data Sources}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Source} & \textbf{Scale} & \textbf{Characteristics} \\
+\midrule
+CommonCrawl / C4 / RefinedWeb & Trillions of tokens & Web text; noisy, diverse, broad coverage \\
+Books (BookCorpus, Gutenberg) & Billions of tokens & Long-form, coherent prose; improves fluency \\
+Wikipedia & $\sim$4B tokens (English) & Factual, well-structured, encyclopedic \\
+Code (GitHub, StackOverflow) & Hundreds of billions & Improves reasoning and structured output \\
+Scientific papers (ArXiv, S2ORC) & Tens of billions & Technical knowledge, formal writing \\
+Curated instruction data & Millions of examples & For SFT stage; human-written or synthetic \\
+\bottomrule
+\end{tabularx}
+\caption{Common pre-training data sources and their characteristics.}
+\label{tab:data-sources}
+\end{table}
+
+\subsection{Data Quality Pipeline}
+
+Raw web crawl data is far too noisy to use directly.  A typical cleaning pipeline:
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.4cm,
+    box/.style={rectangle, draw=deepblue, fill=lightblue!50, minimum width=3.0cm,
+                minimum height=0.55cm, font=\scriptsize\sffamily, rounded corners=2pt, thick},
+    arr/.style={-{Stealth[length=4pt]}, thick, deepblue!60}
+]
+\node[box] (raw) {Raw Web Crawl};
+\node[box, below=0.4cm of raw] (lang) {Language Identification};
+\node[box, below=0.4cm of lang] (dedup) {Deduplication (MinHash / Exact)};
+\node[box, below=0.4cm of dedup] (quality) {Quality Filtering};
+\node[box, below=0.4cm of quality] (toxic) {Toxicity / PII Filtering};
+\node[box, below=0.4cm of toxic] (mix) {Domain Mixing};
+\node[box, below=0.4cm of mix] (tokenize) {Tokenization};
+\node[box, below=0.4cm of tokenize, fill=deepblue!15] (train) {Training Batches};
+
+\draw[arr] (raw) -- (lang);
+\draw[arr] (lang) -- (dedup);
+\draw[arr] (dedup) -- (quality);
+\draw[arr] (quality) -- (toxic);
+\draw[arr] (toxic) -- (mix);
+\draw[arr] (mix) -- (tokenize);
+\draw[arr] (tokenize) -- (train);
+\end{tikzpicture}
+\caption{Typical pre-training data quality pipeline.  Each stage reduces data volume
+while increasing quality.}
+\label{fig:data-pipeline}
+\end{figure}
+
+\paragraph{Key stages.}
+\begin{itemize}
+    \item \textbf{Language identification:} Classify documents by language
+          (fastText langid is standard).  Critical for multilingual models
+          where per-language proportions are deliberately controlled.
+    \item \textbf{Deduplication:} Remove near-duplicate documents using
+          MinHash locality-sensitive hashing.  Exact substring deduplication
+          catches repeated boilerplate (navigational text, legal notices).
+          Lee et al.\ (2022) showed that deduplication improves both training
+          efficiency and downstream quality.
+    \item \textbf{Quality filtering:} Heuristic rules (minimum length,
+          proportion of alphabetic characters, n-gram repetition ratio) and
+          perplexity-based filtering (a language model scores documents;
+          high-perplexity indicates gibberish or machine-generated noise).
+    \item \textbf{Toxicity and PII filtering:} Classifiers remove toxic content;
+          regex and NER-based systems redact personally identifiable information
+          (names, emails, phone numbers, addresses).
+\end{itemize}
+
+\subsection{Data Mixing}
+
+The proportion of each domain in the training set significantly affects model
+capabilities:
+
+\begin{itemize}
+    \item \textbf{More code data} $\rightarrow$ better reasoning and structured
+          output (an empirical finding replicated across Phi, CodeLLaMA, and
+          DeepSeek models).
+    \item \textbf{More book data} $\rightarrow$ better long-form coherence and
+          narrative understanding.
+    \item \textbf{More Wikipedia and scientific text} $\rightarrow$ better
+          factual knowledge.
+    \item \textbf{More multilingual data} $\rightarrow$ better cross-lingual
+          transfer but potentially dilutes performance in dominant languages.
+\end{itemize}
+
+Determining optimal mixing proportions is an active research area.  The Chinchilla
+paper (Hoffmann et al., 2022) established that compute-optimal training requires
+approximately 20 tokens per parameter.  In practice, models are often
+``over-trained'' (more tokens than Chinchilla-optimal) to reduce inference-time
+model size while maximizing quality.
+
+\subsection{Tokenizer Training}
+
+The tokenizer is trained \emph{separately} from the model, before pre-training
+begins.  Vocabulary size is a critical hyperparameter (typical range: 32K--100K
+tokens).  The training corpus for the tokenizer determines what subwords emerge,
+and this cannot be changed after model pre-training without retraining from
+scratch.
+
+\begin{warningbox}
+Data quality is the single most underappreciated factor in LLM development.
+The Phi model family demonstrated that small models trained on carefully curated
+``textbook quality'' synthetic data can outperform much larger models trained on
+raw web crawl.  In interviews, showing awareness that data quality often matters
+more than model size is a strong signal of practical experience.
+\end{warningbox}
+
+
+% ============================================================================
+% SECTION 3: TRANSFER LEARNING PARADIGM
+% ============================================================================
+\section{The Transfer Learning Paradigm}
+\label{sec:transfer-learning}
+
+Transfer learning---pre-train on a large, general corpus, then adapt to a
+specific downstream task---is the fundamental paradigm of modern NLP.  It
+replaced the previous approach of training task-specific models from scratch
+with random initialization.
+
+\subsection{Why Transfer Learning Works}
+
+Pre-training learns \emph{universal language representations} that capture:
+\begin{itemize}
+    \item \textbf{Syntax:} Part-of-speech patterns, constituency structure,
+          dependency relations.
+    \item \textbf{Semantics:} Word meaning, synonymy, analogy, compositional
+          meaning.
+    \item \textbf{World knowledge:} Factual associations, commonsense reasoning,
+          entity relationships.
+    \item \textbf{Discourse:} Coherence, coreference, topic structure.
+\end{itemize}
+
+These representations transfer across tasks because language understanding has
+common prerequisites: a model that understands syntax and semantics for MLM
+also understands them for NER, QA, and sentiment analysis.  This dramatically
+reduces the labeled data needed for any individual task.
+
+\subsection{Feature Extraction vs.\ Fine-tuning}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+\textbf{Aspect} & \textbf{Feature Extraction} & \textbf{Fine-tuning} \\
+\midrule
+What is trained & Only the task head & All parameters (or most) \\
+Pre-trained weights & Frozen & Updated \\
+Training cost & Very low & Moderate to high \\
+Data requirement & Can work with very little data & Needs hundreds+ examples \\
+Quality & Good baseline & Usually significantly better \\
+Risk & No catastrophic forgetting & Possible catastrophic forgetting \\
+Use case & Quick baseline, limited compute & Production systems \\
+\bottomrule
+\end{tabularx}
+\caption{Feature extraction vs.\ fine-tuning for transfer learning.}
+\label{tab:feature-vs-finetune}
+\end{table}
+
+\paragraph{Feature extraction.}
+Freeze the pre-trained model, extract hidden-state representations for each
+input, and train a lightweight classifier (linear layer, small MLP) on top.
+The pre-trained model is used purely as a feature extractor.
+
+\paragraph{Fine-tuning.}
+Unfreeze all (or most) parameters and train the entire model end-to-end on
+the downstream task.  This allows the pre-trained representations to adapt to
+the task-specific distribution, typically yielding 2--5\% absolute improvement
+over feature extraction.
+
+\subsection{Transfer Learning Pipeline}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    phase/.style={rectangle, draw=deepblue, fill=lightblue!40, minimum width=3.5cm,
+                  minimum height=0.8cm, font=\small\sffamily, rounded corners=3pt, thick},
+    data/.style={rectangle, draw=gray!50, fill=gray!8, minimum width=3.5cm,
+                 minimum height=0.5cm, font=\scriptsize\sffamily, rounded corners=2pt},
+    arr/.style={-{Stealth[length=5pt]}, thick, deepblue!70},
+    lbl/.style={font=\scriptsize\sffamily, text=gray!70}
+]
+
+\node[phase] (pretrain) {Pre-training};
+\node[data, above=0.2cm of pretrain] (pd) {Unlabeled corpus (TB-scale)};
+\node[lbl, below=0.05cm of pretrain] {MLM / CLM / Span Corruption};
+
+\node[phase, right=2.5cm of pretrain] (finetune) {Fine-tuning};
+\node[data, above=0.2cm of finetune] (fd) {Labeled task data (100s--10Ks)};
+\node[lbl, below=0.05cm of finetune] {Task-specific loss};
+
+\node[phase, right=2.5cm of finetune, fill=deepblue!15] (deploy) {Deployment};
+\node[data, above=0.2cm of deploy] (dd) {Production queries};
+\node[lbl, below=0.05cm of deploy] {Inference};
+
+\draw[arr] (pretrain) -- (finetune) node[midway, above, font=\scriptsize\sffamily] {Transfer weights};
+\draw[arr] (finetune) -- (deploy) node[midway, above, font=\scriptsize\sffamily] {Optimized model};
+
+\end{tikzpicture}
+\caption{The transfer learning pipeline: pre-train on a large unlabeled corpus,
+fine-tune on task-specific labeled data, deploy for inference.}
+\label{fig:transfer-pipeline}
+\end{figure}
+
+\subsection{Layer-wise Learning Rates}
+
+Different layers capture different levels of abstraction.  Lower layers learn
+general features (syntax, morphology) that transfer broadly; upper layers learn
+more task-specific features.  A common fine-tuning strategy assigns
+\emph{lower learning rates to earlier layers} and higher rates to later layers:
+
+\[
+    \eta_l = \eta_{\text{base}} \cdot \xi^{L - l}
+\]
+
+where $\eta_l$ is the learning rate for layer $l$, $L$ is the total number of
+layers, and $\xi \in (0, 1)$ is the decay factor (typically 0.9--0.95).
+Howard and Ruder (ULMFiT, ACL 2018) showed this discriminative fine-tuning
+significantly outperforms uniform learning rates.
+
+
+% ============================================================================
+% SECTION 4: FULL FINE-TUNING
+% ============================================================================
+\section{Full Fine-Tuning}
+\label{sec:full-finetuning}
+
+Full fine-tuning updates \emph{all} model parameters on the downstream task.
+It is the simplest and often most effective adaptation method when sufficient
+data and compute are available.
+
+\subsection{Standard Recipe}
+
+\begin{enumerate}
+    \item \textbf{Initialize} from pre-trained weights.
+    \item \textbf{Add a task head:} linear layer(s) on top of the pre-trained
+          model's output (e.g., a classification head on \texttt{[CLS]}, or
+          token-level heads for NER).
+    \item \textbf{Train all parameters} end-to-end with a task-specific loss
+          (cross-entropy for classification, span extraction loss for QA).
+    \item \textbf{Use a low learning rate:} typically $1 \times 10^{-5}$ to
+          $5 \times 10^{-5}$ for the pre-trained backbone (the task head can
+          use a higher rate).
+    \item \textbf{Train for few epochs:} 2--5 epochs is usually sufficient for
+          fine-tuning.  Unlike training from scratch, the model starts from a
+          strong initialization.
+\end{enumerate}
+
+\subsection{Catastrophic Forgetting}
+\label{sec:catastrophic-forgetting}
+
+\textbf{Catastrophic forgetting} occurs when fine-tuning on a new task causes
+the model to lose knowledge acquired during pre-training.  The parameters
+shift to optimize the fine-tuning loss, potentially overwriting representations
+that were useful for general language understanding.
+
+\paragraph{Why it happens.}
+Pre-training and fine-tuning optimize \emph{different} objectives on
+\emph{different} data distributions.  Without explicit constraints, gradient
+updates for the fine-tuning task can destructively interfere with the parameter
+configurations that encoded pre-trained knowledge.  The smaller the fine-tuning
+dataset, the more severe the problem---the model overfits to the narrow
+distribution and loses generality.
+
+\subsection{Mitigating Catastrophic Forgetting}
+
+\begin{enumerate}
+    \item \textbf{Low learning rate} ($1\text{e-}5$ to $5\text{e-}5$):
+          Small updates preserve the pre-trained parameter neighborhood.
+          This is the single most important mitigation.
+
+    \item \textbf{Gradual unfreezing} (ULMFiT, Howard \& Ruder, 2018):
+          Start by training only the task head, then progressively unfreeze
+          layers from top to bottom.  This allows lower layers to remain
+          stable while upper layers adapt first.
+
+    \item \textbf{Regularization:}
+          \begin{itemize}
+              \item Weight decay ($L_2$ regularization) penalizes large parameter
+                    changes from the pre-trained values.
+              \item Dropout (typically 0.1) prevents co-adaptation.
+              \item Elastic Weight Consolidation (EWC): adds a penalty
+                    $\sum_i F_i (\theta_i - \theta_i^*)^2$ where $F_i$ is the
+                    Fisher information of parameter $i$ and $\theta_i^*$ are the
+                    pre-trained values.  Parameters important for pre-training
+                    are penalized more for changing.
+          \end{itemize}
+
+    \item \textbf{Early stopping:} Monitor validation performance and stop when
+          it degrades.  Fine-tuning often peaks quickly (2--3 epochs) before
+          overfitting.
+
+    \item \textbf{Data replay:} Mix a small proportion of pre-training-style
+          data with fine-tuning data to maintain general representations.
+\end{enumerate}
+
+\begin{warningbox}
+The most common fine-tuning mistakes in practice (and the ones interviewers
+look for): (1) Using too high a learning rate (e.g., $1\text{e-}3$ instead of
+$1\text{e-}5$), which destroys pre-trained representations in the first few
+steps. (2) Training for too many epochs on a small dataset, causing severe
+overfitting. (3) Not using a learning rate warmup, which can cause unstable
+early updates. (4) Forgetting to set the model to training mode (missing
+dropout, incorrect batch norm behavior). (5) Not freezing the embedding layer
+when the task vocabulary matches the pre-trained tokenizer exactly.
+\end{warningbox}
+
+
+% ============================================================================
+% SECTION 5: PARAMETER-EFFICIENT FINE-TUNING (PEFT)
+% ============================================================================
+\section{Parameter-Efficient Fine-Tuning (PEFT)}
+\label{sec:peft}
+
+As models grow to billions or hundreds of billions of parameters, full
+fine-tuning becomes prohibitively expensive in memory, compute, and storage.
+\textbf{Parameter-Efficient Fine-Tuning (PEFT)} methods train only a small
+fraction of parameters while keeping the vast majority frozen, achieving
+near-full-fine-tuning quality at a fraction of the cost.
+
+\subsection{LoRA: Low-Rank Adaptation --- Deep Dive}
+\label{sec:lora}
+
+LoRA (Hu et al., ICLR 2022) is the most widely used PEFT method and the
+single most frequently asked fine-tuning topic in NLP interviews.
+
+\subsubsection{Core Hypothesis: Low-Rank Updates}
+
+The key insight behind LoRA is that \emph{the weight updates during fine-tuning
+occupy a low-rank subspace}.  Pre-trained models already have high-quality
+representations; fine-tuning only needs to make small, structured adjustments
+to adapt them.  Aghajanyan et al.\ (2021) formalized this as the
+\textbf{intrinsic dimensionality} hypothesis: the optimization landscape of
+fine-tuning can be effectively navigated in a subspace of dimension much
+smaller than the full parameter space.
+
+\subsubsection{Mathematical Formulation}
+
+For a pre-trained weight matrix $\mW_0 \in \R^{d \times k}$, LoRA
+parameterizes the update as a low-rank factorization:
+
+\begin{mathresult}{LoRA: Low-Rank Adaptation}
+\[
+    \mW = \mW_0 + \Delta\mW = \mW_0 + \mB\mA
+\]
+where $\mB \in \R^{d \times r}$, $\mA \in \R^{r \times k}$, and $r \ll \min(d, k)$.
+
+During training, $\mW_0$ is \textbf{frozen} (no gradient updates).
+Only $\mA$ and $\mB$ are trained.  The forward pass becomes:
+\[
+    \vh = \mW_0 \vx + \mB\mA\vx = \mW_0 \vx + \Delta\mW\,\vx
+\]
+
+With scaling:
+\[
+    \vh = \mW_0 \vx + \frac{\alpha}{r}\,\mB\mA\vx
+\]
+where $\alpha$ is a constant scaling factor.
+\end{mathresult}
+
+\subsubsection{Initialization}
+
+Correct initialization is critical for stable training:
+\begin{itemize}
+    \item $\mA$ is initialized with a random Gaussian: $A_{ij} \sim \mathcal{N}(0, \sigma^2)$.
+    \item $\mB$ is initialized to \textbf{zero}: $\mB = \mathbf{0}$.
+\end{itemize}
+This ensures that $\Delta\mW = \mB\mA = \mathbf{0}$ at initialization, so the
+model starts from exactly the pre-trained weights.  During training, $\mB$
+gradually moves away from zero as gradients flow.  This zero initialization is
+analogous to the residual connection design principle: start as identity, learn
+the residual.
+
+\subsubsection{Rank $r$: The Key Hyperparameter}
+
+The rank $r$ controls the expressiveness of the update:
+
+\begin{itemize}
+    \item \textbf{Typical range:} $r = 8$ to $64$.
+    \item \textbf{Low rank ($r = 4$--$8$):} Sufficient for tasks similar to the
+          pre-training domain.  Extremely parameter-efficient.
+    \item \textbf{Medium rank ($r = 16$--$32$):} Good default for most
+          fine-tuning scenarios.
+    \item \textbf{High rank ($r = 64$--$128$):} Approaches full fine-tuning
+          capacity.  Diminishing returns beyond $r = 64$ for most tasks.
+    \item \textbf{Rule of thumb:} More complex tasks or larger domain shifts
+          require higher rank.  But the relationship is sublinear---doubling
+          $r$ does not double quality.
+\end{itemize}
+
+\subsubsection{Alpha ($\alpha$) Scaling}
+
+The effective magnitude of the LoRA update is:
+\[
+    \text{effective update} = \frac{\alpha}{r} \cdot \mB\mA
+\]
+
+The ratio $\alpha/r$ controls how strongly the adaptation modifies the original
+weights.  Common practice:
+\begin{itemize}
+    \item Set $\alpha = 2r$ (so the effective scaling is 2) as a starting point.
+    \item Higher $\alpha$ means stronger adaptation; lower means more conservative.
+    \item When sweeping $r$, keeping $\alpha/r$ constant maintains similar
+          update magnitude across different rank settings.
+\end{itemize}
+
+\subsubsection{Which Modules to Apply LoRA}
+
+\begin{itemize}
+    \item \textbf{Modern default:} Apply LoRA to \emph{all} linear layers---the
+          attention projections ($\mW_Q$, $\mW_K$, $\mW_V$, $\mW_O$) \emph{and}
+          the FFN projections ($\mW_1$, $\mW_2$, and gate projection for
+          SwiGLU).  This is the default in the current PEFT ecosystem.
+    \item \textbf{Historical minimal config:} The original LoRA paper (2021)
+          adapted only the query ($\mW_Q$) and value ($\mW_V$) projections.
+          Q+V-only saves parameters and can suffice for tasks close to the
+          pre-training distribution, but it is the paper's minimal
+          configuration, not current best practice.
+    \item \textbf{Empirical finding:} The QLoRA ablations (Dettmers et al.,
+          2023) showed that adapting all linear layers---FFN included---is
+          what closes the gap to full fine-tuning; attention-only
+          configurations underperform, especially when the task requires
+          significant knowledge adaptation (e.g., domain-specific fine-tuning).
+\end{itemize}
+
+\subsubsection{Parameter Count}
+
+For a single weight matrix $\mW_0 \in \R^{d \times k}$:
+\begin{align*}
+    \text{Full fine-tuning params} &= d \times k \\
+    \text{LoRA params} &= d \times r + r \times k = r(d + k)
+\end{align*}
+
+For a 7B-parameter model with $d = 4096$, applying rank-16 LoRA to Q and V
+projections across 32 layers:
+\[
+    \text{LoRA params} = 32 \times 2 \times 16 \times (4096 + 4096)
+    = 8{,}388{,}608 \approx 8.4\text{M}
+\]
+That is approximately \textbf{0.12\%} of the full model parameters.
+
+\subsubsection{Inference: Zero Overhead via Merging}
+
+\begin{keyinsight}[LoRA Merging: Zero Inference Overhead]
+After training, the LoRA matrices can be \emph{merged} into the base weights:
+$\mW_{\text{merged}} = \mW_0 + (\alpha/r) \cdot \mB\mA$.  The merged model has
+\emph{exactly the same architecture and inference cost} as the original---no
+additional latency, no additional memory for LoRA matrices.  This is a
+decisive advantage over methods like adapters or prefix tuning that add
+inference overhead.  Furthermore, you can maintain multiple LoRA adapters
+(one per task) and swap them at serving time by loading different $\mA, \mB$
+matrices without reloading the base model.
+\end{keyinsight}
+
+\subsubsection{Multi-task LoRA Serving}
+
+In production, a common pattern is to serve multiple tasks from a single base
+model with different LoRA adapters:
+
+\begin{enumerate}
+    \item Load the base model once into GPU memory.
+    \item For each task, load the corresponding $\mA, \mB$ matrices
+          (typically a few MB per adapter).
+    \item At request time, select the appropriate adapter based on the task
+          and either merge on-the-fly or maintain pre-merged copies.
+    \item This enables a single infrastructure to serve dozens of specialized
+          tasks with minimal memory overhead.
+\end{enumerate}
+
+\subsubsection{Why Low-Rank Works: The Intrinsic Dimensionality Argument}
+
+\begin{keyinsight}[Intrinsic Dimensionality of Fine-Tuning]
+Aghajanyan et al.\ (2021) showed that the effective dimensionality of the
+fine-tuning optimization landscape is orders of magnitude smaller than the
+full parameter count.  For BERT-base (110M parameters), the intrinsic
+dimension for many NLP tasks is as low as $\sim$200--800.  This means the
+``useful'' directions for adaptation lie in a tiny subspace of the full
+parameter space.  LoRA directly exploits this structure: rank $r = 16$ provides
+a $16$-dimensional adaptation per weight matrix, and across all adapted matrices,
+the total intrinsic dimensionality easily covers the effective subspace needed
+for most tasks.
+\end{keyinsight}
+
+\subsection{QLoRA: Quantized LoRA}
+\label{sec:qlora}
+
+QLoRA (Dettmers et al., NeurIPS 2023) makes LoRA applicable to models that
+would otherwise not fit in memory by combining quantization with low-rank
+adaptation.
+
+\subsubsection{Three Key Innovations}
+
+\begin{enumerate}
+    \item \textbf{4-bit NormalFloat (NF4) quantization:} The base model
+          weights are stored in 4-bit precision using a data type optimized
+          for the normal distribution of pre-trained weights.  NF4 quantization
+          bins are spaced to minimize quantization error for normally
+          distributed values, unlike uniform INT4.
+
+    \item \textbf{Double quantization:} The quantization constants (scales
+          and zero-points, one per block of 64 weights) are themselves quantized
+          to 8-bit, reducing the memory overhead of quantization metadata from
+          $\sim$0.5 bits/parameter to $\sim$0.13 bits/parameter.
+
+    \item \textbf{Paged optimizers:} Use CPU RAM to handle GPU memory spikes
+          during gradient computation via unified memory, preventing
+          out-of-memory errors during training.
+\end{enumerate}
+
+\subsubsection{Computation Flow}
+
+During the forward pass, 4-bit weights are \emph{dequantized} on-the-fly to
+16-bit for matrix multiplication.  The LoRA adapters ($\mA, \mB$) are always
+stored and computed in 16-bit (BF16 or FP16).  Gradients flow only through the
+LoRA parameters---the quantized base weights are never updated.
+
+\begin{mathresult}{QLoRA Memory Savings}
+For a model with $N$ parameters:
+\begin{align*}
+    \text{Full fine-tuning memory} &\approx 16N \text{ bytes}
+    \quad \text{(FP16 weights + FP32 optimizer states)} \\[4pt]
+    \text{QLoRA memory} &\approx 0.5N + 16 \cdot r(d+k) \cdot L_{\text{adapted}}
+    \text{ bytes}
+\end{align*}
+where the first term is the 4-bit base model ($\sim$0.5 bytes/parameter) and
+the second term is the 16-bit LoRA parameters.  For a 65B model with rank-16 LoRA:
+full fine-tuning requires $\sim$780\,GB; QLoRA requires $\sim$33\,GB (single
+48GB GPU).
+\end{mathresult}
+
+\paragraph{Quality.}
+QLoRA quality is \emph{configuration-dependent}, not a fixed quantization
+penalty.  With the paper's full recipe---NF4 with double quantization and LoRA
+adapters on \emph{all} linear layers---Dettmers et al.\ report matching 16-bit
+LoRA and 16-bit full fine-tuning; this parity claim is the paper's headline
+result (Guanaco).  Gaps of a few percent do appear with weaker configurations:
+low rank, adapters restricted to a subset of modules (e.g., attention-only),
+or harder domain shifts.  State the parity result first, then the caveats.
+
+\subsection{DoRA: Decomposed Weight-Magnitude and Direction}
+\label{sec:dora}
+
+DoRA (Liu et al., 2024) improves on LoRA by decomposing the weight update into
+\emph{magnitude} and \emph{direction} components:
+
+\[
+    \mW' = m \cdot \frac{\mW_0 + \mB\mA}{\norm{\mW_0 + \mB\mA}_c}
+\]
+
+where $m$ is a learnable magnitude vector and $\norm{\cdot}_c$ denotes
+column-wise normalization.  The direction is updated via LoRA, and the magnitude
+is updated independently.  This decomposition is inspired by weight normalization
+(Salimans \& Kingma, 2016) and allows the model to adjust the ``how much''
+and ``in which direction'' of the update separately.  DoRA consistently
+outperforms LoRA by 0.5--1\% across benchmarks with the same parameter budget.
+
+\subsection{Prefix Tuning}
+\label{sec:prefix-tuning}
+
+Prefix tuning (Li \& Liang, ACL 2021) prepends learnable continuous vectors
+(``virtual tokens'') to the keys and values at every transformer layer:
+
+\[
+    \mK' = [\mK_{\text{prefix}};\; \mK], \qquad
+    \mV' = [\mV_{\text{prefix}};\; \mV]
+\]
+
+where $\mK_{\text{prefix}} \in \R^{p \times d_k}$ and
+$\mV_{\text{prefix}} \in \R^{p \times d_v}$ are $p$ learnable prefix vectors
+per layer.  The actual input tokens attend to both the prefix and each other,
+while the prefix is trained end-to-end.
+
+\paragraph{Key properties.}
+Trainable parameters: $2 \times p \times d \times L$ (prefix length $\times$
+dimension $\times$ layers, for K and V).  Typically $p = 10$--$50$, yielding
+$\sim$0.1\% of total parameters.  Quality: 85--95\% of full fine-tuning, best
+when the task is well-defined and does not require substantial knowledge
+adaptation.
+
+\paragraph{Limitation.}
+The prefix consumes context window positions, effectively reducing the usable
+context length.  Also, prefix tuning adds inference overhead because the
+prefix vectors must be processed at every layer for every forward pass.
+
+\subsection{Prompt Tuning}
+\label{sec:prompt-tuning}
+
+Prompt tuning (Lester et al., EMNLP 2021) is the simplest PEFT method:
+prepend $p$ learnable soft tokens to the input embedding only (not at every
+layer, unlike prefix tuning):
+
+\[
+    \mX' = [\mE_{\text{prompt}};\; \mX]
+\]
+
+where $\mE_{\text{prompt}} \in \R^{p \times d}$ are learnable embeddings.
+
+\paragraph{Key properties.}
+Fewest trainable parameters of any PEFT method ($< 0.1\%$).  Performance
+improves with model scale: for models under 1B parameters, prompt tuning
+underperforms significantly; for models above 10B, it approaches full
+fine-tuning quality.  The intuition: larger models can ``interpret'' soft
+prompts more effectively because their in-context learning ability is
+stronger.
+
+\subsection{Adapters}
+\label{sec:adapters}
+
+Adapter layers (Houlsby et al., ICML 2019) insert small bottleneck modules
+between existing transformer sublayers:
+
+\[
+    \vh = \vh + f(\vh\,\mW_{\text{down}})\,\mW_{\text{up}}
+\]
+
+where $\mW_{\text{down}} \in \R^{d \times m}$ projects to a bottleneck
+dimension $m \ll d$, a nonlinearity $f$ (ReLU or GELU) is applied, and
+$\mW_{\text{up}} \in \R^{m \times d}$ projects back.  A residual connection
+ensures the adapter starts as identity.
+
+\paragraph{Trainable parameters:} $\sim$1--5\% of the model, depending on
+bottleneck size $m$.  Quality: 95--99\% of full fine-tuning.  Limitation:
+unlike LoRA, adapters cannot be merged into the base weights, so they add
+inference latency (two additional matrix multiplications per layer).
+
+\subsection{IA3: Infused Adapter by Inhibiting and Amplifying Inner Activations}
+\label{sec:ia3}
+
+IA3 (Liu et al., 2022) learns three vectors $\mathbf{l}_k, \mathbf{l}_v,
+\mathbf{l}_{ff}$ that \emph{rescale} the keys, values, and FFN activations
+element-wise:
+
+\[
+    \vk' = \mathbf{l}_k \odot \vk, \qquad
+    \mathbf{v}' = \mathbf{l}_v \odot \mathbf{v}, \qquad
+    \vh'_{ff} = \mathbf{l}_{ff} \odot \vh_{ff}
+\]
+
+This is the most extreme form of parameter efficiency: only three vectors per
+layer, yielding $\sim$0.01\% trainable parameters.  Quality: 85--90\% of full
+fine-tuning, best for few-shot adaptation.
+
+\subsection{Comprehensive PEFT Comparison}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l c c X@{}}
+\toprule
+\textbf{Method} & \textbf{Mechanism} & \textbf{\% Params} & \textbf{Quality vs.\ Full FT} & \textbf{Inference Overhead} \\
+\midrule
+LoRA          & Low-rank matrices on attn   & 0.1--1\%    & 90--99\%  & None (merge) \\
+QLoRA         & LoRA on 4-bit base model    & 0.1--1\%    & 90--100\% & None (merge) \\
+DoRA          & Magnitude + direction LoRA  & 0.1--1\%    & 92--99\%  & None (merge) \\
+Prefix Tuning & Virtual KV tokens per layer & $\sim$0.1\% & 85--95\%  & Extra KV at every layer \\
+Prompt Tuning & Soft input tokens only      & $< 0.1$\%   & 80--90\%  & Extra input tokens \\
+Adapters      & Bottleneck modules          & 1--5\%      & 95--99\%  & Two MatMuls per layer \\
+IA3           & Learned scaling vectors     & $\sim$0.01\%& 85--90\%  & Negligible (element-wise) \\
+\bottomrule
+\end{tabularx}
+\caption{Comprehensive comparison of PEFT methods.  ``Quality vs.\ Full FT'' indicates
+the typical fraction of full fine-tuning performance retained.  QLoRA reaches
+the top of its range (parity with 16-bit LoRA/full FT) when configured with
+all-linear-layer NF4 adapters (Dettmers et al., 2023); weaker configurations
+land lower.}
+\label{tab:peft-comparison}
+\end{table}
+
+
+% ============================================================================
+% SECTION 6: SUPERVISED FINE-TUNING (SFT) FOR LLMs
+% ============================================================================
+\section{Supervised Fine-Tuning (SFT) for LLMs}
+\label{sec:sft}
+
+Supervised fine-tuning transforms a pre-trained language model (which generates
+arbitrary text completions) into an \emph{instruction-following assistant}
+(which provides helpful, structured responses).  SFT is the bridge between
+pre-training and alignment (RLHF/DPO, covered in Chapter~\ref{chap:rlhf_alignment}).
+
+\subsection{Data Format}
+
+SFT data consists of instruction-response pairs, typically organized in a chat
+format:
+
+\begin{lstlisting}[language={}, caption={Typical SFT training example (ChatML format)}]
+<|system|>
+You are a helpful assistant.
+<|user|>
+Explain the difference between LoRA and full fine-tuning.
+<|assistant|>
+LoRA (Low-Rank Adaptation) freezes the pre-trained weights
+and adds small trainable low-rank matrices...
+\end{lstlisting}
+
+Common chat templates include ChatML (used by OpenAI-style models), Alpaca
+format (instruction/input/output fields), LLaMA chat format (with
+\texttt{[INST]} tags), and Vicuna format.  The exact template
+\emph{must match} what the model was trained with---using the wrong template
+at inference produces degraded outputs.
+
+\subsection{Loss Masking}
+
+A critical implementation detail: during SFT, the loss is computed
+\textbf{only on the assistant tokens}, not on the system prompt or user
+message:
+
+\begin{mathresult}{SFT Loss with Masking}
+\[
+    \loss_{\text{SFT}} = -\sum_{t \in \mathcal{A}} \log P(x_t \mid x_{<t})
+\]
+where $\mathcal{A}$ is the set of positions corresponding to the assistant
+response.  User and system tokens provide context but generate no gradient signal.
+\end{mathresult}
+
+\paragraph{Why mask the prompt.}
+The model should learn to \emph{generate good responses}, not to predict the
+user's question (which would waste capacity learning to model the distribution
+of user inputs rather than the conditional distribution of good responses given
+inputs).
+
+\subsection{Data Quality Matters More Than Quantity}
+
+\begin{keyinsight}[The LIMA Principle: Less Is More for Alignment]
+Zhou et al.\ (2023) demonstrated with LIMA that fine-tuning LLaMA-65B on just
+\textbf{1,000 carefully curated} instruction-response pairs produced a model
+whose responses were, in human evaluations, preferred to or tied with
+DaVinci-003 and Bard in a majority of comparisons---though GPT-4 was still
+preferred over LIMA 57\% of the time.  The
+key finding: a pre-trained model already has the knowledge; SFT mainly teaches
+it the \emph{format and style} of helpful responses.  A few high-quality
+examples are more effective than thousands of noisy ones because they provide a
+clear, consistent signal about how to behave.
+\end{keyinsight}
+
+\paragraph{What makes SFT data high-quality.}
+\begin{itemize}
+    \item \textbf{Correctness:} Responses must be factually accurate.
+    \item \textbf{Diversity:} Cover many task types, complexity levels, and
+          formats (Q\&A, summarization, coding, math, creative writing, etc.).
+    \item \textbf{Consistency:} All examples should follow the same style,
+          formatting, and safety conventions.
+    \item \textbf{Complexity:} Include genuinely hard examples, not just
+          trivial ones---the model needs to learn how to handle difficulty.
+    \item \textbf{Multi-turn coverage:} Include multi-turn conversations to
+          teach context management, not just single-turn Q\&A.
+\end{itemize}
+
+\subsection{SFT as the Bridge to Alignment}
+
+The three-stage LLM training pipeline is:
+\[
+    \text{Pre-training} \xrightarrow{\text{large unlabeled}} \text{SFT}
+    \xrightarrow{\text{small labeled}} \text{RLHF/DPO}
+    \xrightarrow{\text{preferences}} \text{Aligned Model}
+\]
+
+SFT provides the behavioral foundation: it teaches the model the
+\emph{format} of being helpful (respond in complete sentences, follow
+instructions, refuse harmful requests).  Alignment (RLHF/DPO) then refines
+the \emph{quality} of that behavior using preference data.  Without SFT, RLHF
+struggles because the model does not know how to produce well-formed responses
+that can be meaningfully compared.
+
+
+% ============================================================================
+% SECTION 7: INTERVIEW QUESTIONS
+% ============================================================================
+\section{Interview Questions}
+\label{sec:pretraining-questions}
+
+%% QUESTION 1 %%
+\begin{interviewq}
+\textbf{Q: Explain LoRA. Why does it work? How do you choose rank and alpha?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+LoRA freezes the pre-trained weight matrix $\mW_0 \in \R^{d \times k}$ and adds a
+low-rank update $\Delta\mW = \mB\mA$ where $\mB \in \R^{d \times r}$ and
+$\mA \in \R^{r \times k}$, with $r \ll \min(d, k)$.  Only $\mA$ and $\mB$ are
+trained---typically 0.1--1\% of total parameters.  It works because fine-tuning
+updates are empirically low-rank: the intrinsic dimensionality of the fine-tuning
+optimization landscape is much smaller than the full parameter count (Aghajanyan
+et al., 2021 showed intrinsic dimension $\sim$200--800 for BERT tasks on 110M
+parameters).  The model already has good representations; adaptation only needs
+adjustments in a low-dimensional subspace.
+
+$\mB$ is initialized to zero and $\mA$ to random Gaussian so that $\Delta\mW = 0$
+at the start---the model begins from exactly the pre-trained weights.  The effective
+update is scaled by $\alpha/r$, where $\alpha$ controls adaptation strength.  For
+rank: $r = 16$--$32$ is a good default; increase for complex tasks or large domain
+shifts.  For alpha: $\alpha = 2r$ is a common starting point.  Keeping $\alpha/r$
+constant when sweeping $r$ maintains consistent update magnitude.  After training,
+$\mB\mA$ merges into $\mW_0$ for zero inference overhead.
+
+\redflags
+\begin{itemize}
+    \item Cannot state the formula $\mW = \mW_0 + \mB\mA$
+    \item Does not know that $\mB$ is initialized to zero (and why)
+    \item Cannot explain the intrinsic dimensionality argument for why low-rank works
+    \item Unaware of the merging property for zero inference overhead
+\end{itemize}
+
+\interviewtest{Whether the candidate understands LoRA at a mathematical level, not just
+as a library call.  Can they explain the low-rank hypothesis, the initialization choice,
+and the practical implications (merging, multi-task serving)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the formula, explains the initialization and merging
+          property, gives reasonable defaults for $r$ and $\alpha$
+    \item \badgeLsix{L6} Derives the parameter count savings quantitatively, explains
+          the intrinsic dimensionality argument, discusses which modules to apply LoRA
+          to and why, and compares with other PEFT methods
+    \item \badgeLseven{L7} Discusses the spectral analysis of weight updates, connects
+          to matrix completion theory, addresses when LoRA fails (high-rank updates
+          needed for large distribution shifts), and describes multi-adapter serving
+          architectures
+\end{itemize}
+
+\followups{How does the gradient flow through frozen weights in LoRA?  What is
+QLoRA?  When would LoRA fail?  How would you serve 100 different LoRA adapters
+from one base model?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 2 %%
+\begin{interviewq}
+\textbf{Q: When would you use LoRA vs.\ full fine-tuning? When would LoRA fail?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+\textbf{Use LoRA when:} (1) The base model is large (7B+) and full fine-tuning
+is memory-prohibitive. (2) You need to serve multiple tasks from one base model.
+(3) The downstream task is reasonably close to the pre-training distribution.
+(4) You need fast iteration (LoRA's dominant saving is \emph{memory}---far
+smaller optimizer states enable larger batches on the same hardware; the
+wall-clock speedup itself is a more modest $\sim$1.2--1.5$\times$, since
+activations and the full backward pass through the frozen network remain).
+
+\textbf{Use full fine-tuning when:} (1) Maximum quality is required and you have
+the compute budget. (2) The domain shift is extreme (e.g., pre-trained on English
+web text, fine-tuning for specialized medical code in another language). (3) The
+model is small enough that full fine-tuning is feasible (under 1B parameters).
+(4) You are doing continued pre-training (not just task adaptation).
+
+\textbf{LoRA fails when:} (1) The required weight update is genuinely high-rank---
+this happens when the target distribution differs substantially from pre-training
+(the model needs to ``unlearn'' and ``relearn'' many patterns). (2) The task requires
+modifying the embedding layer significantly (e.g., adding a new language). (3) Very
+low rank is used for a complex task---the bottleneck starves the model of capacity.
+
+\redflags
+\begin{itemize}
+    \item Says ``always use LoRA'' or ``always use full fine-tuning''
+    \item Cannot articulate a concrete scenario where LoRA would fail
+    \item Does not mention memory/compute as the primary practical motivation
+\end{itemize}
+
+\interviewtest{Whether the candidate can make nuanced engineering decisions about
+adaptation methods rather than defaulting to one approach.  This tests production
+maturity and understanding of tradeoffs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Gives clear criteria for each approach with concrete examples
+    \item \badgeLsix{L6} Quantifies the memory and compute savings, discusses the rank
+          vs.\ quality tradeoff with specific numbers, mentions QLoRA as a middle ground
+    \item \badgeLseven{L7} Discusses the theoretical conditions under which low-rank
+          approximation is insufficient, connects to the singular value distribution of
+          gradient updates, and describes hybrid approaches (full fine-tuning some layers,
+          LoRA for others)
+\end{itemize}
+
+\followups{How would you decide the rank for a specific task?  What if you need to
+add a new language to the model?  How does LoRA interact with quantization?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 3 %%
+\begin{interviewq}
+\textbf{Q: Compare LoRA, prefix tuning, and prompt tuning. What are the tradeoffs?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{LoRA} adds low-rank matrices to attention (and optionally FFN) weights.
+Trainable params: 0.1--1\%.  After training, merges into base weights for zero
+inference overhead.  Quality: 90--99\% of full fine-tuning.  Best all-around
+PEFT method.
+
+\textbf{Prefix tuning} prepends learnable virtual tokens to keys and values at
+every layer.  Trainable params: $\sim$0.1\%.  Adds inference overhead (extra KV
+per layer) and consumes context window positions.  Quality: 85--95\%.  Cannot
+merge into base weights.
+
+\textbf{Prompt tuning} adds learnable soft tokens to the input embedding only (not
+every layer).  Trainable params: $< 0.1\%$.  Simplest method, fewest parameters.
+Quality scales with model size: poor below 1B, competitive above 10B.
+
+\textbf{Key tradeoffs:} (1) LoRA is the only method with zero inference overhead
+(via merging). (2) Prompt tuning is the simplest but works well only for large
+models. (3) Prefix tuning is more expressive than prompt tuning (touches every
+layer) but less so than LoRA (cannot modify weight behavior, only prepend context).
+(4) LoRA modifies \emph{how} the model processes tokens; prefix/prompt tuning
+modifies \emph{what} the model processes (by adding virtual context).
+
+\redflags
+\begin{itemize}
+    \item Conflates prefix tuning with prompt tuning
+    \item Does not mention LoRA's merging advantage
+    \item Cannot explain the architectural difference (weight modification vs.\ input modification)
+\end{itemize}
+
+\interviewtest{Whether the candidate understands the \emph{mechanism} of each method,
+not just their names.  The weight vs.\ input modification distinction is the key
+conceptual insight.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes all three methods with parameter counts
+          and quality ranges
+    \item \badgeLsix{L6} Explains the architectural distinction (weight modification
+          vs.\ virtual token injection), discusses when each is appropriate, and mentions
+          adapters and IA3 as additional alternatives
+    \item \badgeLseven{L7} Discusses the theoretical expressiveness hierarchy, connects
+          prefix tuning to the kernel perspective on attention, and analyzes how
+          different methods compose (e.g., LoRA + prompt tuning)
+\end{itemize}
+
+\followups{Can you combine LoRA with prefix tuning?  How does prompt tuning relate
+to discrete prompt engineering?  What is IA3?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 4 %%
+\begin{interviewq}
+\textbf{Q: How would you fine-tune an LLM for a domain-specific task with only
+1,000 labeled examples?}
+
+\badgeLfive{L5} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+With only 1,000 examples, full fine-tuning of a large LLM risks severe overfitting.
+My approach:
+
+(1)~\textbf{Start with LoRA} (rank 16--32) on a strong base model (e.g., LLaMA-2 7B
+or 13B).  Low-rank adaptation with few parameters is naturally regularizing.
+(2)~\textbf{Data quality audit:} ensure the 1,000 examples are diverse, correct,
+and representative.  1,000 high-quality examples can be remarkably effective (LIMA
+demonstrated this).
+(3)~\textbf{LoRA-appropriate learning rate} ($1\text{e-}4$ to $3\text{e-}4$,
+roughly $10\times$ the full fine-tuning rate, because only the small adapter
+matrices are being trained) with cosine schedule and warmup.
+(4)~\textbf{Train for 3--5 epochs} with early stopping based on validation loss.
+(5)~\textbf{Data augmentation:} use the base model itself to generate synthetic
+examples (bootstrap from the 1,000), filter by quality, and add to training.
+(6)~\textbf{Evaluation:} hold out 10--15\% for validation; use task-specific
+metrics, not just loss.
+
+If quality is still insufficient: (7)~continued pre-training on domain-specific
+unlabeled text (before SFT) to adapt the model's representations to the domain.
+(8)~Few-shot prompting as a baseline---for some tasks, a well-prompted LLM with
+5 examples outperforms fine-tuning on 1,000 examples when the fine-tuning data
+is noisy.
+
+\redflags
+\begin{itemize}
+    \item Proposes full fine-tuning of a 70B model on 1,000 examples without
+          acknowledging overfitting risk
+    \item Does not mention LoRA or any PEFT method
+    \item Ignores data quality and diversity considerations
+    \item Does not mention evaluation strategy
+\end{itemize}
+
+\interviewtest{Practical ML engineering judgment.  Can the candidate design an
+end-to-end fine-tuning strategy with appropriate regularization, data management,
+and evaluation under real-world constraints?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes LoRA with reasonable hyperparameters, mentions
+          overfitting risk and early stopping
+    \item \badgeLsix{L6} Discusses continued pre-training as a preliminary step,
+          synthetic data augmentation, compares with few-shot prompting baseline,
+          and designs an evaluation strategy
+    \item \badgeLseven{L7} Designs a full pipeline: domain-adaptive pre-training,
+          data augmentation with self-consistency filtering, LoRA fine-tuning with
+          hyperparameter search over rank, active learning loop to acquire more
+          labeled data, and production monitoring for domain drift
+\end{itemize}
+
+\followups{How would you do continued pre-training?  How would you decide
+between LoRA and few-shot prompting?  What if the 1,000 examples are noisy?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 5 %%
+\begin{interviewq}
+\textbf{Q: What is catastrophic forgetting? How do you mitigate it during fine-tuning?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Catastrophic forgetting occurs when fine-tuning on a downstream task causes the model
+to lose knowledge acquired during pre-training.  The parameters shift to optimize
+the new loss, destructively overwriting representations that encoded general
+language understanding.  The smaller the fine-tuning dataset and the higher the
+learning rate, the more severe the forgetting.
+
+Mitigations: (1)~\textbf{Low learning rate} ($1\text{e-}5$ to $5\text{e-}5$)---the
+single most important factor. (2)~\textbf{Gradual unfreezing} (ULMFiT)---train the
+task head first, then unfreeze layers top-to-bottom. (3)~\textbf{Regularization}---
+weight decay keeps parameters near pre-trained values; EWC penalizes changes to
+parameters important for pre-training. (4)~\textbf{Early stopping}---fine-tuning
+peaks in 2--3 epochs. (5)~\textbf{Data replay}---mix pre-training-style data into
+fine-tuning batches. (6)~\textbf{PEFT methods} (LoRA, adapters)---by only modifying
+a small fraction of parameters, the vast majority of pre-trained knowledge is
+preserved by design.
+
+PEFT methods are arguably the most effective mitigation because they structurally
+prevent forgetting: the base weights are literally frozen.
+
+\redflags
+\begin{itemize}
+    \item Cannot define catastrophic forgetting
+    \item Only mentions ``use a small learning rate'' with no other mitigations
+    \item Does not connect PEFT methods to forgetting prevention
+\end{itemize}
+
+\interviewtest{Understanding of a fundamental challenge in transfer learning and the
+ability to propose multiple, principled mitigations.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Defines forgetting clearly, lists 3+ mitigations with
+          rationale for each
+    \item \badgeLsix{L6} Discusses EWC formally, connects to continual learning
+          literature, explains why PEFT methods structurally prevent forgetting
+    \item \badgeLseven{L7} Discusses the loss landscape geometry of forgetting
+          (mode connectivity, linear mode connectivity), analyzes the tradeoff
+          between plasticity and stability, and connects to multi-task learning
+\end{itemize}
+
+\followups{What is Elastic Weight Consolidation?  How does forgetting differ for
+encoder-only vs.\ decoder-only models?  Can you recover from forgetting?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 6 %%
+\begin{interviewq}
+\textbf{Q: Why is data quality more important than data quantity for SFT?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+During pre-training, the model already acquires broad language understanding and
+factual knowledge from trillions of tokens.  SFT does not teach the model
+\emph{new knowledge}---it teaches the model a \emph{behavioral format}: how to
+structure responses, follow instructions, and be helpful.  The LIMA paper (Zhou
+et al., 2023) showed that 1,000 high-quality examples are sufficient to align a
+65B model's behavior, while Alpaca-style models trained on 52K noisy synthetic
+examples performed worse on many dimensions.
+
+The reason: noisy or inconsistent SFT data sends conflicting signals about the
+desired behavior, causing the model to learn an averaged (mediocre) response
+style.  High-quality data provides a clear, coherent target.  Additionally,
+because SFT datasets are small relative to pre-training data, each example has
+outsized influence on the model's behavior---one bad example in 1,000 has far
+more impact than one bad document in a trillion-token corpus.
+
+This principle also extends to diversity: covering many task types matters more
+than having many examples of the same type.  10 diverse, high-quality examples
+across 100 task types teach more than 1,000 examples of a single task type.
+
+\redflags
+\begin{itemize}
+    \item Says ``more data is always better'' without qualification
+    \item Does not distinguish the role of SFT from pre-training
+    \item Unaware of the LIMA result or similar findings
+\end{itemize}
+
+\interviewtest{Whether the candidate understands the distinct roles of pre-training
+(knowledge acquisition) and SFT (behavior formatting), and can reason about data
+efficiency.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains the knowledge-vs.-behavior distinction and
+          references LIMA
+    \item \badgeLsix{L6} Discusses the data quality dimensions (correctness, diversity,
+          consistency, complexity), contrasts with pre-training data strategy, and
+          explains why synthetic data quality is critical for SFT
+    \item \badgeLseven{L7} Connects to the broader alignment tax concept, discusses
+          how data quality interacts with model scale, and analyzes the failure modes
+          of low-quality SFT data (sycophancy, hallucination amplification,
+          inconsistent safety behavior)
+\end{itemize}
+
+\followups{How would you create high-quality SFT data?  What role does synthetic
+data play?  How do you evaluate SFT data quality before training?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 7 %%
+\begin{interviewq}
+\textbf{Q: Explain ELECTRA's pre-training approach. Why is it more efficient than MLM?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+ELECTRA replaces masked language modeling with replaced token detection (RTD).
+A small generator network (trained with MLM) produces plausible replacement tokens
+for masked positions.  The main model (the discriminator) receives the corrupted
+sequence and classifies each token as ``real'' (original) or ``replaced'' (from the
+generator).  The generator is discarded after pre-training; only the discriminator
+is used for fine-tuning.
+
+The efficiency advantage is dramatic: MLM provides training signal at only the 15\%
+of tokens that are masked.  ELECTRA provides signal at \emph{100\%} of tokens---
+every position is classified.  This $\sim$7$\times$ increase in per-example signal
+means ELECTRA matches BERT's performance with roughly 1/4 the compute.  With equal
+compute, ELECTRA significantly outperforms BERT.
+
+The key insight is that detection is an easier task than generation (binary
+classification vs.\ predicting from a 30K+ vocabulary), so even a small discriminator
+can learn effectively from every position.  The generator only needs to be good
+enough to produce ``hard'' negatives---tokens that are plausible but wrong.
+
+\redflags
+\begin{itemize}
+    \item Confuses the generator and discriminator roles
+    \item Cannot explain why 100\% vs.\ 15\% signal matters for efficiency
+    \item Describes ELECTRA as a GAN (it is not---the generator is trained with MLM,
+          not adversarially)
+\end{itemize}
+
+\interviewtest{Whether the candidate understands alternative pre-training objectives
+beyond the standard BERT/GPT approaches, and can reason about sample efficiency.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes the generator-discriminator setup and
+          the efficiency argument
+    \item \badgeLsix{L6} Explains why ELECTRA is not a GAN (different training
+          objectives), discusses the generator size tradeoff (too small: easy negatives;
+          too large: wastes compute), and compares quantitatively with MLM
+    \item \badgeLseven{L7} Discusses the connection to noise-contrastive estimation,
+          analyzes the theoretical sample complexity advantage, and connects to
+          energy-based models and discriminative vs.\ generative pre-training
+\end{itemize}
+
+\followups{Why is ELECTRA not a GAN?  What happens if the generator is too good?
+How does ELECTRA compare to T5's span corruption?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 8 %%
+\begin{interviewq}
+\textbf{Q: What is the difference between feature extraction and fine-tuning?
+When would you use each?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{Feature extraction} freezes all pre-trained weights and trains only a
+task-specific head (typically a linear layer or small MLP) on top of the model's
+output representations.  The pre-trained model is a static feature extractor.
+\textbf{Fine-tuning} updates all (or most) model parameters end-to-end on the
+downstream task, allowing the representations themselves to adapt.
+
+Fine-tuning typically outperforms feature extraction by 2--5\% absolute because
+it adapts the internal representations to the specific task distribution.  However,
+feature extraction is preferred when: (1)~labeled data is extremely limited
+(tens of examples---fine-tuning would overfit). (2)~Compute is constrained
+(feature extraction requires only one forward pass to extract features, then
+trains a lightweight classifier). (3)~You need to preserve the base model
+exactly (e.g., using the same model for multiple tasks without any modification).
+(4)~As a quick baseline before investing in fine-tuning.
+
+In practice, PEFT methods like LoRA occupy the middle ground: they update more
+than feature extraction (the low-rank matrices adapt the representations) but far
+less than full fine-tuning, combining the quality advantage of adaptation with the
+efficiency of limited parameter updates.
+
+\redflags
+\begin{itemize}
+    \item Cannot articulate the difference clearly
+    \item Says fine-tuning is always better (ignores low-data and compute-constrained
+          scenarios)
+    \item Does not mention PEFT as a middle ground
+\end{itemize}
+
+\interviewtest{Whether the candidate understands the spectrum of adaptation strategies
+and can make appropriate choices based on constraints.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly distinguishes the two approaches, gives conditions
+          for choosing each
+    \item \badgeLsix{L6} Discusses layer-wise feature quality (earlier layers more
+          general, later layers more task-specific), mentions probing experiments, and
+          positions PEFT methods on the spectrum
+    \item \badgeLseven{L7} Discusses the representation learning perspective (when do
+          pre-trained features need adaptation vs.\ when are they sufficient), connects
+          to the lottery ticket hypothesis, and analyzes how model scale affects the
+          feature-extraction-vs.-fine-tuning tradeoff
+\end{itemize}
+
+\followups{Which layer's representations are best for feature extraction?  How does
+model size affect the gap between feature extraction and fine-tuning?  What is
+probing and why does it matter?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 9 %%
+\begin{interviewq}
+\textbf{Q: Walk through the QLoRA paper. How does it enable fine-tuning a 65B
+model on a single GPU?}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+QLoRA combines three innovations to make large-model fine-tuning memory-feasible.
+
+(1)~\textbf{NF4 quantization:} Base model weights are stored in 4-bit precision
+using a data type whose quantization bins are optimally spaced for normally
+distributed values (which pre-trained weights empirically follow).  This reduces
+the base model from $\sim$130\,GB (FP16) to $\sim$33\,GB for a 65B model.
+
+(2)~\textbf{Double quantization:} Each block of 64 weights has a FP32 quantization
+constant (scale factor).  These constants are themselves quantized to FP8, reducing
+the overhead from $\sim$0.5 bits/parameter to $\sim$0.13 bits/parameter---saving
+$\sim$3\,GB for a 65B model.
+
+(3)~\textbf{Paged optimizers:} When gradient computation causes GPU memory spikes,
+optimizer states are offloaded to CPU RAM via CUDA unified memory, then paged back
+when needed.
+
+During the forward pass, 4-bit weights are dequantized to BF16 for computation.
+LoRA adapters ($\mA, \mB$) remain in BF16 throughout.  Gradients only update the
+LoRA parameters---the quantized base weights are never modified.  Total memory
+for a 65B model: $\sim$33\,GB base + $\sim$0.5\,GB LoRA + optimizer states for
+LoRA only $\approx$ fits in a single 48\,GB A6000 GPU.
+
+\redflags
+\begin{itemize}
+    \item Does not know what NF4 is or why normal-float is better than uniform INT4
+    \item Cannot explain double quantization
+    \item Thinks the 4-bit weights are trained (they are frozen)
+\end{itemize}
+
+\interviewtest{Whether the candidate understands the systems-level innovations that
+make large-scale PEFT practical, not just the algorithmic idea.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes the three innovations and the overall memory savings
+    \item \badgeLsix{L6} Explains NF4 vs.\ uniform quantization, quantifies memory at
+          each stage, and discusses the quality-memory tradeoff
+    \item \badgeLseven{L7} Discusses the interaction between quantization error and LoRA
+          rank, compares with GPTQ/AWQ post-training quantization, and analyzes when
+          QLoRA quality degrades (very low bit-widths, models with outlier activations)
+\end{itemize}
+
+\followups{What is the difference between QLoRA and GPTQ?  How does quantization
+affect LoRA's effective rank?  Can you do QLoRA with 2-bit quantization?}
+\end{interviewq}
+
+\bigskip
+
+%% QUESTION 10 %%
+\begin{interviewq}
+\textbf{Q: Compare the major pre-training objectives: MLM, CLM, span corruption,
+and ELECTRA. When would you choose each?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{MLM (BERT):} Bidirectional, predicts 15\% of tokens.  Best for
+understanding tasks (classification, NER, retrieval) where full context is
+available at inference.  Limitation: 15\% signal is sample-inefficient; cannot
+generate text natively.
+
+\textbf{CLM (GPT):} Unidirectional, predicts every token left-to-right.  Best for
+generation, in-context learning, and general-purpose LLMs.  100\% signal makes it
+more data-efficient.  Limitation: no right context for understanding tasks.
+
+\textbf{Span corruption (T5):} Bidirectional encoder + autoregressive decoder.  Best
+for structured input-output tasks (translation, summarization, structured extraction).
+The encoder-decoder split naturally separates understanding and generation.
+
+\textbf{ELECTRA (RTD):} Bidirectional, 100\% signal via replaced token detection.
+Most sample-efficient for encoder models.  Best when compute is limited and you
+need a strong encoder for understanding tasks.
+
+Decision framework: (1)~If generation is the primary use case $\rightarrow$ CLM.
+(2)~If understanding/classification with unlimited compute $\rightarrow$ ELECTRA.
+(3)~If structured seq2seq tasks $\rightarrow$ span corruption. (4)~If a simple,
+well-understood baseline $\rightarrow$ MLM.  In practice, CLM dominates the LLM
+era because decoder-only models handle both generation and understanding (via
+in-context learning), even though encoder-only models may be superior for
+pure understanding tasks.
+
+\redflags
+\begin{itemize}
+    \item Can only describe one or two objectives
+    \item Does not mention the signal-per-token efficiency difference
+    \item Cannot articulate when to choose each objective
+\end{itemize}
+
+\interviewtest{Breadth and depth of understanding across the pre-training landscape,
+and the ability to reason about tradeoffs rather than memorize facts.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes all four objectives and gives use cases
+    \item \badgeLsix{L6} Compares sample efficiency quantitatively, discusses UL2
+          (combining multiple objectives) and PrefixLM, and explains why CLM dominates
+          despite MLM's theoretical advantage for understanding
+    \item \badgeLseven{L7} Discusses the information-theoretic perspective (mutual
+          information between masked/predicted tokens and context), analyzes the
+          pretraining-objective-to-capability mapping, and connects to the broader
+          question of whether architectural inductive biases or objective functions
+          matter more at scale
+\end{itemize}
+
+\followups{What is UL2?  Why did the field converge on CLM despite MLM being better
+for understanding?  How does denoising (BART) compare to span corruption (T5)?}
+\end{interviewq}
+
+
+% ============================================================================
+% CHAPTER SUMMARY
+% ============================================================================
+\section*{Chapter Summary}
+
+\begin{enumerate}
+    \item \textbf{Pre-training objectives} determine model capabilities:
+          MLM provides bidirectional understanding, CLM enables generation and
+          in-context learning, span corruption bridges both via encoder-decoder
+          architecture, and ELECTRA achieves maximum sample efficiency through
+          replaced token detection.
+
+    \item \textbf{Pre-training data quality} is the most underappreciated
+          factor in LLM development.  The pipeline of language ID, deduplication,
+          quality filtering, and domain mixing directly determines what the model
+          knows and how well it performs.
+
+    \item \textbf{Transfer learning} works because pre-training learns
+          universal language representations---syntax, semantics, world
+          knowledge---that transfer across downstream tasks with minimal
+          labeled data.
+
+    \item \textbf{Full fine-tuning} updates all parameters and achieves the
+          highest quality, but risks catastrophic forgetting.  Mitigations
+          include low learning rates, gradual unfreezing, regularization, and
+          early stopping.
+
+    \item \textbf{LoRA} is the dominant PEFT method: it adds low-rank matrices
+          $\mB\mA$ to frozen weights, trains 0.1--1\% of parameters, and merges
+          for zero inference overhead.  The intrinsic dimensionality of
+          fine-tuning justifies the low-rank assumption.
+
+    \item \textbf{QLoRA} extends LoRA to models that would not otherwise fit
+          in memory by quantizing the base model to 4-bit (NF4) with double
+          quantization, enabling 65B-parameter fine-tuning on a single GPU.
+
+    \item \textbf{Other PEFT methods}---prefix tuning, prompt tuning, adapters,
+          IA3, DoRA---offer different tradeoffs in parameter efficiency,
+          inference overhead, and quality.  LoRA dominates in practice due to
+          its combination of quality, efficiency, and zero inference overhead.
+
+    \item \textbf{Supervised fine-tuning (SFT)} transforms pre-trained models
+          into instruction-following assistants.  Data quality matters far more
+          than quantity: 1,000 high-quality examples can be sufficient (LIMA).
+          Loss masking on assistant tokens only is a critical implementation
+          detail.
+
+    \item \textbf{The three-stage pipeline}---pre-training, SFT, alignment---is
+          the standard recipe for building production LLMs.  Each stage serves a
+          distinct purpose: knowledge acquisition, behavioral formatting, and
+          quality refinement.
+\end{enumerate}
