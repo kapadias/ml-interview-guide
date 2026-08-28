@@ -1,5 +1,5 @@
 # ML Interview Guide — single-repo build for all four volumes.
-TEX ?= tectonic
+ENGINE ?= tectonic
 VOLS := deep-learning nlp search-recommendation conventional-ml
 
 .PHONY: all check sync-style $(VOLS)
@@ -7,7 +7,7 @@ VOLS := deep-learning nlp search-recommendation conventional-ml
 all: check $(VOLS)
 
 $(VOLS):
-	cd volumes/$@ && $(TEX) main.tex
+	cd volumes/$@ && $(ENGINE) main.tex
 
 check:
 	python3 ci/check_drift.py --root volumes
