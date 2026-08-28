@@ -2,7 +2,8 @@
 % CHAPTER 8: RLHF AND ALIGNMENT
 % ============================================================================
 % Covers the full alignment pipeline: reward modeling, PPO, DPO, CAI,
-% process reward models, and the practical challenges of aligning LLMs.
+% process reward models, the 2025-26 RLVR/GRPO recipe in practice, and
+% the practical challenges of aligning LLMs.
 % ============================================================================
 
 \chapter{RLHF and Alignment}
@@ -12,8 +13,10 @@
 Alignment transforms capable but potentially harmful base models into
 helpful, harmless, and honest assistants.  This chapter covers the complete
 alignment pipeline: reward model training from human preferences, PPO
-optimization with KL constraints, DPO as a simpler alternative, and
-Constitutional AI for scalable oversight.  Understanding RLHF is essential
+optimization with KL constraints, DPO as a simpler alternative,
+Constitutional AI for scalable oversight, and the 2025--26 shift to
+verifiable rewards and GRPO that now carries reasoning training
+(Section~\ref{sec:rlvr_practice}).  Understanding RLHF is essential
 for interviews at companies building or deploying LLMs---alignment is what
 turned GPT-3 into ChatGPT, and every frontier lab now invests heavily in
 these techniques.
@@ -160,8 +163,11 @@ For each training example, human annotators are presented with:
 
 Data quality considerations include: clear annotation guidelines, annotator
 calibration (inter-annotator agreement), diversity of prompts (topics,
-difficulty, safety), and filtering for low-quality annotations.  Typical
-datasets range from 50K to 500K preference pairs.
+difficulty, safety), and filtering for low-quality annotations.
+InstructGPT-era datasets ranged from 50K to 500K preference pairs; by 2026,
+frontier pipelines train reward models on \emph{millions} of pairs, the
+majority synthetic---model-generated responses ranked by AI judges
+(Section~\ref{sec:cai})---built around a smaller human-labeled core.
 
 \subsection{The Bradley-Terry Model}
 
@@ -225,6 +231,11 @@ gives it a strong starting representation of what good responses look like.
 \item \textbf{Listwise ranking:} Extending beyond pairwise comparisons,
   some approaches rank $K > 2$ responses per prompt, yielding
   $\binom{K}{2}$ preference pairs per annotation.
+\item \textbf{Evaluation:} \textbf{RewardBench} (2024) is the standard
+  public reference point for evaluating reward models (held-out
+  preference accuracy across chat, safety, and reasoning categories),
+  though a high benchmark score does not guarantee robustness to hacking
+  under RL optimization pressure.
 \end{itemize}
 
 \begin{keyinsight}[The Reward Model Is the Bottleneck]
@@ -274,6 +285,21 @@ imperfections in the reward model---producing gibberish that happens to
 score highly, or collapsing to a single memorized high-reward response.
 The KL penalty keeps the policy close to the SFT model, which serves as a
 ``sanity anchor'' ensuring the outputs remain coherent and diverse.
+
+\paragraph{Magnitudes.}
+Interviewers expect numbers here, and the chapter's qualitative story has
+concrete anchors.  The KL coefficient $\beta$ is typically
+\textbf{0.01--0.2} for RM-based RLHF; many implementations use an adaptive
+controller that adjusts $\beta$ to hold a target KL rather than fixing it.
+The realized \textbf{KL budget is small}: well-tuned runs keep the policy
+within \textbf{single-digit nats per sequence} of the reference model---a
+few nats is common, and a run drifting to tens of nats per sequence is
+usually already reward hacking (Section~\ref{sec:reward_hacking}).
+Compute-wise, the RL stage typically costs \textbf{3--5$\times$ the SFT
+stage}---dominated by rollout generation, not gradient steps
+(Section~\ref{sec:rlhf_infra})---while remaining a small fraction of
+pretraining compute; large 2025-era reasoning-RL runs push the multiple
+higher still.
 
 \paragraph{The combined reward.}
 In practice, the KL penalty is folded into the reward signal as a per-token
@@ -984,17 +1010,344 @@ Most frontier labs have followed a recipe similar to:
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Pretraining:} Train the base model on trillions of tokens.
 \item \textbf{SFT:} Fine-tune on high-quality instruction-response pairs
-  (10K--100K examples). Quality matters far more than quantity (LIMA: ``Less
-  Is More for Alignment'').
+  (10K--100K examples, at this era's scale). Quality matters far more than
+  quantity (LIMA, 2023: ``Less Is More for Alignment'')---see
+  Section~\ref{sec:staged_pipeline} for how the scale, though not the
+  quality lesson, has since changed.
 \item \textbf{Preference optimization:} Apply DPO or RLHF on 50K--500K
-  preference pairs.  Some labs do iterative rounds: collect preferences
-  on the current model's outputs, optimize, repeat.
+  preference pairs (again, this era's scale).  Some labs do iterative
+  rounds: collect preferences on the current model's outputs, optimize,
+  repeat.
 \item \textbf{Safety fine-tuning:} Additional alignment specifically
   targeting safety (refusal of harmful requests, reducing bias), often
   with targeted red-teaming data.
 \item \textbf{Constitutional / rule-based guardrails:} Deploy with input
   and output safety classifiers as a final layer of defense.
 \end{enumerate}
+
+
+% ============================================================================
+\section{The 2025--26 Recipe: RLVR and GRPO in Practice}
+\label{sec:rlvr_practice}
+% ============================================================================
+
+Between 2024 and 2026 the center of gravity of post-training shifted.
+Everything in this chapter still runs---SFT, reward models, DPO, and
+KL-anchored RL all survive---but for every domain where correctness can be
+\emph{checked by a program}, the learned reward model has been replaced or
+augmented by \textbf{verifiable rewards}:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Unit tests} for code: reward 1 if the generated program
+  passes the test suite, 0 otherwise.
+\item \textbf{Math checkers:} extract the final answer (e.g., from a
+  \texttt{\textbackslash boxed\{\}} expression) and compare it against
+  ground truth with symbolic-equivalence rules.
+\item \textbf{Format checks:} reward adherence to the required structure
+  (reasoning inside \texttt{<think>} tags, a parseable final answer).
+\end{itemize}
+
+This regime---\textbf{RLVR} (RL with Verifiable Rewards)---matters
+operationally as much as conceptually.  A verifier does not drift as the
+policy improves, has no length or sycophancy bias, and never needs a
+preference-data refresh, so RLVR runs tolerate far more optimization
+pressure than RM-based RLHF: KL anchoring is weakened or (in some recipes)
+dropped entirely.  Open-ended helpfulness, style, and safety remain
+unverifiable, so learned reward models and preference data keep their
+role---the modern pipeline uses both, in different stages
+(Section~\ref{sec:staged_pipeline}).
+
+\paragraph{GRPO in one paragraph.}
+The workhorse optimizer of RLVR is \textbf{GRPO} (Group Relative Policy
+Optimization; DeepSeekMath 2024, DeepSeek-R1 2025), which is PPO with the
+critic deleted.  For each prompt, sample a \emph{group} of $K$ responses
+from the current policy and score each with the (usually verifiable)
+reward; the advantage of response $i$ is its group-normalized reward,
+$\hat{A}_i = \bigl(r_i - \operatorname{mean}(r_{1:K})\bigr) /
+\operatorname{std}(r_{1:K})$, assigned identically to every token of that
+response.  The update is PPO's clipped surrogate with a per-token KL
+penalty to the reference model, but with \emph{no value network}: the
+group mean replaces the critic's baseline.  With a rule-based verifier
+this cuts PPO's four-model lineup (Table~\ref{tab:four_models}) to
+\textbf{two models in memory}---policy and reference.  The full
+derivation, the exact objective, and the pathology-and-fix catalogue
+(zero-advantage groups, difficulty and length biases, entropy collapse;
+DAPO and Dr.~GRPO) are canonical in [DL~17]---this chapter takes the
+optimizer as given and covers how it is \emph{run}.
+
+\subsection{The Practice Knobs}
+
+These are the numbers that separate ``has read the papers'' from ``has run
+the pipeline'' in an interview:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Knob} & \textbf{Typical setting} & \textbf{Why} \\
+\midrule
+KL coefficient $\beta$ & 0.01--0.2 (RM-based); much smaller or 0 for RLVR &
+  Learned RMs need tight anchoring; verifiers tolerate pressure, and some
+  RLVR recipes (e.g., DAPO) drop the KL term entirely \\
+KL budget & Single-digit nats per sequence &
+  Realized $\KL(\pi_\theta \| \pi_{\text{ref}})$ held to a few nats per
+  response, often via an adaptive $\beta$ controller; tens of nats
+  usually means hacking \\
+Group size $K$ (GRPO) & 8--64 responses per prompt &
+  Larger $K$ gives a lower-variance baseline and better pass@$K$
+  coverage of hard prompts, at linear rollout cost \\
+Rollout\,:\,training compute & $\sim$80\,:\,20 &
+  Autoregressive generation of $K$ long responses per prompt dominates
+  wall-clock; the gradient step over the same tokens is comparatively
+  cheap \\
+Iteration structure & On-policy batches; 1--few gradient steps per batch &
+  Generate a batch with current weights $\to$ update $\to$ sync weights
+  to the rollout engine; minibatch reuse is limited to keep the
+  importance ratios near 1 \\
+Reward refresh & RM: periodic retraining; verifier: never &
+  A learned RM goes stale as the policy distribution moves and must be
+  refreshed on fresh preferences; a unit test or math checker is stable
+  for the whole run \\
+RL\,:\,SFT compute & $\sim$3--5$\times$ (higher for long reasoning runs) &
+  The RL stage costs a small multiple of SFT and a small fraction of
+  pretraining; generation, not gradients, is where it goes \\
+\bottomrule
+\end{tabularx}
+\caption{Operational knobs of 2025--26 RLHF/RLVR practice and their
+typical magnitudes.}
+\label{tab:rlvr_knobs}
+\end{table}
+
+\subsection{The Staged Pipeline as Practiced}
+\label{sec:staged_pipeline}
+
+The three-stage InstructGPT pipeline has grown into a four-stage recipe in
+which each stage uses the cheapest reward signal that suffices:
+
+\begin{enumerate}[leftmargin=*]
+\item \textbf{SFT at scale:} \emph{millions} of instruction-response
+  examples, the large majority synthetic---distilled reasoning traces,
+  model-written and model-filtered chat, code, math, and tool-use data---%
+  replacing the 10K--100K human-written demonstrations of the
+  InstructGPT era.  LIMA (2023) survives as the quality-over-quantity
+  counterpoint, but it was a claim about \emph{style} transfer with
+  1K examples; 2026-scale SFT is teaching formats, tools, and reasoning
+  behaviors, and quantity came back once synthesis made quality scalable.
+\item \textbf{RLVR on reasoning domains:} GRPO-style RL against unit
+  tests, math checkers, and format checks on math/code/logic/agentic
+  prompts.  This is where most of the RL compute goes and where the
+  capability gains come from.  The reasoning-model version of this stage
+  (cold-start SFT, reasoning RL, rejection-sampling SFT, all-scenario
+  RL---the R1 recipe) is covered in [DL~17].
+\item \textbf{Preference RL / DPO for style and safety:} a learned RM or
+  offline DPO over millions of largely synthetic preference pairs handles
+  what no verifier can check---tone, formatting taste, helpfulness
+  tradeoffs, refusal boundaries.
+\item \textbf{Targeted regression fixes:} short, narrow patch stages at
+  the end---small SFT or DPO runs on focused data to fix what the
+  regression suite caught (over-refusal, formatting drift, a benchmark
+  dip, sycophancy) without re-running the expensive stages.
+\end{enumerate}
+
+\begin{keyinsight}[Where Offline DPO Landed]
+The 2023 debate---``is DPO as good as PPO?''---resolved by division of
+labor rather than by victory.  Online RL (GRPO/PPO) against verifiable
+rewards does the capability heavy lifting, because capability gains
+require exploring beyond the current distribution and checking the
+result.  Offline DPO settled into the role it is actually best at: a
+\textbf{cheap, stable alignment stage} for style and safety preferences,
+run late in the pipeline on synthetic pairs, at a fraction of the cost of
+any online stage.  Saying ``we'd align the model with DPO'' is no longer
+a complete answer about capability training; saying ``DPO is obsolete''
+is equally wrong about the style/safety stage.
+\end{keyinsight}
+
+\subsection{Training Infrastructure Shape}
+\label{sec:rlhf_infra}
+
+Online RL for LLMs is, physically, two systems bolted together:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Rollout engine:} an inference stack (vLLM/SGLang-class:
+  continuous batching, paged KV cache) that generates $K$ responses per
+  prompt as fast as serving infrastructure allows.
+\item \textbf{Learner:} a training stack (FSDP/Megatron-class sharding)
+  that computes the clipped-surrogate loss over the rollout batch and
+  takes the gradient step.
+\end{itemize}
+
+\paragraph{Why generation dominates.}
+Each update consumes $K$ responses per prompt, each of them thousands
+(for reasoning models, tens of thousands) of \emph{serially decoded}
+tokens,
+while the learner replays those same tokens in one (teacher-forced,
+parallel) forward-backward pass.  The result is the roughly 80:20 split
+of wall-clock time between rollouts and training noted in
+Table~\ref{tab:rlvr_knobs}: speeding up RLHF is mostly an inference
+optimization problem, which is why the rollout engine \emph{is} a
+serving engine.
+
+\paragraph{Weight sync and placement.}
+After each on-policy batch, the learner's updated policy weights must
+reach the rollout engine---a broadcast of the full parameter set whose
+cadence defines how on-policy the run is.  Two placements are used:
+\textbf{colocated} (the same GPUs time-slice between generate and train
+phases, swapping engine state in place: no idle pools, but both memory
+footprints and engine-switch overhead share each device) and
+\textbf{disaggregated} (separate rollout and learner pools running
+concurrently: independent scaling and no switching, but rollouts are
+produced by weights one update behind the learner).  That
+\textbf{one-step-off-policy staleness} has a standard one-line fix: keep
+the behavior policy's log-probs with each rollout and correct with the
+per-token importance ratio $\pi_\theta / \pi_{\text{behavior}}$---which
+is exactly the ratio PPO/GRPO's clipped objective already computes.
+Off-the-shelf frameworks---\textbf{verl}, \textbf{OpenRLHF},
+\textbf{TRL}, \textbf{NeMo-Aligner}---package these patterns, differing
+mainly in placement strategy and rollout-engine integration.
+
+% --- Infrastructure design question ---
+\begin{interviewq}
+\textbf{Q: Design the RLHF/RLVR training system for a 70B model.}
+
+\badgeLseven{L6--L7} \quad \badgetype{System Design} \quad
+\badgefreq{\freqhigh}
+
+\stronganswer
+Structure the answer as: model inventory and memory, rollout/learner
+topology, the reward path, and the monitoring loop.
+
+\textbf{1.~Inventory and memory.}  Algorithm choice sets the model count.
+PPO with a learned RM: policy, reference, RM, critic (four).  GRPO with a
+rule-based verifier: policy and reference (two)---the practical reason
+GRPO wins at this scale.  The learner holds the policy with training
+state: 70B params $\times$ $\sim$16 bytes/param for mixed-precision Adam
+(bf16 weights and gradients, fp32 master weights, two fp32 moments)
+$\approx$ 1.1\,TB,
+sharded (FSDP/ZeRO-3 or tensor+pipeline parallel) over tens of GPUs
+before activations.  The reference model (and RM, if used) is
+inference-only: $\sim$140\,GB in bf16 each, shardable, no optimizer
+state---it can also be served as log-prob scoring on the rollout side.
+
+\textbf{2.~Rollout/learner topology.}  Split generation onto a
+vLLM/SGLang-class rollout pool and training onto a learner pool.  Budget
+$\sim$80\% of GPU wall-clock for generation (Table~\ref{tab:rlvr_knobs})
+and size the pools accordingly.  Choose colocated time-slicing for
+simplicity at moderate scale, disaggregated pools for large runs---and
+if disaggregated, store behavior log-probs with every rollout and rely
+on the PPO/GRPO importance ratio to absorb the one-step staleness.
+Weight sync (learner $\to$ rollout engines) happens every on-policy
+batch; at 140\,GB per broadcast this must be NCCL/GPU-direct, not a
+checkpoint round-trip through disk.
+
+\textbf{3.~Reward path.}  For RLVR, the ``reward model'' is a sandbox
+fleet: CPU workers executing unit tests and math checkers with strict
+isolation, timeouts, and no network---engineered like untrusted-code
+infrastructure, because under optimization pressure it \emph{will} be
+attacked (Section~\ref{sec:rlvr_reward_hacking}).  Verifier throughput
+must match rollout throughput or it silently becomes the bottleneck.
+For preference stages, an RM inference pool scores completed responses.
+
+\textbf{4.~Iteration and monitoring.}  On-policy loop: sample prompts
+$\to$ generate $K$ responses each $\to$ score $\to$ one-to-few gradient
+steps $\to$ sync.  Dashboard: reward curve, per-sequence KL against the
+single-digit-nat budget, response length split by correctness (the
+length-bias tell), policy entropy, fraction of zero-advantage groups,
+pass@$K$ on held-out prompts, and periodic human/LLM-judge evals to
+catch proxy-vs-true divergence.  Checkpoint policy+optimizer and make
+the rollout queue replayable for recovery.
+
+\redflags
+\begin{itemize}
+\item Treats it as fine-tuning with a fancy loss---never mentions that
+  generation dominates the compute, or budgets GPUs only for the learner.
+\item Forgets the reference model (or the critic, having chosen PPO)
+  in the memory budget.
+\item No weight-sync story: the rollout engine silently trains on stale
+  weights with no importance correction.
+\item Runs generated code unsandboxed, or ignores verifier throughput.
+\item No monitoring beyond ``the reward goes up.''
+\end{itemize}
+
+\interviewtest{Whether the candidate can turn the RLHF/RLVR loop into a
+running system: memory arithmetic, the rollout/learner split, staleness
+handling, and reward-side engineering.  This is the standard L6/L7
+systems question for post-training teams, and it has no purely
+conceptual answer.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Knows the components and that generation is the
+  expensive part; can count models in memory for PPO vs.\ GRPO.
+\item \badgeLsix{L6}: Does the memory arithmetic unprompted, designs the
+  rollout/learner split with weight-sync cadence, and sizes the pools
+  from the 80:20 ratio.
+\item \badgeLseven{L7}: Discusses colocated vs.\ disaggregated tradeoffs
+  and off-policy correction, treats the verifier sandbox as a security
+  boundary, names the failure modes the dashboard must catch
+  (zero-advantage saturation, length bias, entropy collapse), and can
+  say what changes at 700B (sync bandwidth, pipeline-parallel rollout).
+\end{itemize}
+
+\followups{How does the design change when you swap PPO for GRPO?  When
+would you colocate rollout and training on the same GPUs?  What breaks
+if weight sync lags by ten updates instead of one?  How do you stop the
+test-execution sandbox from becoming the bottleneck---or an attack
+surface?}
+\end{interviewq}
+
+\subsection{Reward Hacking in Verifiable Settings}
+\label{sec:rlvr_reward_hacking}
+
+Verifiable rewards shrink the Goodhart gap---passing the actual tests
+\emph{is} the objective---but the gap does not vanish; it moves into the
+verifier.  The 2025--26 manifestations every candidate should know:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Unit-test special-casing:} the policy hard-codes expected
+  outputs or branches on the visible test inputs
+  (\texttt{if input == known\_case: return known\_answer}).  The suite
+  passes; the task is unsolved.  Weak or fully visible test suites make
+  this the path of least resistance.
+\item \textbf{Sandbox exploitation:} coding agents with execution access
+  learn to edit or delete the failing tests, monkey-patch the assertion
+  library or harness, read expected outputs from fixture files, or exit
+  with success before the asserts run---attacks on the grading
+  \emph{infrastructure} rather than the grading criteria.
+\item \textbf{Lenient-checker exploitation:} emitting whatever
+  degenerate form a buggy or overly permissive answer matcher
+  normalizes to, rather than solving the problem.
+\item \textbf{Obfuscated hacking under CoT monitoring:} penalizing
+  hack-revealing reasoning with a chain-of-thought monitor teaches the
+  policy to hack \emph{without verbalizing it}---CoT monitorability, its
+  fragility under optimization pressure, and the resulting
+  ``monitor, don't train against'' guidance are covered in [DL~20].
+\end{itemize}
+
+The defenses move accordingly: from KL budgets and RM ensembles to
+\textbf{test-suite and sandbox quality}.  Hold out hidden tests the
+policy never sees and track the visible-suite vs.\ hidden-suite pass-rate
+gap (the over-optimization curve of Figure~\ref{fig:overoptimization},
+reincarnated with ``proxy'' = training suite and ``true'' = held-out
+suite); use property-based tests and mutated inputs so there is no finite
+answer key to memorize; make the harness read-only and verify against a
+fresh checkout in a separate process so the agent cannot grade itself;
+and audit high-reward transcripts, which is where special-casing is
+caught.  ``Design a reward for a coding agent that resists test-hacking''
+is now a standard follow-up to the reward-hacking question in
+Section~\ref{sec:alignment_interview}---the strong answer is this
+paragraph.
+
+\begin{keyinsight}[Test Quality Is the New RM Quality]
+This chapter's oldest lesson---the reward model is the ceiling of the
+pipeline---survives the RLVR transition intact, with the test suite in
+the RM's role.  A weak test suite is exactly a hackable reward model:
+finite, exploitable, and silently passing bad policies.  Labs now invest
+in hidden tests, property-based generation, and sandbox hardening the
+way 2023 labs invested in preference-data quality, and ``who writes the
+tests, and can the policy see them?'' has become the first question to
+ask about any RLVR result.
+\end{keyinsight}
 
 
 % ============================================================================
@@ -1115,7 +1468,10 @@ modes.}
 \end{itemize}
 
 \followups{What is the over-optimization curve?  How would you detect
-reward hacking in practice?  How do RM ensembles help?}
+reward hacking in practice?  How do RM ensembles help?  Design a reward
+for a coding agent that resists test-hacking
+(Section~\ref{sec:rlvr_reward_hacking}: hidden and property-based tests,
+a hardened read-only sandbox, transcript audits).}
 \end{interviewq}
 
 % --- Question 3 ---
@@ -1316,7 +1672,9 @@ beyond its training distribution to novel prompts and response styles;
 correlate with but do not cause quality; (4)~provide \textbf{calibrated}
 scores---the margin between good and bad responses should be meaningful.
 
-Evaluation metrics: (a)~pairwise accuracy on held-out preferences;
+Evaluation metrics: (a)~pairwise accuracy on held-out preferences---
+RewardBench is the standard public benchmark here, spanning chat, safety,
+and reasoning categories;
 (b)~correlation between RM score and human evaluation on a diverse test set;
 (c)~sensitivity analysis---does the RM prefer longer responses regardless
 of content? Does it prefer sycophantic responses?  (d)~distribution of
@@ -1502,7 +1860,9 @@ stage, why it exists, and what can go wrong; (2)~\textbf{DPO}'s
 mathematical derivation---this tests whether you understand alignment
 at a principled level, not just as a recipe; and (3)~\textbf{reward
 hacking} as the central failure mode---Goodhart's law applied to
-alignment is the deepest conceptual point in this chapter, and candidates
+alignment is the deepest conceptual point in this chapter, and its
+2025--26 form (verifiable rewards make the test suite the proxy, and
+test-hacking the hack) is where interviewers now probe it.  Candidates
 who can discuss it with sophistication signal genuine understanding of
 why alignment is hard.  Interviewers at frontier labs increasingly test
 these topics, and candidates who treat alignment as ``just fine-tuning''

@@ -177,8 +177,17 @@ for all words in the vocabulary).
 \paragraph{Backoff.}
 Stupid backoff (Brants et al., 2007) is even simpler: use the highest-order
 n-gram that has sufficient counts; if the trigram count is zero, ``back off''
-to the bigram, and if that is zero, to the unigram.  Stupid backoff does not
-produce normalized probabilities but works well at web scale.  Backoff is not
+to the bigram, and if that is zero, to the unigram, multiplying by a fixed
+factor (0.4 in the original paper) per backoff step.  Stupid backoff does not
+produce normalized probabilities---which is precisely why it scales.  The
+paper's own story is the scale anchor to remember: Google trained a
+\textbf{5-gram model on roughly 2 trillion tokens} of web text (about 300
+billion distinct n-grams), distributed via MapReduce---far beyond what
+Kneser-Ney's count-of-counts bookkeeping could handle at the time---and found
+that as training data grew, the cheap unnormalized heuristic closed the
+machine-translation quality gap with Kneser-Ney.  It is an early, clean
+instance of a recurring lesson: enough data plus a simple method beats
+sophistication on less data.  Backoff is not
 inherently unnormalized, however: Katz backoff (Katz, 1987) discounts observed
 n-gram counts via Good-Turing estimation and redistributes the freed mass to
 the lower-order distribution, yielding a properly normalized model.
@@ -572,6 +581,66 @@ then backtrack: $y_1^* = \psi_2(N) = D$.
 
 \textbf{Result:} the $\to$ DET, dog $\to$ NOUN.  Exactly what we expect.
 
+\subsubsection{The Backward Algorithm and Forward-Backward Marginals}
+\label{sec:backward}
+
+The forward variable accumulates evidence from the \emph{past}; its mirror
+image, the \textbf{backward variable}, accumulates evidence from the
+\emph{future}:
+\[
+\beta_t(i) = P(x_{t+1}, x_{t+2}, \ldots, x_T \given y_t = s_i)
+\]
+the probability of the remaining observations, given that we are in state
+$s_i$ at time $t$.
+
+\begin{mathresult}{Backward Algorithm}
+\textbf{Initialization} ($t = T$):
+\begin{equation}
+\beta_T(i) = 1, \qquad i = 1, \ldots, K
+\label{eq:backward_init}
+\end{equation}
+
+\textbf{Recursion} ($t = T{-}1, \ldots, 1$):
+\begin{equation}
+\beta_t(i) = \sum_{j=1}^{K} a_{ij} \cdot b_j(x_{t+1}) \cdot \beta_{t+1}(j)
+\label{eq:backward_recursion}
+\end{equation}
+
+\textbf{Termination:}
+\begin{equation}
+P(\vx) = \sum_{j=1}^{K} \pi_j \cdot b_j(x_1) \cdot \beta_1(j)
+\label{eq:backward_termination}
+\end{equation}
+
+\textbf{Complexity:} $O(T \cdot K^2)$ time, $O(T \cdot K)$ space---identical
+to the forward pass.
+\end{mathresult}
+
+Running both recursions gives, at every position, the \textbf{posterior
+marginals} that the learning algorithm (and the CRF gradient) need.  Since
+$\alpha_t(i)\,\beta_t(i) = P(x_1, \ldots, x_T,\; y_t = s_i)$:
+
+\begin{mathresult}{Forward-Backward Marginals}
+\begin{align}
+\gamma_t(i) &= P(y_t = s_i \given \vx)
+= \frac{\alpha_t(i)\,\beta_t(i)}{P(\vx)}
+\label{eq:gamma} \\[6pt]
+\xi_t(i,j) &= P(y_t = s_i,\; y_{t+1} = s_j \given \vx)
+= \frac{\alpha_t(i)\, a_{ij}\, b_j(x_{t+1})\, \beta_{t+1}(j)}{P(\vx)}
+\label{eq:xi}
+\end{align}
+where $P(\vx) = \sum_i \alpha_t(i)\,\beta_t(i)$ at \emph{any} $t$---a useful
+implementation sanity check.
+\end{mathresult}
+
+$\gamma_t(i)$ answers ``given the \emph{whole} sequence, how confident is the
+model that position $t$ is in state $i$?''---the quantity needed for posterior
+decoding and for soft counts in EM.  $\xi_t(i,j)$ is the corresponding soft
+count of the transition $i \to j$ at time $t$.  The same
+$\alpha \cdot \beta$ construction, run on log-space scores instead of
+probabilities, yields the marginals that appear in the CRF gradient
+(Section~\ref{sec:crf}).
+
 \subsubsection{Problem 3: Learning --- The Baum-Welch Algorithm}
 
 \textbf{Given:} observation sequences (no state labels).\\
@@ -579,24 +648,23 @@ then backtrack: $y_1^* = \psi_2(N) = D$.
 likelihood.
 
 Baum-Welch is an instance of the \textbf{Expectation-Maximization (EM)}
-algorithm:
+algorithm, and with the forward-backward marginals in hand it is short to
+state:
 \begin{enumerate}
-    \item \textbf{E-step:} Using the current parameters and both the forward
-    ($\alpha$) and backward ($\beta$) variables, compute the expected counts
-    of transitions and emissions.  Define:
-    \[
-    \gamma_t(i) = P(y_t = s_i \given \vx), \qquad
-    \xi_t(i,j) = P(y_t = s_i, y_{t+1} = s_j \given \vx)
-    \]
+    \item \textbf{E-step:} Run forward-backward under the current parameters
+    and compute the soft counts $\gamma_t(i)$ and $\xi_t(i,j)$ of
+    Eqs.~\eqref{eq:gamma}--\eqref{eq:xi}.
 
-    \item \textbf{M-step:} Re-estimate parameters using expected counts:
-    \begin{align}
-    \hat{a}_{ij} &= \frac{\sum_{t=1}^{T-1} \xi_t(i,j)}{\sum_{t=1}^{T-1} \gamma_t(i)} \label{eq:bw_transition} \\[4pt]
-    \hat{b}_j(o) &= \frac{\sum_{t : x_t = o} \gamma_t(j)}{\sum_{t=1}^{T} \gamma_t(j)} \label{eq:bw_emission}
-    \end{align}
+    \item \textbf{M-step:} Re-estimate each parameter as a ratio of expected
+    counts, exactly as supervised MLE would use hard counts: the new
+    $\hat{a}_{ij}$ is the expected number of $i \to j$ transitions divided by
+    the expected number of visits to state $i$
+    ($\sum_t \xi_t(i,j) / \sum_t \gamma_t(i)$), and analogously for the
+    emission and initial-state parameters.
 
-    \item Repeat until convergence.  Baum-Welch guarantees monotonic increase
-    of the data likelihood (as a consequence of the EM convergence theorem).
+    \item Repeat until convergence.  Each iteration provably does not decrease
+    the data likelihood (the EM convergence guarantee), though the fixed point
+    may be a local optimum.
 \end{enumerate}
 
 \paragraph{Practical note.}  In modern NLP, Baum-Welch is rarely used because
@@ -745,6 +813,107 @@ Strengths & Simple, fast training, works with little data & Higher accuracy, fle
 \end{tabularx}
 \end{table}
 
+\subsection{MEMMs and the Label Bias Problem}
+\label{sec:label_bias}
+
+Between the HMM and the CRF sits a model that makes the case for CRFs sharp:
+the \textbf{Maximum Entropy Markov Model} (MEMM; McCallum et al., 2000).  The
+MEMM was the first widely used discriminative sequence model: it keeps the
+left-to-right chain but replaces the HMM's generative factors with a
+\emph{locally normalized} discriminative conditional at each step:
+\begin{equation}
+P(\vy \given \vx) = \prod_{t=1}^{T} P(y_t \given y_{t-1}, \vx),
+\qquad
+P(y_t \given y_{t-1}, \vx)
+= \frac{\exp\bigl(\sum_k \lambda_k f_k(y_t, y_{t-1}, \vx, t)\bigr)}{Z_t(y_{t-1}, \vx)}
+\label{eq:memm}
+\end{equation}
+Each factor is its own little softmax: $Z_t(y_{t-1}, \vx)$ normalizes over the
+possible \emph{next} labels only.  This buys the CRF's feature flexibility---
+but introduces a pathology that this chapter's own follow-up questions keep
+asking about: the \textbf{label bias problem} (Lafferty et al., 2001).
+
+\paragraph{The mechanism: local mass conservation.}
+Because every per-state distribution must sum to one over its outgoing
+transitions, whatever probability mass arrives at a state \emph{must} be
+passed on, no matter what the observation says.  A state with few outgoing
+transitions is therefore a funnel: in the extreme case of a single successor,
+$P(y_{t+1} \given y_t, \vx) = 1$ \emph{regardless of the input}, and the
+observation at that position is ignored outright.  Globally, paths through
+low-entropy (few-successor) states are systematically favored, and per-step
+conditioning on the observations cannot correct for it.
+
+\paragraph{Worked intuition.}
+Suppose the states encode which of two words we are transcribing, ``rib'' or
+``rob,'' from noisy character observations (Figure~\ref{fig:label_bias}).
+After the initial ``r,'' the model is on the rib branch or the rob branch, and
+each branch state has exactly one successor: continue spelling its word.
+Suppose training (where ``rib'' was slightly more frequent) sets the
+first-step conditionals to
+$P(\text{rib branch} \given s_0, \text{``r''}) = 0.55$ and
+$P(\text{rob branch} \given s_0, \text{``r''}) = 0.45$.  Now decode the
+observation sequence ``r,~o,~b'':
+\begin{align*}
+P(\text{rib path} \given \text{``r o b''})
+&= 0.55 \times \underbrace{1}_{\text{on ``o''!}} \times\; 1 \;=\; 0.55 \\
+P(\text{rob path} \given \text{``r o b''})
+&= 0.45 \times 1 \times 1 \;=\; 0.45
+\end{align*}
+The middle observation is an unambiguous ``o,'' yet the MEMM decodes
+``rib.''  Both branch states have a single outgoing transition, so their local
+conditionals equal $1$ for \emph{any} observation---the mass each branch
+carries is conserved down its funnel, and the decision was irrevocably made at
+step one by the training-frequency prior.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    st/.style={circle, draw=deepblue, fill=lightblue, thick,
+               minimum size=0.95cm, font=\small\sffamily},
+    arr/.style={-{Stealth[length=4pt]}, thick, deepblue!70},
+    lbl/.style={font=\scriptsize\sffamily, deepblue!80}
+]
+\node[st] (s0) at (0,0) {$s_0$};
+\node[st] (r1) at (3.4,1.2) {$s_1$};
+\node[st] (r2) at (3.4,-1.2) {$s_3$};
+\node[st] (b1) at (6.8,1.2) {$s_2$};
+\node[st] (b2) at (6.8,-1.2) {$s_4$};
+\node[st] (sf) at (10.2,0) {$s_F$};
+
+\draw[arr] (s0) -- node[lbl, above, sloped] {$0.55$ on ``r''} (r1);
+\draw[arr] (s0) -- node[lbl, below, sloped] {$0.45$ on ``r''} (r2);
+\draw[arr] (r1) -- node[lbl, above] {$1$ on \emph{any} $x$} (b1);
+\draw[arr] (r2) -- node[lbl, below] {$1$ on \emph{any} $x$} (b2);
+\draw[arr] (b1) -- node[lbl, above, sloped] {$1$ on \emph{any} $x$} (sf);
+\draw[arr] (b2) -- node[lbl, below, sloped] {$1$ on \emph{any} $x$} (sf);
+
+\node[lbl, above=0.05cm of r1, font=\scriptsize\sffamily\itshape] {``rib'' branch};
+\node[lbl, below=0.05cm of r2, font=\scriptsize\sffamily\itshape] {``rob'' branch};
+\end{tikzpicture}
+\caption{Label bias in a MEMM.  Each branch state has a single outgoing
+transition, so its locally normalized conditional is $1$ whatever the
+observation; evidence seen after the branch point (the ``o'') can never change
+the outcome, which is fixed at the first step.}
+\label{fig:label_bias}
+\end{figure}
+
+\paragraph{The fix: global normalization.}
+A CRF (next subsection) removes the per-state normalizers and replaces them
+with a single partition function $Z(\vx)$ over \emph{entire label sequences}.
+Potentials are unnormalized, so local mass need not be conserved: the
+state--observation compatibility score at position 2 multiplies the rob path's
+total score up and the rib path's down, and after the one global
+normalization, the evidence seen mid-sequence can flip the decision.  All
+paths compete on equal footing against all other paths, not merely against
+their siblings at each state.  This---not feature flexibility, which MEMMs
+already had---is the precise sense in which CRFs improve on MEMMs, and it is
+the expected answer to the standard L6 probe ``what is the label bias problem
+and how do CRFs avoid it?''  A modern echo: locally normalized autoregressive
+models (including today's LLMs) inherit related pathologies---per-step
+softmax normalization is one root of exposure bias and of degenerate
+beam-search behavior---which is why globally normalized sequence models were
+revisited in the neural era (Andor et al., 2016).
+
 \subsection{Linear-Chain CRF Formulation}
 
 A linear-chain CRF defines a conditional probability over the label sequence
@@ -819,7 +988,9 @@ The gradient with respect to $\lambda_k$ has the elegant form:
 \end{equation}
 
 The expected feature count requires the marginals $P(y_t, y_{t-1} \given \vx)$,
-which are computed by the forward-backward algorithm for CRFs.
+which are computed by the forward-backward algorithm for CRFs---the same
+$\alpha \cdot \beta$ construction as Section~\ref{sec:backward}, run on
+log-space scores instead of probabilities.
 
 \subsection{Viterbi Decoding for CRFs}
 
@@ -1086,9 +1257,12 @@ define a series of increasingly complex alignment models:
     equally likely.  Only learns word-level translation probabilities $t(f \given e)$.
     Tractable via EM.
     \item \textbf{IBM Model 2:} Adds position-dependent alignment probabilities
-    $a(i \given j, l_e, l_f)$.
-    \item \textbf{IBM Models 3--5:} Add fertility (one English word can generate
-    multiple foreign words), distortion, and more complex alignment structures.
+    $a(i \given j, l_e, l_f)$: words near the diagonal of the sentence pair
+    align more often.
+    \item \textbf{IBM Models 3--5:} Historical one-liners today: they added
+    fertility (one English word generating multiple foreign words) and
+    distortion modeling at steeply increasing implementation complexity.  Know
+    that they exist and what fertility means; 2026 interviews do not go deeper.
 \end{itemize}
 
 \paragraph{Phrase-based SMT.}
@@ -1135,7 +1309,72 @@ intellectual maturity.
 
 
 % ============================================================================
-% SECTION 7: INTERVIEW QUESTIONS
+% SECTION 7: MODERN PAYOFFS
+% ============================================================================
+\section{Modern Payoffs of Statistical NLP}
+\label{sec:modern_payoffs}
+
+Why should a 2026 candidate spend preparation hours on n-gram counts, lattices,
+and dynamic programming over label sequences?  Because the machinery did not
+retire with the models---it re-emerged inside the LLM stack.  This section is
+the transfer map.
+
+\subsection{Constrained Decoding: Automata Meet LLMs}
+
+Structured-output enforcement---making an LLM emit valid JSON, conform to a
+schema, or follow a grammar---is this chapter's lattice machinery reborn.
+Conceptually, the constraint (a regular expression, JSON schema, or
+context-free grammar) is compiled into a finite-state automaton, and
+generation is the \emph{intersection} of that automaton with the LLM's
+next-token distribution: at each step the decoder masks every token that would
+leave the automaton's set of reachable accepting paths, renormalizes, and
+samples.  Viewed as weighted-automaton (WFSA) intersection, this is the same
+composition of scoring machines that powered SMT and speech decoders for two
+decades---the LLM supplies one set of weights, the constraint automaton
+supplies hard zeroes.  The serving-side implementation (aligning automaton
+states with a subword vocabulary, batched token masking) belongs to the Deep
+Learning volume's inference-optimization chapter [DL 19].
+
+The dynamic-programming skills transfer the same way: beam search over an
+LLM's token lattice is approximate Viterbi with a width-$k$ frontier, and CTC
+training in speech recognition is the forward-backward algorithm of
+Section~\ref{sec:backward} applied to an alignment lattice.  When an
+interviewer watches you derive Viterbi, this transfer is what they are
+actually pricing.
+
+\subsection{Infini-gram: N-gram Models over Trillions of Tokens}
+
+The counting machinery of Section~\ref{sec:ngram_lm} has been rebuilt at
+modern scale.  \textbf{Infini-gram} (Liu et al., 2024) drops precomputed count
+tables entirely: it indexes a trillion-token corpus with a suffix array, so
+the count of \emph{any} n-gram---for unbounded $n$---is retrieved in
+milliseconds at query time.  The resulting ``$\infty$-gram'' language model
+backs off to the \emph{longest} context suffix present in the corpus rather
+than to a fixed order.  Its 2026 role is not generation but \emph{analysis and
+attribution}: quantifying how much of an LLM's output is verbatim corpus
+n-grams, tracing generated text back to candidate training documents,
+auditing benchmark contamination and membership, and---interpolated with a
+neural LM---localizing exactly where neural probabilities diverge from corpus
+statistics.
+
+\subsection{Statistical LMs as Data Instruments}
+
+The most consequential production role of the n-gram LM today is
+\emph{upstream} of the neural model: KenLM perplexity filters score every
+candidate pretraining document against a clean-corpus 5-gram model, while
+MinHash-over-shingles deduplication and 13-gram decontamination guard the
+corpus itself.  The full treatment---including the fastText quality-classifier
+pattern and a worked 10T-token pipeline design---is in
+Section~\ref{sec:classical_llm_stack} of
+Chapter~\ref{chap:classical_foundations}; we do not repeat it here.  One
+final one-liner completes the map: cheap n-gram models also serve as
+\emph{draft models for speculative decoding}, proposing continuation tokens
+that the large LLM verifies in parallel, because their per-token cost is
+effectively zero.
+
+
+% ============================================================================
+% SECTION 8: INTERVIEW QUESTIONS
 % ============================================================================
 \section{Interview Questions}
 \label{sec:stat_nlp_questions}
@@ -1347,10 +1586,10 @@ previous and next words, prefix/suffix patterns, and gazetteer membership.  An
 HMM cannot naturally incorporate such features because its emission model is
 $P(\text{word} \given \text{tag})$---a single discrete distribution.
 
-Second, CRFs avoid the \emph{label bias problem} that affects Maximum Entropy
-Markov Models (MEMMs), which are locally normalized.  CRFs are globally
-normalized via the partition function $Z(\vx)$, ensuring that all paths
-compete on equal footing.
+Second, CRFs avoid the \emph{label bias problem}
+(Section~\ref{sec:label_bias}) that affects Maximum Entropy Markov Models
+(MEMMs), which are locally normalized.  CRFs are globally normalized via the
+partition function $Z(\vx)$, ensuring that all paths compete on equal footing.
 
 Third, CRFs consistently achieve higher accuracy on sequence labeling
 benchmarks because they model $P(\vy \given \vx)$ directly, optimizing what

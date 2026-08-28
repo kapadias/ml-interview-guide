@@ -587,13 +587,19 @@ one.  Votes are aggregated into an Elo rating system (adapted from chess).  Key
 strengths: real user prompts, massive scale (millions of votes), no prompt
 engineering by model creators.  Key limitations: population bias (tech-savvy
 English speakers), prompt distribution does not match all use cases, Elo
-sensitivity to prompt difficulty distribution.
+sensitivity to prompt difficulty distribution---and, per the 2025
+``Leaderboard Illusion'' analysis, operational gaming by submitters
+(private-variant testing, asymmetric sampling; see
+Section~\ref{sec:benchmark_map}), which prompted the platform's move to
+style-controlled rankings.
 
 \paragraph{MT-Bench.}
 A curated set of 80 multi-turn questions spanning 8 categories (writing,
 reasoning, math, coding, extraction, STEM, humanities, roleplay).  Responses are
-scored 1--10 by GPT-4 as judge.  Useful for rapid evaluation during development
-but limited by prompt set size and GPT-4 judge biases.
+scored 1--10 by GPT-4 as judge.  Historically important as the paper that
+quantified judge--human agreement, but legacy by 2025: Arena-Hard-Auto and
+length-controlled AlpacaEval~2.0 (Section~\ref{sec:judge_practice}) replaced
+it as the standard automatic preference proxies.
 
 % ============================================================================
 % SECTION 6: LLM-AS-JUDGE
@@ -663,6 +669,77 @@ results:
           as judge---evaluation results are not reproducible without this.
 \end{itemize}
 
+\subsection{The Practice Layer (2025--26)}
+\label{sec:judge_practice}
+
+The checklist above is table stakes.  Production eval programs now add five
+refinements, each targeting a specific failure of the naive setup.
+
+\paragraph{Length-controlled win rates.}
+The standard fix for verbosity bias---bias (1) in the catalog above---is
+statistical, not prompt-based.  AlpacaEval~2.0 fits a regression of the
+judge's preference on the length difference between the two responses and
+reports the counterfactual win rate at \emph{zero} length difference.  This
+length-controlled (LC) win rate sharply reduces the payoff of simply
+generating longer outputs and raised the metric's correlation with Chatbot
+Arena rankings to $\sim$0.98 Spearman---which is why ``LC win rate'' is now
+the default way pairwise judge results are reported.  Chatbot Arena's style
+control extends the same idea, adding markdown formatting (headers, bold,
+lists) as covariates in the Bradley--Terry model.  Instructing the judge to
+``ignore length'' does not work reliably; regressing length out does.
+
+\paragraph{Calibrate the judge against an expert panel---with kappa targets.}
+``Validate against humans'' needs numbers attached.  Before a judge gates
+anything, score a calibration set (a few hundred items) that a panel of
+domain experts has independently rated, and compute \emph{chance-corrected}
+agreement (Cohen's $\kappa$ or Krippendorff's $\alpha$,
+Section~\ref{sec:human_eval}), not raw percent agreement.  Working targets:
+$\kappa \geq 0.6$ before the judge is used for routine regression detection,
+$\kappa \geq 0.8$ before it participates in launch decisions---and always
+measure the human--human $\kappa$ on the same items, because a judge cannot
+exceed the agreement ceiling the task itself supports.  If human--human
+$\kappa$ is 0.5, fix the rubric before blaming the judge.  Report $\kappa$
+per dimension: judges routinely match experts on fluency while diverging
+badly on factuality.
+
+\paragraph{Judge drift across model versions.}
+The judge is part of the measurement instrument, and it changes whenever the
+underlying model version changes: an 8/10 from judge v2 is not an 8/10 from
+judge v1, and a silent judge upgrade (an API alias pointing to a new
+snapshot) can shift absolute scores by tenths of a point on a 10-point scale
+and flip close pairwise rankings---while your dashboards report a phantom
+model regression.  Discipline: pin the judge to an explicit model snapshot,
+prompt template, and temperature; maintain a frozen \emph{anchor set} that
+every judge version re-scores, so a judge upgrade comes with a crosswalk and
+a deliberate re-baselining of every tracked metric.  Never trend a metric
+across a judge change without one.
+
+\paragraph{Self-preference and same-family judging.}
+Bias (3) becomes operationally dangerous when the judge shares a model
+family with one contestant: swap experiments (same responses, attributed or
+styled differently) show judges systematically favor their own family's
+outputs even when human raters are indifferent.  Practice rules: never use a
+same-family judge for a competitive comparison you intend to publish or act
+on; prefer a cross-family judge, or a small panel of judges from different
+families with majority or mean aggregation, which simultaneously dampens
+self-preference and averages out single-judge quirks; and always disclose
+the judge's identity, because choosing the judge is itself a researcher
+degree of freedom.
+
+\paragraph{Rubric vs.\ pairwise: choose by the decision you are making.}
+Pairwise judging is more sensitive (relative judgments are easier---the same
+argument as for human pairwise protocols in Section~\ref{sec:human_eval})
+and is the right instrument for \emph{model selection} against a baseline.
+But it yields only relative signal, requires a pinned baseline, can be
+intransitive across baselines, and needs both presentation orders to cancel
+position bias.  Rubric (pointwise) scoring with anchored score levels yields
+absolute, longitudinally comparable numbers that support launch gates and
+per-dimension diagnostics, but is coarser and drifts with judge calibration.
+The standard architecture uses both: anchored rubrics for continuous
+regression gates in CI, pairwise against a pinned baseline for release
+decisions---each calibrated against the expert panel above, with the
+statistical gates from [DL~23].
+
 \begin{keyinsight}[LLM-as-Judge: Useful but Not Authoritative]
 LLM-as-judge is best understood as a \emph{noisy, scalable proxy} for human
 evaluation.  It is invaluable during development for rapid iteration (catching
@@ -679,34 +756,162 @@ a representative sample.
 \label{sec:benchmarks}
 
 Benchmarks serve as standardized tests for comparing models, but they are
-imperfect proxies for real-world utility.  A mature candidate knows what each
-benchmark tests, why it exists, and where it fails.
+imperfect proxies for real-world utility---and they age fast.  A mature
+candidate knows what each benchmark tests, where it sits in its lifecycle,
+and why the 2022--23 canon (MMLU, HellaSwag, HumanEval) no longer
+discriminates between frontier models.
 
-\subsection{Major LLM Benchmarks}
+\begin{keyinsight}[The Benchmark Lifecycle]
+Every public benchmark traverses the same five stages:
+\begin{center}
+\textbf{introduced} $\to$ \textbf{discriminative} $\to$ \textbf{saturated}
+$\to$ \textbf{contaminated} $\to$ \textbf{retired}
+\end{center}
+\emph{Introduced:} the benchmark is hard, headroom is large, and scores are
+noisy because models sit near the floor.  \emph{Discriminative:} the useful
+phase---scores spread across models and track capability; this is when a
+benchmark drives the field.  \emph{Saturated:} frontier models cluster near
+the ceiling, and the remaining errors are dominated by mislabeled or ambiguous
+items, so deltas stop meaning anything.  \emph{Contaminated:} questions and
+solutions have diffused into pretraining corpora (and into post-training data
+via distillation and synthetic pipelines), so scores partly measure
+memorization.  \emph{Retired:} the benchmark survives only as a row in legacy
+comparison tables.  Saturation and contamination usually arrive together and
+reinforce each other.  The practical lifespan of a public LLM benchmark has
+shrunk from roughly a decade (SQuAD-era) to 2--4 years (MMLU) to, for
+competition math, about one contest cycle.  Knowing \emph{where a benchmark
+sits in this lifecycle} is worth more in an interview than any leaderboard
+number.
+\end{keyinsight}
+
+\subsection{The Current-Generation Map (2026)}
+\label{sec:benchmark_map}
 
 \begin{table}[H]
 \centering
-\caption{Major benchmarks for LLM evaluation.}
+\caption{Current-generation LLM benchmarks by capability (2026).}
 \label{tab:benchmarks}
 \begin{tabularx}{\textwidth}{@{}l l l X@{}}
 \toprule
-\textbf{Benchmark} & \textbf{Format} & \textbf{Size} & \textbf{What It Tests} \\
+\textbf{Capability} & \textbf{Benchmark} & \textbf{Format / Size} & \textbf{What It Tests} \\
 \midrule
-MMLU         & 4-way MC   & 15K Qs, 57 subjects & Broad knowledge (STEM, humanities, social science) \\
-HumanEval    & Code gen.  & 164 problems         & Python function completion, test-case passing \\
-MBPP         & Code gen.  & 974 problems          & Basic Python programming \\
-GSM8K        & Free-form  & 8.5K problems         & Grade-school math reasoning (multi-step) \\
-MATH         & Free-form  & 12.5K problems        & Competition-level mathematics \\
-ARC          & 4-way MC   & 7.7K questions        & Grade-school / challenge science reasoning \\
-HellaSwag    & 4-way MC   & 10K questions         & Commonsense sentence completion \\
-WinoGrande   & Binary     & 44K problems          & Commonsense coreference resolution \\
-TruthfulQA   & MC / gen.  & 817 questions         & Resistance to common misconceptions \\
-BigBench     & Various    & 200+ tasks            & Diverse capabilities (reasoning, translation, QA) \\
-MT-Bench     & Open-ended & 80 multi-turn Qs      & Multi-turn conversation quality (LLM-judged) \\
-Chatbot Arena & Pairwise  & Millions of votes     & Real-user preference (Elo rating) \\
+Knowledge     & MMLU-Pro          & 10-way MC, 12K Qs      & Reasoning-heavy knowledge; cleaned MMLU successor \\
+Knowledge     & GPQA-Diamond      & 4-way MC, 198 Qs       & PhD-level, ``Google-proof'' science QA \\
+Math          & AIME / HMMT-class & Free-form, $\sim$30/yr & Competition math with auto-checkable answers \\
+Math          & FrontierMath, HLE & Free-form              & Research-level frontier; deep headroom \\
+Code          & LiveCodeBench     & Execution, rolling     & Contest problems time-stamped after training cutoffs \\
+Code          & SWE-bench Verified & Repo patch, 500 issues & Real GitHub issue resolution under a test harness \\
+Instr.\ following & IFEval        & Programmatic, 541 Qs   & Verifiable instruction constraints (length, format, keywords) \\
+Agentic       & $\tau$-bench      & Tools + simulated user & Policy-compliant task completion; reliability via pass$^k$ \\
+Agentic       & OSWorld-class     & Execution, 369 tasks   & Computer use: GUI grounding, multi-step OS control \\
+Multimodal    & MMMU              & MC + open, 11.5K Qs    & College-level reasoning over charts, diagrams, images \\
+Preference    & Arena-Hard-Auto   & Pairwise, 500 prompts  & Hard real-user prompts; length-controlled win rate \\
+Preference    & Chatbot Arena     & Pairwise, human votes  & Live human preference (Elo/Bradley--Terry) \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+\paragraph{Knowledge and reasoning.}
+MMLU-Pro replaces MMLU's four options with ten, filters trivial and noisy
+items, and is reasoning-heavy enough that chain-of-thought helps
+substantially (on original MMLU it barely mattered)---scores drop 15--30
+points relative to MMLU, restoring discriminative power.  GPQA-Diamond is
+198 graduate-level science questions validated by experts: domain PhDs score
+roughly 65--75\%, while skilled non-experts with unrestricted web access
+score $\sim$34\%---the operational definition of ``Google-proof.''  Note the
+compressed lifecycle in action: frontier reasoning models now reach the high
+80s on GPQA-Diamond, so even the field's flagship hard-knowledge benchmark is
+already well up its own saturation curve.
+
+\paragraph{Math.}
+MATH (12.5K competition problems, 2021) is the canonical saturation story:
+within four years frontier models exceeded 95\%, the remaining misses
+concentrated in ambiguous or mis-keyed items, and the dataset leaked
+thoroughly into pretraining and distillation data.  The field moved to
+AIME/HMMT-class competition sets: each year's contest supplies a fresh batch
+that is contamination-free \emph{by construction} (the problems did not exist
+at training time), with integer or short-form answers that are automatically
+checkable.  The cost is sample size---an AIME year is 30 problems---which
+makes single-run scores statistically meaningless
+(Section~\ref{sec:reasoning_eval}).  FrontierMath and Humanity's Last Exam
+occupy the deep end with research-level problems and large remaining headroom.
+
+\paragraph{Code.}
+LiveCodeBench continuously scrapes contest problems (LeetCode, AtCoder,
+Codeforces) with publication timestamps and evaluates each model only on
+problems released \emph{after} its training cutoff---contamination control by
+time-windowing rather than secrecy.  SWE-bench Verified is the repo-level
+standard: given a real GitHub repository and issue, the system must produce a
+patch; grading runs the repository's own test suite and requires the
+\texttt{FAIL\_TO\_PASS} tests (which reproduce the bug) to pass and the
+\texttt{PASS\_TO\_PASS} tests to keep passing.  ``Verified'' is the 500-issue
+human-screened subset (filtered for solvability and adequately specified
+tests) of the original 2{,}294.  The critical caveat is
+\textbf{agent-harness sensitivity}: the same base model can swing by tens of
+points across scaffolds (agentless pipelines vs.\ tool-using agents vs.\
+proprietary harnesses, retry budgets, test-time selection), so a SWE-bench
+number quoted without its scaffold, tool budget, and sampling settings is a
+measurement of a \emph{system}, not a model.
+
+\paragraph{Agentic.}
+$\tau$-bench places the model in a tool-using loop against a simulated user
+(itself an LLM) and a domain policy (retail, airline): success requires
+reaching the correct final database state while obeying policy.  Its headline
+lesson is metric design: pass@$k$ asks ``did \emph{at least one} of $k$
+attempts succeed'' (the right question when a verifier can select the
+winner), while pass$^k$ asks ``did \emph{all} $k$ i.i.d.\ attempts
+succeed''---the reliability a deployed agent actually needs.  Agents with
+respectable pass@1 routinely collapse under pass$^k$; estimators and error
+bars for both are derived in [DL~23].  OSWorld-class benchmarks (OSWorld,
+WebArena, AndroidWorld) drop the agent into real operating-system or browser
+environments with execution-based scoring; humans solve roughly 70\% of
+OSWorld tasks and agents still trail them badly---this family is early in its
+discriminative phase, which is exactly why labs invest in it.
+
+\paragraph{Multimodal.}
+MMMU poses 11.5K college-level questions across 30 subjects whose images are
+information-bearing---charts, diagrams, medical scans, sheet music---rather
+than decorative, so it cannot be solved from text priors alone.
+
+\paragraph{Preference.}
+Arena-Hard-Auto distills the hardest, most discriminative prompts from
+Chatbot Arena traffic ($\sim$500 prompts) and judges candidate responses
+pairwise against a fixed baseline with a frontier judge; combined with
+length-controlled win rates (Section~\ref{sec:judge_practice}) it is the
+standard cheap proxy for human preference rankings.  Preference leaderboards
+have their own pathologies: the 2025 ``Leaderboard Illusion'' analysis
+documented private-variant testing on Chatbot Arena (labs evaluating many
+private variants and publishing only the best---a best-of-$N$ selection bias)
+and asymmetric sampling across labs; LMSYS responded with \emph{style
+control}, regressing out response length and formatting (headers, bold,
+lists) before fitting the Bradley--Terry ranking.  Treat preference
+leaderboards as one noisy signal, not ground truth.
+
+\subsection{The Saturated Legacy Tier}
+\label{sec:legacy_benchmarks}
+
+\begin{table}[H]
+\centering
+\caption{Saturated legacy benchmarks and why each one died.}
+\label{tab:legacy_benchmarks}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Benchmark} & \textbf{Useful Era} & \textbf{Cause of Death} \\
+\midrule
+MMLU      & 2021--24 & Ceiling $\sim$90\% where residual errors are mislabeled/ambiguous items ($\sim$6\% of questions by re-annotation studies); broad contamination; succeeded by MMLU-Pro \\
+HellaSwag & 2019--23 & Adversarial filtering targeted 2019-era discriminators; frontier models exceed 95\%; remaining misses are mostly annotation artifacts \\
+HumanEval & 2021--24 & 164 single-function tasks, heavily memorized and trivially in-distribution; $>$95\% pass@1; succeeded by LiveCodeBench and SWE-bench \\
+GSM8K     & 2021--24 & $>$95\% with basic CoT; template-style grade-school problems pervade training data---models score measurably lower on freshly written GSM-style variants \\
+MATH      & 2021--25 & $>$95\% for reasoning models; leaked wholesale into distillation data; succeeded by AIME/HMMT-class contest cycles \\
+BIG-bench & 2022--23 & Crowd-sourced tasks absorbed into web crawls despite canary strings; the BBH ``hard'' subset then saturated as CoT became standard \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+You still need to \emph{recognize} these names---they anchor the historical
+narrative and still appear in papers' comparison tables---but citing them as
+evidence about frontier-model capability is a staleness signal in a 2026
+interview.
 
 \subsection{Benchmark Pitfalls}
 
@@ -720,11 +925,11 @@ online, dynamic benchmarks with new questions per evaluation round (LiveBench),
 and contamination analysis (n-gram overlap between training data and benchmarks).
 
 \paragraph{Benchmark saturation.}
-As models improve, older benchmarks lose discriminative power.  HellaSwag and
-WinoGrande are near ceiling for frontier models.  Even MMLU has become less
-informative as top models exceed 90\%.  The field must continuously develop
-harder benchmarks---MMLU-Pro, GPQA (PhD-level questions), and FrontierMath
-represent this trend.
+Covered by the lifecycle above: as models improve, benchmarks lose
+discriminative power, and near the ceiling the residual gap is label noise,
+not capability.  A 1-point delta between two models scoring 92\% and 93\% on
+a saturated suite is meaningless; the same delta in the middle of the scale
+on a discriminative benchmark may be real (subject to error bars---[DL~23]).
 
 \paragraph{Gaming and Goodhart's law.}
 ``When a measure becomes a target, it ceases to be a good measure.''  Models can
@@ -738,14 +943,145 @@ safety, instruction following, long-context reasoning, multilingual performance,
 tool use, agentic planning, and domain-specific knowledge all require specialized
 evaluation.
 
+\subsection{Private Held-Out Suites and Live Benchmarks}
+\label{sec:private_evals}
+
+Every frontier lab maintains \textbf{private held-out evaluation suites}, for
+four reasons:
+\begin{enumerate}[label=(\arabic*)]
+    \item \textbf{Contamination immunity.}  Never published means never
+          crawled: a private suite cannot leak into pretraining data.
+    \item \textbf{Product alignment.}  Items are drawn from the distribution
+          the product actually sees (real user tasks, internal domains), not
+          from academic task formats.
+    \item \textbf{Longitudinal stability.}  A frozen private suite yields
+          comparable numbers across model generations---the trend line public
+          rolling benchmarks cannot provide.
+    \item \textbf{Competitive secrecy.}  What a lab chooses to measure reveals
+          its roadmap.
+\end{enumerate}
+The costs are real: expert-written items and gold labels are expensive to
+build and re-validate, results are not externally comparable, and---the subtle
+one---\emph{private suites rot too}.  Not by leakage, but by selection
+pressure: every time the suite gates a data-mix or checkpoint decision, the
+development process fits it a little more.  This is Goodhart without
+contamination.  Mature eval programs therefore version their suites, cap how
+many decisions a given suite can gate, and refresh on a schedule.
+
+\textbf{Dynamic (live) benchmarks} attack contamination in public instead:
+LiveBench refreshes a fraction of its questions monthly (sourced from recent
+papers, news, and freshly generated math/code) and scores everything against
+objective ground truth, deliberately avoiding LLM judges; LiveCodeBench
+applies the time-windowing described above; Chatbot Arena is a continuous
+stream of novel human prompts.  The trade-off is longitudinal comparability:
+a rolling question set is not a fixed scale, so month-over-month numbers
+confound model progress with question drift.  Practice: keep frozen snapshots
+for trend lines, use the live sets for point-in-time rankings.
+
+\subsection{Reasoning-Model Evaluation}
+\label{sec:reasoning_eval}
+
+Reasoning models---long chain-of-thought, trained with RL on verifiable
+rewards---broke several silent assumptions of the classical eval protocol.
+This subsection covers the protocol; the statistical machinery (confidence
+intervals, the pass@$k$ estimator, launch gates) is developed in [DL~23].
+
+\paragraph{pass@1 is ill-defined until you specify the sampling.}
+Classically, ``pass@1'' implied greedy decoding.  But greedy decoding
+\emph{degrades} long-CoT models, which are trained under sampling and fall
+into repetition loops at $T=0$: DeepSeek-R1's release notes explicitly
+recommend $T \approx 0.6$, top-$p$ 0.95, and report ``pass@1'' as the
+\emph{mean} success rate over 64 sampled runs.  A reported pass@1 is
+therefore uninterpretable without three qualifiers: the sampling settings
+(temperature, top-$p$), the number of runs $n$ it was averaged over, and the
+aggregation (mean vs.\ best-of).  Comparing one model's $T{=}0$ number
+against another's 64-sample average is apples-to-oranges, often by several
+points in either direction.
+
+\paragraph{Variance across runs is first-order, not a footnote.}
+Sampled decoding on small suites produces large run-to-run variance: on a
+30-problem AIME set one question is 3.3 points, and swings of $\pm$7--10
+points between seeds are normal.  Protocol: report the mean over $n \geq 16$
+(commonly 64) independent runs \emph{with a confidence interval}, and
+evaluate deltas between models with paired statistics over the same problems
+([DL~23] for the estimators).  A leaderboard delta smaller than the CI of
+either entry is noise---and much of the 2024--25 ``model X beats model Y by
+2 points on AIME'' discourse was exactly that.
+
+\paragraph{maj@$k$, self-consistency, and verifier-graded protocols.}
+Self-consistency (maj@$k$, reported as cons@64 in the R1 line of work)
+samples $k$ chains and majority-votes the final answer: it measures what the
+model achieves with test-time compute and \emph{no oracle}.  It is distinct
+from pass@$k$, which credits success if \emph{any} sample is correct and
+therefore assumes a verifier can pick the winner.  Verifier-graded evals make
+the check itself trustworthy: normalize-then-compare answer checkers
+(symbolic equivalence for math, so $1/2$, $0.5$, and $\frac{2}{4}$ all
+match), unit-test execution for code, and rubric or LLM graders only where no
+programmatic check exists.  Grader bugs are a real error source---a strict
+string-match harness can under-score a strong model by several points.
+Audit the checker before believing a surprising number.
+
+\paragraph{Budget-matched comparisons.}
+Reasoning models trade thinking tokens for accuracy, so accuracy alone
+conflates capability with spend: model A at 20K thinking tokens per problem
+vs.\ model B at 4K is a cost comparison wearing a capability costume.
+Report accuracy \emph{alongside} tokens (or dollars) per problem; compare at
+matched thinking budgets or as an accuracy-vs-compute curve; and align
+``reasoning effort'' settings across systems.  The same discipline applies
+within a family: ``the new model wins'' at $5\times$ the token spend is a
+different claim than a win at parity.
+
+\subsection{The Operational Numbers of an Eval Program}
+\label{sec:eval_ops_numbers}
+
+Staff-level evaluation conversations run on numbers.  Anchors worth
+memorizing (orders of magnitude, not gospel):
+
+\begin{itemize}
+    \item \textbf{Suite sizes.}  Public capability benchmarks span
+          $\sim$150--15K items (GPQA-Diamond 198, HumanEval 164, Arena-Hard
+          $\sim$500, SWE-bench Verified 500, MMLU-Pro $\sim$12K).  Internal
+          launch suites at LLM shops typically aggregate dozens of task
+          families and 5K--50K prompts in total; a per-capability slice needs
+          several hundred items before a delta of a few points is resolvable
+          at all ([DL~23]).
+    \item \textbf{Eval cost.}  Automatic suites are cheap: 10K prompts
+          $\times$ $\sim$2K tokens each $\approx$ 20M tokens---dollars to tens
+          of dollars at small-model prices, low hundreds of dollars with a
+          frontier judge pass over every response.  Reasoning evals are not:
+          $n=32$ seeds $\times$ 500 problems $\times$ $\sim$10K-token traces
+          $\approx$ 160M generated tokens \emph{per model configuration}, so
+          a sweep across checkpoints and settings burns thousands of dollars
+          of inference.  Human evaluation is the expensive tier: expert
+          pairwise judgments cost roughly \$2--10 each, so a 3{,}000-comparison
+          expert study runs \$10K--\$30K and weeks of calendar time---which is
+          precisely the gap LLM-as-judge exists to fill.
+    \item \textbf{Judge--human agreement} (details in
+          Section~\ref{sec:judge_practice}).  Humans agree with each other on
+          chat-response preferences roughly 80\% of the time (MT-Bench
+          measured 81\%); frontier-judge agreement with humans on the same
+          data is $\sim$85\%---at or above the human-human ceiling for
+          general quality---but degrades to $\sim$60--70\% on expert domains
+          (medicine, law, subtle code correctness), which is exactly where
+          you switch to execution-based or expert grading.
+    \item \textbf{Resolving win-rate deltas.}  Distinguishing a 3-point
+          win-rate difference from zero at 95\% confidence takes on the order
+          of 1{,}000--2{,}000 pairwise comparisons; a 1-point delta takes
+          roughly 10{,}000, since the required sample grows as $1/\delta^2$.
+          Paired designs (both models answer the same prompts) and clustering
+          standard errors by prompt materially cut the requirement; the
+          derivation and the paired-bootstrap recipe are in [DL~23].
+\end{itemize}
+
 \begin{keyinsight}[Benchmarks Are Necessary but Unreliable]
 Interviewers are not testing whether you memorized benchmark scores---they are
 testing whether you understand the \emph{limitations} of benchmarks.  The
 strongest answer to ``how would you evaluate your model?'' is never ``we scored
-X on MMLU'' but rather a multi-layered evaluation strategy: automatic metrics
-for development iteration, targeted benchmarks for capability assessment, human
-evaluation for quality validation, and production metrics (engagement, task
-completion rate) for real-world impact.
+X on MMLU'' but rather one that places each benchmark in its lifecycle and
+proposes a multi-layered strategy: automatic metrics for development
+iteration, current-generation benchmarks with error bars for capability
+assessment, human and preference evaluation for quality validation, and
+production metrics (engagement, task completion rate) for real-world impact.
 \end{keyinsight}
 
 % ============================================================================
@@ -960,6 +1296,12 @@ The choice of decoding strategy should match the task:
           grammar enforcement.
     \item \textbf{Production serving at scale}: add speculative decoding for
           throughput improvement.
+    \item \textbf{Caveat---reasoning models invert the deterministic-task
+          rule}: greedy/$T{=}0$ decoding degrades long-CoT models (repetition
+          loops, lower accuracy); run them at their recommended sampling
+          settings (e.g., $T \approx 0.6$) even for ``deterministic'' tasks,
+          and see Section~\ref{sec:reasoning_eval} for what this does to
+          evaluation.
 \end{itemize}
 A candidate who can articulate these distinctions---rather than defaulting to
 ``just set temperature to 0.7''---demonstrates production awareness.
@@ -1762,6 +2104,101 @@ satisfaction?  How would you design an evaluation framework that captures
 real-world utility?}
 \end{interviewq}
 
+\vspace{0.5em}
+
+%% QUESTION 11 %%
+\begin{interviewq}
+\textbf{Q: Your model gained 6 points on the internal benchmark suite, but
+users can't tell the difference---what happened?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+I would investigate four hypothesis families, in order of cheapness to check:
+
+\textbf{1.\ The gain isn't real (variance and selection).}
+First question: what is the error bar on 6 points?  If the suite is a few
+hundred prompts, the 95\% CI on a single score can be several points wide,
+and the CI on a \emph{delta} wider still---compute it with a paired bootstrap
+over prompts ([DL~23]).  Second question: how was this checkpoint chosen?  If
+we evaluated many checkpoints or data mixes and shipped the best one on this
+same suite, the reported gain includes a best-of-$N$ selection bias---the
+winner's curse---and the true improvement is smaller.
+
+\textbf{2.\ The suite is compromised (saturation and contamination---yes,
+internal suites too).}
+Private suites don't leak into web crawls, but they rot through
+\emph{selection pressure}: every data-mix and checkpoint decision the suite
+has gated fits the development process to it a little more---Goodhart without
+literal leakage.  There are also literal leaks: eval prompts copied into SFT
+vendor instructions, logged eval traffic re-entering training pipelines,
+synthetic data generated from suite-like templates.  And if the suite is near
+ceiling, 6 points may be polishing artifacts and mislabeled items rather than
+capability.  Check: score a freshly written, never-used holdout (or a live
+benchmark); if the 6 points shrink to 1, the suite is the problem.
+
+\textbf{3.\ Metric--user mismatch.}
+The suite may measure real improvements users never touch: its distribution
+was frozen when it was built (short single-turn academic-style tasks) while
+users live in long, multi-turn, tool-using sessions; or the gains are
+concentrated in capabilities (competition math, obscure knowledge) that are a
+tiny fraction of traffic.  Meanwhile the dimensions users actually perceive
+---latency, refusal rate, formatting, instruction following, tone---may be
+unmeasured or even regressed, netting out to ``no visible difference.''
+Check: per-slice breakdown of the 6 points, reweighted by real usage
+distribution.
+
+\textbf{4.\ Users can't resolve small true deltas.}
+Even a real, user-relevant improvement can be imperceptible: per-interaction
+quality differences of a few points of win rate need thousands of paired
+comparisons to detect statistically ([DL~23])---individual users see a
+handful of responses and habituate quickly.  If the effect is real but small,
+only a properly powered A/B test on satisfaction/retention metrics will show
+it, not anecdotes.
+
+\textbf{Response plan:} error bars on the delta first; fresh-holdout and
+contamination audit second; usage-weighted slice analysis third; then a
+powered A/B test.  Longer term: version the suite, cap how many launch
+decisions each version gates, refresh it from live traffic, and keep the
+hill-climbing suite separate from the decision suite.
+
+\redflags
+\begin{itemize}
+    \item Takes the 6 points at face value and blames users or the A/B test.
+    \item No mention of variance or error bars on the benchmark delta.
+    \item Assumes internal suites cannot be contaminated because they are
+          private (misses selection-pressure Goodharting).
+    \item Cannot connect the gap to Goodhart's law or to the suite's
+          distribution having drifted from real usage.
+    \item Proposes ``make the suite bigger'' without fixing what it measures.
+\end{itemize}
+
+\interviewtest{Whether the candidate has actually run an eval program: the
+reflex to question the measurement before the model, fluency with variance
+and selection effects, and the judgment that internal metrics are targets
+subject to Goodhart's law like any other.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Names contamination/saturation and metric--user
+          mismatch as candidate explanations.
+    \item \badgeLsix{L6}: Systematic four-family diagnosis (variance +
+          selection bias, suite rot, distribution mismatch, detection power)
+          with concrete checks for each and a remediation plan.
+    \item \badgeLseven{L7}: Frames it as eval governance: separation between
+          hill-climbing and decision suites, suite versioning and refresh
+          policy, usage budgets per suite version, CI-gated error bars
+          ([DL~23]), and the organizational failure mode of setting the
+          internal suite as an OKR---Goodhart institutionalized.
+\end{itemize}
+
+\followups{How would you estimate the error bar on the 6-point delta?  How
+many paired comparisons would you need to confirm a 2-point win-rate gain?
+How do you refresh an internal suite without losing the longitudinal trend
+line?  What would you log in production to catch metric--user mismatch
+earlier?}
+\end{interviewq}
+
 \bigskip
 
 % ============================================================================
@@ -1800,13 +2237,27 @@ real-world utility?}
           scale.
 
     \item \textbf{LLM-as-judge} scales better than human evaluation but has
-          systematic biases (verbosity, position, self-preference).  It is
-          a useful development tool but should not be the sole basis for
-          deployment decisions.
+          systematic biases (verbosity, position, self-preference).  The
+          2025--26 practice layer mitigates them: length-controlled win
+          rates, kappa-targeted calibration against expert panels, pinned
+          judge versions with anchor sets against drift, cross-family judge
+          panels, and rubric-vs-pairwise chosen by the decision at hand.
 
-    \item \textbf{Benchmarks} (MMLU, HumanEval, GSM8K) provide standardized
-          comparison but suffer from contamination, saturation, and narrow
-          coverage.  No single benchmark captures real-world utility.
+    \item \textbf{Benchmarks live a lifecycle}: introduced $\to$
+          discriminative $\to$ saturated $\to$ contaminated $\to$ retired.
+          The 2026 current-generation map: MMLU-Pro / GPQA-Diamond
+          (knowledge), AIME/HMMT-class (math), LiveCodeBench / SWE-bench
+          Verified (code), $\tau$-bench / OSWorld (agentic), MMMU
+          (multimodal), Arena-Hard with length control (preference).  MMLU,
+          HellaSwag, HumanEval, and BIG-bench are saturated legacy; labs
+          lean on private held-out suites and live benchmarks (LiveBench)
+          instead.
+
+    \item \textbf{Reasoning-model evaluation} requires sampled decoding at
+          the model's recommended settings (greedy degrades long CoT),
+          mean$\pm$CI over many seeds on small suites, budget-matched
+          comparisons (accuracy per thinking token), and verifier-graded
+          answers; the statistical machinery lives in [DL~23].
 
     \item \textbf{Decoding strategies} trade off quality, diversity, and latency.
           Greedy and beam search for deterministic tasks; nucleus sampling for

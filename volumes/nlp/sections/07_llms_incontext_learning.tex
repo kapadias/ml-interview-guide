@@ -468,6 +468,42 @@ available resources (examples, tools).}
 \label{fig:prompting_decision}
 \end{figure}
 
+\subsection{Prompting in 2026---What Still Matters}
+\label{sec:prompting_2026}
+
+Frontier models have absorbed much of early prompt engineering.  Four
+things still matter in production:
+
+\paragraph{System prompts are the durable interface.}
+The conventions have stabilized: state the role, the hard constraints, and
+the \emph{output contract} (format, refusal behavior, tone) in the system
+prompt; delimit untrusted or variable content (user input, retrieved
+documents) with explicit tags; and order the prompt stable-prefix-first so
+the static part is cacheable.  Mature teams version and regression-test
+system prompts like code.
+
+\paragraph{Few-shot: declining accuracy value, persistent format value.}
+On frontier instruction-tuned models, demonstrations add little
+\emph{accuracy} for well-specified tasks---the instruction alone usually
+suffices.  They remain the most reliable way to pin down \emph{format}:
+exact output shape, label vocabulary, edge-case conventions.  Keep 1--3
+format-anchoring examples; drop the accuracy-motivated 8-shot stacks.
+
+\paragraph{CoT prompting has been absorbed into trained reasoning.}
+Reasoning-trained models deliberate without being asked; appending ``think
+step by step'' adds little there and mainly lengthens output (some vendors
+explicitly advise against it).  Explicit CoT prompting still earns its keep
+on non-reasoning and smaller open models, and whenever you want the
+intermediate steps as \emph{auditable output} rather than hidden thinking.
+
+\paragraph{Prompt caching changed the economics.}
+Providers price cached prefix tokens at a deep discount---as little as
+$0.1\times$ the normal input rate---so a long static system prompt, tool
+schemas, and a few-shot block cost almost nothing after the first request.  This weakens the
+classic ``long prompts are expensive per query'' argument for fine-tuning;
+caching mechanics are covered in Volume~I, Chapter~19 (\emph{Inference
+Optimization and LLM Serving}).
+
 
 % ============================================================================
 % SECTION 5: INSTRUCTION TUNING
@@ -547,7 +583,14 @@ natively.
 \label{sec:tool_use}
 
 Bridging LLMs to real-world applications requires reliable structured output
-and the ability to invoke external tools.
+and the ability to invoke external tools.  In 2026 this is no longer a niche
+topic: function calling is the substrate of every agentic product, and the
+mechanics below---schemas, calling formats, training, constrained decoding,
+error conventions---are exactly what system-design interviews probe.  This
+section deliberately stays at the level of \emph{formats and mechanics};
+agent architectures, orchestration patterns (planner/executor, sub-agents,
+memory), and agent evaluation (SWE-bench Verified, $\tau$-bench, GAIA) are
+covered in the Deep Learning volume's Agents chapter.
 
 \subsection{Structured Output Generation}
 
@@ -561,7 +604,8 @@ deterministic, machine-parseable outputs:
 
 \item \textbf{Function calling:} The model selects a function from a provided
   schema and generates the arguments as structured data.  The function call
-  is executed externally, and the result is fed back for continued generation.
+  is executed externally, and the result is fed back for continued
+  generation---the round trip detailed next.
 
 \item \textbf{Grammar-based constrained decoding:} At each generation step,
   only tokens consistent with a formal grammar (e.g., GBNF for JSON, regex
@@ -569,29 +613,128 @@ deterministic, machine-parseable outputs:
   structure, eliminating parse failures entirely.
 \end{itemize}
 
-\subsection{Tool Use Patterns}
+\subsection{Tool Definitions and the Calling Round Trip}
 
-The standard tool use loop follows a generate-execute-observe cycle:
+Every major API (OpenAI, Anthropic, Gemini, and the open-weight chat
+templates that imitate them) uses the same basic contract: tools are
+declared as \textbf{JSON-Schema definitions}---a name, a natural-language
+description, and a typed parameter schema:
+
+\begin{lstlisting}
+{
+  "name": "get_weather",
+  "description": "Get current weather for a city.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "city": {"type": "string"},
+      "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+    },
+    "required": ["city"]
+  }
+}
+\end{lstlisting}
+
+The runtime loop is a \textbf{generate--execute--observe} cycle:
 
 \begin{enumerate}[leftmargin=*]
-\item The model generates a \textbf{tool call} (function name + arguments).
-\item The tool is \textbf{executed} in an external environment (API call,
-  code execution, database query).
-\item The \textbf{result} is appended to the context.
-\item The model continues generation, incorporating the result.
+\item \textbf{Schema in context:} Tool definitions are serialized into the
+  prompt (into a system-prompt region defined by the model's chat template).
+  Tool descriptions are instructions to the model---writing them well is
+  prompt engineering, and bad descriptions are a leading cause of wrong-tool
+  selection.
+\item \textbf{The model emits a call:} Instead of prose, the assistant turn
+  contains a structured block (tool \texttt{name} + JSON arguments), and
+  generation halts with a distinguished stop reason (e.g.,
+  \texttt{stop\_reason = tool\_use}).
+\item \textbf{The caller executes:} The application---\emph{not} the
+  model---runs the function (API call, code execution, database query).
+  The model only ever produces text describing what it wants run.
+\item \textbf{Observation returned:} The result is appended to the
+  conversation as a tool-result message tied to the call's ID.
+\item \textbf{Continuation:} The model reads the observation and either
+  answers the user or issues further calls.  Multi-step tool chains are
+  this loop iterated.
 \end{enumerate}
 
-\paragraph{Agentic patterns.}
-Multi-step tool chains enable complex workflows: a model might search the
-web, extract relevant passages, compute a result, and synthesize a final
-answer---each step involving different tools.  Key challenges include:
+\paragraph{Parallel tool calls.}
+Modern models can emit \emph{several} tool calls in a single assistant turn
+when the calls are independent (check the weather in three cities at once).
+The caller executes them concurrently and returns all results in one
+message, saving one full model round trip per call.  APIs let you disable
+parallel calling for tools with side effects that must be ordered.
+
+\paragraph{Tool-choice forcing.}
+APIs expose a \texttt{tool\_choice} parameter with four settings:
+\texttt{auto} (the model decides); \texttt{required} or \texttt{any}
+(must call \emph{some} tool); a \emph{named} tool (must call exactly that
+one); or \texttt{none} (no tools this turn).  Forcing
+a named tool is the standard trick for reliable extraction: define a tool
+whose input schema \emph{is} your desired output schema, force the model to
+call it, and read the arguments.  Several ``JSON mode'' and
+structured-output APIs are implemented exactly this way under the hood.
+
+\subsection{How Tool Use Is Trained into Models}
+
+Function calling is a \emph{trained} behavior, not an inference-time
+add-on:
+
 \begin{itemize}[leftmargin=*]
-\item \textbf{Planning:} Deciding which tools to call and in what order.
-\item \textbf{Error recovery:} Detecting tool failures and retrying or
-  choosing alternative approaches.
-\item \textbf{Cost control:} Preventing unbounded tool call chains that
-  consume excessive compute or API credits.
+\item \textbf{SFT on tool-use trajectories.}  Post-training data includes
+  multi-turn conversations containing tool definitions, assistant tool
+  calls, and tool results---human-written, model-generated-and-filtered, or
+  synthesized against real APIs.  Loss is computed on the assistant tokens,
+  including the serialized call itself, so the model literally learns to
+  emit the calling format.
+\item \textbf{Special tokens and chat-template formats.}  Each model family
+  fixes a canonical serialization: dedicated control tokens or tagged
+  regions delimiting tool definitions, calls, and results (e.g.,
+  Llama's \texttt{<|python\_tag|>}-style markers, Hermes-format
+  \texttt{<tool\_call>} tags, ChatML variants).  A serving stack must render
+  tools with the model's own template---a mismatched format silently
+  degrades calling accuracy more than almost any other integration bug.
+\item \textbf{RL on agentic tasks.}  Increasingly, multi-step tool use is
+  further trained with RL on tasks with verifiable end states (tests pass,
+  ticket resolved), which teaches \emph{when} to call, retry, and stop---
+  behaviors that SFT alone anchors only weakly.
 \end{itemize}
+
+\subsection{Reliability: Constrained Decoding and Error Handling}
+
+\paragraph{Constrained decoding as the reliability layer.}
+Training makes valid calls \emph{likely}; constrained decoding makes the
+syntax \emph{certain}.  While generating a call, the sampler masks every
+token that would violate the tool's JSON schema (compiled to a
+grammar/finite-state machine), so malformed JSON and unknown fields become
+impossible rather than merely rare.  This guarantees syntactic validity
+only---the model can still choose the wrong tool or pass semantically wrong
+argument values, which no grammar can prevent.  The implementation
+(grammar compilation, FSM-guided sampling, Outlines/XGrammar, interaction
+with speculative decoding) is covered in Volume~I, Chapter~19
+(\emph{Inference Optimization and LLM Serving}).
+
+\paragraph{Tool errors are observations, not exceptions.}
+The universal convention: when execution fails, the failure is returned to
+the model as a tool result \emph{flagged as an error} (e.g., an
+\texttt{is\_error: true} result carrying the message).  The model then
+reads the error and reacts---retrying with corrected arguments, switching
+tools, or reporting failure to the user.  Conventions that make this work
+in production: validate arguments against the schema \emph{before}
+executing and return validation failures as observations; make error text
+machine-actionable (what was wrong, what is allowed); surface timeouts
+explicitly rather than hanging; and cap the retry loop so a confused model
+cannot burn unbounded tokens re-calling a broken tool.
+
+\paragraph{MCP-style tool integration.}
+The \textbf{Model Context Protocol} (MCP, 2024) standardizes the plumbing
+\emph{around} tool use: instead of every application hard-coding its own
+tool integrations, tool servers expose tools (plus resources and prompt
+templates) over a common client--server protocol, and any MCP-capable
+application can discover them at runtime and inject their JSON-Schema
+definitions into the model's context.  Nothing changes from the model's
+point of view---it still sees schemas and emits calls---but integration
+effort drops from $N \times M$ bespoke connectors (every app $\times$
+every tool) to $N + M$ implementations against one protocol.
 
 \begin{keyinsight}[Tool Use as the Bridge to Practical Applications]
 Without tool use, LLMs are limited to what they memorized during training.
@@ -641,7 +784,11 @@ report describes process-reward-model scoring and Monte Carlo Tree Search
 (the mechanisms widely hypothesized circa 2023 to power reasoning models)
 as unfruitful directions in its experiments.  At inference, the trained
 policy simply generates a longer reasoning trace; no external search
-procedure is required.
+procedure is required.  The full training recipe---GRPO, RL with verifiable
+rewards (RLVR), and the R1 pipeline of cold-start SFT $\to$ reasoning RL
+$\to$ rejection-sampling SFT $\to$ all-scenario RL---is covered canonically
+in Volume~I, Chapter~17 (\emph{Reinforcement Learning and RLHF}); this
+section focuses on how to \emph{spend} and \emph{budget} inference compute.
 
 \subsection{Process Reward Models (PRM)}
 
@@ -692,6 +839,68 @@ execution, or self-consistency):
 Best-of-N with $N = 64$--256 can provide substantial improvements,
 especially in domains where verification is cheap (math, code).
 
+\subsection{Sequential vs.\ Parallel Scaling: What the Numbers Say}
+
+Test-time compute comes in two currencies.  \textbf{Sequential} scaling
+spends it on one longer attempt---a longer trained reasoning trace---and
+pays in \emph{latency}, since thinking tokens are serial.  \textbf{Parallel}
+scaling spends it on $N$ independent attempts plus selection (majority vote
+or a verifier) and pays in \emph{throughput}, with roughly one generation of
+wall-clock latency.  The quantitative facts an interviewer expects:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Majority voting helps a lot, then saturates.}
+  Self-consistency raised GSM8K accuracy for PaLM-540B from 56.5\% to
+  74.4\% ($+17.9$ points) with 40 sampled chains (Wang et al., 2023)---but
+  most of the gain arrives by $k \approx 10$--20, and the curve is nearly
+  flat past $k \approx 40$.  Doubling samples at the tail buys fractions of
+  a point at double the cost.
+\item \textbf{Verifier selection beats majority voting at matched samples.}
+  Majority voting can only surface answers the model produces \emph{often};
+  a verifier can find a correct answer produced \emph{once}.  On MATH,
+  best-of-$N$ selection with a process reward model reached $\sim$78\%,
+  vs.\ $\sim$72\% for an outcome reward model and $\sim$70\% for majority
+  voting at the same $N = 1860$ samples (Lightman et al., 2023).  Earlier,
+  Cobbe et al.\ (2021) showed a 6B model with verifier-reranked
+  best-of-100 matching a $30\times$ larger model sampled once on GSM8K.
+\item \textbf{Compute-optimal allocation is difficulty-dependent.}  At a
+  fixed inference FLOP budget, a small model plus search beats a much
+  larger model sampled once on easy and medium problems---and loses on
+  problems the small model essentially never solves (pass@$N$ near zero),
+  because selection cannot rescue zero coverage (Snell et al., 2024).
+\item \textbf{Budget forcing controls the sequential axis.}  At the concept
+  level: suppress the end-of-thinking delimiter (optionally appending
+  ``Wait'') to force continued deliberation, or truncate thinking to cap
+  it (the s1 recipe, 2025).  Accuracy scales smoothly with the enforced
+  thinking budget---this is what product-level ``effort'' knobs expose.
+\end{itemize}
+
+\subsection{The Cost Side: A Worked \$-per-Query Estimate}
+
+Reasoning modes multiply \emph{output} tokens by roughly $10$--$50\times$,
+and output tokens are the expensive kind (typically $\sim$5$\times$ the
+input price).  A concrete anchor at frontier-class list prices of \$3 per
+million input tokens and \$15 per million output tokens:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{Standard call:} 1{,}000 input + 300 output tokens
+  $\;\to\; 1{,}000 \cdot \tfrac{\$3}{10^6} + 300 \cdot \tfrac{\$15}{10^6}
+  \approx \$0.008$ per query.
+\item \textbf{CoT-heavy reasoning call:} same prompt, but 10{,}000 thinking
+  tokens + 400 answer tokens (thinking is billed as output)
+  $\;\to\; \$0.003 + 10{,}400 \cdot \tfrac{\$15}{10^6} \approx \$0.16$
+  per query---about $20\times$ the standard call.
+\item \textbf{Reasoning + best-of-4 sampling:} $\approx \$0.63$ per query,
+  $\sim$80$\times$ standard.
+\end{itemize}
+
+At $10^6$ queries/day, those three regimes cost roughly \$8K, \$160K, and
+\$630K per day.  This is why query routing (send only hard queries to the
+expensive regime) and thinking budgets are first-class serving decisions,
+and why prompt caching (Section~\ref{sec:prompting_2026}) matters: it
+discounts the input side, but the reasoning-token multiplier lands entirely
+on the undiscounted output side.
+
 \subsection{Code as Reasoning}
 
 For quantitative problems, generating and executing code is often more
@@ -720,8 +929,8 @@ Benefit profile & Improves all queries uniformly
   & Helps hard queries more than easy ones \\
 Scaling limit & Data and compute availability
   & Latency budget and cost per query \\
-Examples & GPT-3 $\to$ GPT-4 & o1/o3 (trained reasoning), Best-of-N,
-  tree search \\
+Examples & GPT-3 $\to$ GPT-4 & o1/o3, DeepSeek-R1 (trained reasoning),
+  Best-of-N, tree search \\
 \bottomrule
 \end{tabularx}
 \caption{Training-time vs.\ test-time compute scaling.}
@@ -796,6 +1005,12 @@ is significantly more likely to be missed.
   regular intervals, allowing the model to attend to these summaries as
   proxies for the full content, reducing the effective sequence length.
 
+\item \textbf{Attention sinks / StreamingLLM} (Xiao et al., 2023): Keep the
+  first few tokens (the ``sink'' that absorbs excess attention mass) plus a
+  sliding window of recent KV entries---enabling stable streaming
+  generation over millions of tokens with a bounded cache; in practice this
+  has largely superseded landmark-style schemes.
+
 \item \textbf{Context compression:} Summarize or distill long contexts into
   shorter representations before feeding to the model.  Trades information
   fidelity for computational efficiency.
@@ -821,6 +1036,15 @@ is significantly more likely to be missed.
 \item \textbf{Practical tests:} Summarization of long documents, multi-document
   QA, codebase understanding.
 \end{itemize}
+
+\paragraph{Claimed vs.\ effective context.}
+Advertised context length is a memory-capacity claim, not a capability
+claim: RULER- and NoLiMa-style evaluations routinely find that the length
+at which quality holds up is a fraction of the advertised window---gaps of
+$4$--$8\times$ between claimed and effective context are routine,
+especially once the task requires more than literal matching.  Quote \emph{effective} context, not claimed context, in any
+system design.  The benchmark details live in the evaluation subsection of
+Volume~I, Chapter~21 (\emph{Long Context and RAG Systems}).
 
 
 % ============================================================================
@@ -1772,6 +1996,83 @@ who have only read about them.}
 \followups{How do you evaluate a model's ability to use its full context?
 What is the needle-in-a-haystack test? How does the position of retrieved
 passages affect RAG quality?}
+\end{interviewq}
+
+% --- Question 11 ---
+\begin{interviewq}
+\textbf{Q: How does an LLM actually call a tool?  Walk me through the full
+round trip from tool definition to final answer.}
+
+\badgeLfive{L5} \quad \badgeLsix{L6} \quad \badgetype{Conceptual} \quad
+\badgefreq{\freqhigh}
+
+\stronganswer
+The round trip has five stages.  (1)~\textbf{Schema in context:} each tool
+is declared as a JSON-Schema definition (name, description, typed
+parameters), serialized into the model's context by its chat template.
+(2)~\textbf{Constrained generation of a call:} the model---trained via SFT
+on tool-use trajectories to emit calls in its template's format---produces
+a structured block (tool \texttt{name} + JSON arguments) instead of prose
+and halts with a distinguished stop reason (e.g.,
+\texttt{stop\_reason = tool\_use}); serving stacks additionally apply
+constrained decoding against the schema, so the emitted call is guaranteed
+syntactically valid.  (3)~\textbf{Execution by the caller:} the application
+receives the call, validates the arguments, and runs the function.  The
+model never executes anything---it only emits text describing what it
+wants run.  (4)~\textbf{Observation:} the result---or an error, flagged as
+such---is appended to the conversation as a tool-result message tied to
+the call's ID.  (5)~\textbf{Continuation:} the model reads the observation
+and either answers the user or issues further calls; an agent loop is this
+cycle iterated.
+
+Two format-level details signal depth: \textbf{parallel tool calls}
+(several independent calls in one assistant turn, executed concurrently to
+save round trips) and \textbf{tool-choice forcing} (\texttt{auto} /
+required / named tool / none)---forcing a named tool whose input schema is
+your desired output schema is how structured-output extraction is
+implemented in practice.  Finally, constrained decoding guarantees only
+\emph{syntax}; choosing the right tool with the right argument values is a
+model-quality problem no grammar can fix.
+
+\redflags
+\begin{itemize}
+\item Saying or implying that \textbf{the model executes the function}.
+  The model emits a request; the application executes it and returns an
+  observation.
+\item Treating function calling as pure prompting---not knowing it is
+  trained in via SFT on trajectories with special tokens and formats.
+\item Believing constrained decoding makes tool use ``correct'' (it
+  guarantees valid syntax, not correct tool selection or argument values).
+\item Not knowing that tool errors are returned to the model as
+  observations for it to react to---proposing instead that the application
+  silently retries or crashes.
+\item No awareness of chat-template mismatch as a failure mode when
+  self-hosting open-weight models.
+\end{itemize}
+
+\interviewtest{Whether you understand the mechanics well enough to build or
+debug a tool-using system: where the schema lives, what the model actually
+outputs, who executes, and where reliability comes from at each stage.}
+
+\goodgreat
+\begin{itemize}
+\item \badgeLfive{L5}: Correctly walks the loop and places execution on the
+  application side, not the model.
+\item \badgeLsix{L6}: Adds the training story (SFT on trajectories,
+  template-specific formats), constrained decoding as the syntax guarantee,
+  parallel calls, tool-choice forcing, and error-as-observation
+  conventions.
+\item \badgeLseven{L7}: Discusses MCP-style runtime tool discovery, schema
+  design as prompt engineering, validation layers before execution, retry
+  budgets and cost caps, and evaluating calling accuracy separately from
+  end-task success---then points forward to agent orchestration tradeoffs
+  (covered in the Deep Learning volume's Agents chapter).
+\end{itemize}
+
+\followups{How would you get reliable structured JSON out of a model with
+no tool involved at all?  What breaks if your serving stack renders tools
+in a different format than the model was trained on?  How do you cap cost
+when a model gets stuck re-calling a failing tool?}
 \end{interviewq}
 
 \bigskip

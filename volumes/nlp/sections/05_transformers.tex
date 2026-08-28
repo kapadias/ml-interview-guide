@@ -874,14 +874,12 @@ signal.
 
 \subsection{Fine-Tuning BERT}
 
-\begin{itemize}
-    \item \textbf{Classification:} Add linear head on \texttt{[CLS]} output.
-    \item \textbf{NER / Token classification:} Add linear head per token output.
-    \item \textbf{Extractive QA:} Predict start and end token positions from
-          the token-level outputs over the passage.
-    \item \textbf{Sentence similarity:} Siamese BERT (Sentence-BERT) with
-          contrastive or cosine loss on \texttt{[CLS]} pooling.
-\end{itemize}
+The encoder-only use cases listed in Section~\ref{sec:arch-variants} all
+fine-tune the same backbone with a small task head: a linear classifier on
+the \texttt{[CLS]} output for classification, a per-token linear head for
+NER and other tagging tasks, start- and end-position heads over the
+passage tokens for extractive QA, and Siamese pooling (Sentence-BERT) with
+a contrastive or cosine objective for sentence similarity.
 
 \subsection{BERT Variants and Improvements}
 
@@ -942,12 +940,34 @@ GPT-2    & 2019 & 1.5B  & Scale improves zero-shot; language models are multi-ta
 GPT-3    & 2020 & 175B  & In-context learning emerges: few-shot via prompt, no gradient updates \\
 InstructGPT & 2022 & 175B & SFT + RLHF: alignment makes models follow instructions safely \\
 GPT-4    & 2023 & MoE$^*$ & Multimodal (text + vision), dramatically better reasoning \\
+GPT-4o / o-series & 2024--25 & n/a$^*$ & Omni-modal I/O (4o); RL-trained reasoning with
+    scaled test-time compute (o1/o3)---see [NLP~8], [DL~17] \\
 \bottomrule
 \end{tabularx}
-\caption{GPT family evolution.  $^*$Architecture not officially confirmed but
-widely believed to be Mixture of Experts.}
+\caption{GPT family evolution.  $^*$Parameter counts and architectures are
+undisclosed from GPT-4 onward; the MoE attribution is widely reported but
+not officially confirmed.}
 \label{tab:gpt-family}
 \end{table}
+
+\paragraph{Beyond GPT-4 (2024--2026).}
+The story since 2023 has two threads, and an honest telling keeps them
+separate.  First, \textbf{omni-models}: GPT-4o (2024) made multimodality
+native---a single model consumes and produces text, images, and audio with
+real-time latency---rather than bolting a vision encoder onto a text-only
+LLM.  Second, and more consequential for interviews, the
+\textbf{reasoning-model era}: the o-series (o1 in 2024, o3 in 2025) and
+DeepSeek-R1 (2025) are trained with large-scale reinforcement learning to
+produce long chains of thought before answering, trading test-time compute
+for large gains on math, code, and science tasks.  Two honesty notes: (a)
+OpenAI discloses neither parameter counts nor architecture details past
+GPT-4, so treat any ``GPT-4 is MoE''-style claim as reported rather than
+confirmed; (b) during this same period the open-weight frontier (Llama~3,
+DeepSeek-V3/R1, Qwen) closed much of the gap, which is why the
+architectural facts this book \emph{can} verify increasingly come from open
+models.  The corrected account of how reasoning models are actually trained
+(reinforcement learning against verifiable rewards, not RLHF-as-usual) is
+in [NLP~8]; the RL machinery itself is covered in [DL~17].
 
 \subsection{Key Architectural Decisions}
 
@@ -1022,14 +1042,66 @@ reduction in KV-cache) while recovering almost all of MHA's quality.  LLaMA~2
 \toprule
 \textbf{Method} & \textbf{Query Heads} & \textbf{KV Heads} & \textbf{KV-Cache} & \textbf{Used In} \\
 \midrule
-MHA (standard)   & $h$  & $h$  & $1\times$                & BERT, GPT-3, GPT-4 \\
+MHA (standard)   & $h$  & $h$  & $1\times$                & BERT, GPT-2, T5, LLaMA~1 \\
 MQA              & $h$  & $1$  & $1/h$                    & PaLM, Falcon-7B \\
-GQA              & $h$  & $g$  & $g/h$                    & LLaMA 2 70B, Mistral \\
+GQA              & $h$  & $g$  & $g/h$                    & LLaMA 2/3 70B, Mistral, Qwen \\
+MLA              & $h$  & latent & $\approx 1/57\times$ & DeepSeek V2, V3, R1 \\
 \bottomrule
 \end{tabularx}
-\caption{Comparison of attention variants.  KV-cache size relative to standard MHA.}
+\caption{Comparison of attention variants.  KV-cache size relative to
+standard MHA; the MLA figure is at DeepSeek-V3 scale.}
 \label{tab:attention-variants}
 \end{table}
+
+The progression MHA (2017) $\to$ MQA (2019) $\to$ GQA (2023) $\to$ MLA
+(2024) is current practice, not history: new open-weight models default to
+GQA, with MLA as the post-GQA rung of the KV-cache ladder (DeepSeek family;
+see Section~\ref{sec:mla-brief} below, and [DL~5] for the full cache
+arithmetic).  MHA itself survives mainly in encoder models and older
+checkpoints---GPT-3 actually interleaved dense and locally banded sparse
+attention, and GPT-4's attention is undisclosed, so neither belongs in an
+MHA ``used in'' list.
+
+\subsection{Multi-head Latent Attention in Brief}
+\label{sec:mla-brief}
+
+MQA and GQA shrink the KV-cache by cutting the \emph{number} of KV heads.
+\textbf{Multi-head Latent Attention} (MLA; introduced in DeepSeek-V2,
+2024, and carried into DeepSeek-V3/R1) moves along a different axis: keep
+all $h$ heads, but \emph{compress what is cached}.  Each token's keys and
+values are jointly down-projected into a single low-rank latent vector;
+per-head K and V are \emph{reconstructed} from that latent by
+up-projections at use time, and at inference those up-projections can be
+folded into the query and output projections so that decoding reads the
+cached latent directly---compress-then-reconstruct, with the
+reconstruction absorbed into existing weights.  One wrinkle is forced by
+RoPE: a position-dependent rotation cannot be applied to the cached latent
+retroactively (it lands between the two projections and breaks the
+folding), so MLA routes position through a small \emph{decoupled RoPE key}
+cached alongside the latent.
+
+The punchline is the cache size.  At DeepSeek-V3 scale, MLA caches 576
+elements per token per layer versus 32{,}768 for full MHA and 2{,}048 for
+GQA-8---roughly $57\times$ smaller than MHA and $3.6\times$ smaller than
+GQA---while \emph{matching MHA quality}: a learned joint compression
+preserves per-head diversity in a way that head-count reduction cannot.
+This is why ``compare MHA/MQA/GQA/MLA'' is now a standard serving
+question.  The derivation---the projection equations, the
+weight-absorption trick, and the full cache arithmetic---is canonical in
+[DL~5]; this chapter's job is the idea, not the algebra.
+
+\paragraph{A note on QK-norm.}
+Modern attention stacks increasingly add one more normalization:
+\textbf{QK-norm}, an RMSNorm (or LayerNorm) applied per head to the
+queries and keys \emph{before} the dot product (Henry et al., 2020;
+ViT-22B, Dehghani et al., 2023; adopted by Gemma~3, Qwen3, and OLMo~2).
+The $\sqrt{d_k}$ scaling of Section~\ref{sec:sqrt-scaling} controls logit
+variance only at initialization---during training the learned query/key
+magnitudes can grow without bound, and at large scale the resulting
+attention-logit explosion causes entropy collapse and loss spikes.
+QK-norm bounds the logits by construction (up to learned gains),
+stabilizing large-model training at negligible runtime cost.  The full
+treatment belongs with the rest of the normalization story in [DL~4].
 
 \subsection{Flash Attention}
 
@@ -1076,6 +1148,57 @@ meaning the full context is accessible through multi-layer stacking.
 
 This reduces per-layer complexity to $O(n \cdot w)$ and KV-cache to
 $O(w \cdot d)$ per layer, enabling efficient processing of long sequences.
+Gemma~2/3 and gpt-oss (2025) ship the production version of this idea:
+sliding-window layers interleaved with a few full-attention (global)
+layers.
+
+\subsection{Attention Sinks and Streaming}
+\label{sec:attention-sinks}
+
+Inspect the attention maps of any trained autoregressive LLM and one
+pattern appears in nearly every head: a large fraction of the attention
+mass lands on the \emph{first} token (or first few tokens), regardless of
+content---even when position 0 is a BOS token carrying no semantic
+information.  Xiao et al.\ (2023) named these positions \textbf{attention
+sinks}.
+
+\paragraph{Why sinks exist.}
+The cause is structural: $\softmax$ must sum to 1.  A head that finds
+nothing relevant for the current query has no way to output ``attend to
+nothing''---the probability mass must go somewhere.  Under a causal mask,
+the initial tokens are the only positions visible to \emph{every} later
+query, so during training they become the universal dumping ground: the
+model learns to park excess mass on positions whose values contribute
+little, using the sink as a learned no-op.  A corollary interviewers like
+to probe: heavy attention on token 0 signals a softmax artifact, not token
+importance.
+
+\paragraph{Why it matters for serving.}
+The natural way to bound memory in streaming (unbounded-length) generation
+is a sliding window over the KV-cache: keep the most recent $w$ entries,
+evict the oldest.  This fails catastrophically---the moment the sink
+tokens are evicted, perplexity explodes, because the mass parked on them
+is forcibly redistributed onto real tokens in every head at once.
+\textbf{StreamingLLM} (Xiao et al., 2023) is the four-line fix: keep the
+KV entries of the first $\sim$4 tokens \emph{permanently}, plus the
+sliding window of recent tokens.  With sinks retained, language modeling
+stays stable over millions of streamed tokens with no fine-tuning.  Better
+still, a dedicated learnable sink token prepended during pretraining gives
+the model an explicit place to park mass; production models have
+internalized the idea (gpt-oss pairs its sliding-window layers with
+per-head learned sink logits).  The same phenomenon is why smarter
+KV-eviction policies (e.g.\ H2O's ``heavy hitters'') always retain the
+sink positions.
+
+\begin{keyinsight}[Softmax Has to Put the Mass Somewhere]
+Attention sinks are not a data quirk or a bug in one model family---they
+are a structural consequence of normalizing attention with $\softmax$,
+which has no ``no match'' outcome.  Any mechanism that evicts, compresses,
+or re-windows the KV-cache must account for where that parked mass will
+go.  This single observation connects softmax mechanics to serving
+behavior, and it is the standard 2025--26 follow-up to any sliding-window
+or KV-eviction discussion.
+\end{keyinsight}
 
 \subsection{Summary: Efficiency Techniques}
 
@@ -1089,9 +1212,9 @@ $O(w \cdot d)$ per layer, enabling efficient processing of long sequences.
 Flash Attention  & IO-aware tiling in SRAM  & Yes & 2--4$\times$ & Nearly all modern training \\
 MQA              & Shared K/V              & Yes & 1.5--2$\times$ (inference) & PaLM, Falcon-7B \\
 GQA              & Grouped K/V             & Yes & 1.3--1.8$\times$ (inference) & LLaMA 2, Mistral \\
-Sliding Window   & Local attention window   & No$^\dagger$ & $O(nw)$ vs.\ $O(n^2)$ & Mistral \\
-Sparse Attention & Structured sparsity     & No  & 2--5$\times$ & BigBird, Longformer \\
-Linear Attention & Kernel approximation    & No  & $O(n)$ & Research models \\
+Sliding Window   & Local attention window   & No$^\dagger$ & $O(nw)$ vs.\ $O(n^2)$ & Mistral; Gemma 2/3, gpt-oss (+ sinks) \\
+Sparse Attention & Structured sparsity     & No  & 2--5$\times$ & GPT-3, BigBird, Longformer \\
+Linear Attention & Kernel/RNN view         & No  & $O(n)$ & MiniMax-01, Qwen3-Next; SSM hybrids [DL~14] \\
 \bottomrule
 \end{tabularx}
 \caption{Summary of attention efficiency techniques.  $^\dagger$Sliding window is
@@ -1722,6 +1845,8 @@ production?}
           makes models practically useful.
 
     \item \textbf{Efficiency improvements}---Flash Attention (IO-aware tiling),
-          GQA (grouped key-value heads), and sliding window attention---make
-          transformers practical for long sequences and production serving.
+          the MQA $\to$ GQA $\to$ MLA KV-cache compression ladder, and
+          sliding-window attention with retained attention sinks
+          (StreamingLLM)---make transformers practical for long sequences
+          and production serving.
 \end{enumerate}

@@ -11,7 +11,8 @@
 Word representations are the foundation of modern NLP---the quality of your
 embeddings determines the ceiling of your system's performance.  This chapter
 traces the evolution from one-hot vectors through Word2Vec, GloVe, and FastText
-to contextual embeddings (ELMo) and modern sentence embeddings (SBERT, E5).
+to contextual embeddings (ELMo) and modern sentence embedders---from SBERT
+and E5 through the decoder-LLM embedding models that now top MTEB.
 Understanding this evolution is critical for interviews because it explains
 \emph{why} each subsequent approach was developed, what problem it solved, and
 what limitations remained.  Every FAANG NLP interview will test at least one
@@ -749,6 +750,78 @@ discriminative terms:
                               {\sum_{i=1}^{n} \text{tfidf}(w_i)}
 \]
 
+\subsection{Anisotropy: Why Raw LM Embeddings Fail}
+\label{subsec:anisotropy}
+
+Given BERT's dominance on supervised tasks, the obvious recipe for sentence
+embeddings is to mean-pool BERT's token outputs (or take the \texttt{[CLS]}
+vector) and compare sentences with cosine similarity.  This fails, and
+famously so: Reimers and Gurevych (2019) showed that on the STS benchmarks,
+mean-pooled raw BERT scores \emph{several Spearman points below averaged
+GloVe vectors}---a 2014 static-embedding baseline---and the raw
+\texttt{[CLS]} embedding scores dramatically lower still.  A model that
+crushes GloVe on every supervised task loses to it as an off-the-shelf
+similarity function.  Interviewers love this puzzle because reciting
+``BERT is better'' is exactly the wrong answer; the mechanism is
+\emph{anisotropy}.
+
+\paragraph{The Narrow-Cone Phenomenon.}
+Ethayarajh (2019) measured the geometry of contextual embedding spaces
+directly: take the expected cosine similarity between the representations of
+\emph{randomly sampled, unrelated} words,
+\[
+    \bar{S} = \E_{x \neq y}\bigl[\cos(\vh_x, \vh_y)\bigr].
+\]
+For an isotropic (directionally uniform) space, $\bar{S} \approx 0$.  For
+ELMo, BERT, and GPT-2, $\bar{S}$ is large and \emph{grows with layer depth}:
+in GPT-2's final layer, random word pairs average cosine similarity close
+to~1.  All vectors occupy a narrow cone around a shared dominant direction
+rather than spreading over the sphere.  Cosine similarity then has almost no
+dynamic range---``related'' and ``unrelated'' pairs differ by hundredths---so
+rankings become fragile and thresholds meaningless.
+
+\paragraph{Frequency-Distorted Geometry.}
+The cone is not even semantically neutral.  Training the LM softmax pushes
+embeddings in a common direction determined by token frequency (the
+``representation degeneration'' problem, Gao et al., 2019), and Li et al.\
+(2020) showed that high-frequency words pack densely near the origin while
+rare words scatter sparsely far from it.  Vector norms and positions
+correlate with \emph{corpus frequency}, so the cosine similarity of pooled
+sentence vectors is partly a comparison of word-frequency profiles rather
+than of meaning.  Averaging over tokens does not cancel these biases---it
+inherits them.
+
+\paragraph{How Contrastive Fine-Tuning Fixes the Geometry.}
+Post-hoc transforms help somewhat: BERT-flow (Li et al., 2020) maps the
+space to a Gaussian with a normalizing flow, and whitening (Su et al., 2021)
+achieves similar gains with a linear transform.  But the durable fix is
+\emph{contrastive fine-tuning}, as in SimCSE
+(Section~\ref{subsec:simcse}): the InfoNCE loss decomposes into an
+\emph{alignment} term that pulls positive pairs together and a
+\emph{uniformity} term that pushes all embeddings apart on the hypersphere
+(Wang and Isola, 2020).  The uniformity pressure directly destroys the
+cone---after even brief contrastive training, average random-pair cosine
+drops toward zero, the frequency direction is suppressed, and cosine
+similarity regains a usable dynamic range.  This is the mechanism behind
+every ``\texttt{[CLS]} is a poor sentence embedding without fine-tuning''
+claim in this book: the pre-trained representations \emph{contain} the
+semantic signal (linear probes recover it), but the LM objective leaves that
+signal encoded in a geometry that cosine similarity cannot read until
+contrastive training reshapes it.
+
+\begin{warningbox}
+Cosine-based health heuristics must be conditioned on how the embeddings
+were trained.  A rule like ``average pairwise cosine of random items should
+sit near 0--0.3, and values above 0.7 signal embedding collapse'' is valid
+only for \emph{contrastively trained} embedding spaces.  Raw LM feature
+spaces (vanilla BERT or GPT hidden states, no contrastive tuning) routinely
+show average random-pair cosine of 0.5--0.9 while still ranking neighbors
+usefully---anisotropy shifts the baseline; it does not erase the signal.
+Diagnose collapse from the \emph{spread of similarities relative to the
+random-pair baseline} (or from the singular-value spectrum of the embedding
+matrix), never from the absolute cosine level alone.
+\end{warningbox}
+
 \subsection{Sentence-BERT (SBERT)}
 
 Reimers and Gurevych (2019) introduced Sentence-BERT, which fine-tunes BERT
@@ -777,6 +850,7 @@ cross-encoder forward passes.  SBERT produces pre-computed embeddings,
 reducing this to 10,000 forward passes plus simple cosine similarity lookups.
 
 \subsection{SimCSE: Contrastive Learning for Sentence Embeddings}
+\label{subsec:simcse}
 
 Gao et al.\ (2021) proposed SimCSE, which uses contrastive learning to produce
 high-quality sentence embeddings with a remarkably simple technique.
@@ -807,48 +881,175 @@ text-specific augmentations (e.g., synonym replacement can change meaning).
 Uses NLI data: entailment pairs are positives, contradiction pairs are hard
 negatives.  This consistently outperforms the unsupervised variant.
 
-\subsection{Modern Embedding Models}
+\subsection{Modern Sentence Embedders: From 100M Encoders to 7B Decoder LLMs}
+\label{subsec:modern_embedders}
 
-The current generation of sentence embedding models builds on the insights
-from SBERT and SimCSE, scaled with more data, better training recipes, and
-instruction tuning.
+The 2022--2023 generation (E5, BGE, GTE) scaled the SBERT/SimCSE recipe:
+BERT-sized encoders (100M--400M parameters), two-stage training (weakly
+supervised contrastive pre-training on hundreds of millions of mined pairs,
+then supervised fine-tuning with hard negatives), and task prefixes such as
+E5's \texttt{query:}~/~\texttt{passage:} markers so one model can serve
+asymmetric retrieval.
+
+\paragraph{The Decoder-LLM Shift (2024--2026).}
+Since 2024 the top of the MTEB leaderboard has been dominated not by encoders
+but by \emph{fine-tuned decoder LLMs} in the 1B--8B range.  The turning point
+was E5-Mistral (Wang et al., 2024): LoRA fine-tuning Mistral-7B for
+\emph{a few thousand steps} on $\sim$500K largely GPT-4-generated synthetic
+task--pair examples beat encoders trained on billions of mined pairs.
+The lineage that followed:
+\begin{itemize}
+    \item \textbf{GritLM} (Muennighoff et al., 2024): a single 7B model
+    that serves \emph{both} embedding and generation, using bidirectional
+    attention with mean pooling in embedding mode and causal attention for
+    generation---evidence that the two capabilities can share one set of
+    weights.
+    \item \textbf{NV-Embed} (NVIDIA, 2024): removes the causal mask during
+    contrastive training, adds a learned \emph{latent-attention pooling}
+    layer instead of last-token pooling, and trains in two stages (retrieval
+    with hard negatives, then non-retrieval tasks blended in).
+    \item \textbf{LLM2Vec} (BehnamGhader et al., 2024): a general
+    three-step conversion recipe for \emph{any} decoder---(1)~enable
+    bidirectional attention, (2)~adapt to it with masked-next-token
+    prediction, (3)~unsupervised SimCSE---turning a causal LM into a strong
+    embedder with no labeled data.
+    \item \textbf{gte-Qwen2 and Qwen3-Embedding} (Alibaba, 2024--2025):
+    decoder embedders distilled to a size ladder (0.6B/4B/8B);
+    Qwen3-Embedding-8B topped the MTEB multilingual leaderboard on release
+    in 2025.
+\end{itemize}
+
+\paragraph{Last-Token Pooling and Instruction Prompts.}
+Two adaptations recur because causal attention breaks the encoder
+assumptions.  First, \emph{pooling}: under a causal mask, position $t$ only
+attends to positions $\leq t$, so mean pooling averages many
+partial-context states; the standard fix is \textbf{last-token pooling}
+(append \texttt{[EOS]} and take its final hidden state---the only position
+that has seen the whole input), unless the mask is removed
+(NV-Embed, LLM2Vec, GritLM).  Second, \emph{instructions}: the task
+description is prepended to the \emph{query} only (e.g., ``Instruct: Given a
+web search query, retrieve relevant passages.\ Query:~\ldots''), which
+conditions the embedding on the task while leaving document embeddings
+task-agnostic and reusable across tasks.
+
+\paragraph{Why 7B Decoders Win---and What They Cost.}
+The wins come from inherited scale: richer pre-trained representations and
+world knowledge, instruction-following that generalizes to unseen task
+descriptions, larger native dimensions (3584--4096), and the ability to
+generate their own synthetic training pairs.  The price is paid at serving
+time, and it is roughly the parameter ratio: a 7B decoder spends
+$\sim$60--70$\times$ the FLOPs per token of a 110M encoder.  Concretely, at
+$\sim$2 FLOPs per parameter per token, a 512-token passage costs a 7B model
+$\sim$7~TFLOPs; on an H100 ($\sim$1{,}000 TFLOPS BF16 at realistic 40\%
+utilization) that is $\sim$50--60 passages/s, so embedding 1M passages takes
+$\sim$5 GPU-hours ($\sim$\$10--25 at cloud rates).  The 110M encoder does
+the same corpus in a few minutes for well under a dollar, answers queries in
+2--5ms instead of 15--40ms, and holds 0.2GB of weights instead of 14GB.
+The 2026 judgment call: 7B-class embedders (or their API equivalents) win
+for high-value, moderate-QPS workloads such as enterprise RAG; at
+billion-document scale or tight first-stage latency budgets, 100--400M
+encoders---often distilled from the large models---remain the default, with
+the quality gap partially closed by fine-tuning on domain data.
 
 \begin{table}[H]
 \centering
-\caption{Modern sentence embedding models.}
+\caption{Modern sentence embedding models.  The 2024--2026 rows mark the
+shift from BERT-scale encoders to decoder-LLM embedders and
+Matryoshka-truncatable API models.}
 \label{tab:modern_embeddings}
-\begin{tabularx}{\textwidth}{l l l X}
+\small
+\begin{tabularx}{\textwidth}{l l l l >{\raggedright\arraybackslash}X}
 \toprule
-\textbf{Model} & \textbf{Org} & \textbf{Year} & \textbf{Key Innovation} \\
+\textbf{Model} & \textbf{Org} & \textbf{Year} & \textbf{Params}
+& \textbf{Key Innovation} \\
 \midrule
-E5 & Microsoft & 2022 & ``query:'' and ``passage:'' prefixes; trained
-    with contrastive loss on diverse paired data \\
-BGE & BAAI & 2023 & Instruction-tuned embeddings; strong MTEB
-    performance \\
-GTE & Alibaba & 2023 & Multi-stage contrastive training; competitive
-    at small model sizes \\
-Nomic Embed & Nomic AI & 2024 & Long-context (8192 tokens); open-source;
-    Matryoshka training \\
+E5 & Microsoft & 2022 & 110M--330M & \texttt{query:}/\texttt{passage:}
+    prefixes; contrastive training on diverse mined pairs \\
+BGE & BAAI & 2023 & 110M--330M & Instruction-tuned embeddings; strong
+    MTEB performance \\
+GTE & Alibaba & 2023 & 110M--435M & Multi-stage contrastive training;
+    competitive at small sizes \\
+Nomic Embed & Nomic AI & 2024 & 137M & Long-context (8192 tokens); open
+    weights; Matryoshka training (v1.5) \\
+E5-Mistral & Microsoft & 2024 & 7B & First strong decoder embedder; LoRA +
+    GPT-4 synthetic pairs; last-token pooling with instructions \\
+GritLM & Contextual AI et al. & 2024 & 7B & Unified embedding + generation
+    in one model via mode-switched attention \\
+LLM2Vec & McGill/Mila & 2024 & recipe & Converts any decoder: bidirectional
+    attention + MNTP + SimCSE \\
+NV-Embed & NVIDIA & 2024 & 7B & Causal-mask removal; latent-attention
+    pooling; two-stage curriculum \\
+Qwen3-Embedding & Alibaba & 2025 & 0.6B--8B & Decoder embedder size ladder;
+    MTEB multilingual leader at release \\
+text-embedding-3 & OpenAI & 2024 & API & Matryoshka-truncatable dimensions
+    (3072 down to 256) \\
+Gemini Embedding & Google & 2025 & API & MRL truncation; strong MTEB
+    multilingual scores \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\subsection{Matryoshka Embeddings}
+\subsection{Matryoshka Representation Learning}
+\label{subsec:mrl}
 
 Kusupati et al.\ (2022) introduced Matryoshka Representation Learning (MRL),
-where a single model is trained to produce useful embeddings at \emph{multiple}
-dimensions simultaneously.  The training loss sums over multiple truncation
-points:
-\[
-    \loss_{\text{MRL}} = \sum_{d \in \mathcal{D}}
-                         \loss_{\text{task}}(\vw_{[:d]})
-\]
-where $\mathcal{D} = \{32, 64, 128, 256, 512, 768\}$ (for example) and
-$\vw_{[:d]}$ is the first $d$ dimensions of the embedding.
+named after Russian nesting dolls: a single model is trained so that every
+\emph{prefix} of the embedding vector is itself a usable, lower-dimensional
+embedding.  Instead of applying the training loss only to the full
+$D$-dimensional output, MRL applies it to a set of nested truncations
+simultaneously:
 
-This is valuable in production: you can use 64-dimensional embeddings for
-coarse filtering (fast ANN search) and full 768-dimensional embeddings for
-fine-grained re-ranking, all from a single model.
+\begin{mathresult}{Matryoshka (MRL) Training Loss}
+\[
+    \loss_{\text{MRL}}
+    = \sum_{d \in \mathcal{D}} c_d \,
+      \loss_{\text{InfoNCE}}\!\Bigl(
+        \tfrac{\vh_{[:d]}}{\norm{\vh_{[:d]}}}
+      \Bigr),
+    \qquad
+    \mathcal{D} = \{64, 128, 256, \ldots, D\}
+\]
+where $\vh_{[:d]}$ is the first $d$ dimensions of the embedding, each
+truncated prefix is re-normalized before computing similarities, and $c_d$
+are importance weights per truncation level (often uniform).  For sentence
+embedders, $\loss_{\text{InfoNCE}}$ is the same contrastive loss used at
+full dimension; MRL simply evaluates it at every nested prefix.
+\end{mathresult}
+
+Because the low-dimensional prefixes must solve the contrastive task on
+their own, gradient pressure concentrates the coarsest, most discriminative
+information in the leading dimensions, with later dimensions adding
+progressively finer detail---a learned importance ordering reminiscent of
+PCA, but optimized directly for the retrieval objective.  Crucially,
+truncate-then-renormalize is only trustworthy for MRL-trained models;
+truncating a conventionally trained embedding discards dimensions of
+arbitrary importance and degrades quality sharply.
+
+\paragraph{Adoption in API Embedders.}
+MRL moved from paper to production standard within two years.  OpenAI's
+\texttt{text-embedding-3} models (2024) expose a \texttt{dimensions}
+parameter---\texttt{text-embedding-3-large} truncates from 3072 down to 256
+while retaining most of its MTEB score (still outperforming the full
+1536-dimensional \texttt{ada-002} at 256 dims).  Google's Gemini embedding
+models expose \texttt{output\_dimensionality}, and open models (Nomic Embed
+v1.5, many BGE/GTE derivatives) ship MRL-trained checkpoints.  When a
+provider lets you ``choose your embedding size,'' MRL is the mechanism
+underneath.
+
+\paragraph{The Dimension/Cost Knob Workflow.}
+Vector storage, index memory, and ANN search latency all scale roughly
+linearly in $d$, so MRL turns dimensionality into a post-training cost knob:
+for 100M documents in float32, 3072 dims is $\sim$1.2TB of raw vectors while
+256 dims is $\sim$100GB.  The production workflow: (1)~embed once at full
+dimension and store; (2)~evaluate Recall@K/NDCG on \emph{your} domain eval
+set at each candidate truncation; (3)~index the smallest dimension that
+meets the quality bar.  A common refinement is \emph{adaptive (funnel)
+retrieval}: run the first-stage ANN search over cheap truncated vectors
+(e.g., 256 dims), then re-score the shortlist with the full-dimension
+vectors---recovering nearly full quality at a fraction of the index cost,
+all from a single model.  MRL truncation also composes multiplicatively
+with the quantization techniques of
+Section~\ref{subsec:choosing_embedders}.
 
 \subsection{Training Objectives for Embedding Models}
 
@@ -939,8 +1140,8 @@ application is known.
 
 \subsection{MTEB: The Modern Benchmark}
 
-The Massive Text Embedding Benchmark (Muennighoff et al., 2023) evaluates
-sentence embeddings across 8 task categories and 58 datasets:
+The Massive Text Embedding Benchmark (Muennighoff et al., 2023) originally
+evaluated sentence embeddings across 8 task categories and 58 datasets:
 \begin{enumerate}
     \item Classification (e.g., sentiment, topic)
     \item Clustering (e.g., Reddit, arXiv)
@@ -952,8 +1153,87 @@ sentence embeddings across 8 task categories and 58 datasets:
     \item Bitext Mining (parallel sentence alignment)
 \end{enumerate}
 
-MTEB is now the standard benchmark for evaluating general-purpose embedding
-models and is hosted as a public leaderboard on Hugging Face.
+MTEB became the standard benchmark for general-purpose embedding models and
+is hosted as a public leaderboard on Hugging Face.  In 2025 it was
+superseded by \textbf{MMTEB} (Enevoldsen et al., 2025), a community
+expansion to 500+ tasks covering 250+ languages with per-language and
+per-domain leaderboards; the public leaderboard now runs on this expanded
+suite.  How to \emph{use} these leaderboards without being misled by them
+is the subject of the next subsection.
+
+\subsection{Choosing and Evaluating Embedders in 2026}
+\label{subsec:choosing_embedders}
+
+The model landscape of Section~\ref{subsec:modern_embedders} plus the
+benchmark caveats above condense into a selection workflow that interviewers
+increasingly probe end-to-end.
+
+\paragraph{MTEB Is a Shortlist Filter, Not a Decision.}
+Treat leaderboard rank as a coarse pre-filter, for two reasons.  First,
+\emph{contamination and gaming}: many submissions train on the training
+splits of MTEB's constituent datasets---and some overfit well beyond
+that---so top-of-leaderboard margins of a point or two are not trustworthy
+signals of general quality.  The BEIR experience (Thakur et al., 2021)
+already showed that in-domain wins often fail to transfer zero-shot, and
+MMTEB's expanded, partly held-out task pool reduces but does not eliminate
+the problem.  Second, \emph{aggregation mismatch}: the headline MTEB score
+averages classification, clustering, and STS tasks that may be irrelevant to
+your use case.  The practical recipe: filter the leaderboard to the task
+family you care about (e.g., Retrieval), and shortlist 3--5 models spanning
+size tiers (a 100M encoder, a 1B-class model, a 7B-class or API model).
+
+\paragraph{Your Domain Eval Decides.}
+Build an evaluation set from \emph{your} corpus and real query
+distribution: a few hundred to a thousand queries sampled from logs, with
+relevance labels from pooled judgments (an LLM judge with human spot-check
+audits is the standard 2026 pattern; click-derived labels work but inherit
+position bias---see the debugging question at the end of this chapter).  Measure Recall@K at the $K$ your re-ranker
+actually consumes, plus NDCG@10, and run the evaluation \emph{through your
+real pipeline}---your chunking, your ANN index settings---not just
+brute-force similarity in a notebook.  Leaderboard order routinely inverts
+on domain evals; the eval costs a day and de-risks the entire system.
+
+\paragraph{When Recall Falls Short: Fine-Tune with Hard Negatives.}
+If the best off-the-shelf candidate plateaus below the product bar, the
+highest-leverage move is usually not a bigger model but contrastive
+fine-tuning on domain pairs with \emph{mined hard negatives}: retrieve top
+candidates with BM25 and the current model, filter out likely false
+negatives (e.g., with a cross-encoder), and train with InfoNCE.  Gains of
+5--15 Recall points are typical---often more than a model-tier upgrade
+buys, at a fraction of the serving cost.
+
+\paragraph{Quantization: Int8 and Binary Embeddings.}
+Embedding quantization is now standard index-side practice.  Scalar int8
+quantization cuts storage $4\times$ relative to float32 with typically
+under 1\% retrieval-quality loss.  \emph{Binary} quantization keeps one bit
+per dimension---a 1024-dim float32 vector shrinks from 4KB to 128
+bytes ($32\times$)---and replaces cosine with Hamming distance, which
+hardware popcount instructions make extremely fast.  Used naively it costs
+several points of recall, but the standard two-stage trick (binary ANN
+search over an oversampled candidate set, then re-scoring those candidates
+with int8 or float vectors) retains roughly 95\% of full-precision quality.
+Combined with Matryoshka truncation
+(Section~\ref{subsec:mrl}), a 3072-dim float32 index can shrink by two
+orders of magnitude---the difference between a RAM-resident index and a
+sharded cluster.
+
+\paragraph{Embedding-Migration Economics.}
+Swapping embedding models is not a config change, because embedding spaces
+from different models---even the same architecture retrained---are mutually
+incomparable: vectors from two models must never share one index.  A
+migration therefore means (1)~\textbf{re-embedding} the entire corpus (for
+100M documents of $\sim$512 tokens, roughly 500 GPU-hours with a 7B
+embedder versus $\sim$10 with a 110M encoder; via API at
+\$0.02--\$0.13 per 1M tokens, roughly \$1K--\$7K); (2)~\textbf{re-indexing}
+(an HNSW build over 100M vectors is hours-to-days of CPU time and a
+transient double-memory footprint); and (3)~\textbf{validated cutover}: run
+a \emph{shadow index}---dual-write new and updated documents to both
+indexes while a batch job backfills the rest---compare shadow-vs-live
+retrieval offline, A/B or interleave online, then cut over, keeping the old
+index warm for rollback.  Total cost is dominated by operational risk, not
+GPU dollars, which is why teams batch migrations (new model + new
+dimensionality + new quantization in one pass) and why ``how would you roll
+out a new embedding model?'' is a standard L6 follow-up.
 
 \subsection{Comparison of Embedding Methods}
 
@@ -972,7 +1252,8 @@ GloVe         & No  & No  & No  & 100--300      & Good \\
 FastText      & No  & Yes & No  & 100--300      & Good+ \\
 ELMo          & Yes & Yes & Yes & 512--1024     & Very Good \\
 SBERT         & Yes & Yes & Yes & 384--768      & Excellent \\
-E5/BGE/GTE    & Yes & Yes & Yes & 384--1024     & State-of-art \\
+E5/BGE/GTE    & Yes & Yes & Yes & 384--1024     & Excellent \\
+Decoder LLMs  & Yes & Yes & Yes & 2560--4096    & State-of-art \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -1693,4 +1974,114 @@ throughput.}
 \followups{How would you handle incremental updates when new documents
 arrive? How would you A/B test two different embedding models in production?
 What ANN algorithm would you choose and why?}
+\end{interviewq}
+
+\vspace{0.5em}
+
+% --- Question 11 ---
+\begin{interviewq}
+\textbf{Q: Your new embedding model wins offline---$+4$ points Recall@100 on
+your evaluation set---but loses the online A/B test.  Walk me through your
+investigation.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+I would treat this as a discrepancy between two measurements and
+systematically enumerate what differs between the offline eval and the
+online system, ordered by cheapness to check and prior probability.
+
+\textbf{1.\ Validate the experiment itself.}  Before debugging the model:
+is the A/B correctly bucketed, adequately powered, and are guardrail
+metrics clean?  The single most common culprit is \textbf{latency}: if the
+new model is larger (say a 7B decoder replacing a 110M encoder), an extra
+20--40ms per query degrades engagement enough to swamp a $+4$ Recall gain.
+Check latency distributions per arm first---a relevance win inside a
+latency loss is a launch-blocking but perfectly diagnosable state.
+
+\textbf{2.\ Check serving parity with the offline eval.}  The offline
+pipeline and the serving path must run the \emph{same} model the same way:
+\begin{itemize}
+    \item \textbf{Mixed embedding spaces:} if the corpus backfill was
+    incomplete, some documents in the new index still carry old-model
+    vectors.  Embedding spaces from different models are mutually
+    incomparable, so a partially backfilled index fails silently and
+    catastrophically for the un-migrated slice.
+    \item \textbf{Prompt/preprocessing mismatch:} missing
+    \texttt{query:}~/ instruction prefixes at serving time (while the
+    offline eval used them), different truncation lengths, or a missing
+    normalization step will quietly destroy the model's advantage.
+\end{itemize}
+
+\textbf{3.\ ANN--recall interaction.}  Offline evals typically score with
+exact (brute-force) search; production serves from an ANN index (HNSW,
+IVF-PQ) whose parameters were tuned on the \emph{old} model's geometry.
+A new embedder changes norm distributions and cluster structure, so the
+same \texttt{efSearch}/\texttt{nprobe} settings can yield materially lower
+ANN recall on the new vectors.  Measure ANN-vs-exact overlap@100 in both
+arms; if the new arm's ANN recall is lower, retune the index before judging
+the model.
+
+\textbf{4.\ Downstream coupling.}  The first-stage embedder does not act
+alone: a re-ranker or click model trained on the old candidate distribution
+may mis-score the new, unfamiliar candidates, converting better recall into
+worse final rankings.  The clean test is to retrain (or at least
+recalibrate) the re-ranker on candidates from the new model before the A/B.
+
+\textbf{5.\ Interrogate the offline labels.}  The $+4$ itself may be
+partly artifactual.  Eval sets go \textbf{stale}: if queries and labels
+were harvested months ago, the offline win is measured on yesterday's
+query and document distribution, not the live one.  And labels derived
+from logged clicks carry \textbf{position bias} and selection bias: they
+over-represent documents the \emph{old} system surfaced and users could
+see, so offline deltas computed on them are untrustworthy in both
+directions.  If the labels came from an LLM judge, audit for systematic
+preferences correlated with the new model's training data.  Slice both
+offline and online metrics by query segment (head vs.\ tail, navigational
+vs.\ exploratory) to find where the online loss concentrates, and use
+interleaving for a more sensitive online ranking comparison.
+
+In practice the highest-prior causes are, in order: latency regression,
+missing instruction/prefix parity, incomplete re-embedding, and un-retuned
+ANN parameters---all checkable in a day, and all more likely than ``the
+offline metric was simply wrong.''
+
+\redflags
+\begin{itemize}
+    \item Concluding ``the A/B must be underpowered---ship it anyway,''
+    or conversely ``offline metrics are meaningless.''  Both measurements
+    are information; the job is reconciling them.
+    \item Not knowing that embeddings from two different models cannot
+    coexist in one index.
+    \item Never mentioning latency as a confound.
+    \item Assuming production search is exact---not knowing the offline
+    eval used brute force while serving uses ANN.
+    \item No awareness that click-derived labels are position- and
+    selection-biased.
+\end{itemize}
+
+\interviewtest{Production debugging discipline, understanding of the full
+retrieval stack (embedder $\to$ ANN index $\to$ re-ranker $\to$ user), and
+mature skepticism about both offline and online measurement.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5}: Proposes checking latency and basic serving
+    parity; suggests re-running the experiment.
+    \item \badgeLsix{L6}: Systematically enumerates the mismatch classes
+    (mixed spaces, prefix parity, ANN retuning, re-ranker coupling, label
+    bias), proposes measuring ANN-vs-exact overlap per arm, and slices
+    metrics to localize the loss.
+    \item \badgeLseven{L7}: Designs the lasting fix: a migration checklist
+    that makes space/prefix/ANN parity failures impossible to ship, a
+    label-refresh pipeline using randomized interleaving or
+    propensity-logged clicks for unbiased offline evals, and shadow-index
+    scoring so offline/online gaps are caught before the A/B.
+\end{itemize}
+
+\followups{How would you retune an HNSW index for a new embedding
+distribution? How do you collect unbiased relevance labels from click
+logs? Would you retrain the re-ranker before or during the embedder A/B?
+At what point do you abandon the new model versus keep debugging the
+serving stack?}
 \end{interviewq}
