@@ -2,7 +2,7 @@
 \label{chap:inference_optimization}
 
 \begin{tldr}
-Inference optimization is where model quality meets production reality. A 70B model is worthless if it cannot serve responses within your latency budget and cost envelope. This chapter covers the core building blocks of modern LLM serving: KV cache mechanics and PagedAttention, continuous batching, speculative decoding, quantization for inference (GPTQ, AWQ, GGUF), the prefill vs.\ decode phase distinction (and why it matters for hardware utilization), and model parallelism strategies for serving. At Staff+ interviews, you are expected to reason about memory bandwidth, GPU utilization, and end-to-end serving system design---not just name techniques. If your answer to ``how would you serve this model'' is ``put it on a GPU,'' you will not pass.
+Inference optimization is where model quality meets production reality. A 70B model is worthless if it cannot serve responses within your latency budget and cost envelope. This chapter covers the core building blocks of modern LLM serving: KV cache mechanics, PagedAttention, and prefix caching (RadixAttention), continuous batching, speculative decoding, structured decoding, quantization for inference (GPTQ, AWQ, GGUF, FP8/FP4), the prefill vs.\ decode phase distinction (and why it matters for hardware utilization), model parallelism strategies for serving (including expert parallelism for MoE), and the workload shift that reasoning models bring. At Staff+ interviews, you are expected to reason about memory bandwidth, GPU utilization, and end-to-end serving system design---not just name techniques. If your answer to ``how would you serve this model'' is ``put it on a GPU,'' you will not pass.
 \end{tldr}
 
 %==============================================================================
@@ -120,6 +120,33 @@ For calibration against the running example: LLaMA-2 70B with GQA-8 caches $\app
 
 \textbf{Pitfalls.} PagedAttention adds a level of indirection (page table lookups) that slightly increases per-token latency. The block size is a tuning parameter: too small increases page table overhead; too large increases internal fragmentation. Sixteen tokens per block is a common default.
 
+\subsection{Prefix Caching and RadixAttention}
+\label{sec:prefix_caching}
+
+PagedAttention makes KV blocks shareable; \textbf{prefix caching} exploits that: if two requests begin with the same token sequence, the KV for the shared prefix is bit-identical (attention is causal, so a token's KV depends only on the tokens before it) and can be computed once and reused. A hit eliminates both the prefill \textit{compute} and the KV \textit{memory} for the shared portion.
+
+\textbf{Where shared prefixes come from.} Production traffic is far more redundant than benchmark traffic:
+\begin{itemize}
+    \item \textbf{Shared system prompts}: every request to an assistant carries the same 1--5K-token system prompt (instructions, tool schemas, few-shot examples).
+    \item \textbf{Multi-turn chat}: turn $N$ re-sends the entire conversation; everything except the newest user message is a prefix the server already processed.
+    \item \textbf{Agents}: an agent loop re-sends its whole trajectory (system prompt + tool schemas + all prior steps) on every tool-call iteration---often dozens of times per task. Without prefix caching, total prefill work over a $T$-step trajectory grows \textit{quadratically} in trajectory length (each step re-prefills the full history); with it, each step prefills only the new tokens and the total is linear.
+\end{itemize}
+
+\textbf{Worked arithmetic: a 2K-token shared prefix} (LLaMA-2 70B, GQA-8, $\approx 0.32$ MB KV per token from Section~\ref{sec:kv_cache}):
+\begin{itemize}
+    \item \textbf{Memory}: the prefix's KV is $2{,}048 \times 0.32$ MB $\approx 0.65$ GB. Stored once instead of per-request, 200 concurrent requests sharing it save $199 \times 0.65 \approx 130$ GB of KV---more than an entire H100's HBM.
+    \item \textbf{Compute}: prefilling 2K tokens costs $\approx 2 \times 70\text{B} \times 2{,}048 \approx 287$ TFLOPs---roughly 70--100 ms of 8$\times$H100 time (Section~\ref{sec:prefill_decode}). On a hit that work, and its contribution to TTFT, disappears; only the unshared suffix is prefilled.
+    \item \textbf{Economics}: with hit rate $h$ over prompt tokens, prefill cost scales as $(1-h)$. Multi-turn and agent workloads routinely reach $h > 0.8$, which is why major APIs bill cached input tokens at $\sim$10\% of the normal rate---the discount mirrors the provider's real cost structure.
+\end{itemize}
+
+\textbf{RadixAttention (SGLang).} vLLM's automatic prefix caching matches hashed chains of fixed-size blocks; SGLang's RadixAttention generalizes it with a \textit{radix tree} keyed on token sequences. Each tree node maps a token-sequence segment to its KV blocks; an incoming request walks the tree to its longest matching prefix and reuses that KV directly---no application-level cache annotations required. Nodes are reference-counted while in use; under memory pressure an LRU policy evicts least-recently-used leaves first, so hot prefixes near the root (the system prompt) persist while cold conversation tails are reclaimed. Reuse is automatic across requests, turns, and \textit{branching} agent trajectories: two branches forked from the same trajectory share everything up to the fork.
+
+\textbf{Cache-aware routing.} Prefix caches live per replica, so in a multi-replica deployment the load balancer determines the hit rate: random or least-loaded routing scatters a conversation's turns across replicas, each holding a partial, mostly-useless cache. Cache-aware routers (e.g., SGLang's router) maintain an approximate view of each replica's radix tree and send each request to the replica with the longest matching prefix, falling back to least-loaded when no good match exists or the target is overloaded. Session stickiness (hash on conversation ID) is the simple version; prefix-match routing is the general one. This routing decision alone can swing the effective hit rate from $<$20\% to $>$80\%---a first-order cost lever, not a micro-optimization.
+
+\begin{keyinsight}[Prefix Caching Is Capacity Planning, Not a Cache]
+For agentic workloads the majority of prefill FLOPs are redundant recomputation of unchanged trajectories. Radix-tree reuse plus cache-aware routing can cut input-token cost by 5--10$\times$, and prompt-structure discipline (stable content first, volatile content---timestamps, user data---last) protects the hit rate. Interviewers increasingly probe this directly: ``your agent product's prefill bill dominates---what do you do'' expects prefix caching, cache-aware routing, and prompt layout as the answer, with the hit-rate arithmetic to back it.
+\end{keyinsight}
+
 %==============================================================================
 \section{Continuous Batching}
 \label{sec:continuous_batching}
@@ -143,7 +170,7 @@ GPU utilization & Low (waiting on longest request) & High (slots always filled) 
 Throughput & Limited by slowest request & 2--8$\times$ higher in practice \\
 Implementation & Trivial & Requires iteration-level scheduler \\
 Latency fairness & All requests have same latency & Short requests finish faster \\
-Adopted by & Older serving frameworks & vLLM, TGI, TensorRT-LLM \\
+Adopted by & Older serving frameworks & vLLM, SGLang, TensorRT-LLM \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -235,7 +262,27 @@ Decode bottleneck & Memory-bandwidth-bound & Compute-bound \\
 
 \textbf{Typical speedup.} 2--3$\times$ for single-request latency on large models. Diminishes with larger batch sizes because the GPU becomes compute-saturated, leaving no spare capacity for the verification pass.
 
-\textbf{Draft model variants.} The draft model can be a smaller version of the same architecture, a completely different architecture (e.g., a 2-layer transformer), or even a Medusa-style approach where extra prediction heads on the target model itself draft multiple tokens without a separate model.
+\textbf{Draft model variants.} The draft model can be a smaller version of the same architecture, a completely different architecture (e.g., a 2-layer transformer), or the target model can draft for itself: \textbf{Medusa} bolts parallel prediction heads onto the target; \textbf{EAGLE} adds a small autoregressive head that drafts in the target's \textit{feature} (hidden-state) space, which tracks the target far better than an independent small model. EAGLE-2/3 (dynamic draft trees, multi-layer feature fusion) are the deployed default in vLLM/SGLang stacks in 2026---when a production config says ``speculative decoding: on,'' this is usually what is running.
+
+\textbf{MTP heads as built-in drafts.} DeepSeek-V3 trains \textit{multi-token prediction} (MTP) heads during pretraining: a lightweight extra module that, at each position, also predicts the token after next. The objective densifies the training signal, but the serving payoff is that the MTP head doubles as a \textit{self-speculative draft} at inference---it proposes the next token(s), the main model verifies, exactly the draft-verify scheme above, except the draft was trained jointly with the target on the same data and shares its trunk. Reported acceptance of the MTP-drafted token is $\approx$85--90\%, which yields $\sim$1.8$\times$ decode throughput essentially for free: no separate draft model to build, host, or keep in sync with the target as it is fine-tuned. Expect MTP-style self-speculation to be the default in models that pretrain the heads (DeepSeek-V3/R1-lineage), with EAGLE-style retrofit heads as the default everywhere else.
+
+%==============================================================================
+\section{Structured and Constrained Decoding}
+\label{sec:structured_decoding}
+%==============================================================================
+
+Many production calls do not want free text: they want JSON matching a schema, a specific SQL dialect, or a function call whose arguments parse. \textbf{Constrained decoding} guarantees this at the sampling step. The output language is compiled into an automaton---a finite-state machine for regex/JSON-schema constraints, a pushdown automaton for full context-free grammars---that tracks the generation state, and at each decode step the engine \textit{masks the logits} so only tokens that keep the output valid can be sampled. Outlines popularized the regex-to-FSM-over-the-token-vocabulary formulation; XGrammar-style engines extend it to general grammars with an adaptive token-mask cache. The invalid-output rate drops to exactly zero, by construction.
+
+\textbf{Cost: near zero when compiled.} The naive version---checking each of $\sim$128K vocabulary tokens against the grammar at every step---is ruinously slow. Production engines precompile: for each automaton state, the allowed-token set is computed once and stored as a bitmask, so per-step work is a lookup plus a vectorized mask-add on the logits (microseconds), and the mask for step $t+1$ is computed on CPU while the GPU runs the forward pass for step $t$. Grammar compilation happens once per schema and is cached across requests. Both vLLM and SGLang ship XGrammar-style backends with effectively zero throughput impact.
+
+\textbf{Pitfalls.}
+\begin{itemize}
+    \item \textbf{Distribution distortion.} Masking renormalizes the distribution over the allowed set. If the model ``wanted'' an invalid continuation, forcing validity can steer it down low-probability paths; the classic symptom is syntactically perfect JSON with degenerate field values. Constrained decoding guarantees \textit{syntax}, never \textit{semantics}.
+    \item \textbf{Schema-first vs.\ prompt-first.} The mask does not tell the model what it is producing. Enforce the schema \textit{without also describing it in the prompt} and the model fills valid slots with confabulated content. Correct practice is both: schema in the prompt for the model, grammar on the logits for the guarantee.
+    \item \textbf{Tokenizer alignment.} Constraints are defined over strings but applied over tokens, and a grammar boundary can fall mid-token (one token may span a quote and the first characters of a value). Mature engines handle the token/byte mismatch; hand-rolled maskers reliably get it wrong.
+\end{itemize}
+
+\textbf{Why function calling rides on this.} Tool use is only as reliable as its worst-parsed argument. An agent whose tool calls fail to parse 2\% of the time fails a 30-step trajectory almost half the time ($1 - 0.98^{30} \approx 45\%$). Production function-calling stacks therefore enforce the tool-argument schema with constrained decoding: the model chooses the tool and the values, the grammar guarantees the envelope parses. That converts tool-call formatting from a model-quality problem into a solved systems problem---remaining failures are semantic (wrong tool, wrong values), which is where evaluation effort belongs. Constrained decoding also composes with speculative decoding: the same mask is applied to both draft and target logits, so grammar-violating drafts are never proposed and acceptance rates on structured output are typically \textit{higher}, not lower.
 
 %==============================================================================
 \section{Quantization for Inference}
@@ -265,6 +312,7 @@ AWQ & 4 & Fast & High & Protect salient channels by activation magnitude & GPU s
 GGUF & 2--8 & Med & Mixed & Per-block mixed precision; CPU-optimized layout & CPU / Apple Silicon \\
 SmoothQuant & 8 & V.\ Fast & V.\ High & Shift quant difficulty from activations to weights & INT8 W8A8 on GPU \\
 FP8 & 8 & V.\ Fast & V.\ High & Native 8-bit float on H100+ & Drop-in for FP16 on H100+ \\
+NVFP4 / MXFP4 & 4 & V.\ Fast & Med--High & FP4 (E2M1) with per-block microscaling factors & Blackwell-native serving \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -275,9 +323,12 @@ FP8 & 8 & V.\ Fast & V.\ High & Native 8-bit float on H100+ & Drop-in for FP16 o
 
 \textbf{GGUF} is a file format (used by llama.cpp) that supports mixed-precision quantization per tensor block. Different layers or blocks can use different bit widths (e.g., attention projections at 6-bit, FFN at 4-bit). Optimized for CPU inference with SIMD instructions. The go-to for local inference on laptops and Apple Silicon.
 
+\textbf{FP4 and microscaling (Blackwell era).} The frontier of low-precision serving moved past FP8 with 4-bit \textit{float} formats built on microscaling: NVFP4 pairs 4-bit E2M1 values with an FP8 (E4M3) scale per 16-element block plus a tensor-level FP32 scale; MXFP4 (the OCP Microscaling standard) uses a shared power-of-two (E8M0) scale per 32-element block. The fine-grained block scales are the whole idea---a 4-bit code by itself has almost no dynamic range, but rescaling every 16--32 elements recovers it. Blackwell tensor cores execute these formats natively at roughly double FP8 throughput, which makes FP4 a hardware-speed compute path rather than a dequantize-then-compute trick like INT4 GPTQ/AWQ kernels; GPT-oss shipping MXFP4 weights made 4-bit float a mainstream distribution format. Weight-only FP4 is competitive with good INT4 methods; quantizing activations too (W4A4) is more aggressive and still needs care (outlier handling, careful calibration). Separately, \textbf{FP8 KV-cache quantization is now standard practice} in production stacks (vLLM, SGLang, TensorRT-LLM): per-head or per-block scales, half the KV memory, near-lossless---and it composes multiplicatively with everything else in this chapter (double the batch ceiling of Section~\ref{sec:kv_cache}, half the KV transfer volume in disaggregated serving).
+
 \textbf{Decision guide.}
 \begin{itemize}
     \item \textbf{GPU serving, minimal quality loss:} FP8 on H100+ or SmoothQuant (INT8 W8A8). Near-lossless, simplest path.
+    \item \textbf{Blackwell GPUs:} NVFP4/MXFP4 for another $\sim$2$\times$ over FP8 in memory and tensor-core throughput; validate per task, as with any 4-bit format.
     \item \textbf{GPU serving, need to fit on fewer GPUs:} GPTQ or AWQ at 4-bit. Benchmark on \textit{your} task, not just perplexity.
     \item \textbf{CPU/laptop inference:} GGUF via llama.cpp. Choose Q4\_K\_M or Q5\_K\_M for the quality-speed sweet spot.
     \item \textbf{Sub-4-bit:} Experimental only. Quality degrades noticeably; larger models (70B+) tolerate it better than 7B.
@@ -335,6 +386,28 @@ Duration & Short (one pass over prompt) & Long (one pass per output token) \\
 During decode, generating one token for a 70B model requires reading $\sim$140 GB of weights from GPU memory, but only performs $\sim$140 billion multiply-adds. Using A100 numbers (2 TB/s bandwidth, 312 TFLOPS)---and noting that 140 GB exceeds a single A100's 80 GB, so read this as \textit{per aggregate GPU memory and bandwidth} across the GPUs holding the shards---the bandwidth time is $140/2000 = 70$ms but the compute time is $140\text{B}/312\text{T} = 0.4$ms. The GPU spends 99\% of its time waiting for memory reads. This is why quantization (reducing bytes read) and larger batch sizes (amortizing weight reads across requests) are the two most effective decode optimizations---they directly attack the bandwidth bottleneck.
 \end{keyinsight}
 
+\subsection{What the Serving Stack Actually Runs: Attention Kernels and CUDA Graphs}
+\label{sec:serving_kernels}
+
+The IO-aware attention algorithm itself---tiling, online softmax, recomputation, and why less HBM traffic beats fewer FLOPs---is covered in Chapter~\ref{chap:attention_transformers}. Here is the systems view of what executes in production. \textbf{Prefill} runs FlashAttention-2/3 fused kernels: FA2 is the portable default, and FA3 exploits Hopper-specific hardware (warp specialization, TMA asynchronous memory movement, FP8 support) to roughly double realized utilization on H100. Prefill attention behaves like a large tiled GEMM and is compute-bound, exactly as the phase table predicts. \textbf{Decode} cannot reuse the prefill kernel efficiently: with a single query token, the parallelism across query blocks that FlashAttention relies on disappears, so a long context would be walked by a handful of thread blocks while the rest of the GPU idles. \textbf{Flash-Decoding} (split-KV) fixes this by partitioning the KV cache along the sequence dimension, computing partial attention over each split in parallel, then merging the partials with a log-sum-exp reduction---restoring GPU saturation at small batch and long context. Serving engines run \textit{paged} variants of both kernel families that consume the PagedAttention block table directly. Finally, \textbf{CUDA graphs} attack launch overhead: one decode step is hundreds of small kernel launches, and at small batch the CPU-side launch cost (microseconds each) rivals the GPU work itself, so engines capture the decode step once and replay it as a single graph---a default optimization in vLLM, SGLang, and TensorRT-LLM. The interview-ready summary: prefill $=$ FA2/FA3, decode $=$ split-KV Flash-Decoding plus CUDA graphs, and ``why is FlashAttention faster'' $=$ less HBM IO, not less arithmetic.
+
+%==============================================================================
+\section{Serving Reasoning Models}
+\label{sec:serving_reasoning}
+%==============================================================================
+
+Reasoning models (o1/R1-class) invalidate the workload assumptions this chapter's worked examples were built on. A chat model answers a 2K-token prompt with 200--500 tokens; a reasoning model may emit 10K--100K \textit{thinking tokens} before its final answer. Every capacity plan that assumed short outputs breaks in the same places.
+
+\textbf{Decode dominates everything.} With outputs 40--200$\times$ longer and prompts unchanged, the prefill:decode wall-clock ratio collapses: $>$95\% of GPU-seconds land in decode. Serving becomes almost purely a memory-bandwidth and KV-capacity problem; prefill capacity is a rounding error. In a disaggregated design the decode fleet is effectively the whole fleet, and hardware choice tilts toward HBM bandwidth and capacity over raw FLOPS.
+
+\textbf{KV growth blows up batch ceilings.} A request that thinks for 20K tokens carries $\sim$7 GB of KV by the end (70B GQA at 0.32 MB/token, 22K total context)---roughly 9$\times$ the 2.5K-context chat figure---and occupies its slot $\sim$40$\times$ longer. Concurrency $=$ QPS $\times$ residence time (Little's law), so the two factors multiply: the same QPS needs $\sim$40$\times$ the concurrent slots, each several times larger. KV compression---FP8 KV cache, MLA-class architectures (Section~\ref{sec:mla_serving})---goes from nice-to-have to load-bearing, because the KV ceiling, not compute, is what binds first.
+
+\textbf{Latency perception.} TTFT stops being the user-facing metric when the model thinks for two minutes. Product mitigations carry the load: stream summarized thinking or progress markers (raw CoT is typically hidden---for safety, IP, and UX reasons), and measure time-to-final-answer plus progress cadence as the SLOs. A visibly thinking model with good progress signals is perceived as faster than a silent one that answers sooner.
+
+\textbf{Thinking budgets and early termination.} The median query does not need the p99 thinking budget. Production levers: per-tier token budgets (low/medium/high effort), budget forcing (cap and require an answer), early termination when the answer stabilizes across checkpoints, and routing easy queries to low-effort tiers or non-reasoning models. Budget policy is the single biggest cost lever, and it is a product decision as much as an infrastructure one.
+
+\textbf{Cost per query multiplies.} Output tokens are the expensive kind (decode-bound), and reasoning multiplies output by 10--100$\times$: a query that cost half a cent now costs tens of cents. The multiplier must show up in pricing, tiering, or rate limits---capacity plans that carry it silently die in the margin math. Section~\ref{sec:inference_interview} works this replan end-to-end as an interview question.
+
 %==============================================================================
 \section{Model Parallelism for Serving}
 \label{sec:serving_parallelism}
@@ -373,6 +446,19 @@ Best for & Reducing single-request latency & Fitting large models across nodes \
     \item \textbf{Throughput-focused (many concurrent requests):} Consider data parallelism across nodes (replicate the model) instead of PP. Simpler, no pipeline bubbles, and the GPU utilization from a large request batch often outweighs the cost of duplication.
 \end{itemize}
 
+\subsection{MoE Serving}
+\label{sec:moe_serving}
+
+Mixture-of-experts models add a third axis: \textbf{expert parallelism (EP)}, which places different experts on different GPUs. EP beats TP for MoE FFNs because TP would shard \textit{every} expert across \textit{all} GPUs into tiny, inefficient GEMM slices, while EP keeps each expert's GEMM intact and local. The price is communication: each token's hidden state must be \textit{dispatched} (all-to-all) to the GPUs owning its top-$k$ experts and the expert outputs \textit{combined} (a second all-to-all) back---per MoE layer, per token. \textbf{This all-to-all is the serving bottleneck}: at decode batch sizes the messages are small and latency-bound; across nodes they contend for the same interconnect as everything else. Overlapping dispatch/combine with expert compute (and with the attention half of the layer) is where MoE serving engineering effort concentrates.
+
+\textbf{Wide-EP disaggregated serving.} DeepSeek-style deployments push EP wide at decode: the decode unit is hundreds of GPUs spanning tens of nodes, each GPU hosting only one or a few experts. Per-GPU expert weight memory falls to a few GB---freeing HBM for KV cache---and the aggregate batch across the unit keeps every expert's GEMM well fed. The whole unit is a single giant model replica; scaling out means adding units, not GPUs to a unit.
+
+\textbf{Hot experts and redundancy.} Routed load is never uniform, and a hot expert becomes the straggler for every all-to-all in its layer. Production systems replicate the hottest experts (\textit{redundant experts}) so their load splits across copies, and periodically rebalance expert placement from observed routing statistics.
+
+\textbf{Prefill/decode EP asymmetry.} Prefill pushes thousands of tokens per pass, so every expert sees a healthy batch even at modest EP---prefill units run narrow EP over a few nodes. Decode contributes one token per request per step, so only wide EP accumulates enough tokens per expert per step---decode units run much wider EP. Disaggregated MoE serving therefore uses \textit{different EP degrees per phase by design}, which is a big part of why prefill/decode disaggregation and MoE adoption reinforce each other.
+
+The one-line economics recap: a 671B-total/37B-active MoE computes---and streams from HBM---like a 37B model per token, but must hold all 671B of weights somewhere; the active-vs-total parameter arithmetic is developed in Chapter~\ref{chap:efficient_architectures}.
+
 %==============================================================================
 \section{Putting It All Together: The LLM Serving Stack}
 \label{sec:serving_stack}
@@ -396,11 +482,12 @@ Hardware & Multi-GPU node(s) & Compute (GEMMs), memory bandwidth (KV reads) \\
 \end{tabularx}
 \end{table}
 
-\textbf{Key serving frameworks:}
+\textbf{Key serving frameworks (2026 lineup):}
 \begin{itemize}
-    \item \textbf{vLLM}: PagedAttention, continuous batching, prefix caching, GPTQ/AWQ support. Open-source standard for GPU serving.
-    \item \textbf{TensorRT-LLM}: NVIDIA's optimized runtime. Fused kernels, FP8 support, high raw performance but less flexible than vLLM.
-    \item \textbf{Text Generation Inference (TGI)}: Hugging Face's serving solution. Good integration with the HF ecosystem. Flash Attention, continuous batching, quantization.
+    \item \textbf{vLLM}: PagedAttention, continuous batching, automatic prefix caching, speculative decoding (EAGLE), FP8/GPTQ/AWQ support. Co-standard for open-source GPU serving.
+    \item \textbf{SGLang}: RadixAttention automatic prefix reuse (Section~\ref{sec:prefix_caching}), CPU--GPU overlap scheduling, fast structured output (XGrammar). Co-standard with vLLM, and the reference stack for DeepSeek-V3/R1-style wide-EP deployments; wins on multi-turn, agentic, and shared-prefix workloads.
+    \item \textbf{TensorRT-LLM (with Dynamo)}: NVIDIA's optimized runtime. The strongest raw kernels and first support for new formats (FP8/FP4), with Dynamo orchestrating disaggregated prefill/decode; less flexible and NVIDIA-only.
+    \item \textbf{Text Generation Inference (TGI)}: Hugging Face's serving solution. Fading by 2025--26---fine within the HF ecosystem, but open-source mindshare and feature velocity have consolidated on vLLM and SGLang.
     \item \textbf{llama.cpp / GGUF}: CPU-optimized inference. The go-to for local or edge deployment on consumer hardware.
 \end{itemize}
 
@@ -447,6 +534,47 @@ Start with back-of-the-envelope sizing before touching architecture.
 \end{itemize}
 
 \followups{``What if the average prompt is 10K tokens instead of 1K?'' ``How would you handle a 10$\times$ traffic spike?'' ``What if cost is the primary constraint?''}
+\end{interviewq}
+
+%--- New Q (Reasoning-model capacity replan) ---
+
+\begin{interviewq}
+\textbf{Q: Your capacity plan assumed 500-token outputs. The reasoning model you are now deploying emits $\sim$20K thinking tokens per query. Redo the plan.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The plan does not need a tweak; it needs to be rebuilt around decode (Section~\ref{sec:serving_reasoning}). Work the multipliers first, then the levers.
+
+\textbf{Step 1: Workload multipliers.} Output per query: 500 $\to$ $\sim$20.5K tokens ($\approx 40\times$). At $\sim$40 tokens/sec/request, residence time goes from $\sim$12.5 s to $\sim$8.5 minutes. By Little's law, concurrency $=$ QPS $\times$ residence time, so unchanged QPS needs $\sim$40$\times$ the concurrent slots. Prompts are unchanged, so prefill demand is flat and becomes a rounding error: this is now a decode fleet.
+
+\textbf{Step 2: KV binds before compute.} Each request's context now ends at $\sim$22K tokens instead of $\sim$2.5K: per-request KV grows from $\sim$0.8 GB to $\sim$7 GB (70B GQA at 0.32 MB/token), a $\sim$9$\times$ increase per slot. Check both ceilings: aggregate token throughput demand is up $\sim$40$\times$, but KV byte-seconds are up $\sim 40 \times 9 \approx 350\times$. The naive plan is off by two-plus orders of magnitude, and KV capacity---not compute---is the binding constraint, so KV levers dominate the recovery.
+
+\textbf{Step 3: Levers, in order of leverage.} (1) \textit{Thinking budgets}: effort tiers with token caps and routing of easy queries to low-effort tiers; if the median query runs at a 4K budget and only hard queries get 20K+, the mean output multiplier drops from $\sim$40$\times$ to $\sim$10$\times$. This is the biggest lever and it is a product negotiation, not an infra setting---get it agreed first. (2) \textit{KV compression}: FP8 KV cache (2$\times$, near-lossless, standard practice); if model choice is open, an MLA-architecture model cuts KV another $\sim$3.6$\times$ beyond GQA (Section~\ref{sec:mla_serving}). (3) \textit{Disaggregation and rebalancing}: shrink the prefill pool to almost nothing, give the decode pool everything, and retune batch size against the new KV ceiling; wide-EP decode units if the model is MoE (Section~\ref{sec:moe_serving}). (4) \textit{Early termination}: stop when the answer stabilizes; recovers the tail of over-long thinking. (5) \textit{Speculative decoding} (MTP/EAGLE): raises per-request TPS, directly cutting residence time and slot-seconds.
+
+\textbf{Step 4: Re-plan the numbers.} With budget tiers (mean $\sim$10$\times$ tokens instead of 40$\times$) and FP8 KV, the fleet lands at roughly 10--15$\times$ the old plan rather than the naive $\sim$350$\times$. Present it as a range explicitly tied to the budget policy, because that policy---not hardware---is the swing variable.
+
+\textbf{Step 5: SLOs, product, and pricing.} TTFT is no longer the user metric: report time-to-final-answer and stream summarized thinking as progress; hide raw CoT. Cost per query is up $\sim$10--40$\times$ depending on tier---pricing, rate limits, or tiering must absorb it, and the margin math goes to whoever owns pricing before launch, not after.
+
+\redflags
+\begin{itemize}
+    \item Scaling the old plan linearly in GPU count without noticing that KV capacity binds before compute.
+    \item Treating thinking length as fixed---budget policy is the dominant lever and must be negotiated, not assumed.
+    \item Keeping TTFT as the headline SLO for a model that thinks for minutes.
+    \item Sizing prefill and decode together when the workload has become $>$95\% decode.
+\end{itemize}
+
+\interviewtest{Whether you re-derive the plan from workload multipliers (Little's law, KV-per-request growth) instead of patching the old one; whether you identify KV capacity as the binding constraint; and whether you deploy the full lever stack---budgets, KV quantization/MLA, disaggregation, early termination, speculation---in leverage order with numbers attached.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Recognizes that decode now dominates and cost scales with output length.
+    \item \badgeLsix{L6} Computes the concurrency and KV multipliers, identifies KV as binding, and proposes FP8 KV plus thinking budgets with arithmetic.
+    \item \badgeLseven{L7} Rebuilds the plan end-to-end: budget tiers as a negotiated product decision, model-choice implications (MLA, MoE wide-EP decode), revised SLOs and pricing, and a staged rollout with per-tier cost monitoring.
+\end{itemize}
+
+\followups{``Where does speculative decoding help most in the new plan?'' ``The p99 request thinks for 80K tokens---what breaks first?'' ``How does the plan change if the reasoning model is a 671B/37B-active MoE?''}
 \end{interviewq}
 
 %--- Rewritten Q2 (Conceptual) ---

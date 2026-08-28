@@ -2,7 +2,7 @@
 \label{chap:evaluation_metrics}
 
 \begin{tldr}
-Evaluation metrics determine whether your model actually solves the problem. This chapter covers classification metrics (precision, recall, F1, ROC-AUC, PR-AUC, calibration), ranking metrics (NDCG, MRR, MAP), regression metrics, NLP/generation metrics (BLEU, ROUGE, BERTScore, perplexity), and the often-fatal gap between offline and online metrics. A Staff-level engineer must know which metric to use, why the obvious choice fails, and how to prove a model improvement is real rather than noise.
+Evaluation metrics determine whether your model actually solves the problem. This chapter covers classification metrics (precision, recall, F1, ROC-AUC, PR-AUC, calibration), ranking metrics (NDCG, MRR, MAP), regression metrics, NLP/generation metrics (BLEU, ROUGE, BERTScore, perplexity), and the often-fatal gap between offline and online metrics. A Staff-level engineer must know which metric to use, why the obvious choice fails, and how to prove a model improvement is real rather than noise. For the LLM era that means putting an error bar on a benchmark score, estimating pass@$k$ without bias, detecting contamination, evaluating test-time-compute models on a matched budget, and designing the eval stack that decides whether a checkpoint ships.
 \end{tldr}
 
 %==============================================================================
@@ -358,6 +358,10 @@ When automated metrics fail---and they frequently do for open-ended generation--
 
 \textbf{LLM-as-judge:} Using strong LLMs (GPT-4, Claude) as evaluators is increasingly common. Cheap and scalable, but introduces biases: verbosity bias (longer answers rated higher), position bias (first answer preferred), and self-enhancement bias (models prefer their own outputs). Mitigate by: swapping presentation order, using structured rubrics, and calibrating against human judgments.
 
+\textbf{Length-controlled win rates:} Verbosity bias is large enough to move leaderboards---a model can climb several points of raw win rate just by answering longer. The AlpacaEval~2.0-style fix is to fit a regression (a GLM) on the judge's pairwise preferences with the response-length difference as a covariate, then report the counterfactual win rate at zero length difference; this length-controlled win rate correlates substantially better with human arena rankings than the raw one. Chatbot Arena's style control applies the same idea inside its Bradley--Terry fit: length and markdown-formatting features enter as additional covariates, so the per-model coefficient reflects content quality rather than formatting. Neither fully closes the loophole---models can still game residual style channels the covariates do not capture---but uncontrolled win rates should be treated as partially a verbosity measurement.
+
+\textbf{Judge calibration and judge drift:} A judge model is a measurement instrument, and instruments need calibration. Validate the judge against \textit{expert} human labels on a sample from your own distribution: judge--human agreement should be at least as high as human--human agreement on the same items (roughly 80\% for chat quality in the MT-Bench study---so do not expect the judge to exceed the noise ceiling of the task), and agreement should be re-measured per domain, since a judge that is well calibrated on chat helpfulness may be poorly calibrated on, say, medical factuality. Separately, judge \textit{drift}: scores are a function of the judge's version, so upgrading the judge (or a silent API model change) shifts absolute win rates across the board with no change in the evaluated models. Pin the judge version and prompts, keep a fixed anchor set of responses to detect drift, and when the judge must change, re-baseline every tracked model rather than comparing new-judge numbers to old-judge history.
+
 %==============================================================================
 \section{Metric Selection Framework}
 \label{sec:metric_selection}
@@ -525,6 +529,185 @@ Permutation test & Any metric, exact test & Exchangeability under null \\
 \textbf{Rule of thumb for A/B tests:} To detect a relative change of $\delta$ in a metric with variance $\sigma^2$, you need roughly $n \approx 16\sigma^2 / \delta^2$ samples per group (for 80\% power at $\alpha = 0.05$). For conversion rates, $\sigma^2 \approx p(1-p)$.
 
 \textbf{Why this matters in interviews:} If a candidate proposes an A/B test without discussing sample size, it signals they have not run experiments in production. Always estimate whether you have enough traffic \textit{before} running the test.
+
+%==============================================================================
+\section{Evaluating LLMs in Practice}
+\label{sec:llm_eval_practice}
+%==============================================================================
+
+At frontier labs the eval round is now mostly one question asked in many forms: \textit{how do you know model B is better?} Everything in Section~\ref{sec:statistical_significance} still applies---LLM benchmarks just give the machinery new units (questions instead of users, accuracy instead of CTR) and new failure modes (contamination, protocol sensitivity, judge bias). This section is the statistics and practice layer for LLM evaluation: error bars on benchmark scores, unbiased pass@$k$, contamination, reasoning-model protocols, and the launch-eval stack. The benchmark-by-benchmark landscape, generation metrics, and LLM-as-judge protocols in depth are canonical in the NLP volume [NLP~10]; here we keep only a compact map (Section~\ref{sec:benchmark_landscape}).
+
+\subsection{Putting an Error Bar on a Benchmark Score}
+\label{sec:benchmark_error_bars}
+
+A benchmark accuracy is a sample mean of per-question Bernoulli outcomes, so it comes with a standard error like any other estimate---the field just habitually reports it without one.
+
+\begin{mathresult}{Standard Error of a Benchmark Score}
+For a benchmark with $n$ questions and observed accuracy $\hat{p}$ (questions i.i.d.):
+\[
+\text{SE}(\hat{p}) = \sqrt{\frac{\hat{p}(1-\hat{p})}{n}},
+\qquad
+95\%\ \text{CI} \approx \hat{p} \pm 1.96\,\text{SE}(\hat{p}).
+\]
+For comparing two models evaluated \textit{independently}, $\text{SE}(\hat{p}_A - \hat{p}_B) = \sqrt{\text{SE}_A^2 + \text{SE}_B^2} \approx \sqrt{2}\,\text{SE}$. For two models scored on the \textit{same} questions, compute the paired SE from per-question differences $d_i = a_i - b_i \in \{-1, 0, +1\}$: $\text{SE}(\bar{d}) = s_d / \sqrt{n}$, which is dominated by the fraction of questions where the models \textit{disagree}.
+\end{mathresult}
+
+\textbf{Worked example.} On a 1{,}000-question benchmark where the model scores 70\%, $\text{SE} = \sqrt{0.7 \times 0.3 / 1000} \approx 1.45\%$, so the 95\% CI is roughly $\pm 2.8$ points---the ``true'' score is somewhere in $[67.2, 72.8]$. Comparing two independently evaluated models doubles the variance: $\text{SE}_{\text{diff}} \approx \sqrt{2} \times 1.45 \approx 2.05\%$, a 95\% CI of $\pm 4$ points. \textbf{A 2-point gap on a 1{,}000-question benchmark is often noise.}
+
+\textbf{Pairing shrinks the CI.} Both models answered the same 1{,}000 questions, so do not compare marginal scores---compare per-question outcomes. If the models disagree on 10\% of questions, $s_d^2 \approx 0.10$ and $\text{SE}(\bar{d}) = \sqrt{0.10/1000} = 1.0\%$: a $\pm 2$-point CI instead of $\pm 4$, from the same data. This is exactly the paired-test principle of Section~\ref{sec:statistical_significance} (paired $t$-test, McNemar on the discordant counts) applied at the question level; the intuition is that the thousands of questions both models get right (or both get wrong) contribute nothing to the difference, so their variance should not pollute it.
+
+\textbf{Clustered standard errors.} The i.i.d.\ assumption fails when questions share sources: several questions per reading passage, per code repository, per exam subject. Correct answers within a cluster are correlated, so the effective sample size is smaller than $n$ and the naive SE is too optimistic. The fix (the approach in Anthropic's 2024 eval-statistics work, ``Adding Error Bars to Evals'') is the cluster-robust variance familiar from A/B testing---sum residuals within each cluster $g$ before squaring:
+\[
+\widehat{\Var}(\hat{p}) = \frac{1}{n^2} \sum_{g=1}^{G} \Bigl( \sum_{i \in g} (x_i - \hat{p}) \Bigr)^{2}.
+\]
+On passage-based benchmarks (reading comprehension, multi-question coding scenarios) clustering can widen CIs by up to $\sim$3$\times$; ignoring it is the eval-world version of randomizing an A/B test by page-view while analyzing by user.
+
+\begin{keyinsight}[Error Bars Change Shipping Decisions]
+Full MMLU has $n = 14{,}042$, so a single score at 70\% carries $\text{SE} \approx 0.4$ points---but most claimed gaps come from smaller sets: GPQA-Diamond has 198 questions ($\text{SE} \approx 3.5$ points at 60\%; a 5-point gap is noise), and AIME has 30 problems per year ($\text{SE} \approx 9$ points). Before reacting to any benchmark delta, ask three questions: what is $n$, was the comparison paired, and do questions cluster by source? Most ``model B beats model A'' headlines fail at least one.
+\end{keyinsight}
+
+\begin{interviewq}
+\textbf{Q: Model B is 1.5 points better than model A on MMLU---do you ship it?}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
+
+\stronganswer First put an error bar on the gap. Full MMLU has 14{,}042 questions; at $\sim$70\% accuracy, $\text{SE} = \sqrt{0.7 \times 0.3 / 14042} \approx 0.4$ points per score, so two independently evaluated scores differ with $\text{SE}_{\text{diff}} \approx \sqrt{2} \times 0.4 \approx 0.55$ and a 95\% CI of $\pm 1.1$ points---1.5 points is only marginally outside noise, and if the eval ran on a 1{,}000--2{,}000-question subset (common for cost), the CI is $\pm 3$--4 points and the gap means nothing. So, second, do the \textbf{paired analysis}: both models answered the same questions, so count the flips---questions B fixed vs.\ questions B broke---and run McNemar or a paired bootstrap. Pairing typically halves the CI and turns ``marginal'' into a real answer; also compute \textbf{clustered SEs} (MMLU questions cluster by its 57 subjects; a gap concentrated in two subjects is a different claim than a uniform lift). Third, interrogate the \textbf{protocol}: same prompt template, few-shot count, answer-extraction parser, and sampling settings for both models? A 1.5-point gap is smaller than typical prompt-format sensitivity, so any protocol asymmetry voids the comparison. Fourth, \textbf{contamination}: if B was trained on a newer crawl, check n-gram overlap and whether B's gain persists on a private or post-cutoff held-out set. Finally, even a real 1.5-point MMLU gain should not gate a ship decision by itself: MMLU is saturated and one benchmark is one slice. Decision rule: ship if the paired, cluster-robust comparison is significant, the gain replicates on internal held-outs, and the full regression suite (other capabilities, safety, latency/cost) shows no losses.
+
+\redflags
+\begin{itemize}
+    \item ``Yes, 1.5 $>$ 0''---treating a benchmark score as a noiseless measurement
+    \item Not asking how many questions the eval used, or whether the comparison was paired
+    \item Not asking whether the two models were run under the same protocol
+    \item Ignoring contamination when the two models have different training cutoffs
+\end{itemize}
+
+\interviewtest{Numeracy about eval noise. Can you compute the SE in your head, know that pairing shrinks it, and resist shipping on a single-number delta?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Computes $\sqrt{p(1-p)/n}$, concludes 1.5 points is near the noise floor, asks for more data
+    \item \badgeLsix{L6} Paired analysis with McNemar/bootstrap, clustered SEs by subject, protocol-parity and contamination checks
+    \item \badgeLseven{L7} Frames the ship decision as an eval-stack question (regression suites, internal held-outs, practical significance), quantifies how subset size and pairing trade off eval cost against decision quality
+\end{itemize}
+
+\followups{``How does your answer change on GPQA-Diamond (198 questions)?'' ``How would you put a CI on pass@$k$?'' ``What if B's training data was collected after MMLU was published?''}
+\end{interviewq}
+
+\subsection{pass@k Done Right}
+\label{sec:pass_at_k}
+
+\textbf{Definition.} For a task with an automatic verifier (unit tests, exact-match answer), pass@$k$ is the probability that \textit{at least one} of $k$ independent samples from the model passes. It measures capability under a best-of-$k$ protocol with a perfect verifier.
+
+\textbf{Why the naive estimate is biased.} The tempting shortcut is to estimate a per-problem success rate $\hat{c}/n$ from $n$ samples and plug it into $1 - (1 - \hat{c}/n)^k$---especially tempting when extrapolating to a $k$ you did not budget samples for. But $f(p) = 1 - (1-p)^k$ is concave in $p$, so by Jensen's inequality $\E[f(\hat{p})] < f(p)$ whenever $\hat{p}$ is noisy: the plug-in estimator is systematically biased (an underestimate, worst when $k$ is a large fraction of $n$), and it has high variance on top. Evaluating with \textit{exactly} $k$ samples and reporting the fraction of problems with $\geq 1$ pass is unbiased but wastes information and is noisy for a single run. Chen et al.\ (2021, the Codex paper) give the standard fix.
+
+\begin{mathresult}{Unbiased pass@$k$ Estimator (Chen et al., 2021)}
+Generate $n \geq k$ samples per problem, count the number $c$ that pass the verifier, and estimate
+\[
+\text{pass@}k \;=\; \E_{\text{problems}}\!\left[ 1 - \frac{\binom{n-c}{k}}{\binom{n}{k}} \right].
+\]
+The ratio $\binom{n-c}{k} / \binom{n}{k}$ is the probability that a uniformly random size-$k$ subset of the $n$ samples contains none of the $c$ passing ones---so the estimator is the exact average of the ``any pass in $k$ tries'' indicator over all $\binom{n}{k}$ subsets, making it both unbiased and lower-variance than any single $k$-sample run. Compute it with the numerically stable product $1 - \prod_{i=n-c+1}^{n} \bigl(1 - k/i\bigr)$, never with raw factorials.
+\end{mathresult}
+
+\textbf{pass@$k$ vs.\ pass\textasciicircum{}$k$ (capability vs.\ reliability).} pass@$k$ rises with $k$: with per-trial success $p = 0.9$, pass@8 $\approx 1 - 0.1^8 \approx 1.0$. But an agent deployed in production does not get $k$ tries with an oracle picking the good one---it must succeed \textit{every} time. The complementary metric, popularized as pass\textasciicircum{}$k$ by $\tau$-bench, is the probability that \textit{all} $k$ i.i.d.\ trials succeed: with $p = 0.9$, pass\textasciicircum{}8 $= 0.9^8 \approx 0.43$. A customer-service agent that ``passes'' 90\% of episodes fails almost every user who runs eight of them. Report pass@$k$ when a verifier can select among attempts (code with tests, best-of-$n$ with a reward model); report pass\textasciicircum{}$k$---or the full distribution of per-task success rates---when the claim is about reliability. The gap between the two curves as $k$ grows is itself diagnostic: a wide gap means the model is inconsistent rather than incapable.
+
+\subsection{Contamination}
+\label{sec:contamination}
+
+\textbf{How it happens.} Benchmarks leak into training data because both are drawn from the same internet: MMLU and GSM8K questions are reposted in forums and tutorials, HumanEval solutions live in thousands of GitHub repositories, and any benchmark released before a model's crawl date should be presumed present unless actively filtered. Contamination is also indirect---paraphrases and translated versions survive exact-match decontamination---and can enter late via fine-tuning on benchmark-formatted synthetic data. The result is memorization inflating a score that is supposed to measure generalization.
+
+\textbf{Detection methods:}
+\begin{itemize}
+    \item \textbf{N-gram overlap}: Scan training corpora for benchmark substrings (13-gram overlap or $\sim$50-character matches are common thresholds) and either remove tainted training documents or report scores with flagged test items excluded. Necessary but insufficient---misses paraphrases.
+    \item \textbf{Canary strings}: Benchmarks embed a unique GUID (the BIG-bench convention) in their files; if a model can regurgitate the canary, the benchmark files were trained on. Cheap, definitive when positive, silent on scraped copies that dropped the canary.
+    \item \textbf{Temporal holdouts / rolling evals}: Evaluate on problems published \textit{after} the training cutoff---LiveBench and LiveCodeBench refresh questions continuously (e.g., fresh contest problems each month). A model whose score drops sharply on post-cutoff problems of matched difficulty was contaminated on the older ones. This is the strongest practical detector.
+    \item \textbf{Train/test perplexity deltas}: A model assigns suspiciously low perplexity to (or reproduces verbatim completions of) test items relative to matched control text from the same distribution. Related probes: accuracy on the original benchmark vs.\ a lightly perturbed rewrite---memorizers drop hard on the rewrite.
+\end{itemize}
+
+\textbf{Why labs keep private held-out evals.} Every public benchmark decays: it leaks into crawls, its answer keys circulate, and model developers (with or without intent) iterate against it. Frontier labs therefore maintain internal evals that never touch the internet, refresh them periodically, and treat the public-vs-private gap as a contamination and overfitting alarm in its own right. When a candidate cites a benchmark number in an interview, ``how would you know that score is not contaminated?'' is now a mainstream follow-up.
+
+\textbf{Eval-gaming dynamics.} Contamination is the accidental end of a spectrum whose deliberate end is benchmark engineering: once a benchmark becomes a headline target, optimization pressure---selecting pretraining data that resembles it, tuning prompts and extraction per benchmark, cherry-picking the best of many runs, or training on its distribution---decouples the score from the capability it was designed to proxy. This is Goodhart's law applied to evals (``when a measure becomes a target, it ceases to be a good measure''), and it is why saturated public benchmarks stop discriminating long before models stop improving. The defenses are the same as above---private evals, rolling refresh, protocol pre-registration---plus institutional ones: report all runs, fix the eval suite before training, and separate the team that builds evals from the team optimizing against them.
+
+\subsection{Evaluating Reasoning and Test-Time Compute}
+\label{sec:reasoning_eval}
+
+Reasoning models spend variable test-time compute, which breaks the assumptions behind single-number benchmark scores in three ways: the protocol determines the score, comparisons must be budget-matched, and sampling variance explodes on the small expert benchmarks these models target.
+
+\textbf{Protocols.} Know the standard ones and never report a number without naming its protocol:
+\begin{itemize}
+    \item \textbf{maj@$k$ / self-consistency}: Sample $k$ chains of thought at $T > 0$ and take the majority vote over final answers. Requires no verifier (unlike pass@$k$) and measures what extra compute buys at inference; accuracy typically rises then plateaus with $k$.
+    \item \textbf{Verifier-graded evaluation}: Score with an automatic checker---symbolic or numeric equivalence for math (AIME answers are integers by design), unit tests for code, or a grader model for open-ended work. Best-of-$n$ against a reward model evaluates the model-plus-verifier \textit{system}, not the model alone; say which claim you are making.
+    \item \textbf{avg@$k$}: Mean single-sample accuracy over $k$ runs---not a capability boost like maj@$k$, just variance reduction on the estimate of pass@1.
+\end{itemize}
+
+\textbf{Budget-matched comparisons.} A reasoning model that beats a standard model while emitting 30$\times$ the tokens has not won at parity---it has bought accuracy with compute, and the honest comparison is accuracy at equal token (or dollar, or latency) budget. Report accuracy-vs-compute curves rather than points: the interesting questions are where the curves cross and whether the cheap model plus best-of-$n$ matches the expensive model's single run. Comparing a reasoning model's maj@64 against a base model's greedy pass@1 is the trap version of this, and interviewers set it deliberately.
+
+\textbf{``pass@1'' is ill-defined without protocol details.} A reported pass@1 depends on the decoding temperature (greedy vs.\ $T = 0.6$ can differ by several points), on how many samples were used to estimate it (pass@1 estimated from $n = 64$ samples via the unbiased estimator is a different measurement than one greedy run), on the thinking/token budget allowed, and on the answer-extraction parser. High-temperature sampling makes ``the model's accuracy'' a distribution, not a number; a reproducible eval states model, temperature, $n$, max tokens, prompt, and parser.
+
+\textbf{Reasoning-run variance.} The benchmarks where reasoning models differentiate are tiny: AIME is 30 problems per year, so at 60--70\% accuracy a \textit{single} run carries an SE of $\sim$9 points---two runs of the \textit{same} model routinely differ by more than the gaps labs advertise between models. Standard practice is therefore mean $\pm$ CI over many seeded runs (avg@32-style reporting), with the same paired-comparison logic as Section~\ref{sec:benchmark_error_bars} applied across runs and problems. A model comparison on AIME-class sets without error bars over multiple runs is not a measurement; it is an anecdote.
+
+\subsection{The Benchmark Landscape in One Table}
+\label{sec:benchmark_landscape}
+
+The catalog below is a map for orientation---which name answers which capability question in 2026, and which once-standard names are saturated (top models cluster near the ceiling, within noise of each other, so the benchmark no longer discriminates). The full landscape treatment---per-benchmark mechanics, generation metrics, and judge protocols---is canonical in the NLP volume [NLP~10].
+
+\begin{table}[H]
+\centering
+\caption{The LLM benchmark landscape at a glance (2026)}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Capability} & \textbf{Current Standard} & \textbf{Saturated Legacy} \\
+\midrule
+Knowledge \& expert QA & MMLU-Pro, GPQA-Diamond & MMLU, HellaSwag, TriviaQA \\
+Math & AIME-class competition sets, MATH-500 & GSM8K, MATH \\
+Code & LiveCodeBench, SWE-bench Verified & HumanEval, MBPP \\
+Agents \& tool use & $\tau$-bench, OSWorld-class computer use & (young area; benchmarks churn fast) \\
+Multimodal & MMMU & VQAv2, COCO captioning \\
+Open-ended chat & Arena-Hard, arena Bradley--Terry with style control, length-controlled \mbox{AlpacaEval}~2.0 & MT-Bench, raw-Elo arenas \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three durable patterns beat memorizing the roster: (1) every row migrates toward harder, fresher, contamination-resistant versions of itself (MMLU $\to$ MMLU-Pro/GPQA; HumanEval $\to$ LiveCodeBench/SWE-bench Verified); (2) small expert sets (GPQA-Diamond, AIME) buy difficulty at the price of the variance problems of Sections~\ref{sec:benchmark_error_bars} and \ref{sec:reasoning_eval}; (3) quoting a legacy benchmark as your headline eval signals a 2023-era mental model to an interviewer.
+
+\subsection{Launch Evals}
+\label{sec:launch_evals}
+
+Benchmarks answer ``is the model better in general?''; launch evals answer ``is it safe to put \textit{this} checkpoint in front of \textit{our} users?'' The engineering pattern is to treat evals like tests in CI.
+
+\textbf{Eval suites as CI gates.} Every candidate checkpoint runs a fixed battery automatically---capability benchmarks, internal held-outs, safety evals---with pinned prompts, decoding parameters, parsers, and versioned datasets, so that scores are comparable across checkpoints. Gates are paired comparisons against the current production model with pre-set thresholds (block if any tracked capability drops by more than the minimum detectable effect), not vibes on a dashboard.
+
+\textbf{Canary prompts and regression suites.} Alongside broad benchmarks, keep small curated per-capability suites---formatting compliance, refusal behavior on both harmful and benign but suspicious prompts, tool-calling syntax, multilingual behavior, known past incidents---where any flip on a known-good or known-bad canary is an automatic red flag. Broad benchmarks average regressions away; canaries make them visible. Every production incident should add a canary, the same way every bug adds a unit test.
+
+\textbf{A/B tests for model swaps.} Online, an assistant's metrics are behavioral: thumbs up/down rate, regeneration and rephrase rate, conversation continuation, task completion, retention. Guardrail metrics (Section~\ref{sec:metric_selection}) carry over directly: safety incident rate, refusal rate on benign traffic, latency percentiles, cost per conversation. Expect \textbf{novelty effects}---users probe a new model and behave atypically for days---so discount the first days or rely on returning-user cohorts, and remember that per-conversation metrics need the clustered analysis of Section~\ref{sec:benchmark_error_bars} when users contribute many conversations.
+
+\textbf{Staged rollouts.} Internal dogfood $\to$ small-percentage canary traffic $\to$ progressive ramp, with automatic rollback triggers defined \textit{before} the rollout (safety incident rate, error/latency SLOs, thumbs-down spikes). Model swaps should be as reversible as code deploys: keep the old checkpoint warm and route back in minutes, not retrain.
+
+\begin{interviewq}
+\textbf{Q: Design the eval stack that decides whether tomorrow's checkpoint ships.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer A pipeline of gates, cheapest first, each with a pre-registered decision rule. \textbf{Stage 1---Offline automated gates (every checkpoint, $\sim$hours):} capability benchmarks plus contamination-controlled internal held-outs, run under pinned protocols (prompts, temperature, parsers, dataset versions) and scored as \textit{paired} comparisons against the current production model with clustered standard errors; per-capability regression suites and canary prompts (refusals, formatting, tool calls, past incidents) with zero-tolerance flips; safety battery. Block on any regression beyond the pre-set minimum detectable effect. \textbf{Stage 2---Judge evals with calibration ($\sim$hours):} LLM-judge pairwise win rates on a curated prompt set mirroring production traffic, with position swapping and length/style controls; the judge is pinned to a version, calibrated against expert human labels (tracked judge--human agreement per domain), and monitored for drift on a fixed anchor set. Gate: win rate CI excludes a regression. \textbf{Stage 3---Human eval sample ($\sim$days):} a few hundred targeted pairwise comparisons concentrated where judges are weakest---safety-critical content, factuality, high-value segments---with inter-annotator agreement tracked; humans audit the judge as much as the model. \textbf{Stage 4---Online canary:} 1--5\% of traffic behind a flag; behavioral metrics (thumbs, regeneration rate, task completion) plus guardrails (safety incident rate, benign-refusal rate, p95 latency, cost per conversation); user-level randomization and analysis, novelty-effect burn-in before reading topline metrics, sequential testing for early stopping. \textbf{Rollback triggers} defined before the ramp: any guardrail breach or safety spike auto-routes traffic back to the old checkpoint, which stays warm. Cross-cutting: every gate's data is versioned, every decision logged, private held-outs rotated, and the public-vs-private score gap monitored as an eval-overfitting alarm.
+
+\redflags
+\begin{itemize}
+    \item A single benchmark score as the ship gate, or gates without pre-registered thresholds
+    \item Unpaired comparisons and no error bars anywhere in the stack
+    \item An uncalibrated, unpinned LLM judge as the sole quality signal
+    \item No rollback plan, or online metrics read during the novelty period
+\end{itemize}
+
+\interviewtest{Can you compose statistics (paired comparisons, CIs, sequential tests), eval methodology (contamination, judge calibration), and release engineering (gates, canaries, rollback) into one coherent decision system?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Offline benchmarks, then human eval, then an A/B test, with safety checks mentioned
+    \item \badgeLsix{L6} Staged gates with paired statistics and thresholds, judge bias mitigations, canary rollout with guardrails and rollback
+    \item \badgeLseven{L7} Judge calibration and drift monitoring, contamination-controlled private held-outs, cost/latency budget per stage, eval-overfitting alarms, and an explicit theory of which failures each stage can and cannot catch
+\end{itemize}
+
+\followups{``Your new model wins every offline gate but loses the A/B---diagnose.'' ``How big does the human eval sample need to be?'' ``How do you keep the eval suite itself from being overfit by repeated use?''}
+\end{interviewq}
 
 %==============================================================================
 \section{Interview Questions}
@@ -813,6 +996,7 @@ Translation & BLEU & Does not capture meaning & Human eval \\
 Summarization & ROUGE-L & Surface overlap only & BERTScore \\
 Language model & Perplexity & Tokenizer-dependent & Downstream task perf \\
 Production system & Online CTR / conversion & Novelty effects & Guardrail metrics \\
+LLM assistant / agent & Pairwise win rate + task success & Judge bias, contamination & Safety regression suite \\
 \bottomrule
 \end{tabularx}
 \end{table}

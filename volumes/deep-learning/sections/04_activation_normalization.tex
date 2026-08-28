@@ -2,10 +2,10 @@
 \label{chap:activation_normalization}
 
 \begin{tldr}
-Activation functions introduce nonlinearity; normalization techniques stabilize training. This chapter covers the evolution of activations (sigmoid → ReLU → GELU → SwiGLU), normalization methods (BatchNorm, LayerNorm, RMSNorm), and when to use each. Understanding why these components work—and their failure modes—is essential for debugging training issues.
+Activation functions introduce nonlinearity; normalization techniques stabilize training. This chapter covers the evolution of activations (sigmoid → ReLU → GELU → SwiGLU), normalization methods (BatchNorm, LayerNorm, RMSNorm), norm placement (pre- vs.\ post-norm and the 2024--26 hybrids), and attention-logit control (QK-norm, soft-capping). Understanding why these components work—and their failure modes—is essential for debugging training issues, from a dead ReLU on one GPU to a loss spike at 100B tokens.
 \end{tldr}
 
-Activation functions and normalization are building blocks interviewers use to test debugging intuition. Expect questions about vanishing gradients from sigmoid, why transformers use LayerNorm instead of BatchNorm, dead ReLU neurons, and what happens when you remove normalization from a deep network.
+Activation functions and normalization are building blocks interviewers use to test debugging intuition. Expect questions about vanishing gradients from sigmoid, why transformers use LayerNorm instead of BatchNorm, dead ReLU neurons, and—at L6 and above—how normalization placement and attention-logit control keep large training runs from diverging.
 
 \section{Activation Functions}
 \label{sec:activations}
@@ -194,6 +194,8 @@ For FFN in Transformers:
 
 \textbf{Note}: Requires 3 weight matrices instead of 2, so FFN expansion factor reduced (8/3 instead of 4).
 
+\textbf{Concrete numbers (Llama-2-7B, $d = 4096$)}: the SwiGLU hidden dimension is $\frac{8}{3} \times 4096 \approx 10923$, rounded to $11008$ for hardware alignment. FFN parameters per layer: $3 \times 4096 \times 11008 \approx 135$M, so the 32 FFN blocks hold $\approx 4.3$B of the model's 6.7B parameters---about two thirds. Activation memory is similarly FFN-dominated: a transformer layer stores roughly $34\,d$ bytes per token for the backward pass in mixed precision (Korthikanti et al.), i.e., $\approx 140$~KB per token per layer at $d = 4096$ excluding the attention score matrices (which FlashAttention avoids storing)---and the widest tensors in that budget are the three $11008$-dim SwiGLU intermediates. This is why activation checkpointing targets the FFN first.
+
 %--- Q3: GELU vs ReLU vs SwiGLU (after Modern Activations) ---
 
 \begin{interviewq}
@@ -306,9 +308,9 @@ where $\gamma, \beta$ are learned parameters.
 
 The most common culprit is \textbf{BatchNorm's train/eval mode discrepancy}. During training, BatchNorm uses per-batch statistics ($\mu_\mathcal{B}, \sigma^2_\mathcal{B}$). During inference, it uses exponential moving averages ($\mu_{running}, \sigma^2_{running}$) accumulated during training. Several things can go wrong.
 
-\textbf{Scenario 1: Forgot to call model.eval().} This is the most common cause. In PyTorch, if you don't switch to eval mode, BatchNorm continues using batch statistics at inference time. With batch size = 1 (common during inference), these statistics are just the single sample's mean and variance, leading to incorrect normalization. The fix is trivial but the bug is insidious because the model may appear to work but with degraded quality.
+\textbf{Scenario 1: Forgot to call model.eval().} This is the most common cause. In PyTorch, if you don't switch to eval mode, BatchNorm continues using batch statistics at inference time. With batch size = 1 (common during inference), these statistics are just the single sample's mean and variance, leading to incorrect normalization. The fix is trivial but the bug is insidious because the model may appear to work but with degraded quality. Verify with the \texttt{model.training} attribute, and check the mirror-image bug too: if the running mean and variance are all zeros/ones, the model was in eval mode \textit{during training} and the running statistics were never accumulated. A quick behavioral diagnostic: run inference with batch sizes 1, 16, and 64---if the outputs change with batch size, BatchNorm is computing live statistics (LayerNorm would be batch-size-invariant).
 
-\textbf{Scenario 2: Running statistics diverged from true test distribution.} If training data distribution differs from test data (domain shift), running statistics are wrong. This is common when: (a) training uses heavy data augmentation that shifts activation distributions, (b) the model is fine-tuned on a different domain without resetting running statistics, (c) training used dropout, which changes activation magnitudes (BatchNorm after dropout computes statistics on dropped-out activations during training but full activations at inference).
+\textbf{Scenario 2: Running statistics diverged from true test distribution.} If training data distribution differs from test data (domain shift), running statistics are wrong. This is common when: (a) training uses heavy data augmentation that shifts activation distributions, (b) the model is fine-tuned on a different domain without resetting running statistics, (c) training used dropout, which changes activation magnitudes (BatchNorm after dropout computes statistics on dropped-out activations during training but full activations at inference). Two things to check and fix: the momentum parameter (PyTorch's default \texttt{momentum=0.1} means running stats are an exponential average with 0.1 weight on each new batch---too high and they track the last batches, too low and they lag), and, for the augmentation case, recompute running statistics in a final pass over the training set with augmentation disabled; comparing these fresh statistics against the accumulated ones is itself a diagnostic.
 
 \textbf{Scenario 3: Multi-GPU training without SyncBatchNorm.} Each GPU computes BatchNorm statistics from its local mini-batch. If the per-GPU batch size is small (e.g., 4), these statistics are noisy. The running averages accumulate noisy estimates, which diverge from the true population statistics. At inference, these inaccurate running statistics are used, degrading performance. The fix is to use \texttt{torch.nn.SyncBatchNorm} or switch to GroupNorm/LayerNorm.
 
@@ -328,11 +330,11 @@ The most common culprit is \textbf{BatchNorm's train/eval mode discrepancy}. Dur
 \goodgreat
 \begin{itemize}
     \item \badgeLfive{L5} Identifies model.eval() and running statistics issues, knows LayerNorm avoids the problem.
-    \item \badgeLsix{L6} Adds multi-GPU SyncBatchNorm, dropout-before-BatchNorm interaction, and domain shift scenarios. Proposes a diagnostic: compare model output with batch size 1 vs. batch size 64 at inference---if results differ, BatchNorm is computing live statistics.
-    \item \badgeLseven{L7} Discusses the deeper issue that any normalization depending on batch composition creates an implicit dependency between samples, which violates the assumption of independent inference. Connects to the broader design principle of using sample-independent normalization in production systems.
+    \item \badgeLsix{L6} Adds multi-GPU SyncBatchNorm, dropout-before-BatchNorm interaction, and domain shift scenarios. Proposes concrete diagnostics: the batch-size-sensitivity test (outputs at batch 1 vs.\ 16 vs.\ 64), inspecting running statistics for never-updated (all-zero) values, and recomputing fresh statistics on un-augmented data for comparison.
+    \item \badgeLseven{L7} Discusses the deeper issue that any normalization depending on batch composition creates an implicit dependency between samples, which violates the assumption of independent inference. Proposes normalization-robust evaluation pipelines in production: always log running statistics, and add automated batch-size-invariance tests in CI so this entire bug class is caught mechanically. Connects to the broader design principle of using sample-independent normalization in production systems.
 \end{itemize}
 
-\followups{``How would you verify that running statistics are correct?'' ``Does dropout cause a similar train/test discrepancy?'' ``How does BatchNorm interact with gradient accumulation?''}
+\followups{``How would you verify that running statistics are correct?'' ``Does dropout cause a similar train/test discrepancy?'' ``How does BatchNorm interact with gradient accumulation?'' ``How would you automate detection of this class of bugs?''}
 \end{interviewq}
 
 \subsection{Layer Normalization}
@@ -358,7 +360,7 @@ y_i &= \gamma_i \hat{x}_i + \beta_i
 
 \textbf{Used in}: Transformers (BERT, GPT, etc.)
 
-%--- Q1: BatchNorm-Transformer incompatibility (after LayerNorm) ---
+%--- Q1: BatchNorm-Transformer incompatibility (after LayerNorm; merged with former Q7) ---
 
 \begin{interviewq}
 \textbf{Q: Why don't Transformers use BatchNorm? Derive the reasoning from first principles.}
@@ -367,45 +369,7 @@ y_i &= \gamma_i \hat{x}_i + \beta_i
 
 \stronganswer
 
-BatchNorm computes statistics across the batch dimension for each feature channel: $\mu_c = \frac{1}{BT}\sum_{b,t} x_{b,t,c}$ where $B$ is batch size and $T$ is sequence length. This creates several fundamental incompatibilities with Transformers.
-
-First, \textbf{variable sequence lengths} mean that some positions in the batch are padding tokens. Standard BatchNorm averages over both the batch and time dimensions, so its statistics mix real tokens with padding, polluting the normalization. Masking the padding fixes the pollution but makes the effective sample count depend on batch composition (how much padding each batch happens to contain), keeping the statistics noisy. Only a per-position BatchNorm variant---separate statistics for each position $t$---has the sharper failure that positions near the maximum length see very few real tokens.
-
-Second, \textbf{autoregressive generation} processes one token at a time (batch size = 1). BatchNorm's running statistics from training (where sequences are packed) don't match this inference regime. The distribution of activations at generation time---conditioned on partial sequences---differs from the training-time distribution computed over full sequences.
-
-Third, \textbf{the batch dimension in Transformers is fundamentally different from CNNs}. In a CNN, different images in the batch have the same spatial structure, so normalizing across the batch at each spatial-channel position makes sense. In a Transformer, different tokens in different positions have different roles (subject, verb, padding), so normalizing across the batch at a fixed position mixes semantically unrelated activations.
-
-LayerNorm resolves all three issues: it normalizes across the feature dimension \textit{within} each token independently ($\mu = \frac{1}{d}\sum_{i=1}^d x_i$), requiring no batch statistics, behaving identically at train and test time, and treating each token as a self-contained unit. This aligns with how attention processes sequences: each token's representation is updated independently through Q/K/V projections before interacting with other tokens.
-
-\redflags
-\begin{itemize}
-    \item ``BatchNorm just doesn't work for sequences''---this is hand-waving without explaining the mechanism.
-    \item Failing to mention the train/test discrepancy for autoregressive generation.
-    \item Not distinguishing the batch dimension semantics between CNNs and Transformers.
-\end{itemize}
-
-\interviewtest{Whether you can derive \textit{why} an architectural choice was made from the mechanics of both the normalization method and the architecture, rather than just memorizing ``Transformers use LayerNorm.''}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} States the variable-length and train/test issues clearly.
-    \item \badgeLsix{L6} Derives the incompatibility from the formulas, explains why the batch dimension semantics differ between CNNs and Transformers, and mentions that PowerNorm and other BatchNorm variants have been tried in Transformers with limited success.
-    \item \badgeLseven{L7} Connects to the broader design principle that normalization should be \textit{per-example} in architectures where batch composition is variable, discusses the smoothing effect on the loss landscape, and mentions that some recent work (e.g., nGPT) removes normalization entirely in favor of representation learning on the hypersphere.
-\end{itemize}
-
-\followups{``Why RMSNorm over LayerNorm in modern LLMs?'' ``Where is BatchNorm still preferred and why?'' ``What is pre-norm vs. post-norm and why does it matter for training stability?''}
-\end{interviewq}
-
-%--- Q7: Derive BatchNorm incompatibility (after Q1, both on BatchNorm vs LayerNorm) ---
-
-\begin{interviewq}
-\textbf{Q: Derive why BatchNorm doesn't work well for Transformers.}
-
-\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
-
-\stronganswer
-
-Let me derive this from the mechanics of both BatchNorm and the Transformer architecture.
+Derive this from the mechanics of both BatchNorm and the Transformer architecture, rather than asserting the conclusion.
 
 \textbf{BatchNorm formulation.} For input tensor $\vx \in \R^{B \times T \times d}$ (batch, sequence length, features), BatchNorm computes per-feature statistics across the batch and sequence dimensions:
 \begin{equation*}
@@ -413,33 +377,33 @@ Let me derive this from the mechanics of both BatchNorm and the Transformer arch
 \end{equation*}
 Then normalizes: $\hat{x}_{b,t,j} = (x_{b,t,j} - \mu_j)/\sqrt{\sigma_j^2 + \epsilon}$.
 
-\textbf{Problem 1: Token heterogeneity.} In CNNs, feature $j$ at spatial position $(h,w)$ across different images measures a consistent quantity (e.g., edge presence). Averaging across the batch is meaningful. In Transformers, feature $j$ at position $t=1$ might represent the beginning-of-sequence token, while at $t=100$ it represents a content word. Averaging across both batch and time conflates semantically different tokens. The statistics $\mu_j$ and $\sigma_j^2$ are averages over a mixture of distributions, not a single coherent distribution.
+\textbf{Problem 1: Token heterogeneity---the batch dimension means something different than in CNNs.} In a CNN, feature $j$ at spatial position $(h,w)$ across different images measures a consistent quantity (e.g., edge presence), so averaging across the batch is meaningful. In a Transformer, tokens in different positions play different roles (subject, verb, beginning-of-sequence marker, padding): feature $j$ at $t=1$ and feature $j$ at $t=100$ measure different things. Averaging across both batch and time conflates semantically unrelated activations---the statistics $\mu_j$ and $\sigma_j^2$ are averages over a mixture of distributions, not a single coherent distribution.
 
 \textbf{Problem 2: Padding corruption.} With variable-length sequences, shorter sequences are padded. If padding tokens are included in the BatchNorm computation, they corrupt the statistics. If excluded (masked BatchNorm), the effective sample count depends on how much padding each batch contains, so the statistics stay noisy; a per-position variant (separate statistics per $t$) is worse still, since positions near the maximum length see very few real tokens.
 
-\textbf{Problem 3: Autoregressive inference.} At generation time, the model processes one token at a time with batch size 1. BatchNorm must use running statistics from training. But training statistics were computed over \textit{full sequences} (including future tokens), while inference sees only \textit{partial sequences}. The activation distribution conditioned on ``sequence so far'' differs from the training distribution conditioned on ``all tokens.'' This is a fundamental distribution shift.
+\textbf{Problem 3: Autoregressive inference.} At generation time, the model processes one token at a time with batch size 1. BatchNorm must use running statistics from training. But training statistics were computed over \textit{full sequences} (including future tokens), while inference sees only \textit{partial sequences}. The activation distribution conditioned on ``sequence so far'' differs from the training distribution conditioned on ``all tokens.'' This is a fundamental distribution shift, on top of the ordinary train/eval discrepancy BatchNorm already carries.
 
 \textbf{Problem 4: Gradient coupling.} BatchNorm creates a dependency between samples in the batch through the shared statistics. The gradient $\partial \loss / \partial x_{b,t,j}$ depends on all other samples in the batch via $\mu_j$ and $\sigma_j^2$. Be precise here: this coupling is \textit{not} Transformer-specific---CNNs with BatchNorm have exactly the same property. It is a general cost of batch-statistic normalization (noisier gradients, batch-composition dependence, samples no longer independent at inference); the honest framing is that Transformers have no reason to pay this cost, since per-token normalization works at least as well for them.
 
-\textbf{LayerNorm resolves all four issues} by computing statistics across features within each token: $\mu_{b,t} = \frac{1}{d}\sum_{j=1}^d x_{b,t,j}$. Each token is normalized independently. No batch dependence, no padding issues, no train/inference mismatch, no gradient coupling between samples.
+\textbf{LayerNorm resolves all four issues} by computing statistics across features within each token: $\mu_{b,t} = \frac{1}{d}\sum_{j=1}^d x_{b,t,j}$. Each token is normalized independently: no batch dependence, no padding issues, no train/inference mismatch, no gradient coupling between samples. This also aligns with how attention processes sequences---each token's representation is updated independently through Q/K/V projections before interacting with other tokens.
 
 \redflags
 \begin{itemize}
-    \item Stating the conclusion without showing the derivation---the question specifically asks to derive.
+    \item ``BatchNorm just doesn't work for sequences''---hand-waving; the question asks you to derive the mechanism.
     \item Missing the autoregressive inference argument (the strongest theoretical objection).
-    \item Not writing out the BatchNorm statistics formula to show where the batch/time dimensions interact.
+    \item Not writing out the BatchNorm statistics formula to show where the batch/time dimensions interact, or not distinguishing the batch-dimension semantics between CNNs and Transformers.
 \end{itemize}
 
-\interviewtest{Ability to reason from mathematical formulations to architectural consequences, not just pattern-match ``Transformers use LayerNorm.''}
+\interviewtest{Whether you can reason from the mathematical formulation of a normalization method to its architectural consequences---deriving \textit{why} the choice was made rather than pattern-matching ``Transformers use LayerNorm.''}
 
 \goodgreat
 \begin{itemize}
-    \item \badgeLfive{L5} States 2--3 problems clearly.
-    \item \badgeLsix{L6} Writes out the formulas showing how batch and time dimensions interact in BatchNorm statistics, contrasts with LayerNorm formula, and addresses the gradient coupling issue.
-    \item \badgeLseven{L7} Notes that some researchers have made BatchNorm work for Transformers with modifications (PowerNorm, sequence-aware BatchNorm), discusses the theoretical connection between normalization axis choice and the independence assumptions of the architecture, and relates to the broader principle that normalization should align with the architecture's inductive biases.
+    \item \badgeLfive{L5} States 2--3 problems clearly, including variable lengths and the train/test discrepancy.
+    \item \badgeLsix{L6} Writes out the formulas showing how batch and time dimensions interact in BatchNorm statistics, contrasts with the LayerNorm formula, explains why the batch-dimension semantics differ between CNNs and Transformers, addresses gradient coupling honestly, and mentions that PowerNorm and other BatchNorm variants have been tried in Transformers with limited success.
+    \item \badgeLseven{L7} Connects to the broader design principle that normalization should be \textit{per-example} where batch composition is variable and should align with the architecture's inductive biases; discusses the loss-landscape-smoothing view of why normalization helps at all; and mentions that some recent work (e.g., nGPT) removes normalization entirely in favor of representation learning on the hypersphere.
 \end{itemize}
 
-\followups{``What about GroupNorm for Transformers?'' ``Could you make BatchNorm work if you computed statistics per-position?'' ``What is the effect of normalization on the rank of representations?''}
+\followups{``Why RMSNorm over LayerNorm in modern LLMs?'' ``Where is BatchNorm still preferred and why?'' ``Could you make BatchNorm work if you computed statistics per-position?'' ``What is pre-norm vs. post-norm and why does it matter for training stability?''}
 \end{interviewq}
 
 \subsection{RMSNorm}
@@ -522,6 +486,14 @@ Reparameterize weights: $\vw = g \frac{\vv}{\|\vv\|}$
 \textbf{Used in}: Some generative models
 
 \subsection{Pre-Norm vs. Post-Norm}
+\label{subsec:prenorm_postnorm}
+
+Where the normalization sits relative to the residual connection is one of the most consequential stability decisions in a Transformer:
+\begin{align}
+\text{Post-norm (original Transformer, BERT):}\quad \vx_{l+1} &= \mathrm{Norm}\big(\vx_l + F_l(\vx_l)\big) \\
+\text{Pre-norm (GPT-2 onward, modern default):}\quad \vx_{l+1} &= \vx_l + F_l\big(\mathrm{Norm}(\vx_l)\big)
+\end{align}
+where $F_l$ is the attention or FFN sublayer.
 
 \begin{figure}[H]
 \centering
@@ -570,12 +542,82 @@ Reparameterize weights: $\vw = g \frac{\vv}{\|\vv\|}$
 \caption{Pre-norm vs. post-norm placement in Transformer blocks.}
 \end{figure}
 
-\textbf{Pre-norm advantages}:
+\textbf{The gradient argument (Xiong et al., 2020).} In the pre-norm stack the residual path is never normalized, so the Jacobian between any two depths contains a clean identity term:
+\begin{equation}
+\frac{\partial \vx_L}{\partial \vx_l} = \prod_{k=l}^{L-1}\left(\mI + \frac{\partial F_k(\mathrm{Norm}(\vx_k))}{\partial \vx_k}\right) = \mI + (\text{cross terms}),
+\end{equation}
+and the loss gradient reaches every layer with an $O(1)$ component regardless of depth. In the post-norm stack, every factor in the product is wrapped in a $\mathrm{Norm}$ Jacobian---no path from the loss to layer $l$ avoids the $L - l$ intervening normalizations, each of which rescales by roughly the inverse of the activation norm. Xiong et al.\ analyzed both at initialization: post-norm concentrates large parameter gradients in the layers near the output while starving the lower layers, and the imbalance grows with depth. This is precisely why the original Transformer recipe depends on learning-rate warmup---at full learning rate, the first few updates to the top post-norm layers are large enough to destroy the model before training settles---and why deep post-norm stacks (18+ layers) historically failed to train without tricks like DeepNet's rescaled residuals. Pre-norm removes most of this warmup dependence, but not all of it: every modern LLM recipe still warms up, just far less delicately.
+
+\textbf{Pre-norm's own pathology: residual-stream growth.} The identity path means each block \emph{adds} to a stream that is never re-normalized, so $\|\vx_l\|$ grows with depth---roughly $\sqrt{l}$ at initialization (a sum of $l$ roughly independent block outputs), and often faster during training. Each block's $O(1)$-normalized contribution is therefore added to an ever-larger stream: later blocks change the stream's direction less and less, and a deep pre-norm network behaves \emph{effectively shallower} than its layer count. This is one reason doubling depth does not double quality in pre-norm models, and why the final norm before the output head is essential (without it, the head sees activations whose scale depends on depth).
+
+\textbf{2024--26 hybrids.} Recent models re-introduce controlled post-norm elements without breaking the identity path. Gemma~2 uses \emph{sandwich norm}: RMSNorm on the sublayer input \emph{and} on its output before the residual addition, $\vx + \mathrm{Norm}(F(\mathrm{Norm}(\vx)))$, capping how much any single block injects into the stream. OLMo~2 instead \emph{reorders} the norm to the sublayer output only, $\vx + \mathrm{Norm}(F(\vx))$---a post-norm variant that leaves the residual path untouched and measurably improved its training stability. \emph{Peri-LN} (2025) formalizes the pattern---normalize both the input and the output of every module---showing it keeps residual-stream variance growth linear rather than exponential while keeping gradient scales even across depth.
+
+%--- Q9: Pre-norm vs post-norm gradient flow (after Pre-Norm vs. Post-Norm) ---
+
+\begin{interviewq}
+\textbf{Q: Pre-norm vs. post-norm---derive the gradient-flow difference and explain what modern hybrids fix.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Set up the two update rules.} Post-norm: $\vx_{l+1} = \mathrm{Norm}(\vx_l + F_l(\vx_l))$. Pre-norm: $\vx_{l+1} = \vx_l + F_l(\mathrm{Norm}(\vx_l))$. The entire stability story follows from differentiating these.
+
+\textbf{Derive the backward path.} For pre-norm, the chain rule gives
+\begin{equation*}
+\frac{\partial \loss}{\partial \vx_l} = \frac{\partial \loss}{\partial \vx_L}\prod_{k=l}^{L-1}\big(\mI + \mJ_k\big), \qquad \mJ_k = \frac{\partial F_k(\mathrm{Norm}(\vx_k))}{\partial \vx_k}.
+\end{equation*}
+Expanding the product, one term is exactly $\mI$: the loss gradient reaches layer $l$ unattenuated, no matter how deep the stack. Everything else is a correction on top of that identity term. For post-norm, each factor is $\mathrm{Norm}'(\cdot)\,(\mI + \partial F_k/\partial \vx_k)$---the norm Jacobian multiplies \textit{every} path, including the residual one, so no identity term survives. A LayerNorm Jacobian scales like the inverse of its input norm, so the product of $L-l$ of them neither preserves gradient magnitude nor treats layers evenly. Xiong et al.\ (2020) make this precise at initialization: post-norm puts large parameter gradients in the layers near the output, the layer-to-layer imbalance grows with depth, and a full-size learning rate destroys the top layers in the first few steps---which is exactly why post-norm training needs warmup (BERT's recipe) and why removing warmup from a post-norm Transformer diverges. Pre-norm's gradients are well-behaved at any depth, so warmup sensitivity drops sharply (though modern recipes still warm up).
+
+\textbf{What pre-norm gives up.} The unnormalized residual stream grows with depth ($\approx\sqrt{l}$ at initialization, often faster in training), so later blocks contribute relatively less and the network behaves effectively shallower than its layer count. The growing stream also feeds ever-larger activations into attention and the output head, which interacts badly with low precision. Post-norm, when it trains at all, avoids this by re-normalizing the stream every block---one reason well-tuned post-norm models can match or beat pre-norm at convergence.
+
+\textbf{What the hybrids fix.} They buy back post-norm's activation control without giving up the identity path. Gemma~2's sandwich norm normalizes each sublayer's input and its output before the residual addition, bounding what any block injects into the stream. OLMo~2 normalizes the sublayer output only ($\vx + \mathrm{Norm}(F(\vx))$), which its ablations showed reduced gradient-norm spikes. Peri-LN unifies these: normalizing into and out of every module keeps residual variance growth linear and gradient scales even across layers. In all three, the second norm sits on the \textit{sublayer output}, never on the residual sum---normalizing the sum is what would reintroduce post-norm's broken identity path.
+
+\redflags
 \begin{itemize}
-    \item More stable training (gradient flows through residual directly)
-    \item Greatly reduces warmup sensitivity---but does not eliminate it; modern LLM recipes still use learning rate warmup
-    \item Standard in modern LLMs
+    \item ``Pre-norm is better, period''---without the gradient mechanism, this is memorized trivia, and it cannot explain why Gemma~2 and OLMo~2 deliberately added post-norm elements back.
+    \item Claiming pre-norm eliminates the need for warmup entirely---it reduces warmup sensitivity; every modern large-model recipe still warms up.
+    \item Placing sandwich norm's second norm on the residual sum rather than the sublayer output---that would break the identity path and defeat the design.
 \end{itemize}
+
+\interviewtest{Whether you can convert an architecture diagram into a Jacobian statement and reason about what survives a product over depth---and whether your knowledge extends past ``pre-norm is standard'' to why the 2024--26 generation partially reversed it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the two placements, that pre-norm is the modern default, and that post-norm historically required careful warmup.
+    \item \badgeLsix{L6} Derives the identity term in the pre-norm Jacobian, explains post-norm's depth-growing gradient imbalance at initialization (Xiong et al.), and states pre-norm's residual-stream-growth caveat.
+    \item \badgeLseven{L7} Quantifies the stream growth ($\sqrt{l}$ at init), explains the ``effectively shallower'' consequence and its interaction with precision and attention logits, and maps each hybrid (sandwich, OLMo-2 reordering, peri-LN) to the specific failure it addresses; mentions DeepNet-style rescaling as the alternative route to deep post-norm.
+\end{itemize}
+
+\followups{``Why do modern recipes still use warmup if pre-norm fixes the gradients?'' ``What does the final norm before the LM head do in a pre-norm model?'' ``How does norm placement interact with QK-norm and attention-logit growth?''}
+\end{interviewq}
+
+\subsection{QK-Norm and Attention-Logit Growth}
+\label{subsec:qknorm}
+
+The $1/\sqrt{d_k}$ attention scaling (Chapter~\ref{chap:attention_transformers}) controls logit variance \textit{at initialization}: for random query/key vectors with unit-variance entries, the dot product has standard deviation $\sqrt{d_k}$, and dividing by $\sqrt{d_k}$ restores $O(1)$ logits. But the scaling is a constant. Training is free to grow the projections, and in large models it does: query/key norms increase and queries co-align with keys, so the logits $\vq^\top \vk / \sqrt{d_k}$ grow without bound over the run.
+
+\textbf{The failure mode: entropy collapse.} Work the arithmetic for one head with $d_h = 128$. At initialization, logits are $O(1)$. Suppose training grows $\|\vq\|$ and $\|\vk\|$ to $10\sqrt{d_h} \approx 113$ each (a $10\times$ norm growth) and aligns them to cosine similarity $0.3$. The logit becomes $\|\vq\|\|\vk\|\cos\theta/\sqrt{d_h} = 113 \times 113 \times 0.3 / 11.3 \approx 340$. Once the gap between the top logit and the runner-up exceeds even $\sim$20, softmax is numerically one-hot (weight $1 - e^{-20}$), the attention distribution's entropy collapses to zero, and the softmax gradient (proportional to $p(1-p)$) vanishes---the head freezes. Precision makes it worse: BF16 has an 8-bit significand, so at logit magnitude 340 the quantization spacing is $\approx 2$---logit differences smaller than that no longer exist. This is exactly what killed ViT-22B's early training runs: within a few thousand steps, uncontrolled attention-logit growth (orders of magnitude beyond the $O(1)$ init scale) produced near one-hot attention weights and then divergence. The fix---normalizing queries and keys before the dot product---trained stably at 22B and became standard practice.
+
+\begin{mathresult}{QK-Norm}
+Apply RMSNorm to queries and keys, per head, before the dot product:
+\begin{equation}
+z_{ij} = \frac{\mathrm{RMSNorm}_{\gamma_q}(\vq_i) \cdot \mathrm{RMSNorm}_{\gamma_k}(\vk_j)}{\sqrt{d_h}}
+\end{equation}
+Each normalized vector has RMS 1, hence norm $\sqrt{d_h}$ (times its learned gain), so by Cauchy--Schwarz
+\begin{equation}
+|z_{ij}| \leq \sqrt{d_h}\,\gamma_q \gamma_k
+\end{equation}
+The attention logits are bounded \emph{regardless of what the projections learn}---for $d_h = 128$ and unit gains, $|z| \leq 11.3$.
+\end{mathresult}
+
+The cost is two extra RMSNorms over $d_h$-dimensional vectors per token---negligible against the attention matmuls. ViT-22B used the LayerNorm form; Gemma~3, Qwen3, and OLMo~2 apply RMSNorm to Q and K, and it is the expected first answer to ``how do you keep a 30B+ model from diverging.''
+
+\textbf{The alternative: logit soft-capping (Gemma~2)---and its removal.} Gemma~2 instead bounded logits with a smooth squash, $z \leftarrow c \cdot \tanh(z/c)$, with $c = 50$ for attention logits and $c = 30$ for final output logits. This caps the magnitude, but as logits approach the cap the $\tanh$ compresses their differences and its gradient $1 - (z/c)^2$ shrinks---and the nonstandard softmax broke FlashAttention kernel compatibility when Gemma~2 launched. Gemma~3 dropped soft-capping in favor of QK-norm; capping now survives mainly as a mid-run retrofit when a spiking model cannot be re-architected.
+
+\begin{keyinsight}
+The $1/\sqrt{d_k}$ scaling and QK-norm solve two different problems. The scaling is a constant chosen for the \emph{initialization-time} statistics of random projections; it cannot respond to anything training learns. QK-norm constrains the \emph{learned} query/key magnitudes at every step, bounding the logits for the whole run---which is why models using QK-norm still keep the $1/\sqrt{d_h}$ factor. On large runs, the max attention logit per layer is the standard early-warning metric: it climbs for thousands of steps before the first loss spike.
+\end{keyinsight}
 
 \subsection{Normalization Selection Guide}
 
@@ -640,42 +682,44 @@ NaN loss within the first few hundred steps points to numerical instability rath
 \followups{``How do you instrument a training run to catch NaN before it propagates?'' ``What is the relationship between normalization placement and gradient magnitude?'' ``How does BF16 compare to FP16 for training stability?''}
 \end{interviewq}
 
-%--- Q8: Validation accuracy gap / normalization debugging (after Q2) ---
+%--- Q8: Large-scale loss-spike debugging (after Q2; replaces the former validation-gap question, merged into Q5) ---
 
 \begin{interviewq}
-\textbf{Q: Your model's validation accuracy is significantly lower than training accuracy, and you suspect normalization. What is your debugging process?}
+\textbf{Q: Your 70B-parameter run in BF16 starts loss-spiking at 100B tokens. Walk me through the activation- and normalization-level causes and mitigations.}
 
-\badgeLfive{L5} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+\badgeLsix{L6} \badgeLseven{L7} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
 
 \stronganswer
 
-A train-validation gap specifically caused by normalization is a subtle class of bugs. I would investigate systematically.
+First, frame the problem correctly: a run that was healthy for 100B tokens does not have a code bug---bugs fire immediately. Late-onset spikes are \textbf{slow-growth instabilities}: some quantity has been drifting upward for the whole run and has now crossed a threshold, usually interacting with BF16's coarse precision (8-bit significand, relative spacing $\approx 0.4\%$; range is not the issue---BF16 shares FP32's exponent). Also distinguish severity: spikes that recover on their own are warnings; a spike that does not recover is divergence. The same causes produce both.
 
-\textbf{Step 1: Verify eval mode.} The most common cause: the model is still in train mode during validation. In PyTorch, check that \texttt{model.eval()} is called before the validation loop and \texttt{model.train()} is called before resuming training. Verify with \texttt{model.training} attribute. This affects both BatchNorm (uses batch vs. running statistics) and Dropout (drops vs. passes through).
+\textbf{Cause 1: Attention-logit growth $\to$ entropy collapse.} Learned query/key norms and alignment grow over the run until softmax saturates (Section~\ref{subsec:qknorm}). The tell is in the logs \textit{before} the spike: max attention logit per layer/head climbs steadily for thousands of steps and then some layer crosses into one-hot attention. If this metric is not being logged, adding it is step one---it is the single best early-warning signal. Mitigation: QK-norm (RMSNorm on Q and K per head) for the next run or at a restart; logit soft-capping ($c\cdot\tanh(z/c)$) as a mid-run retrofit that does not change parameter shapes.
 
-\textbf{Step 2: Check BatchNorm running statistics.} Log the running mean and running variance of each BatchNorm layer. (a) If they are all zeros, the running statistics were never updated---likely a bug where the model was in eval mode during training, so running stats never accumulated. (b) If they are wildly different from the last batch's statistics, the momentum parameter is wrong (default PyTorch momentum=0.1 means running stats are an exponential average with 0.1 weight on new batches). (c) Compare per-layer running statistics with fresh statistics computed on the full training set in a single pass---they should be close.
+\textbf{Cause 2: Output-logit divergence at the final softmax.} The log-partition $\log Z$ of the output softmax drifts away from zero, softmax gradients degrade, and the cross-entropy becomes spike-prone. The standard mitigation is z-loss ($\sim 10^{-4}\log^2 Z$, PaLM), which regularizes $\log Z$ toward zero at negligible cost---mechanics in Chapter~\ref{chap:loss_functions}. Log $\log Z$ alongside max attention logits.
 
-\textbf{Step 3: Test batch size sensitivity.} Run validation with batch sizes of 1, 16, and 64. If results change significantly with batch size, BatchNorm is using live batch statistics instead of running statistics (model is in train mode). With LayerNorm, batch size should have no effect on results.
+\textbf{Cause 3: Embedding-norm growth.} Embedding rows---especially for frequent tokens---grow throughout training, and with tied or large unembeddings this feeds directly into logit magnitude and into the scale of the layer-0 residual stream. Monitor embedding-norm statistics; mitigations include weight decay applied to embeddings and normalizing the embedding output (as OLMo does) so downstream layers see a controlled scale.
 
-\textbf{Step 4: Check for data augmentation interaction.} Heavy data augmentation (color jitter, cutout, mixup) shifts the training distribution. BatchNorm running statistics reflect the augmented distribution, but validation data is un-augmented. The mismatch between augmented-training statistics and clean-validation statistics causes normalization errors. Fix: compute running statistics on un-augmented training data (a final pass with augmentation disabled).
+\textbf{Cause 4: Normalization epsilon and precision of the norm ops.} As residual-stream RMS grows over the run, norm layers divide by ever-larger statistics computed from ever-coarser BF16 values. Two checks: (a) norms (and softmax) should be computed in FP32 even in a BF16 run---a norm computed natively in BF16 loses the small differences it is supposed to standardize; (b) $\epsilon$ must suit the precision and the data---too small ($10^{-12}$) and a degenerate, near-constant token (e.g., repeated padding or BOS-heavy batches) produces a huge post-norm activation; RMSNorm's $\epsilon$ sits inside the square root (Section~\ref{sec:normalization}), and $10^{-6}$--$10^{-5}$ is the safe band.
 
-\textbf{Step 5: Multi-GPU synchronization.} If training on multiple GPUs without SyncBatchNorm, running statistics are computed per-GPU and may diverge. At validation time (often on a single GPU), only one GPU's running statistics are used, which may not represent the full training distribution. Fix: use SyncBatchNorm or aggregate statistics after training.
+\textbf{Cause 5: It may be the data, not the model.} Before touching architecture, test reproducibility: rewind to the checkpoint before the spike and replay the same batches. If the spike reproduces, inspect those batches (corrupt documents, pathological repetition); the pragmatic mitigation is the skip-batch strategy---rewind and skip a few hundred data batches (PaLM's recipe)---covered with the optimizer-side story (e.g., Adam $\beta_2 = 0.95$, gradient clipping) in Chapter~\ref{chap:training_optimization}. If the spike does \textit{not} reproduce, suspect hardware (a flaky node emitting bad gradients).
+
+\textbf{The monitoring checklist} that separates candidates who have run this from those who have read about it: per-layer gradient norm, max attention logit, $\log Z$, residual-stream RMS per layer, embedding norms. All are nearly free to log, and every cause above announces itself in one of them thousands of steps before the first spike.
 
 \redflags
 \begin{itemize}
-    \item ``Add more regularization''---this addresses overfitting generally but not the normalization-specific diagnosis.
-    \item Not distinguishing between BatchNorm-related and Dropout-related train/eval discrepancies.
-    \item Jumping to solutions without systematic diagnosis.
+    \item ``Lower the learning rate''---a blunt instrument that trades away compute efficiency without identifying which quantity is growing; the spike usually returns.
+    \item Reaching for FP16-era fixes (loss scaling, GradScaler)---BF16 does not underflow the way FP16 does; the issue is precision granularity, not range.
+    \item Treating this as the single-GPU NaN checklist---at 100B tokens the causes are slow-growth (logits, embeddings, residual RMS), not initialization or a wrong $\epsilon$ that would have failed at step 100.
 \end{itemize}
 
-\interviewtest{Methodical debugging approach for a specific class of train/eval discrepancy, deep understanding of how normalization layers behave differently in the two modes, and practical PyTorch knowledge.}
+\interviewtest{Whether you have actually operated a large training run: the bug-vs-instability distinction, the monitoring-first mindset, knowledge of the specific quantities that grow (attention logits, $\log Z$, embedding and residual norms), and matching each mitigation to its mechanism rather than reciting a fix list.}
 
 \goodgreat
 \begin{itemize}
-    \item \badgeLfive{L5} Immediately checks model.eval(), verifies running statistics, and tests batch size sensitivity.
-    \item \badgeLsix{L6} Adds data augmentation interaction and multi-GPU synchronization issues, proposes computing fresh statistics as a diagnostic.
-    \item \badgeLseven{L7} Discusses how to design normalization-robust evaluation pipelines in production (always log running statistics, automated batch-size-invariance tests in CI), and connects to the argument for using LayerNorm/RMSNorm to eliminate this class of bugs entirely.
+    \item \badgeLfive{L5} Proposes gradient-norm logging, checkpoint rewind, and checks data quality; knows BF16 vs.\ FP16 basics.
+    \item \badgeLsix{L6} Distinguishes slow-growth instabilities from bugs, names attention-logit growth and QK-norm, knows z-loss and the skip-batch strategy, and insists norms/softmax run in FP32.
+    \item \badgeLseven{L7} Lays out the full monitoring suite and the order in which signals fire; discusses trade-offs among mitigations (QK-norm vs.\ soft-capping retrofit, embedding weight decay vs.\ embedding norm); connects spike frequency to scale (larger models sit closer to the edge of stability) and knows the published lineage (PaLM's rewind-and-skip, ViT-22B's QK-norm, Gemma~2's capping and its removal in Gemma~3).
 \end{itemize}
 
-\followups{``How would you automate detection of this class of bugs?'' ``Does LayerNorm ever cause train/eval discrepancy?'' ``How does gradient accumulation interact with BatchNorm statistics?''}
+\followups{``Why do loss spikes become more frequent as models scale?'' ``The spike recovered on its own---do you intervene anyway?'' ``How would $\mu$P or a different parameterization change this failure surface?''}
 \end{interviewq}

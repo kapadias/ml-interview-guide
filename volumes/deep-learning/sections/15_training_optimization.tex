@@ -78,6 +78,25 @@ In Adam, they are \textbf{not} equivalent because the adaptive scaling $1/\sqrt{
 
 \textbf{One-sentence summary:} LARS and LAMB normalize the update per layer so that no single layer dominates, which stabilizes large-batch training.
 
+\subsection{Beyond AdamW}
+\label{subsec:beyond_adamw}
+
+``What comes after AdamW?'' is now a standard frontier-lab probe. The short answer: Muon is the first alternative to see production use at the largest scales, second-order methods (Shampoo/SOAP) win benchmark competitions, and everything else is a memory or throughput optimization on the Adam template.
+
+\textbf{Muon (orthogonalized momentum).} Muon (Jordan et al., 2024) treats each hidden weight \emph{matrix} as a matrix, not a bag of scalars. It keeps a standard SGD-momentum buffer $\mathbf{M}_t$ per weight matrix, but before stepping it \emph{orthogonalizes} the update: if $\mathbf{M}_t = \mU \mathbf{S} \mV^\top$ is the SVD, Muon steps in the direction $\mU\mV^\top$---same singular vectors, all singular values set equal. The intuition: the raw momentum matrix is dominated by a few large singular directions (it has low effective rank), so most of the parameter space barely gets updated; orthogonalization gives every direction an equal-magnitude push, which is steepest descent under the spectral norm rather than the Euclidean norm. Computing an SVD every step would be absurd, so Muon approximates $\mU\mV^\top$ with $\sim$5 iterations of a Newton--Schulz polynomial applied to the (normalized) momentum matrix, run in BF16---a few extra matmuls per layer, negligible next to the forward/backward pass.
+
+Two practical points interviewers probe:
+\begin{itemize}
+    \item \textbf{Muon is only for hidden matrices.} Embeddings, the unembedding/LM head, norms, gains, and biases are not ``matrix-shaped'' in the relevant sense and stay on AdamW. Every real Muon deployment is a hybrid: Muon on the 2D hidden weights, AdamW on everything else.
+    \item \textbf{It has been validated at extreme scale.} Moonshot AI's Moonlight (16B MoE) reported roughly $2\times$ compute efficiency over AdamW in matched scaling-law experiments, and Kimi K2---a 1T-parameter MoE trained on 15.5T tokens---used \textbf{MuonClip}: Muon plus QK-clip, which rescales the query/key projection weights whenever the maximum attention logit exceeds a threshold, directly attacking the logit-growth instability (Section~\ref{subsec:stability_at_scale}). The K2 report claims zero loss spikes over the entire run. Citing Muon/MuonClip with the Newton--Schulz mechanism is the 2026 equivalent of the $\beta_2 = 0.95$ tell.
+\end{itemize}
+
+\textbf{Shampoo and SOAP.} These approximate full-matrix preconditioning: the ideal update preconditions with the inverse square root of the full gradient covariance (full-matrix AdaGrad), which is statistically optimal but needs $O(P^2)$ memory. Shampoo approximates it with a Kronecker factorization: for a weight matrix it maintains left and right preconditioners $\mathbf{L}$ and $\mathbf{R}$ (of size $d_{\text{out}}^2$ and $d_{\text{in}}^2$) and applies $\mathbf{L}^{-1/4} \mathbf{G} \mathbf{R}^{-1/4}$, amortizing the expensive inverse-root computation over every $N$ steps. Distributed Shampoo won the external-tuning track of the 2024 AlgoPerf optimizer benchmark, beating tuned AdamW on wall-clock---the strongest controlled evidence that second-order information pays. SOAP simplifies deployment by running AdamW inside Shampoo's slowly-rotating eigenbasis, cutting the tuning sensitivity. The costs are extra optimizer memory, the periodic eigendecomposition/inverse-root work, and awkward sharding of the preconditioners at large scale---which is why Shampoo-family optimizers dominate benchmarks yet remain rarer than Muon in trillion-parameter production runs.
+
+\textbf{Lion} (Chen et al., 2023), discovered by evolutionary program search, updates with the \emph{sign} of an interpolated momentum---one momentum buffer, no second moment, so half of Adam's optimizer memory---and matched AdamW on many workloads but never displaced it at LLM scale. \textbf{8-bit optimizer states} (Dettmers et al.) blockwise-quantize Adam's $m$ and $v$ from 8 bytes/param to $\sim$2, with matched quality; this is a standard memory lever for fine-tuning and is orthogonal to the optimizer choice itself.
+
+\textbf{When AdamW remains the default.} AdamW survives because its failure modes and hyperparameter lore ($\beta_2 = 0.95$, wd $= 0.1$, clip $1.0$, LR scaling with width via muP---Section~\ref{subsec:mup}) are known at every scale, it handles every parameter shape uniformly, and mature sharded implementations exist in every framework. A defensible 2026 answer: ``AdamW everywhere by default; Muon on hidden matrices with AdamW on embeddings if we can afford a validation run at intermediate scale, for the $\sim$1.5--2$\times$ token-efficiency win.''
+
 \subsection{Optimizer Comparison}
 
 \begin{table}[H]
@@ -91,6 +110,8 @@ SGD + Momentum & Vision (ResNet, ConvNeXt) & LR, momentum (0.9), schedule & Best
 Adam & Fast prototyping, NLP, GANs & LR ($3\mathrm{e}{-4}$), $\beta_1$, $\beta_2$ & Less LR-sensitive, faster convergence \\
 AdamW & LLMs, Transformers, default & LR, weight decay ($0.01$--$0.1$) & Always prefer over Adam with WD \\
 LAMB/LARS & Large-batch training & Trust ratio, warmup & Only needed at batch $\geq$ 4K \\
+Muon & LLM hidden matrices & LR, momentum, NS steps & Pair with AdamW on embeddings/norms \\
+Shampoo/SOAP & When tuning budget exists & Precondition freq., LR & Won AlgoPerf 2024; heavier memory \\
 Adafactor & Memory-constrained LLMs & Factored second moment & Saves memory vs.\ Adam \\
 \bottomrule
 \end{tabularx}
@@ -217,7 +238,32 @@ Inverse sqrt & $\eta_t = \eta_0 / \sqrt{t}$ & Original Transformer & Legacy \\
 If you double the batch size, double the learning rate.
 \end{mathresult}
 
-\textbf{When it breaks.} The linear scaling rule fails for very large batches (typically $B > 8\text{K}$ for vision, varies for NLP). At extreme batch sizes, the gradient noise reduction hits diminishing returns, and the larger steps overshoot. This is where warmup and LARS/LAMB become necessary.
+\textbf{When it breaks.} The linear scaling rule fails for very large batches (typically $B > 8\text{K}$ for vision, varies for NLP). At extreme batch sizes, the gradient noise reduction hits diminishing returns, and the larger steps overshoot. This is where warmup and LARS/LAMB become necessary. The principled version of ``when it breaks'' is the gradient noise scale, next.
+
+\subsection{Critical Batch Size and the Gradient Noise Scale}
+\label{subsec:critical_batch}
+
+``$B > 8$K'' is an empirical observation, not a framework. The framework is the \textbf{gradient noise scale} (McCandlish et al., 2018): batching helps exactly as long as the mini-batch gradient is dominated by noise rather than signal, and the crossover point is measurable.
+
+\begin{mathresult}{Gradient Noise Scale and Critical Batch Size}
+\begin{equation}
+B_{\text{noise}} \approx \frac{\operatorname{tr}(\Sigma)}{\|\mathbf{G}\|^2}
+\end{equation}
+where $\mathbf{G}$ is the true (full-batch) gradient and $\Sigma$ is the per-example gradient covariance. The number of steps to reach a target loss follows
+\begin{equation}
+S(B) \approx S_{\min}\left(1 + \frac{B_{\text{noise}}}{B}\right), \qquad
+E(B) \approx E_{\min}\left(1 + \frac{B}{B_{\text{noise}}}\right)
+\end{equation}
+with $E$ the total examples processed. For $B \ll B_{\text{noise}}$, doubling the batch nearly halves the steps (linear scaling pays for itself); for $B \gg B_{\text{noise}}$, extra batch buys almost no step reduction---you burn compute for nothing. $B_{\text{noise}}$ is therefore the \emph{critical batch size}: the point of diminishing returns where time--compute trade-off is balanced.
+\end{mathresult}
+
+\textbf{Interpretation.} When the batch is small, the sampled gradient is mostly noise; averaging more examples genuinely improves the update direction, and the linear scaling rule ($\eta \propto B$) holds because you can safely take a step proportional to the improved signal. Once $B$ approaches $B_{\text{noise}}$, the estimate is already close to the true gradient---more averaging removes noise that was no longer limiting progress. This is the answer to ``why does linear scaling break'': it breaks at the noise scale, and the noise scale is a measurable property of the model, data, and current loss, not a universal constant like 8K.
+
+\textbf{It grows during training.} Early in training the true gradient is huge (the model is wrong about everything), so $B_{\text{noise}}$ is small---often only thousands of tokens. As the loss falls, $\|\mathbf{G}\|$ shrinks faster than the per-example noise, so $B_{\text{noise}}$ grows by orders of magnitude over a run. McCandlish et al.\ found the noise scale correlates with the loss level itself, and harder tasks (lower achievable loss) support larger critical batch sizes.
+
+\textbf{Batch-size warmup.} This growth is why GPT-3-style pretraining \emph{ramps} the batch: GPT-3 linearly increased batch size from 32K tokens to the full 3.2M tokens over the first 4--12B tokens of training. A full-size batch at step zero would be pure waste (compute spent averaging away noise that isn't the bottleneck); a small batch late in training wastes wall-clock (steps that a bigger batch could have merged). Ramping tracks the growing noise scale. In practice you can estimate $B_{\text{noise}}$ on the fly by comparing gradient norms computed at two different batch sizes---the small-batch norm is inflated by exactly the noise term---which is cheap enough to log as a standard training health metric.
+
+\textbf{Interview connection.} On any batch-size question, the L5 answer cites the linear scaling rule; the L6 answer adds ``\ldots up to the critical batch size, which is the gradient noise scale, which grows during training---hence batch ramps in GPT-3-style runs.''
 
 \subsection{Gradient Accumulation}
 
@@ -248,6 +294,29 @@ Training wall-time & Longer (if GPU is underutilized) & Shorter (better parallel
 \end{table}
 
 \textbf{The practical answer.} Use the largest batch that fits in memory, apply the linear scaling rule, and add warmup. If generalization degrades at very large batches, consider techniques like LARS/LAMB or stochastic weight averaging (SWA).
+
+\subsection{muP and Hyperparameter Transfer}
+\label{subsec:mup}
+
+The scaling rules above adjust the LR as the \emph{batch} grows. The harder problem is adjusting hyperparameters as the \emph{model} grows---and it is the subject of a direct interview question: \textbf{``How do you pick the learning rate for a model that is too expensive to sweep?''}
+
+\textbf{The problem.} Under standard parameterization, the optimal LR shifts as you widen the network: a sweep on a 100M-parameter proxy gives you the wrong answer for the 70B target, and a single frontier run costs tens of millions of dollars---you get no second attempt. Historically labs extrapolated from trends across their previous runs; muP makes the transfer principled.
+
+\textbf{Maximal update parameterization (muP).} muP (Yang \& Hu; the muTransfer recipe is Yang et al., 2022, ``Tensor Programs V'') chooses \emph{per-layer} initialization variances and \emph{per-layer} LR multipliers as explicit functions of width so that, as width $\to \infty$: (1) activations stay $O(1)$ at initialization, and (2) every layer's \emph{feature update} per step also stays $O(1)$---each layer learns at the maximal stable rate, hence ``maximal update.'' Concretely, for Adam-style optimizers: hidden-layer LRs scale like $1/\text{width}$ (a $4\times$ wider matrix gets a $4\times$ smaller LR), hidden init variance scales like $1/\text{fan-in}$ as usual, and the output logits are scaled down by an extra factor of width. Under standard parameterization, wider models take effectively \emph{larger} feature updates, which is why the optimal LR drifts downward with width and eventually causes instability; muP cancels this drift by construction.
+
+\begin{keyinsight}[muP Makes Optimal Hyperparameters Width-Invariant]
+Under muP, the optimal learning rate (and to a good approximation the optimal $\beta$s, weight-decay scale, and init multipliers) becomes a property of the \emph{architecture and data}, not of the model \emph{size}. That converts hyperparameter tuning from ``sweep at target scale'' (impossible) to ``sweep once at proxy scale, reuse forever'' (cheap). The muTransfer paper's flagship demo: tune on a 40M-parameter proxy, transfer to a 6.7B GPT-3-style model, and \emph{beat} the published GPT-3 6.7B run---with total tuning compute around 7\% of one 6.7B pretraining run.
+\end{keyinsight}
+
+\textbf{The muTransfer workflow.}
+\begin{enumerate}
+    \item Parameterize the model family in muP (a few lines: per-layer init and LR multipliers keyed on width ratios to a base width).
+    \item Sweep LR (log-spaced), plus optionally init scale, embedding multiplier, and warmup, on a small proxy (tens of millions of parameters, short horizon)---dozens of runs at trivial cost.
+    \item Verify transfer at one intermediate scale: the LR-vs-loss curve should have its optimum at the \emph{same} LR. Aligned optima are the diagnostic that your muP implementation is correct.
+    \item Launch the target run with the proxy's hyperparameters.
+\end{enumerate}
+
+\textbf{Caveats worth volunteering.} Transfer across \emph{width} is the theoretically grounded, empirically reliable direction. Transfer across depth is weaker (depth-muP is an active research area), and batch size and training horizon still shift optima somewhat---so labs transfer width-wise and handle tokens/batch with separate scaling fits. This is why ``every frontier lab uses something like muP'' is the honest phrasing: Cerebras-GPT and MiniCPM publish explicit muP configs; other labs (e.g., DeepSeek) instead fit empirical power laws for optimal LR and batch size as functions of compute from a ladder of small runs. Either way, nobody sweeps at target scale---the L7 answer names both routes and the width-invariance mechanism behind muP.
 
 %==============================================================================
 \section{Mixed Precision Training}
@@ -428,6 +497,33 @@ Typical threshold: $c = 1.0$ for LLMs, $c = 5.0$ for RNNs.
 If the loss spikes during training, debug in this order: (1) Check the learning rate---is it too high or did a schedule step trigger? (2) Check the data pipeline---did a corrupted batch slip through? (3) Check gradient norms---are they exploding? Add or reduce gradient clipping. (4) Check for numerical issues---switch to BF16 or add loss scaling.
 \end{warningbox}
 
+\subsection{Training Stability at Scale}
+\label{subsec:stability_at_scale}
+
+The playbook above is the single-GPU version. In long LLM pretraining runs, loss spikes happen \emph{even with correct code}: larger models are more spike-prone at a given LR, and a months-long run gives rare interactions of data, optimizer state, and logit growth plenty of chances to occur. PaLM logged $\sim$20 spikes over its 540B run; the OPT-175B logbook records dozens of manual restarts. Frontier practice treats stability as an operations discipline with three parts: monitoring, architectural mitigations, and an intervention protocol.
+
+\textbf{What to monitor (before the loss moves).} The loss is a lagging indicator. The two standard leading indicators:
+\begin{itemize}
+    \item \textbf{Global and per-layer gradient norm.} A rising grad-norm trend precedes most spikes by many steps. If clipping (at $c = 1.0$) starts activating every step after rarely activating, instability is building even though the loss still looks fine.
+    \item \textbf{Max attention logits.} The best-documented slow instability is \emph{logit growth}: query/key weights drift so that $\vq^\top \vk$ magnitudes grow over thousands of steps, attention saturates toward one-hot (entropy collapse), gradients through the softmax become ill-conditioned, and the run eventually spikes or diverges. Logging $\max(\vq^\top \vk)$ per layer turns this from a mystery divergence into a visible ramp. Secondary dashboards: update-to-weight ratios per layer, the loss on a fixed held-out shard, and embedding-norm growth.
+\end{itemize}
+
+\textbf{Architectural mitigations.} Two now-standard fixes attack logit growth directly. \textbf{z-loss} (PaLM) adds an auxiliary term $\lambda \log^2 Z$ that keeps the output-softmax normalizer near 1, preventing logit drift in the final layer (details in Chapter~\ref{chap:loss_functions}). \textbf{QK-norm} applies RMSNorm/LayerNorm to queries and keys before the dot product, bounding attention logits by construction (details in Chapter~\ref{chap:activation_normalization}); Kimi K2's MuonClip is the same idea enforced through the optimizer by rescaling Q/K weights when the max logit crosses a threshold. Cheaper knobs that also help: $\beta_2 = 0.95$ (Section~\ref{sec:optimizers}), longer warmup, and a modestly lower peak LR.
+
+\textbf{Embedding-layer instabilities.} The embedding layer is a repeat offender: its gradients are sparse (only tokens present in the batch) and disproportionately large early in training, and untied input/output embeddings can drift to very different scales. Standard hygiene: exclude embeddings from weight decay, watch embedding-norm growth explicitly, and consider a separate (lower) embedding LR or an embedding multiplier (muP makes this explicit). Several published runs traced ``mystery'' spikes specifically to embedding-parameter blowups.
+
+\textbf{The intervention protocol (PaLM/OPT practice).} When a spike hits mid-run, the practiced response is:
+\begin{enumerate}
+    \item \textbf{Rewind, don't push through.} Restart from a checkpoint a few hundred steps \emph{before} the spike. Continuing through a spike risks a permanently degraded run even if the loss ``recovers.''
+    \item \textbf{Skip the batches.} Resume training but skip the 200--500 data batches spanning the spike region. PaLM's key finding: this works---and training the \emph{same} batches from a \emph{different} optimizer state does not spike. Spikes are an interaction of particular data with particular optimizer state, not ``bad documents'' you could have filtered offline.
+    \item \textbf{If spikes recur, drop the LR.} A persistent spike cluster (rather than one-offs) means you are past the stable LR for this phase; OPT repeatedly lowered LR mid-run. This is the blunt instrument---it costs final loss, so it comes after rewind-and-skip fails.
+    \item \textbf{Rule out hardware.} A ``spike'' that reproduces on one node assignment but not another is silent data corruption, not optimization (Section~\ref{subsec:fault_tolerance}).
+\end{enumerate}
+
+\begin{keyinsight}[Spikes Are State--Data Interactions, Not Bad Data]
+The PaLM skip-batch experiment is the load-bearing fact of this subsection: replaying the offending batches from an earlier optimizer state produced \emph{no} spike. So mid-run spikes generally cannot be prevented by better data filtering alone, and the correct unit of response is (checkpoint, batch window)---rewind and skip---not deleting documents. This is also why $\beta_2 = 0.95$ helps: it shortens the optimizer-state memory that makes such interactions violent.
+\end{keyinsight}
+
 %==============================================================================
 \section{Regularization Techniques}
 \label{sec:regularization}
@@ -532,6 +628,32 @@ When the model is too large for a single GPU, split it across GPUs.
 
 \textbf{Pipeline Parallelism:} Assign different layers to different GPUs. Data flows through GPUs sequentially. The naive approach has low utilization (``pipeline bubble''). Micro-batching (GPipe, PipeDream) mitigates this by splitting mini-batches into smaller chunks that overlap across stages.
 
+\subsection{The Full Parallelism Zoo}
+\label{subsec:parallelism_zoo}
+
+DP/TP/PP/ZeRO is the dense-model, moderate-context toolkit. Two more axes are now first-class, because most frontier models are MoE and long-context training is routine.
+
+\textbf{Expert Parallelism (EP).} In a Mixture-of-Experts layer, different experts live on different GPUs. Each token's hidden state is \emph{dispatched} to the GPUs holding its top-$k$ routed experts via an \textbf{all-to-all}, processed there, and returned by a second all-to-all (\emph{combine})---so every MoE layer costs two all-to-alls per forward pass (and two more in backward). The communication volume is $\sim k \times$ tokens $\times$ hidden-size bytes per all-to-all, but the primitive matters as much as the volume: all-to-all is $N$-to-$N$ point-to-point traffic, highly sensitive to the slowest link and to \emph{imbalance}---if routing sends 3$\times$ the average token count to one expert, that GPU's compute and its share of the all-to-all become the step's critical path while other GPUs idle. Training-time load balancing is therefore part of the optimizer story: capacity factors with token dropping, auxiliary load-balancing losses that penalize uneven routing, and DeepSeek-V3-style aux-loss-free balancing that adjusts per-expert routing biases outside the gradient path (details in Chapter~\ref{chap:efficient_architectures}). EP composes with the rest: a common frontier layout is EP across nodes for the MoE layers, TP within nodes for attention/dense layers, plus DP/ZeRO on top.
+
+\textbf{Sequence and Context Parallelism (SP/CP).} Megatron-style \emph{sequence parallelism} splits the activations of LayerNorm/dropout along the sequence dimension across the existing TP ranks, removing the last replicated activations from TP---a memory optimization within a node. \emph{Context parallelism} is the bigger idea: shard the \emph{sequence itself} across GPUs so million-token contexts fit at all. \textbf{Ring Attention} keeps queries local and passes key/value blocks around a ring of GPUs, overlapping each block's transfer with blockwise (FlashAttention-style) computation on the previous block, so attention over the full sequence is computed without any GPU ever holding all of it. \textbf{DeepSpeed Ulysses} instead all-to-alls the sequence shards into \emph{head} shards, so each GPU computes full-sequence attention for a subset of heads, then all-to-alls back---cheaper communication per step, but its parallel degree is capped by the number of attention heads (a real constraint under GQA/MLA).
+
+\begin{table}[H]
+\centering
+\caption{The parallelism decision matrix (2026 edition)}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Axis} & \textbf{What is split} & \textbf{Main communication} & \textbf{Fabric it needs} & \textbf{Use when} \\
+\midrule
+DP (DDP) & Data & All-reduce grads, 1$\times$/step & Any & Model (or shard) fits; always the outer loop \\
+ZeRO/FSDP & Optimizer state, grads, params & All-gather + reduce-scatter per layer & Fast intra-group & Model state exceeds one GPU \\
+TP & Weight matrices & All-reduce activations, per layer & NVLink (intra-node) & Single layer too big; reduce per-GPU memory \\
+PP & Layer blocks & P2P activations at stage edges & Inter-node OK & Model too big for one node; deep models \\
+EP & MoE experts & All-to-all dispatch/combine, 2$\times$/MoE layer & Inter-node, balance-sensitive & MoE models (most 2026 frontier models) \\
+CP (Ring/Ulysses) & Sequence dimension & Ring P2P of KV blocks, or all-to-all of heads & Fast intra-group preferred & Long context ($\gtrsim$128K tokens) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
 \subsection{ZeRO: Eliminating Redundancy}
 
 ZeRO (Zero Redundancy Optimizer) eliminates the memory redundancy in data parallelism. Instead of every GPU storing everything, each GPU stores only a shard.
@@ -556,6 +678,10 @@ ZeRO-3 & + Parameters & $\sim N\times$ (N = GPUs) & Higher (gather params) \\
 ZeRO-3 (DeepSpeed) and FSDP (PyTorch) implement the same core idea: shard everything, gather on demand. The choice between them is a framework decision, not an algorithmic one. Use FSDP if you are in pure PyTorch; use ZeRO if you need DeepSpeed's other features (e.g., offloading to CPU/NVMe, advanced pipeline parallelism).
 \end{keyinsight}
 
+\textbf{HSDP (hybrid sharding).} Fully sharding across \emph{all} GPUs makes every layer's all-gather traverse the slow inter-node fabric. HSDP shards within a group (typically one node, over NVLink) and \emph{replicates} across groups like classic DDP: per-layer all-gather/reduce-scatter stays on NVLink, and only one gradient all-reduce per step crosses the network. This replicated-DDP-of-sharded-groups layout is the standard mid-scale configuration (and it has an operational bonus: a lost node only invalidates one replica group).
+
+\textbf{FSDP2 / DTensor.} The current PyTorch implementation (\texttt{fully\_shard}, ``FSDP2'') replaces FSDP1's flattened parameter buffers with \textbf{per-parameter sharding} on \texttt{DTensor}: each parameter is individually a distributed tensor carrying its own sharding layout on a device mesh. Consequences worth knowing: parallelisms compose declaratively (TP + FSDP is a 2D mesh with per-dimension layouts rather than wrapper gymnastics), optimizer states and checkpoints stay in a shard-aware format (\texttt{torch.distributed.checkpoint} resharding ``just works''), mixed-precision and partial-parameter freezing are per-parameter decisions, and it is the compile-friendly path---\texttt{torch.compile} composes with FSDP2 far better than with FSDP1's flat-buffer machinery.
+
 \subsection{Distributed Training Decision Guide}
 
 \begin{table}[H]
@@ -569,6 +695,8 @@ $<$ 1B params & DDP & Full model fits & All-reduce gradients only \\
 1--10B params & ZeRO-2 / FSDP & Shard optimizer + gradients & Moderate \\
 10--100B params & ZeRO-3 + tensor parallel & Shard everything + split layers & High \\
 $>$ 100B params & Full 3D parallelism & Data + tensor + pipeline & Very high \\
+MoE at any size & Above + expert parallel & Experts sharded across GPUs & All-to-all per MoE layer \\
+Long context ($\gtrsim$128K) & Above + context parallel & Sequence sharded across GPUs & Ring P2P / all-to-all \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -627,6 +755,31 @@ $>$ 100B params & Full 3D parallelism & Data + tensor + pipeline & Very high \\
 \caption{DDP stores full copies of everything on each GPU; ZeRO-3/FSDP shards parameters, gradients, and optimizer states, dramatically reducing per-GPU memory.}
 \label{fig:ddp_vs_zero}
 \end{figure}
+
+\subsection{Fault Tolerance at Scale}
+\label{subsec:fault_tolerance}
+
+At cluster scale, hardware failure is not an exception path---it is a steady-state input to the training design. This is a canonical Staff systems question, and the reasoning is mostly arithmetic.
+
+\textbf{Failure-rate math.} If one component has mean time between failures $M$, then $N$ independent components fail on average every $M/N$: cluster MTBF shrinks linearly with scale. Worked example at 16K GPUs: even granting each GPU an optimistic MTBF of $\sim$50,000 hours ($\sim$6 years), $16{,}384/50{,}000 \approx 0.33$ failures per hour---roughly \textbf{8 per day, one every 3 hours}, before counting NICs, switches, storage, and software. Reality matches: Llama-3 405B pretraining logged 419 unexpected interruptions over 54 days on 16K H100s ($\approx$ one every 3 hours), $\sim$78\% hardware-attributed, with GPU/HBM faults the largest single class. Because training is synchronous, one dead GPU stops all 16K.
+
+\textbf{Optimal checkpoint interval.} Checkpoint too rarely and each failure destroys hours of work; too often and you pay the write cost continuously. Balancing the two (Young/Daly approximation): with checkpoint write time $\delta$ and cluster MTBF $M$,
+\begin{equation}
+\tau_{\text{opt}} \approx \sqrt{2\,\delta\,M}
+\end{equation}
+For our 16K-GPU cluster ($M = 3$ h $= 10{,}800$ s) and a synchronous checkpoint that stalls training for $\delta = 60$ s: $\tau_{\text{opt}} \approx \sqrt{2 \times 60 \times 10{,}800} \approx 1{,}140$ s $\approx$ 19 minutes---and expected waste (checkpoint overhead plus $\sim\tau/2$ lost work per failure) is a few percent of the cluster. The formula also shows the lever that matters: waste scales like $\sqrt{\delta}$, so shrink $\delta$.
+
+\textbf{Async and sharded checkpointing.} Two standard techniques drive $\delta$ from minutes toward seconds. \emph{Sharded (distributed) checkpointing}: every rank writes only its own shard of parameters/optimizer state (which ZeRO/FSDP already hold sharded), so aggregate write bandwidth scales with the cluster instead of bottlenecking on one writer. \emph{Asynchronous checkpointing}: snapshot GPU state to host (CPU) memory in seconds, resume training immediately, and persist to durable storage in a background thread. Together they make very frequent checkpoints affordable, which by the Daly formula shrinks both terms of the waste. One line on the logical end point: \textbf{torchft}-style in-memory recovery keeps checkpoint replicas in \emph{peer GPU/host memory} across replica groups, so a failed group rejoins by copying weights from a live peer and the healthy groups barely stop---no storage round-trip on the recovery path at all.
+
+\textbf{Elastic training and hot spares.} Recovery latency is dominated by detection and re-provisioning, not the restore itself. Production setups keep \emph{hot spares}---warm idle nodes already holding the container image and network config---and run an automated loop: health-check watchdogs detect the failure (NCCL timeout, ECC error, node heartbeat), drain and quarantine the bad node, splice in a spare, and resume from the latest checkpoint. Truly \emph{elastic} resizing (continuing on fewer GPUs) is used more sparingly for large pretraining, because changing world size changes the parallelism layout and effective batch---swap-in-a-spare preserves the run's semantics.
+
+\textbf{Stragglers.} A GPU that is merely \emph{slow} (thermal throttling, a flaky link, a busy host) is worse than a dead one: synchronous collectives make every step as slow as the slowest rank, silently taxing the whole cluster. Detection is statistical: log per-rank step time and time-spent-waiting-in-collective, and flag ranks that are consistently last into the all-reduce; the fix is the same quarantine-and-replace path.
+
+\textbf{SDC and NaN quarantine.} Silent data corruption---a GPU computing \emph{wrong numbers} without raising any error---is rare per-device but expected at 16K-GPU scale, and it can poison a run through one corrupted gradient. Defenses: NaN/Inf watchdogs on losses and gradient norms with automatic rewind; periodic redundant computation (recompute a step or a checksum on two disjoint node sets and compare); and a quarantine protocol---when a numerical anomaly localizes to a node, replay the same step on different hardware; if it does not reproduce, evict the node rather than ``fixing'' the model.
+
+\begin{keyinsight}[Design for MTBF, Not for the Happy Path]
+The whole subsection compresses to one design rule: at $N$ accelerators, failures arrive every $\text{MTBF}/N$, so choose checkpoint cadence $\approx \sqrt{2\delta M}$, spend engineering effort shrinking $\delta$ (sharded + async writes, in-memory replicas), and automate detect--quarantine--replace with hot spares. A 16K-GPU run that loses 5 minutes of work per 3-hour failure with 30-second detection/restore wastes under 5\% of its compute on faults; the same run with 45-minute synchronous checkpoints and manual restarts can waste a third of it.
+\end{keyinsight}
 
 %==============================================================================
 \section{Training Debugging}
@@ -755,7 +908,9 @@ For a dense Transformer model with $P$ parameters, the compute per token during 
 \text{Tokens/sec (theoretical)} = \frac{C}{6P}
 \end{equation}
 
-In practice, you achieve 30--50\% of this theoretical peak (called Model FLOPs Utilization, or MFU). An A100 delivers $\sim$312 TFLOP/s in BF16, so training a 7B model achieves roughly $\frac{312 \times 10^{12}}{6 \times 7 \times 10^9} \times 0.4 \approx 3{,}000$ tokens/sec \textit{per GPU}. Note that a 7B model does not actually fit for training on a single A100-80GB ($\sim$112 GB of parameter-related state alone, before activations)---so read this as per-GPU throughput within a multi-GPU job (e.g., FSDP across a node), where per-GPU compute is unchanged but memory is sharded.
+In practice, you achieve a fraction of this theoretical peak called Model FLOPs Utilization (MFU). Well-optimized frontier pretraining targets \textbf{$\sim$40--55\% MFU on H100-class hardware} (H100 peak: $\sim$989 TFLOP/s dense BF16); quoting ``30--40\%'' as the ceiling is an A100-era reflex, while claiming $>$60\% for large multi-node runs should trigger skepticism---MFU degrades as TP/PP/EP degrees and cluster size grow, so a 7B single-node run at 50\%+ and a 400B multi-thousand-GPU run at 38--45\% are both ``good.'' One-liner on FP8: training with FP8 matmuls (H100+; DeepSeek-V3 is the flagship demonstration) roughly doubles peak tensor-core FLOP/s, so FP8 runs are usually reported as BF16-equivalent MFU or as tokens/sec---quote the convention when you cite a number. On an A100 ($\sim$312 TFLOP/s BF16), training a 7B model achieves roughly $\frac{312 \times 10^{12}}{6 \times 7 \times 10^9} \times 0.4 \approx 3{,}000$ tokens/sec \textit{per GPU}. Note that a 7B model does not actually fit for training on a single A100-80GB ($\sim$112 GB of parameter-related state alone, before activations)---so read this as per-GPU throughput within a multi-GPU job (e.g., FSDP across a node), where per-GPU compute is unchanged but memory is sharded.
+
+\textbf{torch.compile.} A standard lever for closing the MFU gap on the non-matmul portion of the step. TorchDynamo captures the Python model into graphs and Inductor generates fused kernels, collapsing the memory-bound elementwise chains between matmuls (norms, activations, residual adds, rotary embeddings) and cutting kernel-launch overhead; typical training speedups are 10--30\% on top of an eager baseline with FlashAttention already in place. Know when it breaks: \emph{graph breaks} from data-dependent Python control flow (falling silently back to eager for that region), \emph{recompilation storms} from dynamic shapes such as variable sequence lengths (mitigate with \texttt{dynamic=True} or bucketing/packing to fixed shapes), and composition with distributed wrappers---FSDP2/DTensor is the compile-friendly path, while complex hooks and FSDP1-style flat buffers historically caused breaks. The debugging move interviewers listen for: run with graph-break logging (\texttt{TORCH\_LOGS=graph\_breaks}) and count recompiles before trusting any speedup number.
 
 %==============================================================================
 \section{Interview Questions}
@@ -1014,6 +1169,51 @@ NaN loss means a numerical infinity or invalid value has propagated through the 
 \followups{``What if NaN appears only with mixed precision but not FP32?'' ``How do you debug NaN in a distributed training setting where only some ranks see it?'' ``What is the difference between NaN and Inf in terms of root cause?''}
 \end{interviewq}
 
+%--- New Question 6b: Debugging - 70B divergence at 200B tokens ---
+\begin{interviewq}
+\textbf{Q: Your 70B pretraining run diverges at 200B tokens. Give a full differential diagnosis, ordered by prior probability, with the cheapest discriminating experiment for each.}
+
+\badgeLseven{L7} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Context first: 200B tokens deep means the code has been correct for weeks---so ``bug in the model'' has low prior, and anything that changed \emph{at} 200B tokens has high prior. My differential, ordered by prior probability for a mature stack, each with the cheapest experiment that discriminates it:
+
+\begin{enumerate}
+    \item \textbf{Data--optimizer-state interaction (the PaLM-style spike, prior $\sim$40\%).} The default explanation for mid-run divergence: a particular window of batches interacting with the current optimizer state. \textit{Cheapest discriminator (also the fix):} rewind to a checkpoint a few hundred steps pre-divergence and skip 200--500 batches over the divergence window. If training sails through---diagnosis confirmed, run saved, total cost a few cluster-hours. I would start this immediately \emph{in parallel} with everything below, since it is the treatment for the most likely disease.
+
+    \item \textbf{Logit growth / attention entropy collapse (prior $\sim$20\%).} Slow drift of QK magnitudes that finally tips over---often what a ``data spike'' turns into when rewind-and-skip fails. \textit{Cheapest discriminator: free---read the logs.} Max attention logits and z-loss (if logged) should show a ramp over thousands of steps before divergence, not a step change. If confirmed: resume with lower LR as the immediate mitigation; QK-norm/z-loss/MuonClip-style logit control is the fix for the next run (mid-run architectural surgery is a last resort).
+
+    \item \textbf{Data distribution boundary (prior $\sim$15\%).} Did anything change at 200B by \emph{design}? Curriculum phase switch, new data mixture, a new shard of scraped data, sequence-length extension. \textit{Cheapest discriminator:} diff the data schedule against the token count---one grep. Then eyeball a sample of the incoming batches (loss-per-batch, token histograms, language mix). If a mixture boundary lands at 200B, resume across the boundary with the old mixture as the A/B.
+
+    \item \textbf{Hardware / silent data corruption (prior $\sim$10\%, higher if the run has been swapping nodes).} One GPU computing wrong values corrupts a gradient that is then all-reduced into everyone. \textit{Cheapest discriminator:} deterministic replay of the same steps from the same checkpoint on a \emph{different} node set. Divergence that does not reproduce is hardware; quarantine the original nodes. Cross-check ECC counters, Xid errors, and per-rank gradient-norm asymmetries just before the event.
+
+    \item \textbf{Numerics / precision (prior $\sim$10\%).} BF16 accumulation issues, an FP8 scaling failure (if training FP8), loss-scaler pathology (if FP16 anywhere). \textit{Cheapest discriminator:} replay the divergence window with the suspect component upgraded---FP32 gradient accumulation or BF16-instead-of-FP8 for the matmuls. Reproduces in high precision $\Rightarrow$ not numerics; disappears $\Rightarrow$ found it. More expensive than 1--4, hence ordered here despite being easy to describe.
+
+    \item \textbf{Software change / schedule cliff (prior $\sim$5\%).} A quietly deployed framework upgrade, a resume-from-checkpoint that restored optimizer state incorrectly (classic: $v_t$ dropped on resume), a scheduled hyperparameter change. \textit{Cheapest discriminator:} audit the run log---was there a restart shortly before 200B? Compare optimizer-state statistics (mean $\sqrt{v_t}$ per layer) across the restart boundary; a discontinuity convicts the checkpoint path.
+\end{enumerate}
+
+The meta-answer: order by prior $\times$ cost-to-test, run the treatment for the most probable cause (rewind + skip) concurrently with the free log-reading diagnostics, and only then spend compute on replay experiments. Preserve the diverged checkpoint and the exact data cursor---every discriminator above depends on deterministic replay.
+
+\redflags
+\begin{itemize}
+    \item ``Restart from scratch with a lower LR''---throws away 200B tokens of compute to treat an undiagnosed disease, and lowers final quality if the real cause was a bad node.
+    \item ``Find and delete the bad documents''---the PaLM skip-batch result shows spikes are state--data interactions; the same data replayed from a different state is usually fine. Filtering is not the primary fix.
+    \item No mention of reading existing logs before spending cluster-hours on experiments.
+\end{itemize}
+
+\interviewtest{Operational maturity at scale: do you have priors over failure modes (vs.\ a flat list), do you know the cost of each experiment, and do you know the published lore (PaLM rewind-and-skip, logit growth, OPT restarts, SDC at scale)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Lists plausible causes (LR, bad data, NaN, hardware) without ordering or discriminating experiments.
+    \item \badgeLsix{L6} Orders by likelihood, knows rewind-and-skip as standard practice, and proposes deterministic replay to separate hardware from optimization.
+    \item \badgeLseven{L7} Attaches explicit priors and experiment costs, runs the highest-prior treatment in parallel with free diagnostics, names the leading indicators (grad norm, max attention logits) that should have alerted \emph{before} divergence, and turns the incident into monitoring/architecture changes for the next run.
+\end{itemize}
+
+\followups{``What monitoring would have caught this 5,000 steps earlier?'' ``When would you accept adding QK-norm mid-run?'' ``How do you make a 16K-GPU run bitwise-replayable, and what does determinism cost?''}
+\end{interviewq}
+
 %--- New Question 7: Debugging - Distributed training slowdown ---
 \begin{interviewq}
 \textbf{Q: Your distributed training job is 60\% as fast as expected with 8 GPUs. What is wrong?}
@@ -1050,6 +1250,46 @@ Linear scaling from 1 to 8 GPUs is the theoretical ideal. Getting only 60\% mean
 \end{itemize}
 
 \followups{``How would you calculate the theoretical maximum scaling efficiency for this setup?'' ``What changes if you go from 8 GPUs on one node to 8 GPUs across two nodes?'' ``How does FSDP change the communication pattern?''}
+\end{interviewq}
+
+%--- New Question 7b: Debugging/Design - Fault-tolerant 16k-GPU training ---
+\begin{interviewq}
+\textbf{Q: A node dies every 3 hours on your 16K-GPU run. Design the recovery system.}
+
+\badgeLseven{L7} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+First, establish that this failure rate is \emph{expected}, not a broken cluster: 16{,}384 GPUs at $\sim$50K-hour per-GPU MTBF gives $\approx 0.33$ failures/hour---one every 3 hours is exactly the Llama-3 405B experience (419 unexpected interruptions in 54 days on 16K H100s). So the design goal is not ``stop failures'' but ``make each failure cost minutes, automatically.'' I would budget the system around four components:
+
+\textbf{1. Checkpoint cadence---do the math.} Cluster MTBF $M = 3$ h $= 10{,}800$ s. With a naive synchronous checkpoint costing $\delta = 60$ s of stalled training, the Young/Daly optimum is $\tau \approx \sqrt{2\delta M} = \sqrt{2 \times 60 \times 10{,}800} \approx 19$ min. Expected waste per failure $\approx \tau/2 \approx 9.5$ min of lost work, plus $\sim$5\% of wall-clock in checkpoint stalls at that cadence---acceptable, but the $\sqrt{\delta}$ dependence says the real lever is shrinking $\delta$.
+
+\textbf{2. Make checkpoints nearly free.} Two standard steps: (a) \emph{sharded} checkpoints---each rank writes its own parameter/optimizer shard (ZeRO/FSDP already hold state sharded), so write bandwidth scales with the cluster; (b) \emph{asynchronous} checkpoints---snapshot to host memory in seconds, resume training, persist to durable storage in the background. That drives the training-visible $\delta$ to seconds, which by the same formula justifies checkpointing every few minutes; per-failure loss drops to a couple of minutes of work. The end state is torchft-style in-memory recovery: checkpoint replicas live in peer host/GPU memory across DP replica groups, and a failed group restores from a live peer with no storage round-trip, while the other groups continue.
+
+\textbf{3. Automate detect--quarantine--replace with hot spares.} Recovery latency is dominated by detection and re-provisioning, so: health watchdogs (NCCL timeout tuned down from the default, heartbeats, ECC/Xid monitors) detect within seconds; the scheduler drains and quarantines the node; a \emph{hot spare}---warm, image-loaded, network-configured; I would reserve $\sim$1--2\% of fleet---is spliced in; the job restores the failed rank's shard and rejoins. Swap-in-a-spare beats elastic downsizing for pretraining because it preserves world size, parallelism layout, and effective batch. Target: node death $\to$ training resumed in low single-digit minutes, no human involved.
+
+\textbf{4. Handle the failures that don't kill the job.} Two classes are nastier than clean deaths: \emph{stragglers}---a throttling GPU makes every synchronous step slow; detect via per-rank step-time and collective-wait profiling, evict ranks consistently last into the all-reduce---and \emph{silent data corruption}: NaN/Inf watchdogs on loss and grad norms with automatic rewind, periodic redundant recomputation to catch a GPU computing wrong values, and a replay-on-different-hardware protocol before blaming the optimizer (ties into the loss-spike playbook).
+
+\textbf{Sanity check the budget:} 8 failures/day $\times$ ($\sim$2 min lost work + $\sim$3 min restore) $\approx$ 40 GPU-cluster-minutes/day $\approx$ 3\% overhead, plus background checkpoint I/O. Without this system---hourly synchronous checkpoints, manual restarts ($\sim$30 min each)---the same failure rate wastes 25--40\% of the cluster. The recovery system is worth thousands of H100s.
+
+\redflags
+\begin{itemize}
+    \item ``Checkpoint every hour'' (or any cadence not derived from MTBF and checkpoint cost)---the interviewer is testing exactly this arithmetic.
+    \item Treating the failure rate as abnormal (``first, fix the hardware'')---at 16K GPUs this rate \emph{is} healthy hardware.
+    \item No automation story: a design where a human notices the failure has already lost the game---at one failure per 3 hours, on-call humans are the bottleneck and the error source.
+    \item Ignoring stragglers and SDC---the failures that don't throw errors cost more than the ones that do.
+\end{itemize}
+
+\interviewtest{Can you turn MTBF into a quantitative design (Daly interval, spare pool size, waste budget)? Do you know the modern checkpoint stack (sharded + async + in-memory) and the operational loop (detect, quarantine, replace) as practiced on real frontier runs?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes checkpointing and restarts; knows failures are common at scale.
+    \item \badgeLsix{L6} Derives the checkpoint interval from MTBF and write cost, proposes sharded/async checkpointing and hot spares, and quantifies the waste budget.
+    \item \badgeLseven{L7} Designs the full loop end-to-end with a numeric overhead target, covers stragglers and SDC, knows torchft-style in-memory recovery and why spare-swap beats elastic resize for pretraining, and cites real anchors (Llama-3's 419 interruptions) to calibrate.
+\end{itemize}
+
+\followups{``How big should the hot-spare pool be for a 4-week run?'' ``What changes if checkpoint storage bandwidth is the bottleneck?'' ``How does in-memory checkpointing interact with HSDP replica groups?'' ``How do you detect a GPU that computes wrong values without crashing?''}
 \end{interviewq}
 
 %--- New Question 8: Estimation - LoRA vs full fine-tuning memory ---

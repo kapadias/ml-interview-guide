@@ -2,7 +2,7 @@
 \label{chap:efficient_architectures}
 
 \begin{tldr}
-Efficiency is the bridge between research breakthroughs and production impact. This chapter covers the full spectrum: efficient CNN designs (depthwise separable convolutions, MobileNet, EfficientNet), Mixture of Experts for scaling parameters without proportional compute, state space models (Mamba) as sub-quadratic alternatives to transformers, quantization (PTQ, QAT, GPTQ, AWQ), pruning, knowledge distillation, and neural architecture search. The recurring theme: every efficiency technique trades something---accuracy, training complexity, hardware compatibility, or engineering effort. Knowing \textit{what} is traded and \textit{when} the trade is worth it separates staff-level answers from textbook recitations.
+Efficiency is the bridge between research breakthroughs and production impact. This chapter covers the full spectrum: efficient CNN designs (depthwise separable convolutions, MobileNet, EfficientNet), Mixture of Experts from the aux-loss era through the DeepSeek-V3 generation (fine-grained experts, aux-loss-free balancing), state space models from Mamba through Mamba-2/SSD and the production hybrids, KV-cache-efficient attention (GQA/MLA) as a compression technique, quantization (PTQ, QAT, GPTQ, AWQ), pruning, and knowledge distillation including reasoning-trace distillation. The recurring theme: every efficiency technique trades something---accuracy, training complexity, hardware compatibility, or engineering effort. Knowing \textit{what} is traded and \textit{when} the trade is worth it separates staff-level answers from textbook recitations.
 \end{tldr}
 
 %==============================================================================
@@ -114,12 +114,7 @@ The key insight is the combination of where skip connections go and where nonlin
 Depthwise convolutions are \textit{memory-bandwidth bound}, not compute-bound. They have very low arithmetic intensity (FLOPs per byte of memory accessed): each filter has only $D_K^2$ parameters but must be loaded from memory for every spatial position. On GPUs optimized for high arithmetic intensity (many FLOPs per memory access), depthwise convolutions dramatically underutilize compute. A model with $8 \times$ fewer FLOPs may only be $2$--$3 \times$ faster on a GPU. Depthwise separable convolutions are most efficient on CPUs, mobile NPUs, and DSPs, which have lower arithmetic intensity ceilings and benefit directly from FLOP reduction.
 \end{warningbox}
 
-\textbf{When to use each version:}
-\begin{itemize}
-    \item \textbf{MobileNetV1}: When extreme simplicity is needed (easy to implement, port, and debug) or as a teaching baseline. Outclassed by V2/V3 on the accuracy-latency Pareto frontier.
-    \item \textbf{MobileNetV2}: The best general-purpose mobile backbone. Excellent trade-off between accuracy, latency, and implementation complexity. Widely supported across all mobile inference runtimes. The default choice for most mobile deployment scenarios.
-    \item \textbf{MobileNetV3}: When maximum accuracy within a mobile latency budget is required and the deployment target supports all required operators (SE, h-swish). Particularly strong for detection and segmentation backbones (MobileNetV3 + SSDLite, MobileNetV3 + DeepLabV3).
-\end{itemize}
+\textbf{Choosing among them} is not a subtle decision and rarely merits interview time: MobileNetV2 is the default general-purpose mobile backbone (best runtime support, simplest operator set), MobileNetV3 buys a few accuracy points when the target runtime supports SE and h-swish, and V1 survives as a teaching baseline. What \textit{does} generalize---and what interviewers actually probe---is the arithmetic-intensity lesson in the warning above.
 
 %------------------------------------------------------------------------------
 \subsection{EfficientNet}
@@ -182,7 +177,7 @@ G(\vx) = \text{TopK}\bigl(\softmax(\mW_g \vx)\bigr), \quad \text{output} = \sum_
 where $\mW_g \in \R^{N_{experts} \times d}$ is the router weight matrix, $E_i$ is expert $i$, and the output is a weighted sum of the selected experts.
 \end{mathresult}
 
-Typical choices in the 2023-era designs covered here: $N_{experts} = 8\text{--}64$, $k = 1\text{--}2$ (newer fine-grained MoEs push to far higher expert counts with larger $k$). The router is a simple linear layer---complexity is in the load balancing, not the routing itself.
+The classic 2023-era designs used $N_{experts} = 8\text{--}64$ large experts with $k = 1\text{--}2$; the modern fine-grained generation (Section~\ref{subsec:moe_deepseek_gen}) uses hundreds of small experts with $k = 8$ or more. Either way the router is a simple linear layer---complexity is in the load balancing, not the routing itself.
 
 \subsection{Load Balancing: The Central Challenge}
 
@@ -206,6 +201,29 @@ Expert load balancing is the \#1 MoE training challenge. Without explicit balanc
     \item \textbf{Noise injection.} Add Gaussian noise to router logits during training ($\vz + \epsilon$, $\epsilon \sim \mathcal{N}(0, \sigma^2)$) to encourage exploration of underused experts.
 \end{enumerate}
 
+All four are aux-loss-era fixes that buy balance by \textit{distorting the training objective or the routing itself}. The modern generation removes the auxiliary loss entirely and balances through a bias-based feedback controller instead---covered next.
+
+\subsection{The DeepSeek-V3 Generation}
+\label{subsec:moe_deepseek_gen}
+
+By 2025, production MoE design had converged on a recipe quite different from the Switch/Mixtral era, crystallized by DeepSeek-V3 (671B total, 37B active) and adopted in spirit by Llama-4, Qwen3-MoE, Kimi-K2, and most new open-weight MoEs. Its components:
+
+\textbf{Fine-grained expert segmentation.} Instead of 8 large experts with top-2, DeepSeek-V3 uses \textbf{256 small routed experts with top-8}: each expert's FFN is a narrow slice (intermediate width 2048, vs.\ 18432 for the model's dense-layer FFN), and a token activates 8 of 256 routed experts---$1/32$ of the routed expert parameters (overall activation, including attention and the shared expert, is $37\text{B}/671\text{B} \approx 1/18$). The active-parameter budget is held fixed; what changes is its \textit{granularity}. Why this helps: with $k$ large experts, each expert must be a generalist over whatever mixture of knowledge lands on it, and the router has only $\binom{8}{2} = 28$ ways to combine experts. With top-8-of-256 there are $\binom{256}{8} \approx 4 \times 10^{14}$ combinations---the router can compose a near-custom FFN per token, each small expert specializes sharply (a specific language, syntax family, or domain), and redundant copies of common knowledge across experts shrink. Empirically, at fixed total and active parameters, finer segmentation gives strictly better loss (the DeepSeekMoE result that started the trend).
+
+\textbf{Shared experts.} One (or a few) expert is \textit{always active} for every token, alongside the routed top-$k$. The shared expert absorbs common knowledge---function words, generic syntax---so the routed experts do not each waste capacity relearning it, which is precisely what frees them to specialize. DeepSeek-V3 uses 1 shared + 256 routed; Llama-4 likewise pairs a shared expert with its routed ones.
+
+\textbf{Auxiliary-loss-free balancing.} The aux loss has a structural flaw: its gradient pushes the router toward uniform routing \textit{regardless of token content}, directly fighting the language-modeling loss. Tune its coefficient too high and quality drops; too low and balance fails. DeepSeek-V3 removes it. Each expert gets a bias $b_i$ that is added to its routing score \textit{only for top-$k$ selection}---the gating weight applied to the expert's output still uses the raw score, and the bias receives no gradient. After each training step, a simple rule updates the biases from load statistics: if expert $i$ was overloaded relative to the mean, decrease $b_i$ by a fixed step $\gamma$; if underloaded, increase it. This is a feedback controller, not a loss term: it steers \textit{which} experts are selected without distorting either the gating weights or the model's gradients, so balance no longer taxes quality. DeepSeek-V3's ablations show better performance than aux-loss balancing at comparable load balance. (A sequence-level aux loss with a tiny coefficient is kept only as a guardrail against extreme within-sequence imbalance.)
+
+\textbf{Sigmoid routing.} With 256 experts, softmax routing couples every expert's probability to every other's, and per-expert probabilities become tiny and noisy. DeepSeek-V3 scores each expert with an independent sigmoid affinity instead, then normalizes only over the selected top-8 to form gating weights. Independent scores make the bias-adjustment mechanism clean (shifting one expert's selection does not renormalize the rest) and behave more stably at large expert counts.
+
+\textbf{Node-limited routing.} Free routing over 256 experts sharded across many nodes would let a single token scatter its all-to-all traffic across the whole cluster. DeepSeek-V3 restricts each token to experts on at most $M = 4$ nodes (chosen by highest per-node affinity), bounding the expensive inter-node communication while leaving intra-node routing free. This is an architecture decision made for the systems bill---the model is co-designed with its parallelism. Notably, the design is also \textit{dropless}: with balance handled by the bias controller, no tokens are dropped, retiring the Switch-era capacity-factor machinery.
+
+\begin{keyinsight}[The Modern MoE Balance Recipe]
+The 2025-era recipe is: many small experts (hundreds, top-8), a shared expert for common knowledge, sigmoid scoring, per-expert bias adjustment instead of an auxiliary loss, node-limited routing, and no dropped tokens. The conceptual shift: load balancing moved \textit{out of the loss function} (where it fights the model) \textit{into a feedback controller on the selection step} (where it cannot hurt gradients), and the fixed active-parameter budget is spent on combinatorial specialization rather than a few generalist experts. When an interviewer asks ``how do you balance experts without hurting quality,'' this---not the aux loss---is the expected answer.
+\end{keyinsight}
+
+\textbf{Expert parallelism.} At this expert count, experts are sharded across GPUs (expert parallelism, EP), and every MoE layer requires an \textbf{all-to-all dispatch} (send each token's hidden state to the GPUs owning its selected experts) and an \textbf{all-to-all combine} (return the outputs) in every forward pass. The traffic scales with $\text{tokens} \times k \times d_{model}$ and, unlike tensor-parallel all-reduces, routinely crosses node boundaries---which is exactly what node-limited routing bounds. At serving time this is MoE's real cost: wide-EP deployments dedicate large GPU groups so each holds few experts, decode latency becomes sensitive to all-to-all stragglers and inference-time load imbalance, and communication must be overlapped with compute to hide it. Training-side EP mechanics are covered in Chapter~\ref{chap:training_optimization}; the serving economics in Chapter~\ref{chap:inference_optimization}.
+
 \subsection{Key MoE Architectures}
 
 \begin{table}[H]
@@ -215,19 +233,22 @@ Expert load balancing is the \#1 MoE training challenge. Without explicit balanc
 \toprule
 \textbf{Model} & \textbf{Routing} & \textbf{Experts} & \textbf{Key Innovation} & \textbf{Year} \\
 \midrule
-Switch Transformer & Top-1 & 128 & Simplified routing, capacity factor & 2021 \\
 GShard & Top-2 & 2048 & Expert parallelism at scale & 2020 \\
+Switch Transformer & Top-1 & 128 & Simplified routing, capacity factor & 2021 \\
 Mixtral 8x7B & Top-2 & 8 & Open-weight, every-layer MoE & 2024 \\
-DeepSeek-MoE & Top-2 & 64 fine + 2 shared & Shared + routed experts & 2024 \\
+DeepSeek-MoE & Top-6 & 64 fine + 2 shared & Fine-grained + shared experts & 2024 \\
+DeepSeek-V3 & Top-8 (sigmoid) & 256 fine + 1 shared & Aux-loss-free bias balancing; node-limited routing & 2024 \\
+Llama 4 Maverick & Top-1 & 128 + 1 shared & MoE interleaved with dense layers (400B total / 17B active) & 2025 \\
+Qwen3-MoE (235B-A22B) & Top-8 & 128 fine & No shared expert; global-batch balancing & 2025 \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\textbf{Switch Transformer} showed that top-1 routing (single expert per token) works well and simplifies implementation. Each token goes to exactly one expert, halving communication overhead compared to top-2.
+\textbf{Switch Transformer} showed that top-1 routing (single expert per token) works well and simplifies implementation. Each token goes to exactly one expert, halving communication overhead compared to top-2. Its capacity-factor/dropped-token machinery, however, is largely superseded by the dropless, bias-balanced designs of the DeepSeek-V3 generation.
 
 \textbf{Mixtral 8x7B} demonstrated that moderate-scale MoE (8 experts, top-2) can match or exceed a dense 70B model while activating only $\sim$12.9B of its 46.7B parameters per token. Every transformer layer is a MoE layer (no dense layers interspersed).
 
-\textbf{DeepSeek-MoE} introduced a hybrid design with shared experts (always active, every token) plus routed experts (sparse, token-specific). The shared experts capture common knowledge; routed experts specialize.
+\textbf{DeepSeek-MoE} introduced fine-grained segmentation with shared experts (always active, every token) plus routed experts (sparse, token-specific)---the design that, scaled up and combined with aux-loss-free balancing, became DeepSeek-V3 (Section~\ref{subsec:moe_deepseek_gen}). The same recipe keeps scaling: Kimi-K2 (2025) uses 384 fine-grained experts with top-8 at 1T total / 32B active parameters---a $\sim 1/32$ activation ratio.
 
 \textbf{When to use MoE.} When you need to scale model capacity but inference compute or latency is constrained. MoE is particularly effective for language modeling where different tokens genuinely benefit from specialized processing.
 
@@ -263,6 +284,26 @@ In S4, the state transition matrices $\mB, \mC, \Delta$ are fixed---the model pr
 
 \textbf{Computational trick.} Making parameters input-dependent breaks the convolution view that made S4 efficient. Mamba uses a hardware-aware parallel scan algorithm (leveraging GPU SRAM, similar in spirit to Flash Attention) to maintain efficient $O(n)$ computation despite the input dependence.
 
+\subsection{Mamba-2 and State Space Duality}
+\label{subsec:mamba2_ssd}
+
+\textbf{What it is.} Mamba-2 (Dao and Gu, 2024---``Transformers are SSMs'') rests on the \textbf{state space duality (SSD)} result: a selective SSM whose per-step state decay is a scalar per head is \textit{exactly} a form of masked linear attention. Unrolling the recurrence writes the whole sequence transformation as one structured matrix:
+
+\begin{mathresult}{State Space Duality (informal)}
+\begin{equation}
+y_t = \sum_{s \le t} \vc_t^{\top} \Bigl(\textstyle\prod_{r=s+1}^{t} a_r\Bigr) \vb_s\, x_s
+\quad\Longleftrightarrow\quad
+\vy = \bigl(\mathbf{L} \circ \mC \mB^{\top}\bigr)\, \vx, \qquad \mathbf{L}_{ts} = \prod_{r=s+1}^{t} a_r
+\end{equation}
+where $\mC, \mB$ play the role of queries and keys, and $\mathbf{L}$ is a causal mask whose entries are learned, input-dependent decays. With $a_r \equiv 1$, this is precisely (unnormalized) linear attention; with general $a_r$, it is an SSM. The two families are the same object with different masks.
+\end{mathresult}
+
+\textbf{Why it matters computationally.} One object, two algorithms. The \textit{recurrent} form gives $O(n)$ decode with constant memory---the SSM story. The \textit{matrix} form can be evaluated blockwise: split the sequence into chunks, compute within-chunk blocks as attention-like matmuls, and pass state between chunks via low-rank corrections. That turns the bulk of training compute into dense matrix multiplications---exactly what tensor cores are built for---where Mamba-1's element-wise associative scan largely bypassed them. Mamba-2 trains substantially faster and, because large states now cost matmul time rather than scan time, raises the state size from $s = 16$ to $s = 64$--$256$. A bigger state means a less lossy summary of history, attacking Mamba's core weakness (recall) directly. The duality also lets transformer machinery transfer to SSMs---multi-head structure, tensor-parallel sharding patterns, and attention-style systems optimizations---which is much of why hybrid stacks became easy to build and serve.
+
+\begin{keyinsight}[SSD Unifies the Sub-Quadratic Zoo]
+SSD is the standard 2026 frame for the whole sub-quadratic space: selective SSMs (Mamba-2), gated linear attention (GLA), DeltaNet, and RWKV-6/7 are all ``linear attention with a structured, learned causal mask,'' differing in what the mask and state-update rule can express. In an interview, presenting Mamba-2 as ``a faster Mamba'' misses the point; the point is that SSMs and (linear) attention are one family, so the design question becomes how much state, what decay structure, and how many layers of exact softmax attention to keep.
+\end{keyinsight}
+
 \subsection{Transformer vs SSM vs RNN Comparison}
 
 \begin{table}[H]
@@ -283,7 +324,7 @@ Mature ecosystem & Extensive & Growing & Mature & Early \\
 \end{tabularx}
 \end{table}
 
-Here $n$ is sequence length, $d$ is model dimension, and $s$ is state size (typically 16).
+Here $n$ is sequence length, $d$ is model dimension, and $s$ is state size (16 in Mamba-1; 64--256 in Mamba-2).
 
 \subsection{When SSMs Beat Transformers (and When They Don't)}
 
@@ -302,7 +343,26 @@ Here $n$ is sequence length, $d$ is model dimension, and $s$ is state size (typi
     \item Model scale is the priority---transformer scaling laws are better understood
 \end{itemize}
 
-\textbf{The hybrid approach.} Jamba (AI21, 2024) interleaves transformer layers with Mamba layers, getting the best of both: attention layers for retrieval-heavy processing, SSM layers for efficient long-range modeling. This is likely the direction the field is moving.
+\textbf{The hybrid landscape (2025--26).} What was ``likely the direction'' in 2024 is settled practice by 2026: production long-context models are attention--SSM \textit{hybrids}, not pure SSMs. Jamba-1.5 (AI21) interleaves one attention layer per seven Mamba layers; Zamba-2 (Zyphra) runs a Mamba-2 backbone with a periodically applied shared-weight attention block; Nemotron-H (NVIDIA) replaces roughly 90\% of attention layers with Mamba-2; IBM's Granite~4 ships a $\sim$9:1 Mamba-2:attention stack; and Qwen3-Next-class designs do the same with gated linear attention (DeltaNet lineage) as the sub-quadratic layer. The empirical consensus landed at roughly \textbf{one full-attention layer per 5--8 SSM/linear layers}: below that, exact-retrieval and in-context-learning quality degrades; above it, you are paying quadratic cost for capability the SSM layers already provide. Why hybrids won is symmetrical to why pure SSMs did not: a small number of softmax-attention layers restores what a fixed-size state cannot do---exact lookup, copying, induction-head behavior---and a few suffice; meanwhile only the attention layers contribute KV cache, so a 1:7 hybrid carries roughly $1/8$ the KV memory and long-context decode cost of a pure transformer at matched depth. In serving terms, the SSM layers convert the per-request cost from ``grows with context'' to ``constant,'' and the retained attention layers are the small, deliberate exception.
+
+%==============================================================================
+\section{KV-Cache-Efficient Attention as Compression}
+\label{sec:kv_cache_compression}
+%==============================================================================
+
+An efficient-architectures chapter in 2026 must name the most-probed efficiency arithmetic of the era, even though its canonical treatment lives elsewhere: the KV cache. During autoregressive decode, the cache---$2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{seq\_len} \times \text{bytes}$---often outweighs the weights as the binding memory object, and decode reads it every token. The MHA $\to$ GQA $\to$ MQA $\to$ MLA ladder is best understood as a \textit{compression} technique: quantization compresses weights; this ladder compresses the cache.
+
+Per token per layer, at DeepSeek-V3 scale ($n_h = 128$, $d_h = 128$), the ladder caches:
+\begin{itemize}
+    \item \textbf{MHA}: $2 n_h d_h = 32{,}768$ elements---full quality, full cost.
+    \item \textbf{GQA-8} (8 KV heads): $2{,}048$ elements ($16\times$ less)---small quality cost; the 2023--24 default.
+    \item \textbf{MQA} (1 KV head): $256$ elements ($128\times$ less)---noticeable quality cost.
+    \item \textbf{MLA} (cached latent $d_c + d_r = 512 + 64$): $576$ elements ($57\times$ less than MHA, $3.6\times$ less than GQA-8) at \textit{MHA-level quality}---head-count reduction discards per-head diversity; a learned low-rank joint compression keeps it.
+\end{itemize}
+
+At 7B scale the same arithmetic decides feasibility: a 100K-token context in FP16 costs $\sim$52\,GB of cache with full MHA but $\sim$13\,GB with GQA-8, and proportionally less again with MLA---the difference between one request per GPU and a servable batch. Two things compose with the ladder: KV-cache \textit{quantization} (FP8/INT8 cache entries) multiplies the savings, and in hybrid SSM stacks only the attention layers pay for a cache at all (Section~\ref{sec:ssms}).
+
+This chapter deliberately stops here: the mechanism (MLA's latent compression, the decoupled RoPE key, the weight-absorption trick) is derived in Section~\ref{sec:mla} of Chapter~\ref{chap:attention_transformers}, and the serving consequences (paged KV, batching capacity, cache-bound decode throughput) in Chapter~\ref{chap:inference_optimization}. For interviews, carry the formula and the ladder numbers---this single derivation gates many efficiency loops.
 
 %==============================================================================
 \section{Quantization}
@@ -431,6 +491,19 @@ where $\vz_T, \vz_S$ are teacher and student logits, $T$ is temperature, and $\a
 \textbf{Modern distillation for LLMs} often skips the KL-on-logits approach entirely and instead distills at the \textit{data level}: generate high-quality training data from the teacher model, then train the student on this synthetic data with standard cross-entropy. This is simpler, requires no access to teacher internals, and works well in practice (e.g., Alpaca, Vicuna, Orca, Phi models).
 
 %------------------------------------------------------------------------------
+\subsection{Distilling Reasoning}
+\label{subsec:distilling_reasoning}
+%------------------------------------------------------------------------------
+
+\textbf{The R1-distill recipe.} The canonical 2025--26 distillation example is data-level distillation of \textit{reasoning}. DeepSeek-R1's release included a family of small models (1.5B--70B, Qwen and Llama bases) produced by nothing more than \textbf{SFT on $\sim$800K curated traces}---$\sim$600K long chain-of-thought reasoning traces plus $\sim$200K general examples---sampled and filtered (correctness- and readability-checked) from the big RL-trained model. No RL was run on the students at all, yet the distilled 14B outperformed much larger non-reasoning models on math and code benchmarks. The traces carry the behavior: step-by-step decomposition, self-checking, backtracking. The student learns to \textit{imitate the shape of the reasoning}, not just final answers.
+
+\textbf{Why SFT-on-traces beats direct RL on small models.} RL can only amplify behaviors the policy already samples with non-trivial probability. A small base model essentially never samples a 5{,}000-token self-correcting trace, so RLVR on a small model has almost no reward signal to climb---the R1 report ran this control and found distillation strictly better and far cheaper. The division of labor: \textbf{RL discovers} (on a model with enough capacity to stumble onto long deliberation), \textbf{SFT transfers} (into any model that can imitate it). The RL side of this pipeline---GRPO, verifiable rewards, the full R1 recipe---is covered in Chapter~\ref{chap:reinforcement_learning}.
+
+\textbf{Overthinking and length control.} Distilled reasoners inherit the teacher's verbosity without the teacher's judgment about when it is needed: they routinely spend thousands of thinking tokens on trivial problems (``overthinking''), which is pure serving cost---reasoning tokens are decode tokens. Standard mitigations: filter or rewrite training traces toward length-efficient solutions; train with explicit budget conditioning so the model respects a thinking-token cap; enforce budgets at inference (truncate or force the end-of-thinking delimiter); or follow SFT with a short length-penalized RL stage. Length control is now a first-class spec for any distilled reasoning deployment, not an afterthought.
+
+\textbf{On-policy distillation and GKD.} Plain SFT on teacher traces is \textit{off-policy}: the student only ever sees teacher-generated prefixes, so at inference its own early mistakes carry it off the training distribution with no supervision on how to recover (the exposure-bias problem). Generalized Knowledge Distillation (GKD; Agarwal et al., 2024) fixes this by sampling sequences \textit{from the student} and having the teacher supervise them token-by-token (typically with reverse KL on the teacher's logits). This is on-policy learning with a dense, verifier-free reward---structurally a cheap cousin of RL---and it consistently improves over off-policy SFT at equal data budgets. In production pipelines, on-policy distillation is increasingly the finishing step after trace-SFT: the traces teach the behavior; on-policy correction teaches the student to stay on it from its own states.
+
+%------------------------------------------------------------------------------
 \subsection{When to Prune vs Distill vs Quantize}
 %------------------------------------------------------------------------------
 
@@ -460,50 +533,11 @@ Best for & Inference deployment & Removing redundancy & Architectural change \\
 \end{enumerate}
 
 %==============================================================================
-\section{Neural Architecture Search (NAS)}
+\section{Neural Architecture Search: A Legacy Note}
 \label{sec:nas}
 %==============================================================================
 
-\subsection{Overview}
-
-\textbf{What it is.} Automate the design of neural network architectures by searching over a space of possible designs. NAS has three components:
-
-\begin{enumerate}
-    \item \textbf{Search space:} What architectures are possible? (operations, connections, layer types, hyperparameters)
-    \item \textbf{Search strategy:} How to explore the space? (reinforcement learning, evolutionary algorithms, gradient-based, Bayesian optimization)
-    \item \textbf{Performance estimation:} How to evaluate each candidate? (full training, weight sharing, proxy tasks, predictors)
-\end{enumerate}
-
-\subsection{One-Shot NAS vs Full NAS}
-
-\begin{table}[H]
-\centering
-\caption{One-shot NAS vs full NAS}
-\begin{tabularx}{\textwidth}{lXX}
-\toprule
-\textbf{Aspect} & \textbf{Full NAS} & \textbf{One-Shot / Supernet NAS} \\
-\midrule
-Approach & Train each candidate from scratch & Train one supernet containing all candidates \\
-Compute cost & Thousands of GPU-hours & Comparable to training one large model \\
-Search time & Days to weeks & Hours to days \\
-Quality & Gold standard (each candidate fully trained) & Approximation (weight sharing introduces coupling) \\
-Example methods & NASNet (RL), AmoebaNet (evolutionary) & DARTS (gradient-based), Once-for-All, FBNet \\
-Practical usage & Research exploration & Production architecture design \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\textbf{DARTS} (Differentiable Architecture Search) is the most influential one-shot method. It relaxes the discrete architecture choice into a continuous one, allowing gradient-based optimization of both architecture parameters and network weights simultaneously. The search completes in a single training run.
-
-\textbf{Practical guidance:}
-\begin{itemize}
-    \item NAS found the base architectures for EfficientNet, MobileNetV3, and MnasNet---its main legacy is those specific architectures, which are now used directly.
-    \item For most practitioners, using a NAS-derived architecture (EfficientNet, MobileNetV3) off the shelf is more practical than running NAS yourself.
-    \item Custom NAS is worthwhile when you have unusual hardware constraints (e.g., specific NPU, FPGA) where standard architectures are suboptimal.
-    \item Hardware-aware NAS (measuring actual latency, not just FLOPs) is essential---FLOP count is a poor proxy for real-world speed due to memory bandwidth, parallelism, and operator support differences.
-\end{itemize}
-
-\textbf{Pitfalls.} NAS can overfit to the search proxy (e.g., optimize for FLOPs but not actual latency). DARTS is known to be unstable and can converge to degenerate architectures (e.g., dominated by skip connections). Search space design matters more than search algorithm---a well-designed space with random search often beats a poorly designed space with sophisticated search.
+NAS automates architecture design by searching a space of candidates (its three components: search space, search strategy, performance estimation), and one-shot weight-sharing methods---DARTS, Once-for-All, FBNet---made the search affordable by training a single supernet instead of thousands of candidates. Treat it, in 2026, as history with two durable lessons. First, \textbf{its legacy is the artifacts, not the method}: EfficientNet, MobileNetV3, and MnasNet are NAS-found architectures used off the shelf, and for nearly every practitioner adopting one beats running a search---custom NAS pays off only for unusual hardware targets (a specific NPU or FPGA) where standard architectures are suboptimal. Second---the lesson that generalizes far beyond CNNs---\textbf{the search target must be measured hardware latency, not FLOPs}: FLOP count is a poor proxy for speed because memory bandwidth, arithmetic intensity, and operator support dominate real latency (the same roofline logic as the depthwise-convolution warning in Section~\ref{sec:efficient_cnns}). Method-level details are low-yield for interviews: know that DARTS relaxed discrete choices into differentiable ones, that it was unstable (degenerate skip-connection-dominated cells), and that search-space design mattered more than search algorithm---a well-designed space with random search often beat a poor space with a clever searcher. In the LLM era the architecture-search energy moved into scaling-law-guided design: sweep small models, fit the law, extrapolate.
 
 %==============================================================================
 \section{Interview Questions}
@@ -701,6 +735,52 @@ Using Mixtral's actual configuration (32 layers, $d_{model} = 4096$, FFN dim 143
 \end{itemize}
 
 \followups{``What if we use top-1 instead of top-2?'' ``How does this change for training vs.\ inference?'' ``How does expert parallelism affect the actual wall-clock speedup?'' ``What is the memory overhead of MoE vs.\ the compute savings?''}
+\end{interviewq}
+
+%--- Question 4b: Architecture Design - Design to a serving budget ---
+\begin{interviewq}
+\textbf{Q: You have a serving budget of 80\,GB of GPU memory and 20\,ms/token decode latency, with contexts up to 128K. Design the model.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+This question is the chapter in miniature: every piece---MoE activation ratios, the KV ladder, quantization, hybrids---composes into one design, and the design is driven by two lines of arithmetic.
+
+\textbf{Step 1: Turn the constraints into byte budgets.} Decode is memory-bandwidth bound: generating one token requires reading all \textit{active} weights plus the request's KV cache from HBM. On an H100 (3.35\,TB/s peak, assume $\sim$50\% achieved during decode, so $\sim$1.7\,TB/s):
+\begin{itemize}
+    \item \textbf{Latency budget:} $1.7\,\text{TB/s} \times 20\,\text{ms} \approx 34$\,GB readable per token. So: active-weight bytes $+$ per-token KV read $\leq$ 34\,GB.
+    \item \textbf{Memory budget:} total weight bytes $+$ KV working set $+$ overhead $\leq$ 80\,GB. Memory charges \textit{total} parameters; latency charges \textit{active} ones. Those are different numbers only for MoE---which is why MoE wins this question.
+\end{itemize}
+
+\textbf{Step 2: Dense vs.\ MoE.} Check the dense ceiling first: a dense 70B at FP8 (70\,GB) fits memory but reads 70\,GB/token $\to$ $\sim$42\,ms---fails. At INT4 (35\,GB) it decodes in $\sim$21\,ms---right at budget with \textit{zero} headroom for the KV read, and INT4 degrades reasoning first. The latency budget caps dense at roughly 34B-class (FP8). A fine-grained MoE breaks the bind: e.g., $\sim$120B total, 1 shared $+$ many small routed experts, top-8, $\sim$1/10 activation $\to$ $\sim$12B active. At INT4: 60\,GB total (fits, 20\,GB left for KV), 6\,GB active read $\to$ $\sim$3.5\,ms---a $\sim$120B-class model at a sixth of the dense-70B decode cost. The activation ratio is the design knob: it is chosen so active bytes fit the latency budget while total parameters spend the whole memory budget.
+
+\textbf{Step 3: GQA vs.\ MLA.} At 128K the cache is a first-order term, in both budgets. For a 48-layer, $d_h = 128$ model with an FP8 cache: GQA-8 costs $2 \times 8 \times 128 \times 48 \approx 96$\,KB/token $\to$ 12.9\,GB per 128K request, read at $\sim$7.7\,ms/token; MLA ($d_c + d_r = 576$ elements) costs $\sim$27\,KB/token $\to$ 3.6\,GB and $\sim$2.2\,ms. Against the 20\,GB KV budget, that is \textbf{one} concurrent 128K request with GQA versus \textbf{five} with MLA---and total decode latency of $\sim$11\,ms (GQA) vs.\ $\sim$6\,ms (MLA) including the 6\,GB weight read. MLA is the right call at this context length.
+
+\textbf{Step 4: Quantization.} Weights INT4 (AWQ/GPTQ) to double the parameter count the memory buys---but benchmark reasoning and code, not perplexity, and fall back to FP8 for sensitive layers. KV cache in FP8 (assumed above; it is where half the arithmetic came from).
+
+\textbf{Step 5: The long-context tail.} If the workload is dominated by 128K contexts, go hybrid: an SSM:attention stack at the empirical 1:5--1:8 ratio means only the attention layers carry KV at all, multiplying the MLA savings by another $\sim$6--8$\times$ and making per-token cost nearly context-independent. If instead the latency budget tightens (say 5\,ms), architecture alone will not get there---add speculative decoding or an MTP head (Chapter~\ref{chap:inference_optimization}).
+
+\textbf{Final design:} $\sim$120B-total fine-grained MoE (top-8, shared expert, aux-loss-free balancing), $\sim$12B active, MLA attention, INT4 weights, FP8 KV cache; hybrid SSM layers if long contexts dominate. Roughly 64\,GB resident, $\sim$6\,ms/token at short context and $\sim$8--9\,ms at 128K---inside both budgets with margin for batching.
+
+\redflags
+\begin{itemize}
+    \item Sizing memory by active parameters (``a 120B MoE only needs 6\,GB because 12B are active'')---memory holds \textit{all} experts; only the latency math uses active bytes.
+    \item Ignoring the KV read in the latency budget---at 128K with GQA, the cache read ($\sim$13\,GB) \textit{dwarfs} the active-weight read (6\,GB); candidates who only count weights get the wrong bottleneck.
+    \item Using 100\% of peak bandwidth---real decode achieves 40--60\%; the design must survive the realistic number.
+    \item Choosing INT4 everywhere without a task benchmark---reasoning and code degrade first, and this design's quality margin lives or dies there.
+\end{itemize}
+
+\interviewtest{Whether you can \textit{compose} the chapter---MoE activation ratio, the KV ladder, quantization, hybrids---into one budgeted design, doing the bandwidth and byte arithmetic explicitly rather than reciting techniques. Staff signal is deriving the two budgets first and letting them force every choice.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows decode is memory-bandwidth bound, does the weights-only latency math, and proposes a quantized dense model that fits.
+    \item \badgeLsix{L6} Writes both budgets, shows why the latency budget forces MoE over dense at this quality target, picks an activation ratio deliberately, and runs the GQA-vs-MLA cache numbers at 128K including concurrency.
+    \item \badgeLseven{L7} Adds the dimensions the prompt didn't state: batch effects (at high batch MoE decode becomes compute- and all-to-all-bound, expert load imbalance appears at inference), prefill/decode disaggregation, hybrid SSM for the context tail, MTP/speculative decoding if the latency budget tightens, and what changes with 8 GPUs and expert parallelism.
+\end{itemize}
+
+\followups{``What changes at batch 64?'' ``The budget drops to 5\,ms/token---now what?'' ``The workload becomes 90\% 128K-context---redesign.'' ``You get 8 GPUs instead of one---where does expert parallelism enter, and what does all-to-all do to your latency?''}
 \end{interviewq}
 
 %--- Question 5: Trade-off - INT8 vs INT4 vs FP8 ---

@@ -2,7 +2,7 @@
 \label{chap:loss_functions}
 
 \begin{tldr}
-Loss functions translate your learning objective into a mathematical optimization problem. The choice of loss function determines what your model learns to prioritize. This chapter covers classification losses (cross-entropy, focal, asymmetric), metric learning losses (contrastive, triplet, InfoNCE, ArcFace), ranking losses (BPR, LambdaRank), regression losses, and specialized losses for generation, segmentation, and knowledge distillation. Understanding \textit{when} to use each loss is as important as understanding the mathematics.
+Loss functions translate your learning objective into a mathematical optimization problem. The choice of loss function determines what your model learns to prioritize. This chapter covers classification losses (cross-entropy, focal, asymmetric), language-model losses (next-token cross-entropy, loss masking, z-loss), metric learning losses (contrastive, triplet, InfoNCE, SigLIP, ArcFace), ranking and preference losses (BPR, LambdaRank, Bradley--Terry, DPO), regression losses, MoE auxiliary losses, and specialized losses for segmentation and knowledge distillation. Understanding \textit{when} to use each loss is as important as understanding the mathematics.
 \end{tldr}
 
 \section{The Philosophy of Loss Functions}
@@ -75,6 +75,13 @@ The loss function is how you communicate your objective to the optimizer. If you
     \node[level2, below=1.8cm of other, xshift=-0.8cm] (dice) {Dice/IoU};
     \node[level2, below=1.8cm of other, xshift=0.8cm] (kd) {Distillation};
 
+    % Level 1 - Generation / Preference (second row, LLM-era branch)
+    \node[level1, below=5.6cm of root] (gen) {Generation / Preference};
+    \node[level2, below=0.8cm of gen, xshift=-3.9cm] (ntce) {Next-Token CE};
+    \node[level2, below=0.8cm of gen, xshift=-1.3cm] (bt) {Bradley--Terry};
+    \node[level2, below=0.8cm of gen, xshift=1.3cm] (dpo) {DPO};
+    \node[level2, below=0.8cm of gen, xshift=3.9cm] (moeaux) {MoE Aux};
+
     % Edges
     \draw[-] (root) -- (class);
     \draw[-] (root) -- (metric);
@@ -99,6 +106,12 @@ The loss function is how you communicate your objective to the optimizer. If you
     \draw[-] (other) -- (ctc);
     \draw[-] (other) -- (dice);
     \draw[-] (other) -- (kd);
+
+    \draw[-] (root) -- (gen);
+    \draw[-] (gen) -- (ntce);
+    \draw[-] (gen) -- (bt);
+    \draw[-] (gen) -- (dpo);
+    \draw[-] (gen) -- (moeaux);
 \end{tikzpicture}
 \caption{Taxonomy of loss functions covered in this chapter.}
 \label{fig:loss_taxonomy}
@@ -489,6 +502,160 @@ Multi-label with rare positives & Asymmetric loss & Per-label imbalance \\
 \end{interviewq}
 
 %==============================================================================
+\section{Language-Model Losses}
+\label{sec:lm_losses}
+%==============================================================================
+
+Measured in FLOPs spent minimizing it, one loss now dominates all others combined: next-token cross-entropy. It is exactly the softmax CE of Section~\ref{sec:classification_losses}---a $V$-way classification with $V$ the vocabulary size (32K--256K)---applied at every sequence position, with the target being the next token. What makes it a distinct interview topic is everything \textit{around} the formula: how the per-token losses are averaged, which tokens count, and what the loss layer costs at LLM scale. Frontier-lab loops probe these mechanics hard, because they are where real training bugs live.
+
+\subsection{Next-Token Cross-Entropy and Perplexity}
+
+\begin{mathresult}{Next-Token Cross-Entropy}
+For token sequences with loss-bearing positions $\mathcal{T}$ (see loss masking below):
+\begin{equation}
+\loss_{\text{LM}} = -\frac{1}{|\mathcal{T}|}\sum_{t \in \mathcal{T}} \log p_\theta(x_t \mid x_{<t})
+\end{equation}
+By the chain rule of probability, $\sum_t \log p_\theta(x_t \mid x_{<t}) = \log p_\theta(x_{1:T})$: minimizing this loss is exact maximum-likelihood estimation of the sequence distribution. Causal masking lets all $T$ positions be computed in a single forward pass.
+\end{mathresult}
+
+\textbf{Reading the numbers:}
+\begin{itemize}
+    \item \textbf{Perplexity} $= e^{\loss}$ (loss in nats/token): the effective branching factor. Perplexity 8 means ``as uncertain, on average, as choosing among 8 equally likely tokens.''
+    \item \textbf{Bits per token} $= \loss / \ln 2$; \textbf{bits-per-byte (BPB)} $= (n_{\text{tokens}} / n_{\text{bytes}}) \cdot \loss / \ln 2$ normalizes away the tokenizer---the right metric for comparing models with different vocabularies. Strong LLMs reach $\sim$0.5--0.7 BPB on held-out web text.
+    \item \textbf{Typical magnitudes}: base-model pretraining losses land around 1.5--2.5 nats/token on web-scale corpora (perplexity $\sim$4.5--12), depending on data mix and tokenizer. Loss cannot reach zero: the entropy of language is the floor.
+    \item \textbf{Why a 0.01-nat delta matters}: (i) power-law spacing---with $L(C) \propto C^{-0.05}$, a 0.01-nat improvement around $L \approx 2$ is roughly what $\sim$10\% more training compute buys, i.e., millions of dollars at frontier scale; (ii) compounding---downstream tasks that need $k$ correct steps amplify per-token gains as $p^k$; (iii) but deltas this small are also exactly the magnitude produced by the normalization bugs below, so they are only meaningful with an identical tokenizer, eval set, and averaging convention.
+\end{itemize}
+
+\subsection{Loss Masking: Which Tokens Count}
+
+The set $\mathcal{T}$ is a design decision, and getting it wrong is a classic source of quietly broken fine-tunes:
+
+\begin{itemize}
+    \item \textbf{Pretraining}: every real token counts; padding is excluded---in PyTorch, target positions set to \texttt{ignore\_index} ($-100$) are skipped.
+    \item \textbf{SFT}: mask the prompt/instruction tokens---compute loss only on response tokens. The model should learn the mapping from instruction to response, not spend capacity re-modeling the instruction distribution (which also dilutes the gradient signal when prompts are long). In multi-turn data, user turns are masked; whether earlier assistant turns count is a per-recipe choice that must be consistent between training and evaluation.
+    \item \textbf{Packing}: multiple documents are packed into one fixed-length sequence for efficiency. Mask the loss at document boundaries (the first tokens of a document should not be predicted from the tail of an unrelated previous document), and ideally block cross-document attention too. Forgetting boundary masking trains the model on noise transitions.
+\end{itemize}
+
+\begin{warningbox}
+\textbf{Mean-of-means is not the mean: the gradient-accumulation normalization bug.} With variable-length sequences there are two inequivalent ways to average token losses: (a) average per micro-batch (or per sequence), then average those means; (b) sum all token losses and divide once by the total number of unmasked tokens. With equal lengths they coincide; with variable lengths they do not---(a) up-weights tokens that sit in short sequences or small micro-batches. This was a real bug in Hugging Face \texttt{Trainer} (fixed October 2024): losses were averaged \textit{within} each micro-batch before gradient accumulation, so the effective loss and gradients depended on how tokens happened to be distributed across micro-batches---training with accumulation was \textit{not} equivalent to the same effective batch without it, and reported losses shifted with the accumulation factor. The correct convention for pretraining and SFT is the global token mean: scale each micro-batch's summed loss by (micro-batch tokens / total effective-batch tokens), which requires knowing the total unmasked-token count across the effective batch (and across data-parallel ranks) before the backward passes.
+\end{warningbox}
+
+\begin{interviewq}
+\textbf{Q: Your SFT loss changes when you change batch composition or gradient-accumulation steps---same data, same model, same effective batch size. Why?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Symptoms:} Re-bucketing sequences by length, changing the accumulation factor, or reshuffling which examples share a micro-batch shifts the loss curve---sometimes by more than a typical ablation effect ($\sim$0.01--0.05 nats)---even though the token-level data is identical.
+
+\textbf{Hypotheses (ranked by likelihood):}
+
+\textit{H1: Per-micro-batch (or per-sequence) loss normalization---the mean-of-means bug.} If each micro-batch's loss is averaged over its own tokens and those means are then averaged, tokens in short sequences carry more weight than tokens in long ones. Worked example: sequences $A$ (10 unmasked tokens, summed loss $S_A$) and $B$ (1{,}000 tokens, $S_B$). Global token mean: $(S_A + S_B)/1010$. Mean of per-sequence means: $\frac{1}{2}(S_A/10 + S_B/1000)$---each of $A$'s tokens now weighs $100\times$ more than each of $B$'s. Re-bucketing changes which tokens share a denominator, so the loss (and the gradient direction) moves. This is exactly the 2024 Hugging Face \texttt{Trainer} gradient-accumulation bug.
+
+\textit{H2: Masking differences.} Padding or prompt tokens leaking into $\mathcal{T}$ in some bucketing configurations but not others (e.g., packing changes which tokens sit at boundaries).
+
+\textit{H3: Packing boundary leakage.} With packed sequences and no cross-document masking, batch composition changes which document pairs abut, changing the (noise) loss at boundaries.
+
+\textit{H4: Nondeterminism (dropout, kernel non-determinism).} Produces random scatter, not a systematic shift correlated with bucketing---distinguishable by repeated runs.
+
+\textbf{Experiments to confirm:}
+\begin{enumerate}
+    \item Recompute the loss offline with explicit global-token-mean normalization on a fixed batch; compare against the training-loop value.
+    \item Invariance test: vary the accumulation factor at fixed effective batch. A correct implementation gives (bitwise-near) identical losses; the bug gives losses that scale with the accumulation factor.
+    \item Log the unmasked-token count per micro-batch; correlate loss shifts with its variance.
+\end{enumerate}
+
+\textbf{Resolution:} Sum token losses and divide once by the total unmasked-token count of the effective batch (across accumulation steps \textit{and} data-parallel ranks---the total needs an all-reduce of token counts before scaling). In HF, use a version with the fix and pass \texttt{num\_items\_in\_batch} through; hand-rolled loops should scale each micro-batch loss by its token share before \texttt{backward()}. If you \textit{want} per-sequence weighting (every example equal regardless of length---a defensible choice for some instruction-tuning sets), make it an explicit, documented decision rather than an artifact of the accumulation code.
+
+\redflags
+\begin{itemize}
+    \item ``An average is an average---it can't matter'' (with variable lengths, the two conventions differ, and the difference is exactly the size of effects you A/B test)
+    \item ``It's just noise, keep training'' (a shift that correlates with bucketing/accumulation is systematic, not noise)
+    \item Fixing the symptom by fixing sequence lengths (padding everything to max length wastes compute and hides the bug rather than fixing it)
+\end{itemize}
+
+\interviewtest{Whether you understand loss normalization mechanics well enough to debug them---this is a real, recent, ecosystem-wide bug, and the invariance test (loss must not depend on accumulation factor) is the signal that you have actually verified a training loop.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Suspects masking or normalization, proposes comparing against an offline recomputation.
+    \item \badgeLsix{L6} Names the mean-of-means vs.\ global-token-mean distinction with the worked example, knows the HF Trainer incident, and proposes the accumulation-invariance test.
+    \item \badgeLseven{L7} Discusses which convention is \textit{right} for which setting (global token mean for pretraining/SFT; per-sequence weighting as a deliberate choice; per-prompt normalization debates in DPO/RLHF), and the data-parallel subtlety (cross-rank token-count all-reduce, since ranks see different token counts).
+\end{itemize}
+
+\followups{``Is gradient accumulation exactly equivalent to a larger batch once this is fixed?'' (In expectation yes for the loss; BN or other cross-example ops break exact equivalence.) ``How would this bug show up in DPO?'' (Sequence-level log-prob sums vs.\ length-normalized variants change the objective---SimPO exists partly because of length effects.) ``How do you catch this class of bug in CI?'' (Loss-invariance tests across accumulation factors and bucketings on a fixed seed.)}
+\end{interviewq}
+
+\subsection{The Cost of the Loss Layer: Logits Memory and Fused Kernels}
+
+The final projection maps every position's hidden state to $V$ logits, so training materializes a $B \times T \times V$ tensor. This is an \textit{activation}, produced anew for every token position---not to be confused with the unembedding weight matrix ($d \times V$), which is comparatively tiny.
+
+\textbf{Worked example}: $B = 8$, $T = 4096$, $V = 128\text{K}$, BF16: $8 \times 4096 \times 131072 \times 2$ bytes $\approx 8.6$ GB---for \textit{one} tensor, before its same-size gradient and any FP32 upcast for a numerically stable log-softmax (which can double or triple the footprint). Meanwhile the unembedding weights at $d = 4096$ are $4096 \times 131072 \times 2 \approx 1.1$ GB. At large vocabularies and long contexts, the loss layer can dominate activation memory for the entire network.
+
+\textbf{Mitigations} (now standard practice):
+\begin{itemize}
+    \item \textbf{Chunked cross-entropy}: process the sequence (or vocabulary) in chunks, computing each chunk's log-sum-exp and target logit without ever materializing the full logits tensor; recompute in the backward pass.
+    \item \textbf{Fused linear + CE kernels}: fuse the unembedding matmul with the loss (Liger's fused linear cross-entropy; Apple's Cut Cross-Entropy, 2024), computing the log-sum-exp on the fly---logit memory drops from gigabytes to megabytes with negligible throughput cost.
+    \item \textbf{Vocabulary (tensor) parallelism}: shard the $V$ dimension across GPUs. The softmax only needs a per-token max and sum to be all-reduced (log-sum-exp decomposes), so communication is two scalars per token.
+    \item \textbf{Precision discipline}: keep logits in BF16 and upcast only the per-token log-sum-exp accumulation to FP32, rather than upcasting the whole tensor.
+\end{itemize}
+
+\begin{interviewq}
+\textbf{Q: Estimate the memory and FLOP cost of the cross-entropy layer for a 128K-vocabulary model training on a 1M-token batch. How do you reduce it?}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
+
+\stronganswer Take a 7--8B-class model, $d = 4096$, $V = 128\text{K} = 1.31 \times 10^5$, effective batch $10^6$ tokens.
+
+\textbf{Memory (the dominant concern):} The logits activation is $10^6 \times 1.31 \times 10^5 = 1.31 \times 10^{11}$ entries; in BF16 that is $\approx 262$ GB. It cannot be materialized on any single GPU, and even sharded 64 ways across the cluster it is $\sim$4 GB per GPU---plus a same-size gradient, plus $2\times$ more if naively upcast to FP32: the loss layer alone can rival the activation memory of the whole transformer stack. (Per-GPU sanity check: an 8K-token micro-batch materializes $8192 \times 131072 \times 2 \approx 2.1$ GB of BF16 logits.)
+
+\textbf{FLOPs (significant but not dominant):} The unembedding matmul costs $2dV \approx 2 \times 4096 \times 131072 \approx 1.07$ GFLOP per token---$\approx 1.1$ PFLOP forward for the 1M-token batch, $\sim$3$\times$ that with backward. Compare the rest of the model at $\sim 2N \approx 16$ GFLOP per token forward: the head is $\sim$6--7\% of FLOPs but can be $>$50\% of activation memory. The asymmetry---cheap in FLOPs, brutal in bytes---is the insight being tested.
+
+\textbf{Reductions, in the order I would apply them:}
+\begin{enumerate}
+    \item Fused linear + cross-entropy kernel (Liger, Cut Cross-Entropy): never materialize logits; memory falls to $O(BT)$ scalars from $O(BTV)$.
+    \item Chunked CE over sequence or vocab chunks with recomputation in backward---the simple DIY version of the same idea.
+    \item Vocabulary-sharded tensor parallelism: log-sum-exp decomposes, so syncing costs one max and one sum per token.
+    \item BF16 logits with FP32 only in the log-sum-exp accumulator.
+    \item Architectural: a smaller vocabulary trades this cost against tokenizer fertility (more tokens per text)---a real trade, not a free win.
+\end{enumerate}
+
+\textbf{Scope note}: this is a \textit{training} (and prefill-with-loss) cost. At decode time only the last position's logits are needed---$1 \times V$, trivially small.
+
+\redflags
+\begin{itemize}
+    \item Estimating the \textit{weight} matrix ($dV \approx 1$ GB) when asked about the loss layer---the activation, $BTV$, is the problem, and confusing the two is the most common failure.
+    \item Forgetting the backward pass and upcasts multiply the footprint by 2--3$\times$.
+    \item ``GPUs have 80 GB, 8.6 GB is fine''---per-micro-batch logits compete with every other activation, and at 1M-token effective batches the aggregate is hundreds of GB.
+\end{itemize}
+
+\interviewtest{Back-of-envelope fluency ($B \cdot T \cdot V \cdot$ bytes), the activation-vs-weight distinction, and whether you know the modern kernel-level fixes---this exact estimate is a standard screen for pretraining-adjacent roles.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Computes $BTV \cdot$ bytes correctly and notices it is large.
+    \item \badgeLsix{L6} Separates memory from FLOPs, notes the head is memory-dominant but FLOP-minor, and names chunking or fused kernels as the fix.
+    \item \badgeLseven{L7} Knows the log-sum-exp decomposition that makes vocab parallelism cheap, quantifies the FP32-upcast multiplier, cites Cut Cross-Entropy/Liger, and connects vocabulary size to tokenizer fertility as a system-level trade-off.
+\end{itemize}
+
+\followups{``Why does sharding the vocabulary make the softmax cheap to synchronize?'' (Log-sum-exp decomposes into per-shard maxes and sums.) ``What changes at $V = 256\text{K}$?'' (Everything doubles; fused kernels become non-optional.) ``Why is this not a problem at inference?'' (Decode needs only the final position's logits.)}
+\end{interviewq}
+
+\subsection{Stabilization Losses: z-Loss and Logit Soft-Capping}
+
+Cross-entropy constrains only \textit{differences} between logits---adding a constant to all logits changes nothing in the loss. The absolute scale of the normalizer $Z = \sum_k e^{z_k}$ is therefore unconstrained and can drift upward during training, which is harmless in FP32 but dangerous in BF16, where large logits cost precision and can overflow to produce loss spikes. Auxiliary losses fix this at the loss level:
+
+\begin{mathresult}{z-Loss (PaLM)}
+\begin{equation}
+\loss_{z} = \lambda_z \left(\log Z\right)^2, \qquad Z = \sum_{k=1}^{V} e^{z_k}, \qquad \lambda_z = 10^{-4}
+\end{equation}
+Added to the CE loss, it anchors $\log Z$ near zero, keeping softmax inputs in a well-conditioned range without changing the model's preferences (it penalizes the shared scale, not the differences).
+\end{mathresult}
+
+\textbf{Logit soft-capping} (Gemma 2) is the hard-bound alternative: $z \leftarrow c \cdot \tanh(z/c)$ with $c = 30$ for final logits and $c = 50$ for attention logits---logits can never exceed $\pm c$. The cost is kernel compatibility (capping inside attention breaks fused FlashAttention-style kernels), which is why Gemma 3 dropped soft-capping in favor of QK-norm. Both z-loss and capping are \textit{numerics} interventions, not task losses: expect them in any ``why did my 30B run spike at 100B tokens'' debugging conversation. The same $(\log Z)^2$ trick reappears as the router z-loss in MoE training (Section~\ref{sec:moe_aux_losses}); attention-side stabilization (QK-norm) is covered in Chapter~\ref{chap:activation_normalization}.
+
+%==============================================================================
 \section{Metric Learning / Embedding Losses}
 \label{sec:metric_losses}
 %==============================================================================
@@ -739,6 +906,22 @@ Alternatives that decouple negative count from batch size: (1) \textbf{MoCo} mai
 \textbf{When to use.} Self-supervised pretraining (SimCLR, MoCo, CLIP), any contrastive learning setup where you have augmented views or paired data.
 
 \textbf{Pitfalls.} Temperature $\tau$ is critical---too low and training becomes unstable; too high and the loss is too easy. Batch size directly affects quality of the bound.
+
+%------------------------------------------------------------------------------
+\subsection{SigLIP: Pairwise Sigmoid Contrastive Loss}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} The modern answer to InfoNCE's batch-size coupling (Zhai et al., 2023; SigLIP 2, 2025). Instead of a softmax over the batch, every image--text pair becomes an \textit{independent binary classification}: matched or not.
+
+\begin{mathresult}{SigLIP Loss}
+For a batch of $B$ paired, normalized embeddings $(\vx_i, \vy_i)$:
+\begin{equation}
+\loss_{\text{SigLIP}} = -\frac{1}{B} \sum_{i=1}^{B} \sum_{j=1}^{B} \log \sigma\!\left( z_{ij} \left( t \, \vx_i \cdot \vy_j + b \right) \right), \qquad z_{ij} = \begin{cases} +1 & i = j \\ -1 & i \neq j \end{cases}
+\end{equation}
+where $t$ (temperature) and $b$ (bias) are learned scalars; $b$ is initialized strongly negative ($\approx -10$) because each positive faces $B-1$ negatives---starting predictions near ``not a match'' prevents a massive initial gradient from the negative mass.
+\end{mathresult}
+
+Because there is no softmax normalizer coupling all pairs, the loss \textit{decomposes over pairs}: no global $B \times B$ similarity matrix has to live on one device, the computation can proceed in device-local chunks with embeddings passed ring-wise, and---unlike InfoNCE (see the warning above)---gradient accumulation works. Empirically, sigmoid training matches or beats softmax CLIP at moderate batch sizes (8--16K) and performance saturates around 32K, showing the huge batches of the CLIP era were partly an artifact of the loss. Softmax-contrastive still wins in some regimes: when very large batches are affordable, the normalized in-batch ranking objective remains slightly stronger for retrieval-style evaluation, and InfoNCE with in-batch negatives is still the default for text-embedding training, where relative ranking against many negatives is the point. For pretraining image--text encoders, however, SigLIP (and its successor SigLIP 2) is the 2026 default---it is the vision tower in most current VLMs.
 
 %------------------------------------------------------------------------------
 \subsection{ArcFace, CosFace, and SphereFace}
@@ -1144,6 +1327,37 @@ Use impressed-but-not-clicked documents as negatives (stronger signal than rando
 \followups{``How do you estimate position bias propensity?'' ``What if users click but immediately bounce back?'' ``How do you evaluate this system offline without editorial labels?''}
 \end{interviewq}
 
+%------------------------------------------------------------------------------
+\subsection{Preference Losses: Bradley--Terry and DPO}
+\label{sec:preference_losses}
+%------------------------------------------------------------------------------
+
+The pairwise ranking machinery above is now the training substrate of LLM alignment: the ``items'' are model responses to the same prompt, and the preference signal comes from human (or AI) raters. In 2026, ``write down the preference loss'' is a standard frontier-lab screen. Both losses below are presented \textit{as losses}; the derivations---why they follow from the KL-regularized RLHF objective---live in Chapter~\ref{chap:reinforcement_learning}.
+
+\begin{mathresult}{Bradley--Terry Reward-Model Loss}
+For prompt $x$ with preferred response $y_w$ and dispreferred response $y_l$, train a scalar reward model $r_\phi$ with:
+\begin{equation}
+\loss_{\text{RM}} = -\E_{(x, y_w, y_l)}\left[\log \sigma\!\left(r_\phi(x, y_w) - r_\phi(x, y_l)\right)\right]
+\end{equation}
+\end{mathresult}
+
+Structurally, this \textit{is} BPR with responses in place of items: a sigmoid on a score difference. Its gradient with respect to the margin $\Delta = r_w - r_l$ is $-\sigma(-\Delta)$, so training pressure concentrates on pairs the reward model currently mis-orders and vanishes on pairs it already gets right. Like every pairwise loss, it constrains only \textit{differences}: rewards are shift-invariant per prompt, which is why downstream RL normalizes or centers them.
+
+\begin{mathresult}{DPO Loss}
+\begin{equation}
+\loss_{\text{DPO}} = -\E_{(x, y_w, y_l)}\left[\log \sigma\!\left(\beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}\right)\right]
+\end{equation}
+This is the Bradley--Terry loss with the learned reward replaced by the \textit{implicit reward} $\hat{r}(x,y) = \beta \log \frac{\pi_\theta(y \mid x)}{\pi_{\text{ref}}(y \mid x)}$: the policy is its own reward model, and $\beta$ sets the strength of the KL anchor to the frozen reference $\pi_{\text{ref}}$.
+\end{mathresult}
+
+\textbf{Gradient interpretation} (the part interviewers actually probe):
+\begin{equation}
+\nabla_\theta \loss_{\text{DPO}} = -\beta \, \E\left[\, \underbrace{\sigma\!\left(\hat{r}_l - \hat{r}_w\right)}_{\text{weight: how mis-ordered}} \left( \nabla_\theta \log \pi_\theta(y_w \mid x) - \nabla_\theta \log \pi_\theta(y_l \mid x) \right) \right]
+\end{equation}
+Increase the log-probability of the chosen response, decrease the rejected one---weighted by how wrongly the implicit reward currently orders the pair. Examples the policy already ranks correctly contribute almost nothing; the update budget flows to the pairs it gets backwards.
+
+\textbf{Pitfalls.} As with all pairwise losses, only the \textit{difference} is constrained: DPO can (and demonstrably does) decrease the log-probability of \textit{both} responses while widening their margin---monitor chosen-response log-probability, not just the loss. Sequence log-probabilities also scale with length, producing length bias. Variants address specific failure modes---IPO (bounded objective against overfitting the preference data), KTO (unpaired thumbs-up/down data), SimPO (length-normalized, reference-free)---and the full PPO-vs-DPO decision framework is in Chapter~\ref{chap:reinforcement_learning}.
+
 %==============================================================================
 \section{Regression Losses}
 \label{sec:regression_losses}
@@ -1365,6 +1579,21 @@ The soft output tells the student: ``dogs and cats are similar, cars are differe
 
 \textbf{Pitfalls.} Temperature $T$ is critical: too low and soft targets look like hard labels (no benefit); too high and the distribution is uniform (no signal). Typical $T \in [3, 20]$. The $\alpha$ balance also matters---start with $\alpha = 0.5$.
 
+\subsection{MoE Auxiliary Losses}
+\label{sec:moe_aux_losses}
+
+\textbf{What they are.} Mixture-of-Experts models add losses that shape \textit{routing} rather than predictions. Without them, routing collapses: a few experts attract all tokens, get better, attract more (rich-get-richer), and the rest of the parameters go to waste. Since every 2026 frontier model is an MoE, ``what losses does an MoE add and what breaks without them'' is a standard L6 question.
+
+\begin{mathresult}{Load-Balancing Loss (Switch/GShard)}
+For $N$ experts over a batch of tokens:
+\begin{equation}
+\loss_{\text{balance}} = \alpha \cdot N \cdot \sum_{i=1}^{N} f_i \cdot P_i
+\end{equation}
+where $f_i$ is the \textit{fraction of tokens actually routed} to expert $i$ (a hard count---not differentiable) and $P_i$ is the \textit{mean router probability} assigned to expert $i$ (differentiable). Typical $\alpha = 0.01$.
+\end{mathresult}
+
+The product form is the trick: gradients flow through $P_i$, with $f_i$ acting as a per-expert weight, so the router is pushed to lower its probability on overloaded experts. The loss is minimized at uniform routing ($f_i = P_i = 1/N$, giving $\loss = \alpha$), and the $N$ factor keeps its scale independent of expert count. The coefficient encodes a real tension: too high forces uniform routing and destroys expert specialization; too low permits collapse. A companion \textbf{router z-loss} (ST-MoE), $\frac{1}{B}\sum_b (\log \sum_i e^{z_i^{(b)}})^2$, keeps router logits small and the routing distribution well-conditioned---the same $(\log Z)^2$ mechanism as the final-softmax z-loss of Section~\ref{sec:lm_losses}. DeepSeek-V3 dropped the auxiliary loss almost entirely: \textit{aux-loss-free balancing} adjusts a per-expert bias used only for top-$k$ selection, tuned outside gradient descent from observed utilization, avoiding the gradient interference the balancing loss injects into the language-modeling objective---details, along with routing architectures and expert parallelism, in Chapter~\ref{chap:efficient_architectures}.
+
 %==============================================================================
 \section{Loss Function Selection Guide}
 \label{sec:loss_selection}
@@ -1462,8 +1691,15 @@ The soft output tells the student: ``dogs and cats are similar, cars are differe
 
     \draw[arrow] (rank) -- node[left] {Pairwise} (bpr);
     \draw[arrow] (rank) -- node[right] {Listwise} (lambda);
+
+    % Generation / preference branch (LLM-era addition, drawn as its own row)
+    \node[decision, align=center, below=7.2cm of task] (gendec) {Generation:\\token-level or\\preference data?};
+    \node[result, left=0.8cm of gendec] (ntceR) {Next-Token CE};
+    \node[result, right=0.8cm of gendec] (dpoR) {DPO / Bradley--Terry};
+    \draw[arrow] (gendec) -- node[above] {Token} (ntceR);
+    \draw[arrow] (gendec) -- node[above] {Preference} (dpoR);
 \end{tikzpicture}
-\caption{Decision tree for loss function selection.}
+\caption{Decision tree for loss function selection. The generation/preference branch (bottom row) is the LLM-era addition: token-level objectives use next-token cross-entropy (with loss masking, Section~\ref{sec:lm_losses}); pairwise preference data uses DPO or a Bradley--Terry reward model (Section~\ref{sec:preference_losses}).}
 \end{figure}
 
 \subsection{Quick Reference Table}
@@ -1490,6 +1726,10 @@ Regression, uncertainty & Quantile Loss & - \\
 Segmentation & Dice + CE & IoU Loss \\
 Sequence labeling & CTC & - \\
 Model compression & KD Loss & - \\
+LLM pretraining / SFT & Next-token CE (masked, global token mean) & + z-loss at scale \\
+Preference tuning (LLM) & DPO & BT reward model + PPO \\
+Image--text pretraining & SigLIP (sigmoid) & CLIP-style InfoNCE \\
+MoE router balance & Load-balancing + router z-loss & Aux-loss-free bias \\
 \bottomrule
 \end{tabularx}
 \end{table}

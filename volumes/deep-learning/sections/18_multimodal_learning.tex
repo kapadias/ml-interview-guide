@@ -2,7 +2,7 @@
 \label{chap:multimodal_learning}
 
 \begin{tldr}
-Multimodal learning combines information from different modalities---text, images, audio, video---into a unified representation or generation pipeline. This chapter covers fusion architectures (early, late, cross-attention and when each wins), vision-language models (CLIP, LLaVA, Flamingo, GPT-4V), text-to-image generation (Stable Diffusion pipeline, brief since diffusion is covered in Chapter~\ref{chap:generative_models}), and audio/speech models (Whisper, multimodal alignment). At Staff+ interviews, you must know how modalities are aligned, why contrastive pretraining works, and the architectural tradeoffs between adapter-based and natively multimodal designs. The recurring theme: the hard problem is not processing each modality---it is \textit{aligning} them into a shared space where cross-modal reasoning becomes possible.
+Multimodal learning combines information from different modalities---text, images, audio, video---into a unified representation or generation pipeline. This chapter covers fusion architectures (early, late, cross-attention and when each wins), vision-language models (CLIP, LLaVA, Flamingo, and the 2024--2025 generation: Qwen2.5-VL, Chameleon, Llama~3.2-Vision), natively multimodal and omni models with open recipes, text-to-image generation (brief, since diffusion is covered in Chapter~\ref{chap:generative_models}), video understanding and its token economics, and audio/speech---from Whisper through neural audio codecs to real-time speech-to-speech. At Staff+ interviews, you must know how modalities are aligned, why contrastive pretraining works, and the architectural tradeoffs between adapter-based and natively multimodal designs. The recurring theme: the hard problem is not processing each modality---it is \textit{aligning} them into a shared space where cross-modal reasoning becomes possible.
 \end{tldr}
 
 %==============================================================================
@@ -174,19 +174,30 @@ The number of visual tokens is a critical bottleneck in VLMs. A CLIP ViT-L/14 at
     \item \textbf{Interleaved image-text}: Flamingo natively handles documents with multiple images interleaved with text---essential for few-shot multimodal prompting.
 \end{itemize}
 
-\subsection{GPT-4V and Gemini: Natively Multimodal}
+\subsection{Dynamic and Native Resolution}
+\label{subsec:dynamic_resolution}
 
-Unlike adapter-based models (LLaVA, Flamingo), natively multimodal architectures process all modalities within a single unified model from pretraining.
+Fixed-resolution vision towers were the standard until roughly 2023: every image, whatever its size or aspect ratio, was resized to a square $224$ or $336$\,px input. That design is now dated. Resizing a $3840 \times 2160$ screenshot to $336 \times 336$ discards $\sim$99\% of the pixels---a 10pt menu label becomes sub-pixel noise, and no amount of LLM reasoning recovers text the encoder never saw. Three mechanisms replaced fixed resolution:
 
-\textbf{GPT-4V} (OpenAI, 2023): Details are proprietary, but it likely uses a large-scale vision encoder tightly integrated with the GPT-4 decoder, with visual tokens fed directly into the transformer's input sequence. Training on massive multimodal data during pretraining (not just fine-tuning) enables stronger cross-modal reasoning.
+\textbf{NaViT patch packing (Dehghani et al., 2023).} NaViT applies the sequence-packing trick from LLM training to ViTs: images are patchified at their \textit{native} resolution and aspect ratio, producing variable-length token sequences, and multiple images are packed into one training sequence with attention masks that prevent cross-image attention. Factorized, fractional positional embeddings handle arbitrary aspect ratios, and random token dropping varies the effective resolution per example. NaViT is the enabling insight: once a ViT accepts variable-length input, ``resolution'' stops being an architectural constant and becomes a token budget you spend per image.
 
-\textbf{Gemini} (Google, 2023): Confirmed natively multimodal---trained on interleaved text, image, audio, and video from the start. Uses a unified tokenization approach where visual and audio inputs are encoded into tokens within the same vocabulary/embedding space as text.
+\textbf{Native-resolution ViTs with M-RoPE (Qwen2-VL, Qwen2.5-VL).} Qwen2-VL's encoder consumes any resolution directly; after $2 \times 2$ patch merging, each $28 \times 28$ pixel region costs one LLM token, so a $1344 \times 1008$ photo costs $48 \times 36 = 1{,}728$ tokens and a small icon costs a handful. Positions are encoded with \textbf{M-RoPE} (multimodal RoPE), which factorizes rotary position into temporal, height, and width components: text tokens advance all three together (recovering ordinary 1D RoPE), image tokens advance height/width according to their 2D location, and video frames advance the temporal axis. Qwen2.5-VL additionally aligns the temporal axis to absolute timestamps (useful for video, Section~\ref{sec:video_understanding}) and uses windowed attention inside the ViT to keep encoder cost near-linear in resolution.
+
+\textbf{Tiling (InternVL, LLaVA-NeXT ``AnyRes'').} Keep a fixed-resolution encoder but apply it several times: split the image into up to $N$ tiles of $448 \times 448$ chosen to match its aspect ratio (InternVL-1.5: up to 12), plus one downsampled thumbnail tile for global context; encode each tile separately, and compress each tile's $32 \times 32 = 1{,}024$ patches to 256 tokens via pixel unshuffle. Tiling retrofits high resolution onto any pretrained tower, at two costs: no attention across tile boundaries during encoding (objects straddling tiles fragment; the thumbnail partially compensates), and token count that grows linearly with tile count.
+
+\begin{keyinsight}[Interview Probe: ``How Do You Handle a 4K Screenshot?'']
+State the token budget \textit{first}, then pick the mechanism. Encoding $3840 \times 2160$ at full native resolution costs $(3840/28) \times (2160/28) \approx 137 \times 77 \approx 10{,}500$ visual tokens---most of a 16K context for a single image. The production answers: (1) \textbf{cap and downsample}---native-resolution models expose min/max pixel budgets (Qwen2-VL) and tiling models cap tile count (InternVL: 12 tiles $\times$ 256 = 3{,}072 tokens); (2) \textbf{task-adaptive resolution}---UI agents and OCR need the detail, captioning does not, so make resolution a request-time parameter rather than a constant; (3) \textbf{two-pass zoom}---a cheap low-resolution pass locates the relevant region, then only that crop is re-encoded at full detail (this is what ``zoom in'' tool calls in computer-use agents do). Adding that every visual token also inflates the KV cache for all subsequent decode steps in a multi-turn session is what separates an L6 answer from an L5 one.
+\end{keyinsight}
+
+\subsection{From GPT-4V to Open Native Multimodality}
+
+Unlike adapter-based models (LLaVA, Flamingo), natively multimodal architectures process all modalities within a single unified model from pretraining. \textbf{GPT-4V} (OpenAI, 2023) and \textbf{Gemini~1} (Google, 2023) demonstrated this at frontier scale---Gemini was confirmed to be trained on interleaved text, image, audio, and video from the start, with visual and audio inputs encoded into the same token stream as text. The exact recipes of those two systems remain undisclosed, but native multimodality itself is no longer a proprietary mystery: since 2024, open models (Chameleon, Transfusion, Janus, Qwen2.5-Omni) have published complete recipes, making this a class of architectures you are expected to describe concretely in an interview rather than gesture at. Section~\ref{sec:native_multimodal} covers them.
 
 \subsection{VLM Architecture Comparison}
 
 \begin{table}[H]
 \centering
-\caption{Major vision-language model comparison}
+\caption{Major vision-language model comparison (through 2025)}
 \begin{tabularx}{\textwidth}{lXcccc}
 \toprule
 \textbf{Model} & \textbf{Architecture} & \textbf{Fusion} & \textbf{LLM Frozen?} & \textbf{Vis.\ Tokens} & \textbf{Year} \\
@@ -196,15 +207,71 @@ Flamingo & Perceiver + gated cross-attn & Cross-attn & Yes & 64 & 2022 \\
 BLIP-2 & Q-Former + frozen LLM & Cross-attn & Yes & 32 & 2023 \\
 LLaVA & Linear projection (Vicuna) & Early & No (stage 2) & 256 & 2023 \\
 LLaVA-1.5 & MLP projection + hi-res & Early & No (stage 2) & 576 & 2023 \\
-GPT-4V & Native multimodal & Early & N/A & Unknown & 2023 \\
-Gemini & Native multimodal & Early & N/A & Unknown & 2023 \\
+GPT-4V & Native multimodal (undisclosed) & Early & N/A & Undisclosed & 2023 \\
+Gemini 1 & Native multimodal & Early & N/A & Undisclosed & 2023 \\
+Chameleon & Unified early fusion, discrete VQ image tokens & Early & N/A & 1024 (VQ) & 2024 \\
+Llama-3.2-Vision & Gated cross-attn adapter on Llama-3.1 & Cross-attn & Yes & K/V only & 2024 \\
+Qwen2.5-VL & Native-resolution ViT + M-RoPE & Early & No & Varies & 2025 \\
+GPT-4o & Native omni (text, image, audio) & Early & N/A & Undisclosed & 2024 \\
+Gemini 2 & Native omni, long context & Early & N/A & Undisclosed & 2024--25 \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
+\textbf{The vision-tower default has shifted.} Through 2023, ``the visual backbone'' meant OpenAI's CLIP ViT. By 2025 the default tower in open VLM stacks is a SigLIP-class encoder (PaliGemma, Idefics, LLaVA-OneVision all use SigLIP-SO400M), which outperforms the original CLIP checkpoints at equal size thanks to sigmoid pretraining at larger scale. Frontier open models increasingly train their own towers instead (InternViT, Qwen's native-resolution ViT) or eliminate the separate tower entirely (Chameleon, Section~\ref{sec:native_multimodal}). If you name CLIP as the default vision encoder in a 2026 interview, qualify it: contrastive towers remain the paradigm, but CLIP-the-checkpoint has been superseded.
+
 \begin{keyinsight}[Adapter-Based vs Natively Multimodal: The Key Tradeoff]
 Adapter-based VLMs (LLaVA, Flamingo, BLIP-2) are cheap to build---you reuse pretrained vision and language models and only train a small connector. But the modalities were pretrained independently, so alignment is limited by the connector's capacity. Natively multimodal models (Gemini, GPT-4V) are expensive to pretrain from scratch but learn deeper cross-modal representations because every layer processes all modalities jointly. The practical implication: adapter-based models work well for tasks CLIP already understands (object recognition, basic scene understanding), but natively multimodal models excel at tasks requiring deep spatial reasoning, counting, and compositional understanding. When asked ``which approach is better?'' in an interview, the answer is always ``it depends on budget and task complexity.''
 \end{keyinsight}
+
+\subsection{Evaluating VLMs}
+\label{subsec:evaluating_vlms}
+
+Interviewers expect concrete benchmark names, not ``evaluate on VQA.'' The 2025-era core:
+
+\begin{itemize}
+    \item \textbf{MMMU} (2023): $\sim$11.5K college-level questions across six disciplines requiring joint reasoning over charts, diagrams, maps, and figures---the de facto headline capability number for VLMs (the harder MMMU-Pro variant corrects for questions answerable without the image).
+    \item \textbf{MathVista} (2023): mathematical reasoning grounded in images---geometry diagrams, function plots, chart reading---isolating ``can it reason over what it sees'' from ``can it see.''
+    \item \textbf{DocVQA} (2021, still standard): extractive QA over scanned documents; the OCR-and-layout probe, and the benchmark that exposes low-resolution pipelines instantly.
+\end{itemize}
+
+\textbf{Measuring visual hallucination.} The hallucination debugging question later in this chapter asks ``how do you evaluate visual hallucination rates?''---the standard answer is:
+
+\begin{itemize}
+    \item \textbf{POPE} (Polling-based Object Probing Evaluation, 2023): binary questions of the form ``Is there a \textit{fork} in the image?'', where the probed absent objects are sampled three ways---randomly, from globally frequent objects (\textit{popular}), and from objects that co-occur with objects actually present (\textit{adversarial}). Accuracy/F1 on the adversarial split directly measures how much the model answers from language priors rather than pixels; a ``yes''-bias shows up as a precision collapse.
+    \item \textbf{CHAIR} (Caption Hallucination Assessment with Image Relevance, 2018): for open-ended captioning, counts mentioned objects absent from the ground-truth annotations---CHAIR$_i$ (fraction of hallucinated object mentions) and CHAIR$_s$ (fraction of captions containing at least one hallucinated object).
+\end{itemize}
+
+One caution: public VLM benchmarks contaminate quickly---their images and questions leak into training crawls---so frontier labs pair them with held-out private sets, and public leaderboard numbers should be quoted with that caveat.
+
+%==============================================================================
+\section{Natively Multimodal Models (2024--2026)}
+\label{sec:native_multimodal}
+%==============================================================================
+
+Until 2023, native multimodality was something only frontier labs did and nobody outside could describe. That excuse expired in 2024: Meta published Chameleon and Transfusion, DeepSeek published Janus, and open omni models followed, so ``how would you build a natively multimodal model'' is now a concrete architecture question with three known-good answers. All three share the same commitment---one transformer trained on \textit{interleaved} image-text token streams from the start, so every layer sees every modality---and differ in how images enter and leave that stream.
+
+\subsection{Three Open Recipes}
+
+\textbf{Recipe 1: Early fusion over discrete tokens (Chameleon, Meta 2024).} A learned VQ image tokenizer maps each $512 \times 512$ image to 1{,}024 discrete codes from an 8{,}192-entry codebook; those codes live in the same vocabulary as text tokens. A single decoder-only transformer is then trained from scratch with plain next-token prediction over interleaved mixed-modal sequences---so image understanding \textit{and} image generation are both just autoregressive decoding, and the model can emit text and images interleaved in one response. The published pain points matter as much as the recipe: joint training is unstable at scale (modality competition drives divergent norm growth, which Chameleon countered with query-key normalization and revised layer-norm placement), generation quality is capped by the VQ tokenizer's reconstruction fidelity, and the discrete bottleneck costs fine-grained perception (small text, texture) on the understanding side.
+
+\textbf{Recipe 2: AR text + diffusion images in one transformer (Transfusion, Meta 2024).} Keep text autoregressive, but represent images as \textit{continuous} VAE latent patches and train the \textit{same} transformer with two objectives in one sequence: next-token loss on text tokens, diffusion (denoising) loss on image patches---with bidirectional attention within each image and causal attention across the sequence. This avoids the discretization bottleneck entirely: image quality matches dedicated diffusion models at comparable compute while text remains a first-class autoregressive citizen. This recipe class is widely understood to be how ``native image generation'' features in frontier assistants work, and it beats Chameleon-style discrete AR on image quality per FLOP in Meta's own scaling comparisons.
+
+\textbf{Recipe 3: Decoupled understanding and generation encoders (Janus / Janus-Pro, DeepSeek 2024--25).} The observation: understanding and generation want \textit{different} visual representations. Understanding wants a semantic encoder (SigLIP-class---high-level, spatially coarse); generation wants a low-level tokenizer (VQ---reconstruction-faithful, semantically shallow). Forcing one representation to serve both, as Chameleon does, degrades both. Janus feeds a single autoregressive transformer from two separate visual pathways---SigLIP features for image inputs, VQ tokens for image outputs---and Janus-Pro scales the recipe to 7B, reporting understanding scores competitive with same-size adapter VLMs while retaining generation.
+
+\subsection{Omni Models at Concept Level}
+
+GPT-4o (OpenAI, 2024), Gemini~2 with its Live API (Google, 2024--25), and open equivalents (Moshi, Kyutai 2024; Qwen2.5-Omni, 2025) extend the same idea across text, vision, \textit{and audio}: audio enters and leaves as neural-codec tokens (Section~\ref{sec:speech_realtime_voice}), images enter as visual tokens, and one model handles the interleaved stream end to end. Two consequences define the product category. First, \textbf{latency}: no cascade hand-offs means voice responses in $\sim$300\,ms instead of seconds. Second, \textbf{cross-modal transfer}: the model hears tone, hesitation, and emotion rather than a transcript, and can express them on output. The proprietary systems' internals remain undisclosed, but every ingredient---early fusion, codec audio tokens, interleaved multimodal pretraining, streaming duplex inference---now has an open reference implementation. Treat ``undisclosed'' as a matter of engineering detail, not an unknowable.
+
+\subsection{The Honest Trade-off vs Adapter VLMs}
+
+Section~\ref{sec:vision_language_models} made the adapter case: cheap, modular, sufficient for CLIP-shaped tasks. Native multimodality is how you buy out of the adapter's capability ceiling, and it is worth pricing both sides precisely:
+
+\begin{itemize}
+    \item \textbf{What native buys.} No frozen-tower ceiling: perception is learned end-to-end, so spatial reasoning, counting, OCR-adjacent skills, and cross-modal transfer are limited by data and scale rather than by what a contrastive encoder happened to learn. Interleaved \textit{generation}---responses containing text and images inline---which no adapter VLM can produce. Omni-level latency and paralinguistics for voice.
+    \item \textbf{What native costs.} Web-scale interleaved multimodal pretraining---trillions of mixed tokens; you are training a frontier model, not fine-tuning one. Loss of modularity: no swapping the tower or upgrading the LLM independently. A real risk of \textit{text regression} from modality competition---Chameleon needed architectural surgery just to keep training stable, and Meta shipped Llama~3.2-Vision as a cross-attention \textit{adapter} precisely so the text model's benchmark scores would not move. And inference economics: generating an image natively costs $\sim$1{,}000+ sequential decode steps in your largest model, versus off-loading to a cheap dedicated diffusion endpoint.
+    \item \textbf{Where that leaves 2026 practice.} Adapters still dominate open production VLMs for pure understanding, because per benchmark point they are dramatically cheaper to build and iterate on. Native early fusion wins where the product itself is multimodal: real-time voice, interleaved image generation, agents that watch screens continuously. The 2023 framing (``native is proprietary magic'') and the naive counter-framing (``native is simply better'') are both wrong; the correct interview answer prices both sides and picks by product requirement.
+\end{itemize}
 
 %==============================================================================
 \section{Text-to-Image Generation}
@@ -237,6 +304,31 @@ where $w$ is the guidance scale (typically 7--12). Higher $w$ increases text-ima
 \textbf{Newer architectures:} DiT (Diffusion Transformer) replaces the U-Net with a transformer backbone, and models like DALL-E 3, Imagen, and Flux use larger text encoders (T5-XXL) for better text understanding, especially for compositional prompts and text rendering.
 
 \textbf{When to discuss this in interviews:} The multimodal fusion mechanism (cross-attention between text and image features) is the key point. Interviewers want to hear that you understand how text conditions the generation process, not the diffusion math itself.
+
+%==============================================================================
+\section{Video Understanding}
+\label{sec:video_understanding}
+%==============================================================================
+
+Video is where token budgets stop being an inconvenience and become \textit{the} design problem. Every architectural decision in video language models is downstream of one piece of arithmetic.
+
+\subsection{Frame Sampling vs Token Budgets}
+
+The standard pipeline samples frames, encodes each with the image tower, and feeds the resulting tokens to the LLM. Work the numbers for one hour of video:
+
+\begin{itemize}
+    \item \textbf{Naive:} 1 fps $\times$ 3{,}600\,s $\times$ 576 tokens/frame (a LLaVA-1.5-class tower) $\approx$ \textbf{2.1M tokens}. Not a context window that exists in production.
+    \item \textbf{Compressed:} at a typical 100--250 tokens/frame after pooling or resampling, 1 fps over an hour is still \textbf{360K--900K tokens}---beyond every 128K-class model and filling most of a 1M context. (Gemini~1.5's documented $\sim$1-hour video capacity is exactly this arithmetic: $\sim$258 tokens/frame $\times$ 3{,}600 frames $\approx$ 930K tokens.)
+    \item \textbf{Working backwards:} a 128K context at 250 tokens/frame and 1 fps holds $\sim$8.5 \textit{minutes} of video. To fit an hour you must cut fps to $\sim$0.1, cut tokens/frame to $\sim$32, or both---and each cut discards information you may be asked about.
+\end{itemize}
+
+The four levers, with their failure modes: \textbf{lower fps} (misses brief events---a goal scored in two seconds vanishes at 0.2 fps); \textbf{fewer tokens per frame} (kills fine detail: on-screen text, small objects); \textbf{longer context} (quadratic attention cost at prefill, and a KV cache that keeps every frame resident for the rest of the conversation); \textbf{retrieval} (two-stage: cheap per-clip embeddings locate candidate segments, dense tokens are spent only on retrieved segments---the same retrieve-then-read pattern as RAG, and the only lever that scales to video archives). Exploit redundancy too: consecutive frames are often $>$90\% identical, which is why spatiotemporal patching (Qwen2-VL tokenizes frame \textit{pairs}) and cross-frame token merging buy $2\times$ or more nearly for free.
+
+\subsection{Temporal Pooling vs Temporal Attention}
+
+\textbf{Temporal pooling} collapses the time axis before the LLM sees it: average (or attention-pool) frame features per spatial location, or run a Q-Former-style resampler over all frames down to a fixed token count (Video-LLaMA-class models). Cheap and context-friendly, but order information survives only coarsely: pooled models are weak on ``did the person pick up the cup \textit{before} or \textit{after} opening the door,'' on event counting, and on speed judgments. \textbf{Temporal attention} keeps frames as a sequence and lets the LLM attend across time, with positions carrying temporal structure---M-RoPE's temporal axis (Section~\ref{subsec:dynamic_resolution}); Qwen2.5-VL aligns temporal position to \textit{absolute timestamps}, making ``what happens at 12:40'' and second-level event localization directly answerable. The cost is exactly the token budget above. Production systems mix the two: dense temporal attention over a short window around the query-relevant segment, pooled summaries elsewhere.
+
+\textbf{Video generation is a different stack.} Understanding compresses video into as few tokens as possible; generation (Sora-class systems, Veo, and open models such as Wan and HunyuanVideo) runs diffusion---typically a DiT over spacetime latent patches---and belongs to the toolbox of Chapter~\ref{chap:generative_models}. As of 2026 the two remain separate production stacks even as unified-model research (Section~\ref{sec:native_multimodal}) pushes to merge them; in an interview, do not answer a video-understanding design question with a diffusion architecture or vice versa.
 
 %==============================================================================
 \section{Audio and Speech}
@@ -302,6 +394,62 @@ Learned embeddings & Task-specific (from pretrained model) & Transfer learning, 
 \end{table}
 
 \textbf{Mel spectrograms} are the standard input for modern speech and audio models. The mel scale warps frequencies to match human perception---lower frequencies get finer resolution because humans are more sensitive to pitch differences in speech range ($\sim$100--4000 Hz). Typical parameters: 80 mel bins, 25ms window, 10ms hop.
+
+%==============================================================================
+\section{Speech and Real-Time Voice}
+\label{sec:speech_realtime_voice}
+%==============================================================================
+
+Whisper is speech \textit{understanding}. The 2024--2026 wave is speech as a first-class LM modality---audio in \textit{and} audio out---built on one enabling component: the neural audio codec.
+
+\subsection{Neural Audio Codecs: Audio as Tokens}
+
+\textbf{SoundStream} (Google, 2021) and \textbf{EnCodec} (Meta, 2022) compress raw waveforms into discrete tokens a language model can model. A convolutional encoder downsamples 24\,kHz audio to $\sim$75 latent frames per second; each frame is quantized by \textbf{residual vector quantization (RVQ)}: codebook 1 quantizes the latent vector, codebook 2 quantizes the residual left by codebook 1, and so on for $N_q$ codebooks. A decoder, trained with reconstruction plus adversarial losses, reconstructs the waveform. Bitrate is frame rate $\times$ $N_q$ $\times$ $\log_2(\text{codebook size})$: 75\,Hz $\times$ 8 codebooks $\times$ 10 bits $=$ 6\,kbps for near-transparent speech. Two properties matter for modeling: audio becomes a few \textit{parallel} discrete token streams rather than one, and the RVQ hierarchy is coarse-to-fine---the first codebook carries phonetic and semantic content while later codebooks carry speaker timbre and acoustic detail---so a model can predict the first stream carefully and fill in the rest cheaply.
+
+\textbf{The audio-token LM lineage in two sentences.} AudioLM (Google, 2022) showed that a decoder-only transformer over semantic tokens plus codec acoustic tokens generates coherent speech continuations---language modeling applied directly to sound. VALL-E (Microsoft, 2023) cast text-to-speech as conditional codec-token language modeling---autoregressive over the first RVQ stream, parallel over the rest---achieving zero-shot voice cloning from a 3-second prompt; every native speech LLM since is a descendant of this framing.
+
+\subsection{Cascade vs End-to-End Speech-to-Speech}
+
+\textbf{The cascade} (ASR $\rightarrow$ LLM $\rightarrow$ TTS) chains three systems through text. Its latency budget: endpointing---waiting $\sim$0.5--1.0\,s of trailing silence to decide the user has finished---plus streaming-ASR finalization ($\sim$100--300\,ms), LLM time-to-first-token ($\sim$200--500\,ms), and TTS time-to-first-audio ($\sim$100--300\,ms). Total: \textbf{$\sim$1--2\,s} voice-to-voice in typical production systems; a heroically streamed cascade lands around 800\,ms. Beyond latency, the text bottleneck deletes paralinguistics in both directions---tone, emotion, hesitation, sarcasm, speaker identity on input; expressive control on output---and each stage compounds errors (a mis-transcription becomes a confidently wrong answer). Barge-in (the user interrupting mid-response) must be plumbed across all three services plus echo cancellation.
+
+\textbf{Native speech-to-speech} models a single interleaved stream of codec audio tokens (plus text): GPT-4o (2024) reports $\sim$320\,ms average voice response---human conversational turn-taking gaps are $\sim$200\,ms---and Kyutai's open Moshi (2024) reaches $\sim$200\,ms with full-duplex operation: the model listens while it speaks, so barge-in and backchannels (``mm-hm'') are modeling capabilities rather than plumbing. Moshi's ``inner monologue''---predicting text tokens alongside audio tokens---recovers much of the reasoning quality that pure audio-token models lose. Qwen2.5-Omni (2025) splits the difference architecturally with a thinker-talker design: a text-generating thinker and a streaming audio-token talker in one system. The honest costs of native: harder to inspect and guardrail (you moderate audio tokens, not a transcript), voice-cloning and audio-jailbreak safety surface, risk of text-capability regression, and---as of the mid-2020s---weaker complex reasoning than the best text-only models, which is why production systems often route hard queries from the voice front-end to a stronger text model.
+
+\begin{interviewq}
+\textbf{Q: Cascade vs native speech-to-speech for a voice assistant---decide and defend.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Frame the decision on four axes before naming a winner: latency target, paralinguistic requirements, control and safety, and engineering budget.
+
+\textbf{Latency.} Work the cascade budget out loud: endpointing $\sim$0.5--1.0\,s (you must wait through silence to know the user finished) $+$ streaming ASR finalization $\sim$100--300\,ms $+$ LLM TTFT $\sim$200--500\,ms $+$ TTS first-audio $\sim$100--300\,ms $\approx$ 1--2\,s voice-to-voice; an aggressively streamed cascade reaches $\sim$800\,ms. Human turn-taking is $\sim$200\,ms, and beyond roughly half a second the interaction reads as ``talking to a machine.'' Native models (GPT-4o class, Moshi) respond in $\sim$200--320\,ms because there are no hand-offs and the model processes audio while the user is still speaking; full-duplex models learn endpointing implicitly, so barge-in and backchannels come free.
+
+\textbf{Paralinguistics.} The cascade's text bottleneck deletes tone, emotion, hesitation, and speaker identity on input, and limits output expressiveness to TTS control knobs. If the product is a tutor, a companion, or anything where \textit{how} something is said carries meaning, the cascade is disqualified on this axis alone.
+
+\textbf{Control and safety.} The cascade wins on inspectability: an exact transcript in and text out, so you can log, filter, and unit-test each stage, upgrade components independently, and route hard queries to your best text model. Native models raise voice-cloning and audio-jailbreak surface, are harder to guardrail, and still trail frontier text models at complex reasoning---which is why real products use hybrids: a native voice front-end that tool-calls a stronger text model, or a Qwen2.5-Omni-style thinker-talker split.
+
+\textbf{Decision.} For command-and-control (timers, home automation, in-car): cascade with streaming components---latency tolerance is higher, outputs are short, and debuggability and cost win. For a conversational product where interruption, emotion, and flow \textit{are} the product: native or half-cascade (native audio understanding $+$ streaming TTS), with the pragmatic migration path being cascade-first with instrumentation, then moving the hot path native when latency and barge-in complaints show up in the data.
+
+\redflags
+\begin{itemize}
+    \item Quoting only model inference time---endpointing is the largest and most-forgotten term in the cascade budget.
+    \item ``Native is better because it is newer''---without pricing the loss of inspectability, independent component upgrades, and text-reasoning quality.
+    \item Treating barge-in as a UI detail---in a cascade it requires echo cancellation, ASR-during-TTS, and cancellation plumbing across three services; in full-duplex native models it is a modeling capability.
+    \item No mention of the safety delta (voice cloning, audio jailbreaks, persona control) when recommending native.
+\end{itemize}
+
+\interviewtest{Whether you can turn a fuzzy product question into a quantified latency budget, and whether you know what the text bottleneck destroys. Strong candidates give numbers for each cascade stage and the $\sim$300\,ms native figure; the strongest defend a hybrid and describe the migration path.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes both architectures and names latency and paralinguistics as the key differences.
+    \item \badgeLsix{L6} Produces the stage-by-stage cascade latency budget, knows native models reach $\sim$300\,ms, discusses barge-in and full-duplex, and makes a product-dependent recommendation.
+    \item \badgeLseven{L7} Adds the control/safety dimension (inspectability, voice cloning, audio guardrails), proposes the hybrid thinker-talker or tool-calling escape hatch for reasoning quality, and reasons about serving economics from codec token rates (e.g., 12.5\,Hz $\times$ 8 RVQ streams $\approx$ 100 audio tokens per second of speech, versus $\sim$4 text tokens per second for the same words).
+\end{itemize}
+
+\followups{``Where does each 100\,ms of the cascade budget go, and which stages can you stream?'' ``How does full-duplex modeling change the endpointing problem?'' ``Your native model is worse at math than your text LLM---what do you do?''}
+\end{interviewq}
 
 %==============================================================================
 \section{Interview Questions}
@@ -375,7 +523,7 @@ These represent two fundamentally different philosophies for building vision-lan
 
 \textit{Strengths:} (1) Deepest cross-modal integration---every layer processes all modalities jointly. (2) Better at spatial reasoning, counting, and compositional understanding because these are learned during pretraining, not retrofit via an adapter. (3) Can handle arbitrary interleaving of modalities (text, image, text, image, ...) naturally.
 
-\textit{Weaknesses:} (1) Extremely expensive to pretrain (requires multimodal data at web scale). (2) Not modular---cannot swap the vision encoder without full retraining. (3) Proprietary; hard to reproduce.
+\textit{Weaknesses:} (1) Extremely expensive to pretrain (requires multimodal data at web scale). (2) Not modular---cannot swap the vision encoder without full retraining. (3) Training instability from modality competition (see Chameleon's published fixes, Section~\ref{sec:native_multimodal})---and while open recipes now exist (Chameleon, Transfusion, Janus), executing them still demands frontier-scale data and compute.
 
 \textbf{Decision:} Adapter-based if you need a VLM quickly with limited compute and the tasks align with what CLIP already understands. Natively multimodal if you need deep cross-modal reasoning, have the pretraining budget, or require capabilities beyond CLIP's representational limits.
 
@@ -753,8 +901,10 @@ Image-text retrieval & CLIP / SigLIP (late fusion) & Batch size, hard negatives 
 Visual QA / reasoning & LLaVA / Flamingo (cross-attn) & Visual token count & Context window exhaustion \\
 Text-to-image & Latent Diffusion + cross-attn & Guidance scale, text encoder & Compositional prompts fail \\
 Speech recognition & Whisper (encoder-decoder) & Model size vs.\ latency & Long-form audio chunking \\
+Real-time voice & Native speech-to-speech (codec tokens) & Cascade vs.\ native latency & Endpointing dominates cascade \\
+Video QA / search & Sampled frames + temporal attn; retrieval at archive scale & fps $\times$ tokens/frame budget & Context explosion at 1 fps \\
 Multimodal search & Dual encoder + re-ranker & ANN index type & Embedding drift over time \\
-Any-to-any multimodal & Native multimodal (Gemini) & Training data mixture & Extreme compute cost \\
+Any-to-any multimodal & Native early fusion (GPT-4o class, Chameleon) & Training data mixture & Extreme compute cost \\
 \bottomrule
 \end{tabularx}
 \end{table}

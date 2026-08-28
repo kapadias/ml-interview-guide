@@ -2,7 +2,7 @@
 \label{chap:long_context_rag}
 
 \begin{tldr}
-Modern LLMs face a fundamental tension: context windows are growing (128K--1M+ tokens), yet real-world knowledge bases far exceed any context window. This chapter covers both sides of the problem. Long-context techniques (RoPE scaling, NTK-aware interpolation, YaRN) extend what the model can process in a single forward pass. Retrieval-Augmented Generation (RAG) sidesteps context limits by fetching only the relevant information at query time. A Staff-level engineer must know when to stuff the context window, when to build a RAG pipeline, and when to combine both---because the wrong choice wastes either compute or accuracy.
+Modern LLMs face a fundamental tension: context windows are growing (128K--1M+ tokens), yet real-world knowledge bases far exceed any context window. This chapter covers both sides of the problem. Long-context techniques---today primarily continued pretraining on progressively longer sequences, with RoPE-scaling retrofits (PI, NTK-aware interpolation, YaRN) as the no-retrain path---extend what the model can process in a single forward pass. Retrieval-Augmented Generation (RAG) sidesteps context limits by fetching only the relevant information at query time. A Staff-level engineer must know when to stuff the context window, when to build a RAG pipeline, and when to combine both---because the wrong choice wastes either compute or accuracy.
 \end{tldr}
 
 %==============================================================================
@@ -12,7 +12,7 @@ Modern LLMs face a fundamental tension: context windows are growing (128K--1M+ t
 
 \subsection{The Problem: Extending Trained Context Length}
 
-Most LLMs are trained with a fixed maximum sequence length (e.g., 4K or 8K tokens). Deploying them on longer inputs requires \textit{context extension}---modifying the model so it can generalize beyond its training length without full retraining.
+LLMs are trained with a fixed maximum sequence length---4K--8K for the 2023 generation of open models, and even for today's frontier models the bulk of pretraining still happens at 8K-scale lengths before a dedicated long-context stage. Deploying a model on inputs longer than it was trained for requires \textit{context extension}: either modifying the model at inference time so it generalizes beyond its training length (this section), or training it for the target length directly (Section~\ref{subsec:native_long_context}, which is how frontier models actually get their 128K--1M windows).
 
 The bottleneck is almost always \textbf{positional encoding}. Absolute learned embeddings cannot extrapolate at all. Sinusoidal encodings degrade quickly. The modern approach is Rotary Position Embeddings (RoPE), which encodes relative position by rotating query and key vectors in 2D subspaces.
 
@@ -29,11 +29,14 @@ where $\mR_{\theta, m}$ rotates each pair of dimensions $(2i, 2i{+}1)$ by angle 
 
 \textbf{Why extension is possible.} Because RoPE encodes position through rotation angles, you can manipulate the frequencies to ``compress'' longer sequences into the model's trained range. The key parameter is the \textbf{base frequency}---changing it changes the wavelength of each rotary dimension.
 
-\subsection{Context Extension Methods}
+\subsection{Inference-Time Extension Methods}
+\label{subsec:inference_time_extension}
+
+The methods in this table are what you reach for when you \textit{cannot retrain}: they rescale RoPE at inference time (optionally with a brief fine-tune) so that positions beyond the training length map back into the trained distribution. They dominated 2023 practice and remain the standard emergency path for a short-trained model---but they are retrofits. Frontier models do not reach 128K--1M this way; they are trained for length (Section~\ref{subsec:native_long_context}). Position the two correctly in an interview: this table is the ``ship next month'' answer, the training recipe is the ``how it is actually done'' answer.
 
 \begin{table}[H]
 \centering
-\caption{RoPE-based context extension methods}
+\caption{RoPE-based context extension methods (inference-time retrofits, optionally with brief fine-tuning)}
 \begin{tabularx}{\textwidth}{lXXc}
 \toprule
 \textbf{Method} & \textbf{Key Idea} & \textbf{Trade-off} & \textbf{Year} \\
@@ -64,8 +67,54 @@ Not all long-context solutions modify position encodings:
     \item \textbf{ALiBi} (Attention with Linear Biases): Adds a position-dependent penalty directly to attention logits. No learned positional parameters. Extrapolates naturally but cannot match RoPE quality at very long contexts.
     \item \textbf{Ring Attention}: Distributes the long sequence across multiple devices, with each device computing attention for its local chunk and passing KV blocks in a ring topology. Enables context lengths limited only by the number of devices, not memory.
     \item \textbf{Landmark / infini-attention}: Compress old context into fixed-size memory states, maintaining a ``compressive memory'' that the model can attend to. Trades exact retrieval for bounded memory.
-    \item \textbf{Training on long data}: The most reliable method. Models like Gemini 1.5 (context up to 1M--2M tokens) and GPT-4 Turbo (128K) are trained natively on long sequences. Requires significant compute but avoids all extension artifacts.
+    \item \textbf{Training on long data}: The most reliable method, and how every current frontier model (128K--1M+ windows) actually gets its context length. Avoids all extension artifacts at the cost of a dedicated training stage---covered next.
 \end{itemize}
+
+\subsection{How Long Context Is Actually Achieved (2024--2026)}
+\label{subsec:native_long_context}
+
+The PI/NTK/YaRN table describes retrofits. Since 2024, frontier practice treats long context as a \textbf{training recipe}: a continued-pretraining stage with progressive length extension and a long-data mixture, run between the main pretraining run and post-training. The Llama~3.1 128K recipe is the canonical published shape:
+
+\begin{enumerate}
+    \item \textbf{Pretrain at standard length.} The bulk of tokens (trillions) are trained at 8K. Long sequences are expensive---attention FLOPs grow quadratically and activation memory linearly---and most of what the model learns does not require them.
+    \item \textbf{Raise the RoPE base.} Before the long stage, increase the base frequency (Llama~3.1 uses 500{,}000 instead of 10{,}000) so the lowest-frequency dimensions have wavelengths that span the target window. This is the same lever as NTK-aware scaling, but applied \textit{before training on long data} rather than as an inference-time patch.
+    \item \textbf{Continued pretraining with progressive length extension.} Increase the context length in stages (Llama~3.1: six stages from 8K to 128K, $\sim$800B tokens total---roughly 5\% of the full token budget). At each stage, train until long-context probes (needle-in-a-haystack) recover \textit{and} short-context benchmarks have not regressed, then lengthen again.
+    \item \textbf{Long-data mixture.} Upsample naturally long documents (books, code repositories, long web pages) but keep the mixture mostly short. Training exclusively on long data degrades short-context quality; the mixture ratio is a tuned hyperparameter, not an afterthought.
+    \item \textbf{Long-context post-training.} Include long-context SFT data (long-document QA, summarization, repo-level code tasks---largely synthetic) so instruction following survives at length. Skipping this step produces a model that passes base-model needle tests but ignores instructions at 100K.
+\end{enumerate}
+
+Two named 2024 methods extend this picture, one on each side of the train/serve divide:
+\begin{itemize}
+    \item \textbf{LongRoPE}: replaces hand-derived rescaling schedules (NTK, YaRN) with an evolutionary \textit{search} over non-uniform per-dimension interpolation factors, combined with progressive extension---reaching 2M-token windows from short-context models with modest fine-tuning.
+    \item \textbf{Dual-chunk attention (DCA)}: a \textit{training-free} serving-time method that splits positions into chunks and remaps intra-chunk vs.\ inter-chunk relative positions so no rotary angle ever exceeds the trained range (used in Qwen's long-context serving).
+\end{itemize}
+
+\textbf{Infrastructure corollary.} Training at 128K+ does not fit a single GPU's activation memory: the long stage requires \textbf{context parallelism}---sharding the sequence dimension across devices with ring-style KV exchange, the training-side counterpart of the Ring Attention idea above. See Chapter~\ref{chap:training_optimization} for the parallelism taxonomy.
+
+\begin{keyinsight}[Extension Tricks vs.\ the Native Recipe]
+When an interviewer asks ``how would you give this model 128K context?'', the 2026 answer starts with the continued-pretraining recipe (raise the base, progressive lengths, long-data mixture, long SFT) and reaches for PI/NTK/YaRN only under the constraint ``you cannot retrain and must ship now.'' Describing YaRN as the state of the art---rather than as the best of the retrofits---dates you to 2023.
+\end{keyinsight}
+
+\subsection{Evaluating Long Context}
+\label{subsec:long_context_eval}
+
+Every model advertises a \textbf{claimed} context length---the maximum positions it accepts. What matters is the \textbf{effective} context length: the longest input at which it still does the task. The two routinely diverge, and ``the model claims 1M tokens---how do you verify its effective context?'' is now a standard interview question.
+
+\textbf{Needle-in-a-haystack (NIAH), and why it saturated.} Insert a short out-of-place fact (the ``needle'') at controlled depths in long distractor text and ask the model to retrieve it; plot accuracy as a depth $\times$ length heatmap. NIAH was the de facto long-context eval of 2023--2024 and is now a \textit{saturated smoke test}: retrieving one verbatim fact is far easier than using a long context, and frontier models pass NIAH at 1M tokens while failing aggregation or multi-hop tasks at 64K. Passing NIAH is necessary, not sufficient---a red-green NIAH grid still catches position-OOD cliffs and serving bugs, which is why it survives as a regression test.
+
+\textbf{The harder eval classes:}
+\begin{itemize}
+    \item \textbf{RULER-style synthetic suites}: scale difficulty past single-needle retrieval---multiple needles, multi-hop variable tracking (follow a chain of aliased variables across the context), and \textit{aggregation} (e.g., extract the most frequent words), plus long QA. RULER defines effective context length as the longest input at which the score stays above a fixed baseline; its headline 2024 finding was that roughly half of the models claiming 32K+ failed to hold threshold performance even at 32K, and claimed-vs-effective gaps of $4\times$ or more remain routine.
+    \item \textbf{Multi-hop reasoning}: the answer requires chaining facts located at distant positions; degrades much earlier than single-fact retrieval.
+    \item \textbf{Aggregation / holistic tasks}: summarization, counting, theme extraction over the \textit{entire} input. The hardest class and where degradation appears first, because no retrieval shortcut exists.
+    \item \textbf{Long-CoT / long generation}: reasoning models must also \textit{produce} long outputs; evaluating reasoning quality over a long deliberation is a separate axis from reading length, and realistic suites (LongBench-style long-document QA, repo-level code tasks) increasingly combine both.
+\end{itemize}
+
+\textbf{Lost in the middle, quantified.} On multi-document QA, Liu et al.\ measured accuracy dropping by up to $\sim$20 points when the answer-bearing document sits mid-context rather than first or last---a U-shaped curve over answer position. The effect is \textit{partially fixed by training}: models that went through a native long-context stage flatten the U considerably at moderate lengths, but the dip re-emerges as you approach a model's effective-length limit. Treat position sensitivity as a property to measure, not an assumption in either direction.
+
+\begin{warningbox}
+\textbf{Never accept a claimed context length.} Before serving a long-context workload, run your own grid: NIAH as the smoke test, then a RULER-style aggregation/multi-hop suite at \textit{your} target lengths, with answer positions permuted. Extension retrofits in particular can hold perplexity flat while retrieval-in-context collapses---perplexity is not a long-context eval.
+\end{warningbox}
 
 %==============================================================================
 \section{RAG Architecture}
@@ -279,6 +328,53 @@ Cross-encoder & Best & Slow ($N$ passes) & None (no precompute) & Rerank only \\
 \end{warningbox}
 
 %==============================================================================
+\section{Beyond Top-$k$: GraphRAG, Contextual Retrieval, Agentic Retrieval}
+\label{sec:modern_rag}
+%==============================================================================
+
+The pipeline above---chunk, embed, retrieve top-$k$, rerank, generate---is the 2023 canonical stack. Three 2024--2026 developments extend it in different directions: GraphRAG changes \textit{what is indexed}, contextual retrieval and late chunking change \textit{how chunks are represented}, and agentic retrieval changes \textit{who drives the loop}.
+
+\subsection{GraphRAG}
+
+\textit{Pointer: the core RAG pipeline that GraphRAG extends is treated canonically in the NLP volume [NLP~9]; this subsection covers only the graph-based extension.}
+
+\textbf{The structural failure of top-$k$.} Vector retrieval answers \textit{local} questions---ones whose answer lives in a few passages. It structurally cannot answer \textit{corpus-level} questions: ``What are the main themes across these 10{,}000 support tickets?'' or ``How did our contract terms evolve over five years?'' No top-$k$ set of chunks contains the answer, because the answer is a property of the corpus, not of any passage. Retrieving more chunks does not fix this; the information must be \textit{aggregated at index time}.
+
+\textbf{Construction (Microsoft GraphRAG, 2024).} An LLM pass over every chunk extracts entities and relations, which are assembled into a knowledge graph. Community detection (Leiden) then partitions the graph into a hierarchy of communities, and the LLM writes a \textbf{community summary} for each node at each level---pre-computed aggregations of the corpus at multiple granularities.
+
+\textbf{Query time.} Route by query type:
+\begin{itemize}
+    \item \textbf{Global queries} (themes, trends, corpus-wide comparisons): map-reduce over community summaries---each relevant summary produces a partial answer, a final LLM call synthesizes them. This is what vanilla RAG cannot do at all.
+    \item \textbf{Local queries} (about a specific entity): enter the graph at the matched entities, expand along edges to neighbors and their source chunks. This also improves multi-hop entity questions, since relations are explicit edges rather than embedding-space neighbors.
+\end{itemize}
+
+\textbf{Cost and when to use it.} Index construction runs LLM calls over the entire corpus---orders of magnitude more expensive than embedding, and incremental updates are awkward (entity extraction is cheap to append; community structure and summaries need periodic rebuilds). Use GraphRAG when corpus-level sensemaking or entity-centric multi-hop questions are a first-class requirement; stay with vector top-$k$ for straightforward factual QA.
+
+\subsection{Contextual Retrieval and Late Chunking}
+
+\textit{Pointer: chunking fundamentals (strategies, sizes, parent-child) are covered above and canonically in [NLP~9]; this subsection covers the 2024 fix for context-starved chunks.}
+
+\textbf{The problem: chunks lose their document.} A chunk reading ``The company's revenue grew 3\% over the previous quarter'' is nearly useless in isolation---which company? which quarter? Pronouns, dangling references, and missing section headers make chunk embeddings poorly discriminative and defeat BM25 entirely. Parent-child retrieval fixes the \textit{generation} side (return more context to the LLM) but not the \textit{retrieval} side: the small chunk is still embedded without its context.
+
+\textbf{Contextual retrieval (Anthropic, 2024).} At index time, prompt an LLM with the \textit{full document plus the chunk} to generate 50--100 tokens of situating context (``This chunk is from ACME Corp's Q2 2023 SEC filing; the previous quarter's revenue was \ldots''), and prepend it to the chunk before embedding \textit{and} before BM25 indexing (contextual embeddings + contextual BM25). Anthropic reports top-20 retrieval failure rate reduced by $\sim$35\% with contextual embeddings, $\sim$49\% combined with contextual BM25, and $\sim$67\% with reranking added. The cost---one LLM call per chunk at index time---is made tolerable by prompt caching: the full-document prefix is cached once and reused across all of that document's chunks, so each chunk pays only for its own tokens plus the cached-input rate.
+
+\textbf{Late chunking.} A generation-free alternative: run the \textit{full document} through a long-context embedding model in one pass, then mean-pool the contextualized token embeddings within each chunk boundary \textit{afterwards}. Every chunk embedding is conditioned on the whole document (the tokens attended across chunk boundaries before pooling) without any LLM calls. Requires a long-context embedding model and only helps the dense side.
+
+\textbf{Choosing between them.} Contextual retrieval costs LLM tokens at index time but works with any embedder and fixes BM25 too; late chunking costs one embedding pass and nothing else but leaves sparse retrieval context-blind. Both compose with parent-child retrieval, which remains the generation-side complement.
+
+\subsection{Agentic Retrieval}
+
+\textit{Pointer: the single-pass RAG pipeline and its query-transformation variants are canonical in [NLP~9]; this subsection covers the shift from pipeline to loop.}
+
+\textbf{From pipeline to loop.} Instead of one retrieve-then-generate pass, retrieval becomes a \textbf{tool call} the model invokes zero or more times: retrieve, reason over the results, notice what is missing, reformulate, retrieve again, then answer. Multi-hop questions are handled naturally---the second query is \textit{conditioned on} the first hop's answer, which no single-pass system can do. Self-RAG and CRAG-style reflection compress this idea into trained behaviors: the model (or a lightweight critic) decides \textit{whether} to retrieve at all, grades the retrieved passages, and triggers corrective action (re-query, fall back to web search) when they are bad.
+
+\textbf{The live debate: does an agent with grep beat a vector DB?} Coding agents demonstrated that an agent iterating with exact-match search (\texttt{grep}/ripgrep) and file reads over a raw corpus often outperforms one-shot vector retrieval---on codebases, decisively. The reasons generalize: queries against code and structured corpora are precise identifiers (exact-match wins, embeddings paraphrase); the agent \textit{sees its results and iterates}, so a bad first query costs one loop iteration rather than the answer; and no index means no staleness, no chunking decisions, and no embedding-drift maintenance. The vector DB retains the advantage when the corpus is huge (iterating with grep over 25B tokens does not converge), when vocabulary mismatch is the dominant failure mode (users paraphrase; documents do not), and when a sub-second, fixed-latency single pass is required---an agentic loop costs several LLM calls and seconds to minutes. The 2026 trend is that cheaper, faster models plus prompt caching keep moving the crossover toward agentic search; the defensible interview answer is a hybrid: semantic retrieval as \textit{one tool among several} (alongside grep, metadata filters, and a citation graph) inside an agent loop, with the loop budget matched to query value.
+
+\begin{keyinsight}[Retrieval Is Becoming a Tool, Not a Pipeline]
+The 2023 question was ``design a RAG pipeline.'' The 2026 question is ``which retrieval tools do you expose to the agent, and when does the agent skip the vector DB entirely?'' Answering the second question well requires the first---the pipeline components do not disappear; they become tools whose invocation the model controls.
+\end{keyinsight}
+
+%==============================================================================
 \section{RAG Evaluation}
 \label{sec:rag_eval}
 %==============================================================================
@@ -366,13 +462,102 @@ Failure mode & ``Lost in the middle'' attention degradation & Retrieval misses r
 \textbf{When to combine both:} The most robust production pattern is RAG with a generous context window. Retrieve the top 20--30 chunks (filling 10K--30K tokens), then let the long-context model reason across all of them simultaneously. This avoids the ``lost in the middle'' problem of stuffing 100K tokens while retaining the cross-document reasoning strength of long context.
 
 \begin{warningbox}
-\textbf{``Lost in the middle'' is a real production risk.} Liu et al.\ (2024) showed that LLMs pay most attention to the beginning and end of their context window. Information placed in the middle of a 128K context is significantly more likely to be ignored. For long-context approaches, order your documents with the most relevant first and last. For RAG, this means the reranker's ordering directly impacts generation quality---do not treat the top-$k$ results as an unordered set.
+\textbf{``Lost in the middle'' is a real production risk.} Liu et al.\ (2024) showed that LLMs pay most attention to the beginning and end of their context window: on multi-document QA, accuracy drops by up to $\sim$20 points when the answer-bearing document sits mid-context rather than first or last---a U-shaped curve that native long-context training flattens but does not eliminate (Section~\ref{subsec:long_context_eval}). For long-context approaches, order your documents with the most relevant first and last. For RAG, this means the reranker's ordering directly impacts generation quality---do not treat the top-$k$ results as an unordered set.
 \end{warningbox}
 
 %==============================================================================
 \section{Interview Questions}
 \label{sec:rag_interview}
 %==============================================================================
+
+%--- New Q0a: Long-context extension under deadline ---
+
+\begin{interviewq}
+\textbf{Q: Your 8K-trained model must serve 64K contexts next month. What are your options, and what do they cost?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Frame the option space first.} An $8\times$ extension with a one-month deadline puts five options on the table, at different points on the quality--effort--risk frontier:
+
+\textbf{Option 1: Training-free RoPE rescaling (Dynamic NTK, dual-chunk attention).} Shippable this week: change the RoPE base (or chunk the position mapping) at inference so no rotary angle leaves the trained range. Zero training cost. Quality degrades toward the far end of the window, and $8\times$ is near the edge of what training-free methods deliver---acceptable as a stopgap behind a flag, not as the endpoint.
+
+\textbf{Option 2: PI / NTK-aware / YaRN with a brief fine-tune.} YaRN at $8$--$16\times$ with a short fine-tune on long sequences (a few hundred million to a few billion tokens, a tiny fraction of pretraining) is the best quality-per-GPU-hour among the retrofits (Section~\ref{subsec:inference_time_extension}). Fits the month, including data prep and evaluation. Risks: fine-tuning only on long data regresses short-context quality (mix lengths), and perplexity can stay flat while retrieval-in-context fails---gate the launch on NIAH plus a RULER-style suite at 64K, not on loss curves (Section~\ref{subsec:long_context_eval}).
+
+\textbf{Option 3: Continued pretraining with progressive lengths (the frontier recipe).} Raise the RoPE base, extend in stages 8K$\to$16K$\to$32K$\to$64K on a long-data mixture, then long-context SFT (Section~\ref{subsec:native_long_context}). Most robust; also the most expensive: long-document data curation, context-parallel training infrastructure (Chapter~\ref{chap:training_optimization}), and multiple weeks. The right roadmap item; risky as the only plan for a one-month deadline.
+
+\textbf{Option 4: Don't extend---RAG over the long input.} If ``64K support'' really means ``answer questions over long documents,'' chunk and retrieve within the existing 8K window. No model work at all. Fails when the task is holistic (summarize the whole deal, find contradictions across the document), which is exactly where long context earns its cost.
+
+\textbf{Option 5: Buy it.} Serve a model already trained to 64K+ (API or open weights) for the long-context traffic slice. Often the honest one-month answer if licensing, data governance, and quality allow.
+
+\textbf{The serving bill arrives regardless of method.} Whatever makes 64K \textit{work}, serving it costs:
+\begin{itemize}
+    \item \textbf{KV cache: $8\times$ per request.} For a 70B GQA model, per-token KV is $\approx 0.3$ MB, so a 64K request holds $\approx$20 GB of KV (vs.\ 2.5 GB at 8K)---concurrency per GPU collapses unless you add KV quantization, more HBM, or offloading. Do this arithmetic unprompted; the formula and worked example are in Chapter~\ref{chap:inference_optimization}.
+    \item \textbf{Prefill compute grows $\sim$64$\times$} in the quadratic attention term: time-to-first-token moves from sub-second to seconds. Chunked prefill and prefix caching become mandatory, not optional.
+    \item Long requests also occupy their KV for longer, compounding the throughput hit.
+\end{itemize}
+
+\textbf{Recommendation shape:} ship Option 1 behind a flag now, land Option 2 within the month as the supported path, put Option 3 on the roadmap, and route retrieval-style traffic to Option 4 so the expensive window is spent only on holistic tasks.
+
+\redflags
+\begin{itemize}
+    \item ``Set \texttt{max\_position\_embeddings} to 65536 and redeploy''---positions past 8K are out-of-distribution rotary angles; attention beyond the trained range is garbage without one of the options above.
+    \item Quoting perplexity as evidence that the extension worked.
+    \item No mention of serving cost---the KV and prefill bill is often the binding constraint, not model quality.
+\end{itemize}
+
+\interviewtest{Do you know the extension-method menu and its quality ladder, that the native training recipe---not YaRN---is the frontier answer, and do you connect a context-length decision to its KV-cache and prefill consequences?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names PI/NTK/YaRN, knows they need brief fine-tuning, and picks YaRN for $8\times$.
+    \item \badgeLsix{L6} Lays out the full option space including RAG and switching models, proposes an eval gate (NIAH as smoke test, RULER-style aggregation at 64K, short-context regression suite), and does the KV arithmetic.
+    \item \badgeLseven{L7} Proposes the staged derisking plan (training-free now, YaRN this month, continued pretraining on the roadmap), quantifies the concurrency/TTFT impact on serving economics, and routes by workload---holistic tasks get the window, retrieval-style tasks get RAG.
+\end{itemize}
+
+\followups{``Why does NTK-aware scaling preserve short-range quality better than PI?'' ``How much long data does the continued-pretraining stage need?'' ``What breaks first if you serve 64K with the KV cache quantized to INT4?''}
+\end{interviewq}
+
+%--- New Q0b: Long-context quality degradation debugging ---
+
+\begin{interviewq}
+\textbf{Q: Your model's quality degrades beyond 32K context. Walk me through the diagnosis.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Characterize the failure before touching anything.} Three discriminating questions: (1) Is the drop a \textit{cliff} at a specific length or a gradual slide? (2) Does it depend on \textit{where} in the context the needed information sits? (3) Does it reproduce with the serving stack taken out of the loop? The answers separate four root-cause families:
+
+\textbf{Hypothesis 1: Position OOD (cliff at a fixed length, task-independent).} The model's trained-or-extended positional range effectively ends near 32K: a YaRN/NTK-extended model being served past its extension target, or---the classic production bug---the serving stack silently ignoring the \texttt{rope\_scaling} config or applying different scaling parameters than fine-tuning used. Signature: a NIAH heatmap goes uniformly red past a fixed length column, at every depth. Fix: audit the serving config against the training config first; only genuine extension (Section~\ref{subsec:inference_time_extension}) or retraining fixes a real range limit.
+
+\textbf{Hypothesis 2: Lost in the middle (gradual, position-dependent).} Accuracy depends on answer position---the U-shaped curve, up to $\sim$20 points between mid-context and edge placement on multi-document QA (Section~\ref{subsec:long_context_eval}). Signature: permute the needle/answer position at a \textit{fixed} length; strong depth dependence with weak length dependence. Fix: reranker-aware ordering (most relevant first and last), fewer better chunks, or a model with a native long-context training stage.
+
+\textbf{Hypothesis 3: Serving-side KV compression (gradual, worsens with length).} KV-cache quantization (INT8/INT4) accumulates error over long sequences, and KV eviction---sliding windows or token-dropping heuristics---silently discards distant tokens. A 32K sliding window produces \textit{exactly} ``fine to 32K, degrades beyond.'' Signature: rerun the same prompts offline with full-precision, full-KV inference; if the gap closes, the model is innocent. Check \texttt{kv\_cache\_dtype}, sliding-window settings, and any cache-eviction policy in the serving config.
+
+\textbf{Hypothesis 4: Eval artifact.} The harness truncates inputs (tokenizer \texttt{max\_length}, template limits) so the needle never reaches the model; the chat template inflates token counts past the window; or the $>$32K test slice is drawn from a different, harder distribution (only certain domains produce 32K+ documents). Signature: log the exact token count entering the model and verify the needle survives preprocessing; compare task difficulty across length buckets.
+
+\textbf{Diagnostic order---cheapest first:} (1) eval harness + serving/training config diff (minutes); (2) full-precision, full-KV ablation (hours); (3) position-permutation NIAH grid (hours); (4) only then model-side work---extension fine-tuning or a long-context training stage (days to weeks).
+
+\redflags
+\begin{itemize}
+    \item Jumping straight to ``fine-tune on longer data''---the two most common real causes (config mismatch, serving-side KV policy) are fixable in an afternoon.
+    \item Diagnosing from a single aggregate score without a length $\times$ depth breakdown.
+    \item Not knowing what KV precision and eviction policy their own serving stack runs.
+\end{itemize}
+
+\interviewtest{Systematic isolation: model vs.\ serving stack vs.\ harness. Do you know the distinct signatures of position OOD, lost-in-the-middle, and KV compression, and do you order experiments by cost?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names lost-in-the-middle and out-of-distribution positions as candidate causes.
+    \item \badgeLsix{L6} Adds the serving-side (KV quantization/eviction, rope-scaling config drift) and eval-artifact families, with a discriminating experiment for each.
+    \item \badgeLseven{L7} Runs the decision tree in cost order, invokes the claimed-vs-effective context distinction, and institutionalizes the fix: a NIAH/RULER length-grid regression suite in CI so the next silent config change is caught before production.
+\end{itemize}
+
+\followups{``The NIAH grid is green but users still complain at 50K---what does that tell you?'' ``How would you detect a lost-in-the-middle regression in production without labels?'' ``Which KV quantization schemes degrade gracefully with length?''}
+\end{interviewq}
 
 %--- Rewritten Q1: Enterprise RAG system design ---
 
@@ -441,7 +626,7 @@ Failure mode & ``Lost in the middle'' attention degradation & Retrieval misses r
 
 \stronganswer
 
-\textbf{Scenario:} Enterprise Q\&A over a knowledge base. User asks a question; the system returns an answer grounded in documents. Compare two architectures using current API pricing (approximate as of 2024--2025).
+\textbf{Scenario:} Enterprise Q\&A over a knowledge base. User asks a question; the system returns an answer grounded in documents. Work with \textit{illustrative} prices and say so out loud: take $p_{\text{in}} = \$10$/M input tokens, $p_{\text{out}} = \$30$/M output tokens, and cached input at $\sim 0.1 \times p_{\text{in}} = \$1$/M as round numbers. API prices fall every year (most 2026 frontier prices are below these), so the durable content of this answer is the \textit{structure} of the comparison---input tokens dominate, caching rescales them---not the constants.
 
 \textbf{Long-context approach:} Stuff the full context window with relevant documents.
 \begin{itemize}
@@ -474,7 +659,7 @@ Failure mode & ``Lost in the middle'' attention degradation & Retrieval misses r
 
 \textbf{When long context is still worth the cost:} Single-document analysis (80-page contract), cross-document reasoning that RAG would miss, and low-volume high-value use cases where quality justifies cost.
 
-\textbf{Caching changes the math:} If users repeatedly query the same document set (e.g., multi-turn conversation over a contract), prefix caching reduces the cost of subsequent queries to near-zero for the cached prefix. In this case, long context becomes cost-competitive with RAG for multi-turn sessions.
+\textbf{Caching changes the math---quantify it.} APIs price cached input separately, at roughly $0.1\times$ the fresh-input rate (some charge a small premium, $\sim$1.25$\times$, to \textit{write} the cache). For a multi-turn session over the same 128K document set: turn 1 pays the full $\sim$\$1.28 and writes the cache; every later turn pays $128{,}000 \times \$1/10^6 \approx \$0.13$ for the cached prefix (plus output)---a $10\times$ reduction, and cache hits also skip prefill compute, so TTFT collapses too. Amortized over a 10-turn session: $(\$1.28 + 9 \times \$0.13)/10 \approx \$0.25$ per turn---no longer $29\times$ RAG's \$0.045 but $\sim$5--6$\times$, close enough that quality (cross-document reasoning) rather than cost should decide. Any caching argument that does not use the cached-input price is hand-waving.
 
 \redflags
 \begin{itemize}
@@ -713,7 +898,7 @@ This is not an either/or decision. The right choice depends on four factors: cor
 \textbf{Choose RAG when:}
 \begin{itemize}
     \item The corpus is large (10K+ documents). No context window can hold it all.
-    \item Cost matters. 128K input tokens at \$10/M = \$1.28/query. RAG with 5K tokens = \$0.05/query. At 10K queries/day: \$12,800/day vs.\ \$500/day.
+    \item Cost matters. At an illustrative \$10/M input tokens (state API prices as variables---they fall every year), 128K input = \$1.28/query vs.\ \$0.05/query for RAG with 5K tokens. At 10K queries/day: \$12,800/day vs.\ \$500/day. Cached-input pricing ($\sim$0.1$\times$ the fresh rate) shrinks the repeated-prefix case by $\sim$10$\times$ but does not close the gap for independent queries.
     \item The knowledge base updates frequently. Updating a vector index is cheap.
     \item You need source attribution. RAG provides ``answer from Document X, page Y'' naturally.
 \end{itemize}
@@ -724,7 +909,7 @@ This is not an either/or decision. The right choice depends on four factors: cor
     \item For multi-hop questions: retrieve, generate intermediate answer, retrieve again, generate final answer (``retrieve-and-reason'' loop).
 \end{itemize}
 
-\textbf{The ``lost in the middle'' problem:} LLMs pay most attention to the beginning and end of context. Information in the middle of a 128K context is significantly more likely to be ignored. For long context: order documents with the most relevant first and last. For RAG: the reranker's ordering directly impacts generation quality.
+\textbf{The ``lost in the middle'' problem:} LLMs pay most attention to the beginning and end of context---up to $\sim$20 points of multi-document QA accuracy separate mid-context from edge placement (partially fixed by modern long-context training; Section~\ref{subsec:long_context_eval}). For long context: order documents with the most relevant first and last. For RAG: the reranker's ordering directly impacts generation quality.
 
 \redflags
 \begin{itemize}

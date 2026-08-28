@@ -2,7 +2,7 @@
 \label{chap:attention_transformers}
 
 \begin{tldr}
-Attention mechanisms enable neural networks to dynamically focus on relevant parts of the input. This chapter covers the mathematical foundations of attention (additive, multiplicative, scaled dot-product), self-attention and multi-head attention, the complete Transformer architecture, positional encodings (sinusoidal, learned, RoPE, ALiBi), efficient attention variants (sparse, linear, Flash Attention), and modern design choices (pre-norm, GQA, SwiGLU). Understanding attention deeply---including computational complexity and memory requirements---is essential for staff-level ML interviews.
+Attention mechanisms enable neural networks to dynamically focus on relevant parts of the input. This chapter covers the mathematical foundations of attention (additive, multiplicative, scaled dot-product), self-attention and multi-head attention, the complete Transformer architecture, positional encodings (sinusoidal, learned, RoPE, ALiBi), efficient attention variants (fixed and trainable sparsity, linear attention, FlashAttention 1--3 and Flash-Decoding, MQA/GQA/MLA), and modern design choices (pre-norm, GQA, SwiGLU, and the 2024--26 refinements: QK-norm, interleaved sliding-window attention, large vocabularies). Understanding attention deeply---including computational complexity and memory requirements---is essential for staff-level ML interviews.
 \end{tldr}
 
 \section{Attention as a Computational Primitive}
@@ -40,57 +40,19 @@ The choice of alignment function $e_i = f(\vq, \vk_i)$ defines different attenti
 \label{sec:attention_types}
 %==============================================================================
 
-\subsection{Additive (Bahdanau) Attention}
+\subsection{Additive (Bahdanau) and Multiplicative (Luong) Attention}
 
-\begin{mathresult}{Additive Attention}
+The first attention mechanisms came from neural machine translation. \textbf{Additive (Bahdanau) attention} (Bahdanau et al., 2014) scores each query--key pair with a small MLP:
 \begin{equation}
 e_i = \vv_a^T \tanh(\mW_q \vq + \mW_k \vk_i + \vb)
 \end{equation}
-where $\mW_q \in \R^{d_a \times d_q}$, $\mW_k \in \R^{d_a \times d_k}$, and $\vv_a \in \R^{d_a}$.
-\end{mathresult}
+\textbf{Multiplicative (Luong) attention} (Luong et al., 2015) replaces the MLP with a bilinear form $e_i = \vq^T \mW_a \vk_i$, or a plain dot product $e_i = \vq^T \vk_i$ when query and key dimensions match.
 
-\textbf{Properties}:
-\begin{itemize}
-    \item Parameters: $d_a(d_q + d_k + 1)$
-    \item Allows different query and key dimensions
-    \item More expressive (nonlinear combination)
-    \item Slower due to the MLP
-\end{itemize}
+\textbf{Additive vs.\ multiplicative.} Multiplicative attention is faster in practice because the score computation reduces to a single matrix multiply, which is heavily optimized on GPUs. Additive attention is more expressive for small $d_k$ because the $\tanh$ nonlinearity can learn complex alignment patterns. For large $d_k$ (as in Transformers), the expressivity gap vanishes and the speed advantage of multiplicative attention dominates. This is why scaled dot-product attention became the standard.
 
-\textbf{Historical context}: Introduced in the seminal neural machine translation paper (Bahdanau et al., 2014).
+\textbf{Local attention precursor.} Luong also proposed a \emph{local} variant that predicts an aligned position $p_t$ and attends only to a window $[p_t - D, p_t + D]$---$O(D)$ per step regardless of source length, and a direct precursor of the sliding-window attention in modern efficient Transformers (Longformer, Mistral).
 
-\subsection{Multiplicative (Luong) Attention}
-
-\textbf{Luong Attention.} Introduced by Luong et al.\ (2015) as a simpler and faster alternative to Bahdanau attention for sequence-to-sequence models. The core idea: compute alignment scores using multiplicative (bilinear) functions instead of an additive MLP.
-
-\begin{mathresult}{Luong Attention --- Three Score Functions}
-\begin{align}
-\text{Dot:} \quad e_i &= \vh_t^T \bar{\vh}_s \label{eq:luong_dot} \\
-\text{General:} \quad e_i &= \vh_t^T \mW_a \bar{\vh}_s \label{eq:luong_general} \\
-\text{Concat:} \quad e_i &= \vv_a^T \tanh(\mW_a [\vh_t ; \bar{\vh}_s]) \label{eq:luong_concat}
-\end{align}
-where $\vh_t$ is the current decoder hidden state and $\bar{\vh}_s$ are encoder hidden states.
-\end{mathresult}
-
-\textbf{Key difference from Bahdanau}: Bahdanau uses the \emph{previous} decoder hidden state $\vh_{t-1}$ to compute attention (because the context feeds into the current step's RNN input). Luong uses the \emph{current} top-layer decoder hidden state $\vh_t$, which is simpler to implement and avoids the recurrence dependency in the attention computation.
-
-\textbf{Properties}:
-\begin{itemize}
-    \item Simpler, faster (no nonlinearity in dot/general variants)
-    \item Dot product requires $d_q = d_k$
-    \item General form adds expressivity with $\mW_a$
-    \item Concat variant is functionally equivalent to Bahdanau (additive) attention
-\end{itemize}
-
-\textbf{Global vs.\ Local Attention.} Luong also introduced a \textbf{local attention} variant:
-\begin{itemize}
-    \item \textbf{Global attention}: Computes alignment over \emph{all} source positions (same as standard soft attention). Cost is $O(n)$ per decoder step.
-    \item \textbf{Local attention}: Predicts an aligned position $p_t$ and attends only to a window $[p_t - D, p_t + D]$. This is $O(D)$ per step regardless of source length---a precursor to the sliding-window attention used in modern efficient Transformers (Longformer, Mistral).
-\end{itemize}
-
-\textbf{When to use additive vs.\ multiplicative?} Multiplicative (dot/general) is faster in practice because the score computation reduces to a single matrix multiply, which is heavily optimized on GPUs. Additive attention is more expressive for small $d_k$ because the $\tanh$ nonlinearity can learn complex alignment patterns. For large $d_k$ (as in Transformers), the expressivity gap vanishes and the speed advantage of multiplicative attention dominates. This is why scaled dot-product attention became the standard.
-
-\textbf{Historical significance}: Luong attention (2015) and Bahdanau attention (2014) together established the attention vocabulary---queries, keys, values, alignment scores---that Vaswani et al.\ (2017) generalized into self-attention and the Transformer. The progression from additive $\to$ multiplicative $\to$ scaled dot-product is a direct lineage.
+\textbf{Lineage}: Bahdanau (2014) and Luong (2015) established the attention vocabulary of queries, keys, values, and alignment scores that Vaswani et al.\ (2017) generalized into self-attention and the Transformer. The progression from additive $\to$ multiplicative $\to$ scaled dot-product is a direct lineage.
 
 \subsection{Scaled Dot-Product Attention}
 
@@ -245,6 +207,10 @@ Empirical observations:
     \item \textbf{Delimiter heads}: Attend to [SEP], periods
     \item \textbf{Previous/next token heads}: Local context
 \end{itemize}
+
+\begin{keyinsight}[Induction Heads: The Mechanistic View]
+Mechanistic interpretability decomposes a head into two circuits: the \textbf{QK circuit} decides \textit{where} to attend, and the \textbf{OV circuit} decides \textit{what} information is copied to the output once attention lands there. The best-understood composite mechanism is the \textbf{induction head}: given a repeated pattern $[A][B] \ldots [A]$, it attends from the second $[A]$ to the token \textit{after} the previous occurrence of $[A]$ and copies it---predicting $[B]$. It works via two-layer composition: an earlier ``previous-token head'' writes each token's predecessor into the residual stream, so the induction head's QK circuit can match ``current token $=$ token that preceded you,'' and its OV circuit copies the matched token forward. Olsson et al.\ (2022) showed induction heads form abruptly during a phase change early in training, coincident with the emergence of in-context learning---the leading mechanistic account of why Transformers can learn from their prompt. The modern answer to ``what do attention heads do'' is this circuit-level story, not BERT-era probing taxonomies.
+\end{keyinsight}
 
 %==============================================================================
 \section{The Transformer Architecture}
@@ -622,6 +588,23 @@ Attend to positions at fixed intervals, similar to dilated convolutions.
 \label{fig:attention_patterns}
 \end{figure}
 
+\subsection{Trainable Sparse Attention (NSA, MoBA)}
+\label{sec:trainable_sparse}
+
+Longformer/BigBird-style patterns are \textit{fixed}: a human decides the sparsity mask (window, strides, global tokens) and bolts it onto the architecture. Two problems follow. First, the important tokens for a given query are content-dependent, so any fixed mask discards relevant context. Second, irregular gather patterns map poorly onto tensor cores, so theoretical FLOP savings often fail to become wall-clock savings. The 2025--26 generation of sparse attention fixes both by making the sparsity pattern \textbf{learned, content-dependent, and hardware-aligned}---and by training with it from scratch rather than retrofitting it.
+
+\textbf{DeepSeek NSA (Native Sparse Attention, 2025).} Each query combines three parallel branches through learned per-head gates:
+\begin{enumerate}
+    \item \textbf{Compression}: keys/values are aggregated block-wise by a learned MLP into coarse summary tokens---a cheap low-resolution view of the whole context.
+    \item \textbf{Selection}: attention scores against the compressed blocks rank the full-resolution blocks; the top-$n$ blocks are kept and attended to exactly (fine-grained view where it matters).
+    \item \textbf{Sliding window}: a local window preserves recent context, so the other two branches don't have to relearn local patterns.
+\end{enumerate}
+The design is \textit{hardware-aligned}: everything operates on contiguous blocks (GPU-friendly loads, GQA-group-aware KV sharing), so the sparsity actually converts into speed---roughly an order of magnitude at 64K context across prefill and decode. Crucially, NSA is \textbf{trained natively}, end-to-end from pretraining: the model learns \textit{where} to attend sparsely, instead of having a fixed mask imposed post-hoc, and matches or beats full attention on benchmarks at the same scale.
+
+\textbf{MoBA (Mixture of Block Attention, Moonshot AI, 2025).} The same idea via mixture-of-experts routing: partition the context into blocks, mean-pool each block's keys, and let a gate route each query to its top-$k$ blocks; full attention runs only within the selected blocks. Because the mask degenerates gracefully to full attention (select all blocks), MoBA can be toggled between sparse and full attention during training---used in Kimi's long-context models.
+
+\textbf{Production status.} DeepSeek-V3.2's DSA (DeepSeek Sparse Attention) put NSA-lineage trainable sparsity into a flagship production model, cutting long-context inference cost enough to drive API price cuts. The interview-relevant summary: the 2026 answer to ``how do production models do sub-quadratic attention'' is trainable, block-level, content-dependent sparsity (NSA/MoBA/DSA)---citing only Longformer/BigBird dates you to 2020.
+
 \subsection{Linear Attention}
 
 \textbf{Key idea.} Replace the softmax with a decomposable kernel $\phi(\vq)^T \phi(\vk)$, enabling the computation to be rearranged from $O(n^2 d)$ to $O(n d^2)$---linear in sequence length.
@@ -758,7 +741,7 @@ Flash Attention is not a different attention mechanism---it computes \textbf{exa
 
 \subsubsection{The Memory Bottleneck}
 
-Standard attention materializes the full $n \times n$ attention matrix in GPU HBM (high bandwidth memory). But GPU SRAM (fast on-chip memory) is much smaller (20 MB vs 40 GB on A100). The bottleneck is memory I/O, not compute.
+Standard attention materializes the full $n \times n$ attention matrix in GPU HBM (high bandwidth memory). But GPU SRAM (fast on-chip memory) is much smaller (20 MB vs 40 GB on A100; the ratio is similar on H100: $\sim$33 MB of SRAM vs 80 GB of HBM3). The bottleneck is memory I/O, not compute.
 
 \subsubsection{Flash Attention Approach}
 
@@ -784,6 +767,15 @@ where $m = \max_j x_j$. Can be computed incrementally as blocks arrive.
 
 \textbf{Used in}: Essentially all modern LLM training and inference
 
+\subsubsection{FlashAttention-3: Hopper-Native Attention}
+
+FA1/FA2 were designed around Ampere (A100); on Hopper (H100) FA2 reaches only $\sim$35\% of peak. \textbf{FlashAttention-3} (2024) rewrites the kernel for Hopper's hardware features: \textbf{warp specialization} splits each thread block into producer warps that issue asynchronous \textbf{TMA} (Tensor Memory Accelerator) copies from HBM to SRAM and consumer warps that run the tensor-core matmuls, so data movement overlaps compute; interleaved (``pingpong'') scheduling hides the slow softmax exponentials behind the matmuls of another block; and \textbf{FP8 attention} with block quantization and an incoherent-processing (Hadamard) trick controls outlier error, roughly doubling throughput again. Result: $\sim$75\% H100 utilization ($\sim$740 TFLOPS in FP16, $\sim$1.5$\times$--2$\times$ over FA2 on the same silicon, approaching 1.2 PFLOPS in FP8). The lesson generalizes: each GPU generation changes the optimal tiling/scheduling, so ``Flash Attention'' is a family of hardware-specific kernels, not one algorithm.
+
+\subsubsection{Flash-Decoding: Split-KV Parallelism for Decode}
+\label{sec:flash_decoding}
+
+Vanilla FA parallelizes across batch, heads, and \textit{query blocks}---abundant during training and prefill. During decode there is exactly \textbf{one query token} per step, so at small batch only (batch $\times$ heads) thread blocks exist and most of the GPU idles while the KV cache is read serially. \textbf{Flash-Decoding} (Dao et al., 2023) restores parallelism along the only axis left: the \textbf{KV sequence}. It splits the cached K/V into chunks, computes partial attention (with running max/sum statistics) for each chunk in parallel across SMs, then merges the partials in a cheap log-sum-exp reduction---exact, by the same algebra as online softmax. This saturates memory bandwidth for long-context decode (up to $\sim$8$\times$ faster generation at 64K+ context) and is the standard answer to ``FA doesn't help decode'': split-KV kernels are built into vLLM, FlashInfer, and TensorRT-LLM.
+
 \begin{interviewq}
 \textbf{Q: Explain Flash Attention. Why is it faster even though it does the same computation?}
 
@@ -792,8 +784,8 @@ where $m = \max_j x_j$. Can be computed incrementally as blocks arrive.
 \stronganswer Flash Attention computes \textit{exactly} the same result as standard attention, but reorganizes the computation to minimize memory I/O:
 
 \begin{enumerate}
-    \item \textbf{Problem}: Standard attention materializes the full $n \times n$ matrix in slow HBM memory (40 GB on A100, $\sim$2 TB/s bandwidth). The bottleneck is reading/writing this matrix, not computing it---attention is memory-bound, not compute-bound.
-    \item \textbf{Solution}: Process attention in tiles that fit in fast SRAM (20 MB on A100, $\sim$19 TB/s bandwidth). Use the online softmax trick to compute exact softmax incrementally without ever materializing the full matrix. Each tile computes a partial softmax, maintaining running max and sum statistics that get corrected as new tiles arrive.
+    \item \textbf{Problem}: Standard attention materializes the full $n \times n$ matrix in slow HBM memory (40 GB on A100 at $\sim$2 TB/s; 80 GB HBM3 on H100 at $\sim$3.35 TB/s). The bottleneck is reading/writing this matrix, not computing it---attention is memory-bound, not compute-bound.
+    \item \textbf{Solution}: Process attention in tiles that fit in fast SRAM (20 MB on A100 at $\sim$19 TB/s; H100's SRAM is similarly tiny relative to HBM). Use the online softmax trick to compute exact softmax incrementally without ever materializing the full matrix. Each tile computes a partial softmax, maintaining running max and sum statistics that get corrected as new tiles arrive.
     \item \textbf{Result}: Memory drops from $O(n^2)$ to $O(n)$. Speed improves 2--4$\times$ because operations become compute-bound rather than memory-bound. Enables longer sequences that would otherwise OOM.
 \end{enumerate}
 
@@ -809,11 +801,11 @@ where $m = \max_j x_j$. Can be computed incrementally as blocks arrive.
 \goodgreat
 \begin{itemize}
     \item \badgeLfive{L5} Explains the tiling approach and that it's exact, not approximate. Knows memory drops from $O(n^2)$ to $O(n)$.
-    \item \badgeLsix{L6} Can explain the online softmax trick, knows the SRAM/HBM sizes on A100, understands the arithmetic intensity shift from memory-bound to compute-bound. Mentions Flash Attention 2 improvements (better parallelism, causal masking optimization).
-    \item \badgeLseven{L7} Discusses implications for system design: Flash Attention changes which operations are the bottleneck (now FFN, not attention). Knows that vanilla FA gives little benefit in the decode phase (a single query has no large attention matrix to avoid; short-context decode is bound by loading model weights)---but that Flash-Decoding (split-KV parallelism) is the standard fix for long-context decode, where reading the KV cache becomes the bottleneck. Can reason about when IO-aware algorithms matter beyond attention.
+    \item \badgeLsix{L6} Can explain the online softmax trick, knows the SRAM/HBM sizes on A100/H100, understands the arithmetic intensity shift from memory-bound to compute-bound. Mentions Flash Attention 2 improvements (better parallelism, causal masking optimization).
+    \item \badgeLseven{L7} Discusses implications for system design: Flash Attention changes which operations are the bottleneck (now FFN, not attention). Knows that vanilla FA gives little benefit in the decode phase (a single query has no large attention matrix to avoid; short-context decode is bound by loading model weights)---but that Flash-Decoding (split-KV parallelism, Section~\ref{sec:flash_decoding}) is the standard fix for long-context decode, where reading the KV cache becomes the bottleneck. Knows FlashAttention-3's Hopper redesign (warp specialization, TMA async copies, FP8, $\sim$75\% H100 utilization). Can reason about when IO-aware algorithms matter beyond attention.
 \end{itemize}
 
-\followups{``What's the online softmax trick?'' ``When would Flash Attention NOT help?'' (Small sequences where attention isn't the bottleneck; naive short-context decode where the bottleneck is weight loading---though Flash-Decoding's split-KV parallelism does help long-context decode.) ``What changed in Flash Attention 2 vs 1?'' (Better work partitioning across thread blocks, reduced non-matmul FLOPs.)}
+\followups{``What's the online softmax trick?'' ``When would Flash Attention NOT help?'' (Small sequences where attention isn't the bottleneck; naive short-context decode where the bottleneck is weight loading---though Flash-Decoding's split-KV parallelism does help long-context decode.) ``What changed in Flash Attention 2 vs 1? And 3 vs 2?'' (FA2: better work partitioning across thread blocks, reduced non-matmul FLOPs. FA3: Hopper-native---warp-specialized producer/consumer pipelines with TMA async copies, softmax-matmul overlap, FP8 support.)}
 \end{interviewq}
 
 %==============================================================================
@@ -821,24 +813,41 @@ where $m = \max_j x_j$. Can be computed incrementally as blocks arrive.
 \label{sec:modern_design}
 %==============================================================================
 
-\subsection{Architecture Comparison: GPT-2 vs LLaMA}
+\subsection{Architecture Evolution: GPT-2 $\to$ LLaMA $\to$ Modern (2024--26)}
 
 \begin{table}[H]
 \centering
-\caption{Evolution of Transformer design choices}
-\begin{tabularx}{\textwidth}{lXX}
+\caption{Evolution of Transformer design choices across three periods}
+\begin{tabularx}{\textwidth}{lXXX}
 \toprule
-\textbf{Component} & \textbf{GPT-2 (2019)} & \textbf{LLaMA (2023)} \\
+\textbf{Component} & \textbf{GPT-2 (2019)} & \textbf{LLaMA (2023)} & \textbf{Modern (2024--26)} \\
 \midrule
-Normalization & LayerNorm & RMSNorm \\
-Norm placement & Post-norm & Pre-norm \\
-Position encoding & Learned & RoPE \\
-Activation & GELU & SwiGLU \\
-Attention & Multi-head & Grouped-query (LLaMA 2) \\
-Bias terms & Yes & No \\
+Normalization & LayerNorm & RMSNorm & RMSNorm; sandwich (pre+post) in Gemma \\
+Norm placement & Post-norm & Pre-norm & Pre-norm + QK-norm \\
+Logit control & --- & --- & QK-norm; soft-capping (Gemma-2) \\
+Position encoding & Learned & RoPE (base 10K) & RoPE, base 500K--1M \\
+Activation & GELU & SwiGLU & SwiGLU (unchanged) \\
+Attention & Multi-head & Grouped-query (LLaMA 2) & GQA/MLA; interleaved SWA + full layers \\
+Vocabulary & $\sim$50K & 32K & 128K--256K \\
+Embeddings & Tied & Untied & Tied in small models \\
+Bias terms & Yes & No & No \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+\subsection{The 2024--26 Refinements}
+\label{sec:modern_2024_26}
+
+The LLaMA recipe (pre-norm RMSNorm, RoPE, SwiGLU, GQA, no biases) froze into the open-weight default by 2023. The changes since then form a coherent third period, driven by two pressures: \textit{training stability at scale} and \textit{long-context inference cost}.
+
+\begin{itemize}
+    \item \textbf{QK-norm}: apply RMSNorm to queries and keys before the dot product, bounding attention logits by construction. Adopted by Qwen3, Gemma-3, and most 2025-era models as the fix for attention-logit growth that $1/\sqrt{d_k}$ scaling alone cannot prevent (Chapter~\ref{chap:activation_normalization} covers the normalization mechanics).
+    \item \textbf{Logit soft-capping}: Gemma-2 instead bounded logits with $z \leftarrow c \cdot \tanh(z/c)$ ($c{=}50$ for attention, $30$ for the final logits). It worked but broke stock FlashAttention kernels; Gemma-3 dropped it in favor of QK-norm---a nice case study in a design choice being superseded within one generation.
+    \item \textbf{Interleaved sliding-window/full attention}: rather than every layer paying full $O(n^2)$ attention and full KV cache, alternate cheap sliding-window layers with occasional full-attention layers. Gemma-2 alternated 1:1; Gemma-3 pushed to \textbf{5:1} (five 1K-window layers per full layer), cutting KV-cache memory several-fold with negligible perplexity cost. Mistral's rolling-buffer KV cache is the same idea operationally: a window-sized circular buffer per layer bounds cache growth.
+    \item \textbf{RoPE base scaling}: the RoPE base grew from 10K to \textbf{500K (Llama 3.1) and 1M+} so that rotation frequencies stay resolvable across 128K--1M contexts, combined with the context-extension toolbox of Section~\ref{sec:positional} (position interpolation, NTK-aware scaling, YaRN). Long context became a pretraining design parameter, not a fine-tuning afterthought.
+    \item \textbf{Vocabulary growth}: LLaMA-2's 32K gave way to \textbf{128K (Llama 3) and 256K (Gemma)}. Bigger vocabularies spend parameters on the embedding table but buy shorter sequences ($\sim$15\% fewer tokens for the same text), which cuts $O(n^2)$ attention cost and improves multilingual coverage---reversing the earlier ``smaller vocab is better'' lesson.
+    \item \textbf{Tied embeddings in small models}: at 1--4B scale the embedding table is a large fraction of all parameters (256K $\times$ 2304 $\approx$ 0.6B in Gemma-2 2B), so small models re-tie input and output embeddings; large models keep them untied where the table is a rounding error.
+\end{itemize}
 
 \subsection{RMSNorm vs LayerNorm}
 
@@ -970,7 +979,7 @@ With $f=4$: FLOPs per layer $\approx 24nd^2 + 4n^2d$
 
 \textbf{Total}: $\sim$130--140 GB without gradient checkpointing. With mixed-precision training (BF16 compute, FP32 master weights).
 
-\textbf{To fit on 1$\times$ A100 80GB}: Need ZeRO-3 (shard optimizer states + gradients + params across GPUs), or at minimum ZeRO-2 + gradient checkpointing on 2$\times$ A100.
+\textbf{To fit on 1$\times$ A100 80GB}: Need ZeRO-3 (shard optimizer states + gradients + params across GPUs), or at minimum ZeRO-2 + gradient checkpointing on 2$\times$ A100. The arithmetic is identical on an H100 (also 80 GB, HBM3 at 3.35 TB/s---faster, not bigger); an H200's 141 GB changes the sharding math but still doesn't fit $\sim$130 GB comfortably with headroom for activations.
 
 \redflags
 \begin{itemize}
@@ -988,7 +997,7 @@ With $f=4$: FLOPs per layer $\approx 24nd^2 + 4n^2d$
     \item \badgeLseven{L7} Discusses memory fragmentation overhead ($\sim$10--20\% extra). Knows activation memory depends on sequence length quadratically (attention) vs linearly (FFN). Can compare FSDP vs DeepSpeed ZeRO tradeoffs. Mentions that communication volume differs by ZeRO stage.
 \end{itemize}
 
-\followups{``What changes if we use sequence length 32K instead of 2K?'' (Activation memory explodes due to $O(n^2)$ attention, unless Flash Attention is used.) ``How many A100s do you need to train this model?'' ``What's the difference between ZeRO-1, ZeRO-2, and ZeRO-3?''}
+\followups{``What changes if we use sequence length 32K instead of 2K?'' (Activation memory explodes due to $O(n^2)$ attention, unless Flash Attention is used.) ``How many A100s (or H100s) do you need to train this model?'' ``What's the difference between ZeRO-1, ZeRO-2, and ZeRO-3?''}
 \end{interviewq}
 
 \begin{interviewq}
@@ -1115,6 +1124,41 @@ Dividing by $\sqrt{d_k}$ restores unit variance: if $\vq, \vk \sim \mathcal{N}(0
 \end{interviewq}
 
 \begin{interviewq}
+\textbf{Q: Your large BF16 pretraining run shows intermittent loss spikes. Instrumentation shows attention logits growing into the hundreds over training. Diagnose and fix.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer This is \textbf{attention-logit growth}, a canonical large-scale instability. The $1/\sqrt{d_k}$ scaling only guarantees unit-variance logits at \textit{initialization}; during training the norms of $\mW^Q$ and $\mW^K$ (and of the residual stream) grow, so $\vq^T\vk$ logits can grow without bound. The failure chain: large logits $\to$ softmax saturates to one-hot (attention entropy collapse) $\to$ tiny gradients through most of the softmax with occasional huge ones $\to$ loss spikes. BF16 makes it worse not by overflowing (its exponent range matches FP32) but through its 8-bit mantissa: at magnitude $\sim$256 the spacing between representable values exceeds 1, so nearby logits become indistinguishable and $\exp(\cdot)$ can still overflow if the softmax is computed without max-subtraction.
+
+\textbf{Diagnosis}: (1) log the \textbf{max attention logit} per layer per head over training---the standard early-warning metric (ViT-22B; Wortsman et al.'s small-scale proxies work); a slow upward trend into the 50--100+ range predicts spikes before they happen. (2) Correlate spike steps with which layer's logits blew up. (3) Confirm numerics hygiene: softmax with max-subtraction, FP32 accumulation inside attention (FlashAttention does both by default).
+
+\textbf{The mitigation ladder} (in order of modern preference):
+\begin{enumerate}
+    \item \textbf{QK-norm}: RMSNorm applied to queries and keys before the dot product---bounds logits by construction, negligible cost, composes with FlashAttention. The 2025-era default (Qwen3, Gemma-3); see the normalization chapter (Chapter~\ref{chap:activation_normalization}) and its NaN-loss debugging question for the general instability workflow.
+    \item \textbf{Logit soft-capping}: $z \leftarrow c \cdot \tanh(z/c)$ (Gemma-2, $c{=}50$). Works, but breaks stock fused attention kernels and was dropped by Gemma-3 in favor of QK-norm.
+    \item \textbf{Training-side levers} if you cannot change the architecture mid-run: lower peak LR / extend warmup, tighter gradient clipping, and z-loss on the output softmax for the sibling divergence at the LM head.
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``BF16 has FP32's range, so nothing can overflow'' --- misses precision collapse at large magnitudes and $\exp(\cdot)$ overflow without max-subtraction.
+    \item ``Just lower the learning rate'' --- symptom-level fix; the logit growth resumes and you've paid a convergence tax.
+    \item Not knowing QK-norm exists, or proposing to fix it purely with more aggressive gradient clipping.
+\end{itemize}
+
+\interviewtest{Whether you have operated (or could operate) a real large-scale run: monitoring the right scalar (max logit) before failure, knowing why $\sqrt{d_k}$ scaling is insufficient, and knowing the current mitigation stack and its kernel-compatibility trade-offs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Connects logit growth to softmax saturation and proposes clipping/LR changes plus some form of logit bounding.
+    \item \badgeLsix{L6} Names QK-norm and soft-capping, knows who uses them and why soft-capping lost, and proposes max-logit monitoring as the leading indicator rather than waiting for spikes.
+    \item \badgeLseven{L7} Discusses the BF16 mantissa mechanism quantitatively, the interaction with fused kernels (why soft-capping was operationally painful), z-loss for the output softmax, and how to intervene mid-run (warm-restart with QK-norm inserted vs riding it out with LR surgery)---and can cite the max-logit growth literature (ViT-22B, Wortsman et al.).
+\end{itemize}
+
+\followups{``Why doesn't the $1/\sqrt{d_k}$ scaling prevent this?'' (It normalizes only under init-time variance assumptions; learned correlations grow.) ``Where exactly does QK-norm go, and what does it cost?'' ``Your run is 40\% done and spiking---do you restart with QK-norm or patch with LR/clipping?''}
+\end{interviewq}
+
+\begin{interviewq}
 \textbf{Q: Calculate the FLOPs for a single forward pass through a 7B parameter Transformer.}
 
 \badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
@@ -1153,7 +1197,7 @@ For $L=32, d=4096, n=2048$:
 \begin{itemize}
     \item \badgeLfive{L5} Knows the $2P$ forward, $6P$ training rule. Gets the right order of magnitude.
     \item \badgeLsix{L6} Can derive per-layer breakdown. Knows the attention term ($4n^2d$) vs projection term ($24nd^2$). Can identify when attention FLOPs dominate (when $n > 6d$, roughly $n > 24K$ for $d=4096$).
-    \item \badgeLseven{L7} Can convert FLOPs to wall-clock time given GPU specs (A100 = 312 TFLOPS BF16). Knows MFU (Model FLOPs Utilization) is typically 40--60\%. Can estimate total training cost: Chinchilla-optimal for 7B $\approx$ 140B tokens $\rightarrow$ $6 \times 7B \times 140B = 5.88 \times 10^{21}$ FLOPs $\approx$ 9--13K A100-hours at 40--60\% MFU.
+    \item \badgeLseven{L7} Can convert FLOPs to wall-clock time given GPU specs (A100 = 312 TFLOPS BF16; H100 $\approx$ 990 TFLOPS dense BF16---quote the dense number, not the 2:4-sparsity 1979). Knows MFU (Model FLOPs Utilization) is typically 40--60\%. Can estimate total training cost: Chinchilla-optimal for 7B $\approx$ 140B tokens $\rightarrow$ $6 \times 7B \times 140B = 5.88 \times 10^{21}$ FLOPs $\approx$ 9--13K A100-hours, or $\approx$ 2.7--4.1K H100-hours, at 40--60\% MFU.
 \end{itemize}
 
 \followups{``How does this change at 128K context?'' ``What's the training cost in GPU-hours?'' ``Where does the $6P$ come from?'' (2P forward + 4P backward.)}
@@ -1202,7 +1246,7 @@ LLaMA 70B specs: 80 layers, 8 KV heads (GQA), $d_{\text{head}} = 128$, BF16 (2 b
     \item \badgeLseven{L7} Reasons about system-level implications: at 128K with 42 GB KV cache per sequence, batch size is effectively 1 on a single 80 GB A100 (after model weights). Proposes disaggregated prefill/decode, or prefix caching for shared system prompts. Mentions H200 with 141 GB HBM3e (the H100 has 80 GB) or multi-GPU serving as solutions.
 \end{itemize}
 
-\followups{``How would you reduce this KV cache size?'' ``What batch size can you support on 8xA100?'' ``How does prefix caching help for chatbot workloads?''}
+\followups{``How would you reduce this KV cache size?'' ``What batch size can you support on 8xA100 (or 8xH100---same 80 GB, 3.35 TB/s HBM3)?'' ``How does prefix caching help for chatbot workloads?''}
 \end{interviewq}
 
 \begin{interviewq}
@@ -1389,10 +1433,12 @@ Six key changes, each with a clear motivation:
     \item \textbf{GELU $\to$ SwiGLU}: Gating provides multiplicative interaction. Better empirical performance. Uses 3 weight matrices (up, gate, down) instead of 2, so FFN expansion adjusted from 4$\times$ to $\sim$2.67$\times$.
     \item \textbf{MHA $\to$ GQA} (LLaMA 2): Reduces KV cache for inference by sharing KV heads across query head groups. Minimal quality impact.
     \item \textbf{Bias terms removed}: Slightly fewer parameters, marginal speedup, no quality loss. Simpler.
-    \item \textbf{Vocabulary size 50K $\to$ 32K}: LLaMA uses SentencePiece BPE vs GPT-2's BPE. Smaller vocab = smaller embedding table, but this varies by model.
+    \item \textbf{Vocabulary size 50K $\to$ 32K}: LLaMA uses SentencePiece BPE vs GPT-2's BPE. Smaller vocab = smaller embedding table---but note this claim \textit{reversed} after LLaMA (see below).
 \end{enumerate}
 
 \textbf{The meta-lesson}: Every change was motivated by either \textit{training stability} (pre-norm, RMSNorm), \textit{inference efficiency} (GQA, no bias), or \textit{better quality per FLOP} (SwiGLU, RoPE). The architecture evolved toward simplicity and efficiency, not complexity.
+
+\textbf{And what changed after LLaMA (2024--26)}: the same two pressures continued. For stability: QK-norm on queries/keys (Qwen3, Gemma-3; Chapter~\ref{chap:activation_normalization}) and, transiently, Gemma-2's logit soft-capping. For inference cost: interleaved sliding-window/full attention layers (Gemma-3's 5:1 ratio; Mistral's rolling-buffer cache) and MLA-style KV compression. RoPE bases scaled to 500K--1M for 128K+ contexts (Llama 3.1). And the vocabulary claim inverted: Llama 3 went to 128K and Gemma to 256K tokens, because a bigger vocab shortens sequences (cheaper $O(n^2)$ attention, better multilingual fertility)---while small models re-tied embeddings to absorb the bigger table. A complete answer tells the story through 2026, not just to 2023.
 
 \redflags
 \begin{itemize}
@@ -1406,10 +1452,10 @@ Six key changes, each with a clear motivation:
 \begin{itemize}
     \item \badgeLfive{L5} Names at least 4 of the 6 changes with correct motivations.
     \item \badgeLsix{L6} Explains the \textit{why} behind each change (stability, efficiency, quality). Can discuss the SwiGLU expansion factor adjustment. Knows that these choices are now standard across Mistral, Qwen, Yi, etc.
-    \item \badgeLseven{L7} Discusses what might change next: QK-Norm for extreme scale, mixture of experts (Mixtral), deeper-and-narrower vs wider-and-shallower tradeoffs, potential move to post-norm with proper initialization, $\mu$P for hyperparameter transfer across scales.
+    \item \badgeLseven{L7} Continues the story past LLaMA: QK-norm and (briefly) soft-capping for stability, interleaved SWA/full layers and MLA for KV cost, RoPE base scaling to 500K--1M, the vocab reversal to 128K--256K, tied embeddings in small models, mixture of experts (Mixtral, DeepSeek). Knows which 2023 claims aged badly (``smaller vocab is better'') and can name what is still genuinely open ($\mu$P-style hyperparameter transfer, post-norm revivals, attention-free hybrids).
 \end{itemize}
 
-\followups{``Why RMSNorm specifically rather than LayerNorm?'' ``What's the SwiGLU expansion factor and why?'' ``What do you expect to change next?''}
+\followups{``Why RMSNorm specifically rather than LayerNorm?'' ``What's the SwiGLU expansion factor and why?'' ``And what changed after LLaMA---walk me through 2024--26.'' ``What do you expect to change next?''}
 \end{interviewq}
 
 \begin{interviewq}

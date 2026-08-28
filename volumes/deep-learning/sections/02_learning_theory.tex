@@ -2,7 +2,7 @@
 \label{chap:learning_theory}
 
 \begin{tldr}
-This chapter covers learning theory concepts crucial for understanding why deep learning works: the bias-variance trade-off, double descent phenomenon, scaling laws, the lottery ticket hypothesis, grokking, and emergent abilities. These concepts are frequently discussed in staff-level interviews when evaluating model capacity and generalization.
+This chapter covers learning theory concepts crucial for understanding why deep learning works: the bias-variance trade-off, double descent phenomenon, scaling laws (including how they are fit, data-constrained scaling, and the test-time-compute axis), the lottery ticket hypothesis, grokking, and emergent abilities. These concepts are frequently discussed in staff-level interviews when evaluating model capacity and generalization.
 \end{tldr}
 
 Staff-level interviewers probe learning theory to assess whether you understand \textit{why} scaling up works, when to stop training, and how to reason about model capacity. Expect questions on double descent, Chinchilla scaling, emergent abilities, and why over-parameterized models generalize. These topics separate candidates who memorize recipes from those who can reason from first principles about what will happen when you change the data, the model, or the compute budget.
@@ -256,6 +256,31 @@ Optimal ratio: $D \approx 20N$ (tokens $\approx$ 20 × parameters)
 
 \textbf{Implication}: GPT-3 (175B params, 300B tokens) was undertrained. Chinchilla (70B params, 1.4T tokens) outperforms both GPT-3 and its compute-matched sibling Gopher (280B) at the same training budget as Gopher.
 
+\subsection{The Joint Parametric Form and How Scaling Laws Are Fit}
+\label{sec:scaling_fitting}
+
+The single-variable power laws above are slices of a joint loss surface. The form Chinchilla actually fit---and the one to write down when asked to design a scaling study---is:
+
+\begin{mathresult}{Chinchilla Joint Parametric Form}
+\begin{equation}
+L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}
+\end{equation}
+with fitted values (Hoffmann et al., 2022): $E \approx 1.69$, $A \approx 406$, $B \approx 411$, $\alpha \approx 0.34$, $\beta \approx 0.28$.
+\end{mathresult}
+
+Each term has a meaning: $E$ is the irreducible entropy of the data---the floor an infinite model trained on infinite data would reach; $A/N^{\alpha}$ is the penalty for finite capacity; $B/D^{\beta}$ is the penalty for finite data. Minimizing $L(N,D)$ subject to $C = 6ND$ (a one-line Lagrange calculation) gives $N_{\text{opt}} \propto C^{\beta/(\alpha+\beta)}$ and $D_{\text{opt}} \propto C^{\alpha/(\alpha+\beta)}$; with $\alpha \approx \beta$, both exponents are $\approx 0.5$---which is exactly where ``scale $N$ and $D$ together'' and the 20:1 ratio come from.
+
+\textbf{The three fitting approaches.} Chinchilla ran all three; their mutual agreement is the actual evidence for the 20:1 rule:
+\begin{enumerate}
+    \item \textbf{Fixed-$N$ sweeps}: Train a grid of model sizes, each over a range of token counts. For each compute budget, read off which $(N, D)$ pair achieved the minimum loss, then fit $N_{\text{opt}}(C)$ through those minima.
+    \item \textbf{IsoFLOP profiles}: Fix several total budgets $C$ and vary $N$ (with $D = C/6N$). Loss vs.\ $N$ at fixed $C$ traces a parabola on a log axis; its minimum is $N_{\text{opt}}(C)$. This is the cleanest visualization and the standard picture in scaling papers.
+    \item \textbf{Parametric fit}: Fit $L(N,D) = E + A/N^{\alpha} + B/D^{\beta}$ directly to all runs (in practice: a Huber loss on log-space residuals, minimized from a grid of initializations to avoid bad local optima), then optimize the fitted surface analytically.
+\end{enumerate}
+
+\begin{warningbox}
+Every fit point must come from a run whose learning-rate schedule was \textit{completed} at that token count. Reading intermediate losses off one long run silently inflates them (the LR has not yet decayed), and this---together with omitting embedding parameters in the parameter count at small scale---is a large part of why Kaplan et al.\ (2020) concluded $N_{\text{opt}} \propto C^{0.73}$ (scale model size much faster than data) while Chinchilla's corrected fits gave $C^{0.5}$. The two papers disagreed about experimental method, not about nature.
+\end{warningbox}
+
 \subsection{Implications for Practice}
 
 \begin{table}[H]
@@ -362,6 +387,53 @@ Using the Chinchilla compute law $C \approx 6ND$ (where $C$ = FLOPs, $N$ = param
 \medskip
 
 \begin{interviewq}
+\textbf{Q: You get 1\% of the target training budget to run scaling experiments that must predict the final run's loss. Design the study.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Frame the budget first: if the target run costs $C$, the study gets $0.01C$. That is enough for $\sim$20 runs spanning two-plus orders of magnitude of compute below the target---provided the largest experiment stays around $10^{-3}C$ and a reserve is kept for reruns.
+
+\textbf{Design:}
+\begin{enumerate}
+    \item \textbf{Freeze everything that must match the target}: tokenizer, data mixture (same sampling weights, same dedup pipeline), architecture family, context length. If the mixture or preprocessing shifts between the small runs and the target, the fit is invalid before it starts.
+    \item \textbf{IsoFLOP grid}: Pick $\sim$4 compute budgets logarithmically spaced (e.g., $10^{-5}C$ to $3 \times 10^{-3}C$); at each, train $\sim$5 model sizes spanning roughly an order of magnitude around the expected optimum, with $D = C_i/6N$. Total $\approx 0.7\%$ of $C$, leaving reserve.
+    \item \textbf{Scale hyperparameters, do not copy them}: every run gets its own \textit{completed} LR decay to its final token count (never intermediate checkpoints of a longer run); peak LR is re-tuned per scale or transferred in a principled way ($\mu$P); batch size stays below the critical batch size at every scale so the compute accounting is honest.
+    \item \textbf{Fit}: $L(N,D) = E + A/N^{\alpha} + B/D^{\beta}$ with a Huber loss on log-residuals from a grid of initializations; cross-check against the IsoFLOP-minima fit (Section~\ref{sec:scaling_fitting})---the two should agree.
+    \item \textbf{Validate before believing}: hold out the largest compute tier, fit on the rest, and check the prediction error on the held-out tier; bootstrap the fit for a confidence interval. Report predicted loss as a band, not a point---you are extrapolating $\sim$2 orders of magnitude.
+    \item \textbf{Deliverable}: $N_{\text{opt}}$, $D_{\text{opt}}$, predicted loss $\pm$ CI, plus the explicit caveat that the fit predicts \textit{loss} only---downstream benchmark accuracy does not extrapolate (see the emergence discussion).
+\end{enumerate}
+
+\textbf{Failure modes} (the standard follow-up is ``your extrapolation missed by 2$\times$---why?''):
+\begin{itemize}
+    \item \textbf{LR schedule not scaled}: fit points taken from intermediate checkpoints of one cosine run, or one peak LR reused across all scales (the optimum shifts with scale unless you use $\mu$P).
+    \item \textbf{Mixture shift across scales}: small runs on a convenience subset with different composition, or multi-epoch at small scale while the target is single-epoch.
+    \item \textbf{Fitting range too narrow}: an exponent fitted over 1--1.5 orders of magnitude and extrapolated over 2+ amplifies small exponent errors exponentially.
+    \item Batch size above the critical batch size at some scales (wasted FLOPs corrupt the compute axis); evaluation noise at the smallest scales dominating the fit.
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item ``Train one small model and scale its loss by the textbook exponent'' (no fit, no uncertainty, wrong exponents for your data)
+    \item Using intermediate losses of a single long run as fit points (the Kaplan-vs-Chinchilla lesson)
+    \item Promising benchmark scores from a loss extrapolation
+\end{itemize}
+
+\interviewtest{Can you design an experiment under a hard budget constraint, and do you know where scaling-law fits break in practice? This distinguishes having read Chinchilla from having reproduced it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the idea: several small runs, fit a power law, extrapolate.
+    \item \badgeLsix{L6} Designs an IsoFLOP grid, insists on completed LR schedules per point, fits the joint parametric form, and cross-checks two fitting approaches.
+    \item \badgeLseven{L7} Validates on a held-out compute tier with bootstrap uncertainty, uses $\mu$P for hyperparameter transfer, knows the Kaplan-vs-Chinchilla methodology story, budgets a rerun reserve, and states explicitly what the study cannot predict.
+\end{itemize}
+
+\followups{``Your extrapolation came in 2$\times$ off---list causes in priority order.'' (LR schedule not scaled, mixture shift across scales, fitting range too narrow, batch size off the critical-batch curve.) ``How does $\mu$P change this study?'' (Hyperparameters tuned at small width transfer to large width, removing the per-scale LR sweep.) ``The target run will repeat data---does the fit still hold?'' (Not directly; see the data-constrained scaling discussion below.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
 \textbf{Q: Neural scaling laws: what scales and what does not? When do they break?}
 
 \badgeLseven{L7} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
@@ -409,6 +481,45 @@ Using the Chinchilla compute law $C \approx 6ND$ (where $C$ = FLOPs, $N$ = param
 
 \followups{``How would you use scaling laws to plan a training run?'' (Train 3--5 small models at different scales, fit the power law, extrapolate to target compute. Add safety margin for distribution shift between small and large scale.) ``Do scaling laws hold for fine-tuning?'' (Approximately yes for loss, but with different exponents and higher sensitivity to data quality.)}
 \end{interviewq}
+
+\subsection{Data-Constrained Scaling}
+\label{sec:data_constrained}
+
+Chinchilla assumes unlimited fresh data: every one of the $D$ tokens is unique. The 2026 reality is different---frontier runs already consume most of the usable web---so the binding question became: \textit{what happens when you must repeat data?} Muennighoff et al.\ (2023) answered it quantitatively by training hundreds of models at varying unique-data budgets and epoch counts:
+
+\begin{itemize}
+    \item \textbf{Up to $\sim$4 epochs, repetition is nearly free}: loss after 4 passes over $D$ unique tokens is almost indistinguishable from one pass over $4D$ fresh tokens.
+    \item \textbf{Returns decay rapidly after that}: they fit an effective-data form in which the marginal value of a repeated token decays exponentially with epoch count.
+    \item \textbf{Past $\sim$16 epochs, additional repetition is essentially worthless}: extra compute spent on more passes buys no loss reduction---the model has extracted what the corpus contains.
+    \item Under a data constraint, the compute-optimal allocation shifts: relative to naive Chinchilla on the unique-token count, train \textit{smaller models for more epochs} rather than scaling parameters into data the model will only memorize.
+\end{itemize}
+
+\textbf{The ceiling.} Estimates of usable, deduplicated, quality-filtered web text land around 10--20T tokens. Frontier pretraining runs already train on 15--40T tokens, so the 4-epoch grace period stretches the wall to perhaps 50--80T effective tokens---while compute budgets keep growing on a much faster schedule than the web does.
+
+\textbf{What labs do at the wall:}
+\begin{enumerate}
+    \item \textbf{Mine non-web pools}: code and multilingual corpora add tens of trillions of tokens and improve reasoning and transfer beyond their own domains.
+    \item \textbf{Synthetic data with verification}: model-generated math and code filtered by execution, checkers, or verifiers; rephrased and textbook-style corpora. Verifiability is the load-bearing word---unverified synthetic data risks degenerate self-training loops, which is why math and code lead this wave.
+    \item \textbf{Curation over collection}: aggressive dedup, filtering, and quality weighting shift the effective scaling exponents---the same loss from fewer, better tokens.
+    \item \textbf{Spend compute on a different axis}: epochs to the $\sim$4-epoch point, then inference-time compute (next subsection).
+\end{enumerate}
+
+\begin{keyinsight}[Epochs Are Nearly Free, Until They Are Worthless]
+Repeating the corpus up to $\sim$4 epochs costs almost nothing relative to fresh data; by $\sim$16 epochs, further repetition contributes essentially zero. ``We are running out of web data'' therefore really means ``we are running out of cheap epochs'': the wall sits $\sim$4$\times$ further out than single-epoch accounting suggests---and then it is genuinely a wall, which is why frontier labs pivot to code, multilingual, and verified synthetic data rather than more passes.
+\end{keyinsight}
+
+\subsection{The Third Axis: Test-Time Compute}
+\label{sec:third_axis}
+
+Until 2024, ``scaling'' meant two train-time axes: parameters $N$ and data $D$. Reasoning models (OpenAI o1 in 2024, DeepSeek-R1 in 2025) opened a third: \textbf{FLOPs spent per query at inference}. RL on verifiable rewards trains models to emit long chains of thought before answering, and accuracy on reasoning benchmarks then scales roughly log-linearly with the compute spent thinking---a lever that exists \textit{after} training is finished. In the Chinchilla frame: train-time compute buys a better per-token distribution; test-time compute spends extra forward passes to extract more reliability from a fixed model. The two are partially fungible, which breaks the old assumption that capability is fixed at training time.
+
+Sequential scaling spends the budget on one longer chain of thought---deliberation, self-checking, backtracking---and pays in \textit{latency}, since thinking tokens are generated serially. Parallel scaling spends it on $N$ independent samples plus a selection rule (best-of-$N$ against a verifier or reward model, self-consistency majority voting) and pays in \textit{throughput} while keeping wall-clock latency near a single generation.
+
+\textbf{Compute-optimal test-time scaling} (Snell et al., 2024): at a fixed inference-FLOP budget, the optimal split between model size and per-query search is \textit{difficulty-dependent}. On easy and medium problems, a smaller model plus many samples and a selector beats a much larger model sampled once, because the small model's coverage (pass@$N$) is already high and selection converts coverage into accuracy. On the hardest problems, coverage is the binding constraint---pass@$N$ stays near zero no matter how large $N$---and no selection mechanism can help; capability must come from parameters and training. The selector is also a ceiling of its own: against an imperfect verifier, large $N$ increasingly harvests false positives---Goodhart's law at inference time.
+
+\textbf{When it substitutes for parameters---and when it cannot.} Test-time compute substitutes for model size when the task is verifiable (or a good selector exists), base-model coverage is nonzero, and the latency budget tolerates thinking. It does \textit{not} substitute for knowledge: a small model cannot think its way to facts it never stored, so recall-heavy workloads still scale with parameters (or get retrieval instead). Economically, total cost $=$ training $+$ inference $\times$ queries now contains a per-query knob set at serving time: ``what size model should we train'' becomes entangled with a routing and thinking-budget policy---cheap fast paths for easy queries, deliberation for hard ones.
+
+The machinery behind this axis---GRPO and RL on verifiable rewards, the R1 training recipe, budget forcing, best-of-$N$ and verifier-based selection, and the serving implications of decode-heavy reasoning workloads---is covered in Section~\ref{sec:reasoning_ttc} of Chapter~\ref{chap:reinforcement_learning}; the prompting-side view (chain-of-thought and self-consistency as user-level techniques) is in the NLP volume (see [NLP 7], Volume II). The reason this subsection exists is that no 2026 scaling answer may stop at Chinchilla: ``how would you spend $10\times$ more compute'' now has three legitimate answers---bigger $N$, more $D$, or more inference---and a strong candidate weighs all three.
 
 \section{The Lottery Ticket Hypothesis}
 \label{sec:lottery_ticket}
@@ -538,17 +649,19 @@ Using the Chinchilla compute law $C \approx 6ND$ (where $C$ = FLOPs, $N$ = param
 
 \begin{table}[H]
 \centering
-\caption{Examples of emergent abilities}
-\begin{tabularx}{\textwidth}{lXr}
+\caption{Commonly cited emergence thresholds---as reported in 2022, with their current status}
+\begin{tabularx}{\textwidth}{lXX}
 \toprule
-\textbf{Ability} & \textbf{Description} & \textbf{Emerges at} \\
+\textbf{Ability} & \textbf{2022-era threshold} & \textbf{Status by 2026} \\
 \midrule
-In-context learning & Learn from examples in prompt & ~10B params \\
-Chain-of-thought & Multi-step reasoning & ~100B params \\
-Instruction following & Follow arbitrary instructions & ~10B params \\
+In-context learning & $\sim$10B params (GPT-3-era recipes) & Routine in sub-1B models trained on modern data mixtures \\
+Instruction following & $\sim$10B params & Sub-1B instruct-tuned models follow instructions competently \\
+Chain-of-thought reasoning & $\sim$100B params & Distilled 1.5B reasoning models produce coherent multi-step chains \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+Read the middle column as an \textbf{artifact of that era's training recipes}, not a property of scale itself. The 2022 thresholds were measured on models trained on lightly filtered web text with no instruction data, no reasoning traces, and no distillation. Once a capability has been discovered at scale, better data (instruction mixes, curated chain-of-thought) and distillation reliably move it into models 10--100$\times$ smaller---exactly what the metric-artifact reading of emergence predicts. Quote the historical numbers as data points about 2022 recipes, never as laws. The debate itself has also moved: the 2026 version asks whether RL post-training \textit{creates} new capabilities or \textit{elicits} ones already latent in the base model (the pass@$k$ vs.\ pass@1 argument)---see Chapter~\ref{chap:reinforcement_learning}.
 
 \subsection{Debate on Emergence}
 

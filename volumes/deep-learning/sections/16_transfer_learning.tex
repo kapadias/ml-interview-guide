@@ -2,7 +2,7 @@
 \label{chap:transfer_learning}
 
 \begin{tldr}
-Transfer learning leverages knowledge from pre-trained models for new tasks. This chapter covers when and how to fine-tune (full vs. frozen backbone vs. layer-wise), and critically, parameter-efficient fine-tuning (PEFT) methods: LoRA, QLoRA, Adapters, Prefix Tuning, and Prompt Tuning. Understanding PEFT is essential for modern LLM applications and a frequent staff-level interview topic.
+Transfer learning leverages knowledge from pre-trained models for new tasks. This chapter covers when and how to fine-tune (full vs. frozen backbone vs. layer-wise), and critically, parameter-efficient fine-tuning (PEFT) methods: LoRA, QLoRA, the modern LoRA lineage (DoRA, rsLoRA, LoRA+, PiSSA), Adapters, Prefix Tuning, and Prompt Tuning. It also covers the SFT mechanics that separate ``read about LoRA'' from ``shipped a fine-tune''---loss masking, sequence packing, chat templates, vocabulary extension---and how to serve many adapters from one base model. PEFT mechanics are canonical here; the end-to-end adaptation lifecycle and pre-training data pipelines are covered in the NLP volume.
 \end{tldr}
 
 \section{Transfer Learning Fundamentals}
@@ -54,7 +54,11 @@ Different domain, abundant data & Low-moderate & May not need transfer \\
 \label{sec:finetuning_strategies}
 %==============================================================================
 
-\subsection{Strategy Overview}
+\subsection{The Landscape in 2026}
+
+The classic transfer-learning playbook---download an ImageNet backbone or a BERT checkpoint, then choose among feature extraction, gradual unfreezing, and full fine-tuning---was developed for models small enough to fine-tune on one GPU. In 2026 the dominant transfer pattern is \textbf{foundation-model adaptation}: a large pre-trained model adapted with parameter-efficient methods (Section~\ref{sec:peft}) plus the supervised fine-tuning mechanics of Section~\ref{sec:sft_mechanics}. The vision-era menu below still applies to encoder models (BERT-class classifiers, ViT backbones) and still appears as an interview warm-up, so know it---but the Staff-level depth lives in the PEFT and SFT sections that follow. The end-to-end adaptation lifecycle (pre-train vs.\ continue pre-training vs.\ fine-tune vs.\ prompt) and pre-training data pipelines are treated in the NLP volume's \emph{Pre-training, Fine-tuning, and Transfer Learning} chapter; this chapter is the canonical home for PEFT mechanics.
+
+\subsection{The Classic Menu, Compressed}
 
 \begin{figure}[H]
 \centering
@@ -117,101 +121,17 @@ Different domain, abundant data & Low-moderate & May not need transfer \\
 \label{fig:finetuning_strategies}
 \end{figure}
 
-\subsection{Feature Extraction (Frozen Backbone)}
-
-\textbf{Approach}: Freeze all pre-trained weights, only train new task head.
-
-\textbf{When to use}:
 \begin{itemize}
-    \item Very limited target data
-    \item Source and target domains very similar
-    \item Computational constraints
-    \item Avoid catastrophic forgetting
+    \item \textbf{Feature extraction (frozen backbone)}: freeze every pre-trained weight and train only a new task head (\texttt{requires\_grad = False} on the backbone). The right choice for very small datasets, very similar domains, tight compute, or when catastrophic forgetting must be avoided entirely.
+    \item \textbf{Full fine-tuning}: update every parameter. Maximum capacity to adapt; warranted for abundant data or large domain shift. Risks overfitting and forgetting pre-trained knowledge, and at LLM scale requires the memory budget analyzed in Section~\ref{sec:peft}.
+    \item \textbf{Gradual unfreezing (ULMFiT, 2018)}: train the head first, then unfreeze layers top-down a few epochs at a time, with discriminative learning rates $\eta_\ell = \eta_{base} \cdot \gamma^{L-\ell}$ ($\gamma \approx 0.9$) so early, general-purpose layers move less than late, task-specific ones. Historically important; in modern practice its role is filled by PEFT, which sidesteps the freeze-schedule question entirely. Know the idea, not the schedule.
 \end{itemize}
 
-\textbf{Implementation}:
-\begin{lstlisting}[language=Python]
-# Freeze backbone
-for param in model.backbone.parameters():
-    param.requires_grad = False
-
-# Only head is trainable
-model.head = nn.Linear(hidden_size, num_classes)
-\end{lstlisting}
-
-\subsection{Full Fine-Tuning}
-
-\textbf{Approach}: Update all parameters on target task.
-
-\textbf{When to use}:
-\begin{itemize}
-    \item Sufficient target data
-    \item Domains differ significantly
-    \item Maximum performance needed
-\end{itemize}
-
-\textbf{Caution}: Can overfit or forget pre-trained knowledge.
-
-\subsection{Gradual Unfreezing}
-
-\textbf{Approach}: Start with frozen backbone, progressively unfreeze layers.
-
-\begin{algorithm}[H]
-\caption{Gradual Unfreezing (ULMFiT)}
-\begin{algorithmic}[1]
-\STATE Train only task head for $k$ epochs
-\FOR{$i = N$ down to 1}
-    \STATE Unfreeze layer $i$
-    \STATE Train for $k$ epochs with discriminative learning rates
-\ENDFOR
-\end{algorithmic}
-\end{algorithm}
-
-\textbf{Discriminative learning rates}:
-\begin{equation}
-\eta_\ell = \eta_{base} \cdot \gamma^{L-\ell}
-\end{equation}
-Earlier layers get smaller learning rates ($\gamma \approx 0.9$).
+\textbf{Selection heuristic} (in place of the old decision tree): the less data you have and the closer the domains, the more you freeze (feature extraction, low-rank PEFT); the more data and the larger the shift, the more you train (higher-rank PEFT, then full fine-tuning). For anything LLM-sized, the practical question is no longer \emph{which layers to unfreeze} but \emph{which PEFT configuration}---see the selection table in Section~\ref{sec:transfer_practical}.
 
 \subsection{Layer-wise Learning Rate Decay (LLRD)}
 
-\begin{equation}
-\eta_\ell = \eta_{base} \cdot \text{decay}^{L - \ell}
-\end{equation}
-
-\textbf{Typical values}:
-\begin{itemize}
-    \item BERT fine-tuning: decay = 0.95
-    \item Later layers (task-specific): Higher LR
-    \item Earlier layers (general features): Lower LR
-\end{itemize}
-
-\subsection{Strategy Selection}
-
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-    node distance=1cm,
-    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, font=\small},
-    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2cm, font=\small},
-    arrow/.style={->, thick}
-]
-    \node[decision] (data) {Target data size?};
-    
-    \node[result, below left=1.2cm and 0.5cm of data] (frozen) {Feature Extraction};
-    \node[decision, below right=1.2cm and 0.5cm of data] (domain) {Domain shift?};
-    
-    \node[result, below left=1cm and 0cm of domain] (gradual) {Gradual Unfreeze};
-    \node[result, below right=1cm and 0cm of domain] (full) {Full Fine-tuning};
-    
-    \draw[arrow] (data) -- node[above left, font=\small] {Small} (frozen);
-    \draw[arrow] (data) -- node[above right, font=\small] {Large} (domain);
-    \draw[arrow] (domain) -- node[left, font=\small] {Small} (gradual);
-    \draw[arrow] (domain) -- node[right, font=\small] {Large} (full);
-\end{tikzpicture}
-\caption{Fine-tuning strategy decision tree.}
-\label{fig:ft_decision}
-\end{figure}
+The one encoder-era technique still in routine use for \emph{full} fine-tuning of encoder models: scale the learning rate per layer, $\eta_\ell = \eta_{base} \cdot \text{decay}^{L-\ell}$ with decay $\approx 0.95$ for BERT-class models, so early layers (general features) change slowly while later layers (task-specific features) change quickly. LLRD is a soft, continuous version of gradual unfreezing that needs no unfreeze schedule, and it remains the default recipe for squeezing the last points out of a BERT/RoBERTa/DeBERTa fine-tune. For decoder LLMs trained with LoRA it is rarely used---the adapter's structure already constrains how far the model can drift.
 
 %==============================================================================
 \section{Parameter-Efficient Fine-Tuning (PEFT)}
@@ -428,6 +348,65 @@ QLoRA (4-bit base) & ~6 GB & Single GPU (24GB) \\
 \end{enumerate}
 
 %------------------------------------------------------------------------------
+\subsection{The Modern LoRA Lineage}
+\label{subsec:lora_lineage}
+%------------------------------------------------------------------------------
+
+Vanilla LoRA (2021) spawned a family of refinements that are standard vocabulary by 2026. Each fixes a specific, nameable weakness; an interviewer who asks ``what beats vanilla LoRA?'' expects you to know which weakness each variant targets, not just the names.
+
+\subsubsection{DoRA: Weight-Decomposed Low-Rank Adaptation}
+
+DoRA (2024) decomposes each weight into a magnitude and a direction and adapts them separately:
+\begin{equation}
+\mW_{DoRA} = \underbrace{\vphantom{\frac{\mW_0}{\norm{\mW_0}}}m}_{\text{trained directly}} \cdot \frac{\mW_0 + \mB\mA}{\norm{\mW_0 + \mB\mA}_c}
+\end{equation}
+where $\norm{\cdot}_c$ is the column-wise norm and $m$ is a trainable magnitude vector (one entry per column). The motivation is empirical: analyzing full fine-tuning shows it makes substantial \emph{directional} updates with relatively independent magnitude changes, whereas vanilla LoRA couples the two through a single low-rank term. Decoupling lets the low-rank part specialize on direction, and DoRA consistently beats LoRA at low rank ($r = 4$--$16$), at the cost of roughly 20\% training-time overhead from the norm computations. At inference the decomposition collapses back into a single weight matrix, so it merges exactly like LoRA---serving cost is unchanged.
+
+\subsubsection{rsLoRA: Rank-Stabilized Scaling}
+
+Vanilla LoRA scales the update by $\alpha/r$. rsLoRA (2023) argues this is the wrong rank dependence:
+\begin{equation}
+\vh = \mW_0\vx + \frac{\alpha}{\sqrt{r}}\,\mB\mA\vx \quad \text{instead of} \quad \vh = \mW_0\vx + \frac{\alpha}{r}\,\mB\mA\vx
+\end{equation}
+For the adapter's output (and its gradients) to have a magnitude that neither explodes nor vanishes as rank grows, the scale must shrink like $1/\sqrt{r}$, not $1/r$: with $r$ approximately-independent rank-one contributions, their sum grows like $\sqrt{r}$. Dividing by $r$ therefore \emph{over}-shrinks the update as rank increases, so high-rank adapters ($r \geq 64$) learn as slowly as low-rank ones and waste the capacity you paid for---the folk observation that ``increasing rank stops helping'' is partly an artifact of the $\alpha/r$ convention, not a property of the task. With $\alpha/\sqrt{r}$, higher ranks buy real quality on hard adaptations (new languages, large domain shift). One flag in HF PEFT (\texttt{use\_rslora=True}).
+
+\subsubsection{LoRA+: Asymmetric Learning Rates for A and B}
+
+LoRA+ (2024) trains $\mB$ with a larger learning rate than $\mA$: $\eta_B = \lambda\,\eta_A$ with $\lambda \approx 16$ in practice. An infinite-width analysis shows that a single shared learning rate makes the update badly scaled for wide models: $\mB$ (zero-initialized, projecting the $r$-dimensional bottleneck back up to $d$ dimensions) ends up undertrained relative to $\mA$, so feature learning is inefficient. The fix is free---an optimizer parameter group---and yields modest but consistent gains (1--2\%) and up to $\sim$2$\times$ faster convergence.
+
+\subsubsection{PiSSA: SVD-Based Initialization}
+
+PiSSA (2024) keeps LoRA's architecture but changes the initialization. Take the truncated SVD $\mW_0 \approx \mU_r \bm{\Sigma}_r \mV_r^\top$, initialize $\mB = \mU_r \bm{\Sigma}_r^{1/2}$ and $\mA = \bm{\Sigma}_r^{1/2}\mV_r^\top$, and freeze the residual $\mW_{res} = \mW_0 - \mB\mA$ as the base. Training then starts in the directions where the pre-trained weight has the most energy, instead of a random subspace (Gaussian $\mA$, zero $\mB$): convergence is faster and final quality often better. A second benefit in the QLoRA setting: quantizing the residual (whose largest singular values have been removed) instead of the full weight reduces quantization error.
+
+\subsubsection{One-Liners You Should Recognize}
+
+\begin{itemize}
+    \item \textbf{AdaLoRA} (2023): allocates rank per layer adaptively during training by importance-pruning singular directions---the answer to ``is one global rank optimal?'' (it is not).
+    \item \textbf{VeRA} (2024): a single pair of \emph{frozen random} low-rank matrices shared across all layers; only tiny per-layer scaling vectors are trained, shrinking per-task checkpoints by another order of magnitude at some quality cost.
+    \item \textbf{IA3} (2022): no low-rank matrices at all---learned element-wise rescaling vectors on keys, values, and FFN activations; even fewer parameters than LoRA, from the T-Few few-shot recipe.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{The LoRA lineage at a glance}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Method} & \textbf{One-line mechanism} & \textbf{Weakness it fixes} & \textbf{Cost vs.\ LoRA} \\
+\midrule
+DoRA & Magnitude/direction decomposition & Quality gap at low rank & $\sim$20\% slower training \\
+rsLoRA & $\alpha/\sqrt{r}$ scaling & $\alpha/r$ wastes high rank & Free (one flag) \\
+LoRA+ & LR($\mB$) $\approx 16\times$ LR($\mA$) & Undertrained $\mB$ & Free (optimizer config) \\
+PiSSA & SVD init of $\mA, \mB$ & Random-subspace init & One-time SVD \\
+AdaLoRA & Learned per-layer rank & Uniform-rank waste & Training overhead \\
+VeRA & Frozen shared $\mA,\mB$ + scaling vectors & Per-task storage & Quality dip on hard tasks \\
+IA3 & Activation rescaling vectors & (Different niche: few-shot) & Fewest parameters \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{When any of this matters vs.\ vanilla-LoRA-is-fine.} Vanilla LoRA at $r = 16$, $\alpha = 32$, all-linear targets remains the right default for the majority of SFT jobs; data quality and learning rate dominate any variant effect. Reach for rsLoRA whenever you raise rank to 64+ (large domain shift, new language)---otherwise the $\alpha/r$ convention silently cancels the capacity you added. Reach for DoRA when quality at small rank matters (e.g., many adapters under tight storage) and a modest training slowdown is acceptable. LoRA+ and PiSSA are near-free wins worth enabling when chasing convergence speed. If an interviewer pushes ``which variant would you ship?'', the strong answer is eval-driven: the variants differ by a few percent at most, so run vanilla first and add moving parts only when a benchmark justifies them.
+
+%------------------------------------------------------------------------------
 \subsection{Adapters}
 %------------------------------------------------------------------------------
 
@@ -598,36 +577,81 @@ Prompt Tuning & 0.01\% & Small & 80-95\% & Large models only \\
 QLoRA's quality figure is task- and configuration-dependent rather than a fixed penalty: with NF4, double quantization, and adapters on \textit{all} linear layers, the QLoRA paper reports matching 16-bit LoRA (and full fine-tuning) on its benchmarks, while narrower adapter placement or harder tasks can show a real gap. Verify against a 16-bit LoRA baseline on your task.
 
 %==============================================================================
+\section{SFT Mechanics: What Actually Goes Wrong}
+\label{sec:sft_mechanics}
+%==============================================================================
+
+Supervised fine-tuning (SFT) of an instruction-following model looks trivial---format the examples, call \texttt{trainer.train()}---which is exactly why interviewers probe it: the failure modes live in tokenization and batching details that you only learn by shipping a fine-tune. The four below are the ``have you actually fine-tuned an LLM'' signals.
+
+\subsection{Loss Masking on Prompt Tokens}
+
+An SFT example is a concatenation of prompt and response, but the causal LM loss is computed per token over whatever you label. Naively setting \texttt{labels = input\_ids} trains the model to predict the \emph{prompt} tokens too. Standard practice is completion-only loss: set the label to the ignore index ($-100$ for PyTorch cross-entropy) on every prompt token so only response tokens contribute:
+
+\begin{lstlisting}[language=Python]
+labels = input_ids.clone()
+labels[:prompt_len] = -100  # CrossEntropyLoss(ignore_index=-100)
+\end{lstlisting}
+
+Why it matters: with loss on prompt tokens, a large share of the gradient signal---often the majority, since prompts frequently dominate token counts---teaches the model to generate user-turn text: questions, instructions, boilerplate. The classic symptom is a fine-tuned model that \textbf{echoes or paraphrases the prompt before answering}, or answers and then invents a fresh ``User:'' turn and continues the conversation with itself: it has learned that prompt-formatted text is what comes next. The nuance an interviewer will reward: full-sequence loss is not always wrong---on very small datasets, prompt-token loss acts as a regularizer, and some recipes deliberately keep a small prompt-loss weight---but it must be a choice, not an accident. The default in every major SFT framework (TRL's completion-only collator, Axolotl's \texttt{train\_on\_inputs: false}) is to mask.
+
+\subsection{Sequence Packing and Cross-Contamination}
+
+SFT examples are short (hundreds of tokens) relative to context windows (8K--128K), so padding each example to maximum length wastes most of the batch's FLOPs. \textbf{Packing} concatenates multiple examples into one max-length sequence, often raising throughput several-fold. The subtlety: inside a packed sequence, causal attention lets the tokens of example $k$ attend to all of examples $1, \ldots, k-1$. An EOS separator does not stop attention---it is just another token. Without correction, examples \textbf{cross-contaminate}: the model conditions on unrelated conversations to its left, learns spurious continuations, and quality degrades in ways that look like data noise.
+
+The fix is a \textbf{block-diagonal attention mask} at packing boundaries---each example attends only within itself---together with position IDs that restart at each boundary. Modern stacks implement this without materializing the mask via FlashAttention's variable-length (\texttt{varlen}) kernels, which take cumulative sequence-length offsets, so correct packing costs essentially nothing. The interview probe ``you turned on packing and quality dropped---why?'' expects exactly this mechanism, plus the position-ID detail: without resets, short examples train the early positions only and long-position behavior drifts.
+
+\subsection{Chat Templates and EOS: The Silent Killers}
+
+The base model never saw your chat format; the template's role markers and turn delimiters are part of what SFT teaches. Three recurring failures:
+
+\begin{itemize}
+    \item \textbf{Train/serve template mismatch}: fine-tune with one template, serve with another---or forget \texttt{add\_generation\_prompt=True} at inference---and the model is conditioned on token sequences it never saw during training. Symptoms range from degraded quality to the model completing the \emph{user's} turn instead of starting the assistant's.
+    \item \textbf{Missing EOS}: if assistant turns in the training data do not end with the EOS/turn-end token (or the tokenizer silently drops it, or an off-by-one in the loss mask excludes it), the model never learns to stop---it generates until \texttt{max\_tokens}, often rambling into a fabricated next turn.
+    \item \textbf{Special tokens that are not special}: adding a marker like \texttt{<|im\_end|>} as a plain string without registering it as a special token makes the tokenizer split it into fragments; the model then learns a multi-token ``stop word'' that inference-time stop criteria never match.
+\end{itemize}
+
+The debugging discipline: \textbf{decode one collated batch and look at it}---print the tokens, the attention mask, and which positions carry loss. Nearly every template bug is visible within a minute of inspecting a single example. The template-debugging interview question is treated in depth in Chapter~\ref{chap:nlp_architectures}.
+
+\subsection{Extending the Vocabulary Alongside LoRA}
+
+Domain adaptation sometimes requires new tokens (chemical entities, a code DSL, a new language's script, new chat special tokens). Two things must then happen: the embedding matrix and the LM head must grow rows, and those new rows must be \emph{trained}. LoRA over frozen weights cannot do this---new rows start random (or mean-initialized), and a rank-16 update cannot rescue an untrained row. The escape hatch in HF PEFT is \texttt{modules\_to\_save} listing \texttt{embed\_tokens} and \texttt{lm\_head}: those modules get a full trainable copy while the rest of the model gets LoRA. Costs to name in an interview: for a 4096-dim model with a 128K vocabulary, each of the two matrices is $\sim$0.5B parameters, so the ``LoRA'' checkpoint balloons from tens of MB to gigabytes and optimizer state grows accordingly; and training embeddings raises forgetting risk, so initialize new rows to the mean of the existing embeddings and keep their learning rate modest.
+
+\subsection{The ``Have You Actually Fine-Tuned'' Signals}
+
+Interviewers rarely name these topics; they surface them by symptom. The signals that you have done this for real:
+
+\begin{itemize}
+    \item You mention loss masking before being asked, and know the ignore-index mechanics.
+    \item You know packing needs boundary masks and position-ID resets, not just concatenation with EOS.
+    \item You reflexively decode a training batch when anything looks wrong.
+    \item You know that EOS and template handling determine whether the model ever stops generating.
+    \item You carry wall-clock and cost anchors: a 10K-example, 3-epoch, rank-16 LoRA on a 7B model is an hours-scale, single-GPU, tens-of-dollars job---not a days-scale cluster job.
+    \item You know which of these your framework (TRL, Axolotl, Llama-Factory) handles by default, and which defaults you have personally verified.
+\end{itemize}
+
+%==============================================================================
 \section{Practical Guidelines}
 \label{sec:transfer_practical}
 %==============================================================================
 
-\subsection{Method Selection Flowchart}
+\subsection{Method Selection}
 
-\begin{figure}[H]
+Method choice is not a one-bit flowchart; it is a read across four axes---data quantity, compute budget, quality bar, and serving constraints:
+
+\begin{table}[H]
 \centering
-\begin{tikzpicture}[
-    node distance=1cm,
-    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, font=\small},
-    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2cm, font=\small},
-    arrow/.style={->, thick}
-]
-    \node[decision] (memory) {Memory constrained?};
-    
-    \node[decision, below left=1.2cm and 0.5cm of memory] (quality) {Quality critical?};
-    \node[result, below right=1.2cm and 0.5cm of memory] (qlora) {QLoRA};
-    
-    \node[result, below left=1cm and 0cm of quality] (full) {Full FT / LoRA};
-    \node[result, below right=1cm and 0cm of quality] (lora) {LoRA};
-    
-    \draw[arrow] (memory) -- node[above left, font=\small] {No} (quality);
-    \draw[arrow] (memory) -- node[above right, font=\small] {Yes} (qlora);
-    \draw[arrow] (quality) -- node[left, font=\small] {Yes} (full);
-    \draw[arrow] (quality) -- node[right, font=\small] {No} (lora);
-\end{tikzpicture}
-\caption{PEFT method selection.}
-\label{fig:peft_selection}
-\end{figure}
+\caption{Fine-tuning method selection across the four decision axes}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Method} & \textbf{Data quantity} & \textbf{Compute} & \textbf{Quality bar} & \textbf{Serving} \\
+\midrule
+Full FT & $>$100K examples & Multi-GPU (FSDP/ZeRO) & Maximum; large domain shift & One dedicated model per task \\
+LoRA & 1K--100K & Single GPU for 7--13B & 95--99\% of full FT & Merge for zero overhead, or serve many adapters (Section~\ref{sec:multi_adapter_serving}) \\
+QLoRA & 1K--100K & Single 24--80 GB GPU for 33--70B & Parity achievable when configured well; verify vs.\ 16-bit & Must dequantize--merge--requantize, or serve unmerged \\
+Prompt tuning & Small, simple tasks & Minimal & Weakest below $\sim$10B & Hundreds of tiny per-task vectors \\
+\bottomrule
+\end{tabularx}
+\end{table}
 
 \subsection{LoRA Hyperparameters}
 
@@ -732,6 +756,39 @@ Best regime & Multi-task with moderate data & General-purpose adaptation & Gener
 \end{tabularx}
 \end{table}
 
+\subsection{Serving Many Adapters}
+\label{sec:multi_adapter_serving}
+
+Fine-tuning at an organization creates a fleet problem: one base model, many tasks or customers, each with its own adapter. Merging (Section~\ref{sec:peft}) is right for a single dedicated deployment and exactly wrong for a fleet---this subsection answers the chapter's own follow-up, ``how do you serve 100 different LoRA adapters efficiently?''
+
+\textbf{The memory math for 100 adapters.} Using this chapter's own numbers: a rank-16 adapter over the attention projections of a 70B GQA model is $\sim$65M parameters $\approx$ 130 MB in BF16 (the 70B question in Section~\ref{sec:transfer_interview}); on a 7B model it is $\sim$16.8M parameters $\approx$ 34 MB.
+\begin{itemize}
+    \item \textbf{Merged}: 100 fine-tuned 70B models $\times$ 140 GB (BF16) = 14 TB of weights---hundreds of GPUs, most idle at any given moment, one per tenant.
+    \item \textbf{Unmerged}: one 140 GB base + $100 \times 130$ MB $=$ 13 GB of adapters $\approx$ 153 GB total---the entire fleet fits on the same 8-GPU node that serves a single copy of the base. Adapters are small enough to page between host RAM and GPU in tens of milliseconds.
+\end{itemize}
+
+\textbf{The cost of staying unmerged.} Each targeted matmul becomes $\mW_0\vx + \frac{\alpha}{r}\mB(\mA\vx)$: two skinny GEMMs per target matrix, well under a few percent extra FLOPs at rank 16. The real problem is scheduling: a naive implementation loops over the distinct adapters within a batch, serializing what should be one batched computation and destroying the continuous-batching throughput that makes LLM serving economical.
+
+\textbf{Batched heterogeneous adapter kernels (Punica, S-LoRA).} The production insight is that requests using \emph{different} adapters still share the base-model computation: the batch's base GEMMs are identical for everyone; only the small adapter GEMMs differ per request. Punica introduced the SGMV (segmented gather matrix--vector) CUDA kernel: all live adapters' $\mA_i, \mB_i$ reside in GPU memory, each request carries an adapter index, and a single kernel launch gathers the right weights per request segment and computes every adapter product in one grouped operation---throughput stays close to the single-adapter case even with a fully heterogeneous batch. S-LoRA builds the system around such kernels: adapter weights live in the same paged memory pool as the KV cache (``unified paging,'' PagedAttention extended to adapters), adapters prefetch asynchronously from host RAM, and the scheduler forms heterogeneous batches---demonstrating \emph{thousands} of adapters served from one node with single-digit-percent overhead over serving the base alone. \textbf{vLLM's multi-LoRA} support productionizes the pattern: adapters registered or dynamically loaded, per-request adapter selection, an LRU cache of adapter slots on GPU (\texttt{max\_loras}, \texttt{max\_lora\_rank}, \texttt{max\_cpu\_loras}), Punica-style kernels underneath.
+
+\begin{table}[H]
+\centering
+\caption{Merged vs.\ unmerged adapter serving}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Merged} & \textbf{Unmerged (multi-adapter)} \\
+\midrule
+Latency & Zero adapter overhead & A few percent (two skinny GEMMs per target) \\
+Tasks per GPU set & One & Hundreds to thousands \\
+Adapter switch & Full weight reload (minutes) & Pointer swap or page-in (milliseconds) \\
+Quantized base & Dequantize--merge--requantize, error-prone & Base stays quantized; adapters ride alongside in 16-bit \\
+Batching across tasks & Impossible (different weights) & SGMV heterogeneous batching \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The summary answer to ``100 LoRA adapters'': one shared (optionally quantized) base, unmerged rank-16 adapters ($\sim$13 GB for all 100 at 70B scale), SGMV-style batched kernels so heterogeneous requests share the base computation, and LRU paging for the long tail of cold adapters. Merge only for the rare tenant whose traffic justifies a dedicated deployment.
+
 \subsection{Fine-Tuning Pipeline Design}
 
 A production fine-tuning pipeline for domain adaptation involves more than calling \texttt{trainer.train()}. The key stages:
@@ -803,6 +860,32 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 \end{interviewq}
 
 \begin{interviewq}
+\textbf{Q: Your fine-tuned model echoes the prompt before answering---why?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer The most likely cause is \textbf{missing loss masking on prompt tokens}. If the training loop set \texttt{labels = input\_ids} without masking the prompt span to the ignore index ($-100$), the model was trained to predict prompt tokens as well as response tokens---and since prompts often dominate token counts, most of the gradient signal taught it to generate user-turn text. The trained behavior is exactly the symptom: given a prompt, produce more prompt-shaped text (echo or paraphrase it), then answer, and often invent a fresh user turn afterward. Verification takes minutes: decode one collated batch from the actual training pipeline and print which positions carry loss (\texttt{labels != -100}); if prompt positions carry loss, that is the bug. Fix: a completion-only collator (TRL's \texttt{DataCollatorForCompletionOnlyLM}, Axolotl's \texttt{train\_on\_inputs: false}) and retrain---cheap, since LoRA SFT at typical scale is an hours-long single-GPU job. Two differentials to rule out before retraining. First, \textbf{template mismatch}: if serving renders a different chat template than training---or omits the generation prompt---the model may be \emph{completing the user's turn} rather than starting the assistant's; check by rendering the exact inference-time token sequence and diffing it against a training example. Second, \textbf{base-model residue}: a non-instruct base checkpoint fine-tuned on only a few hundred examples can echo as leftover pretraining behavior (documents that restate questions); the fix there is more or better SFT data, not the mask. The discriminating test: a masking bug produces echoing even when you replay a literal training example through the training-time template offline; a template mismatch disappears under that replay.
+
+\redflags
+\begin{itemize}
+    \item Immediately blaming the base model or ``not enough data'' without inspecting a collated training batch
+    \item Not knowing the labels/ignore-index mechanics at all
+    \item Proposing to hide it---a system prompt telling the model not to echo, or string-stripping the echoed prompt in postprocessing (an acceptable stopgap, but it leaves the model wasting tokens and signals you cannot find the root cause)
+\end{itemize}
+
+\interviewtest{Whether you have actually run an SFT job. Loss masking is invisible in tutorials that work and the first thing broken in homegrown training loops.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies prompt-token loss as the cause, knows the $-100$ convention
+    \item \badgeLsix{L6} Gives the decode-a-batch verification step, distinguishes masking from template mismatch with a concrete discriminating test, names the framework flags that control it
+    \item \badgeLseven{L7} Knows when full-sequence loss is legitimate (tiny datasets, deliberate prompt-loss weight as a regularizer), and generalizes the bug class into process: assertions on the loss mask in the data pipeline plus eval-time canary prompts that catch echoing before deployment
+\end{itemize}
+
+\followups{``You enabled sequence packing and quality dropped---what happened?'' (cross-example attention without block-diagonal masks; position IDs not reset at boundaries) ``The model never stops generating---what do you check?'' (EOS present at the end of assistant turns, not excluded by the loss mask, registered as a special token, and the same template at train and serve time)}
+\end{interviewq}
+
+\begin{interviewq}
 \textbf{Q: LoRA vs QLoRA vs full fine-tuning vs prompt tuning---give a complete decision framework.}
 
 \badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
@@ -833,7 +916,7 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 
 \badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
 
-\stronganswer With 10K examples, I would use LoRA on a 7B--13B model. The pipeline has six stages. \textbf{Stage 1---Data preparation}: Clean and deduplicate the 10K examples. Format as instruction-completion pairs matching the model's chat template. Run quality filtering: compute perplexity under the base model and remove outliers (likely noisy examples). Split 80/10/10 for train/val/test. \textbf{Stage 2---Base model selection}: A 7B--13B model is the sweet spot here---not because a 70B model would overfit (with PEFT, larger models are generally \textit{more} sample-efficient), but because of cost, iteration speed, and serving: a 7B LoRA run finishes in hours on a single GPU, so you can iterate on data and hyperparameters many times, and the result is cheap to serve. A 1B model likely lacks capacity for a complex domain. Move up to 70B only if the smaller model's quality plateaus below the bar and the serving budget supports it. \textbf{Stage 3---LoRA configuration}: Rank 16 targeting Q, K, V, O, and FFN projections. Alpha = 16 (scale factor 1.0). Learning rate 2e-4 with cosine schedule and 10\% warmup. BF16 mixed precision. Gradient checkpointing to fit in a single 40GB GPU. \textbf{Stage 4---Training}: 3 epochs with early stopping on validation loss. Effective batch size 32 via gradient accumulation. Monitor for validation loss plateau. \textbf{Stage 5---Evaluation}: Domain-specific metrics on the held-out test set PLUS general capability benchmarks (MMLU, HellaSwag) to detect catastrophic forgetting. Only deploy if domain metrics improve and general metrics do not degrade beyond tolerance ($<$2\% drop). \textbf{Stage 6---Deployment}: Merge LoRA weights into base model for production serving with zero adapter overhead. Keep unmerged LoRA checkpoint for continued iteration.
+\stronganswer With 10K examples, I would use LoRA on a 7B--13B model. The pipeline has six stages. \textbf{Stage 1---Data preparation}: Clean and deduplicate the 10K examples. Format as instruction-completion pairs matching the model's chat template. Run quality filtering: compute perplexity under the base model and remove outliers (likely noisy examples). Split 80/10/10 for train/val/test. \textbf{Stage 2---Base model selection}: A 7B--13B model is the sweet spot here---not because a 70B model would overfit (with PEFT, larger models are generally \textit{more} sample-efficient), but because of cost, iteration speed, and serving: a 7B LoRA run finishes in hours on a single GPU, so you can iterate on data and hyperparameters many times, and the result is cheap to serve. A 1B model likely lacks capacity for a complex domain. Move up to 70B only if the smaller model's quality plateaus below the bar and the serving budget supports it. \textbf{Stage 3---LoRA configuration}: Rank 16 targeting Q, K, V, O, and FFN projections. Alpha = 16 (scale factor 1.0). Learning rate 2e-4 with cosine schedule and 10\% warmup. BF16 mixed precision. Gradient checkpointing to fit in a single 40GB GPU. \textbf{Stage 4---Training}: 3 epochs with early stopping on validation loss. Effective batch size 32 via gradient accumulation. Monitor for validation loss plateau. Wall-clock anchor: 10K examples at $\sim$500 tokens each is $\sim$5M tokens per epoch, 15M total; a 7B model with rank-16 LoRA in BF16 plus gradient checkpointing sustains roughly 2--4K tokens/s on one A100, so the full run is \textbf{1--2 hours, not days}---cheap enough to sweep learning rate and rank several times. QLoRA's dequantize-on-the-fly roughly doubles this; the same data through a 70B QLoRA run is a day-scale job. At on-demand A100 pricing ($\sim$\$2--4/hr), each 7B run costs single-digit dollars, which is why data iteration, not compute, is the bottleneck at this scale. \textbf{Stage 5---Evaluation}: Domain-specific metrics on the held-out test set PLUS general capability benchmarks (MMLU, HellaSwag) to detect catastrophic forgetting. Only deploy if domain metrics improve and general metrics do not degrade beyond tolerance ($<$2\% drop). \textbf{Stage 6---Deployment}: Merge LoRA weights into base model for production serving with zero adapter overhead. Keep unmerged LoRA checkpoint for continued iteration.
 
 \redflags
 \begin{itemize}
@@ -1008,4 +1091,30 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 \end{itemize}
 
 \followups{``What about adapter layers vs LoRA?'' ``Does LoRA work for pre-training?'' ``How do you serve 100 different LoRA adapters efficiently?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You have one base model and 100 customers, each with their own LoRA adapter. Design the serving system.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer Start with the memory math, because it decides the architecture. Merged serving means 100 full model copies: at 70B in BF16 that is $100 \times 140$ GB $=$ 14 TB of weights---hundreds of GPUs, each dedicated to one mostly-idle tenant. Unmerged, a rank-16 adapter over the attention projections of a 70B GQA model is $\sim$65M parameters $\approx$ 130 MB in BF16, so all 100 adapters total $\sim$13 GB---under a tenth of one base copy---and the entire fleet runs on the same 8-GPU node that serves the base once. So the design is: \textbf{one shared base, adapters kept unmerged}. The base can additionally be quantized (FP8/INT4) since unmerged serving never requires merging into it; adapters ride alongside in 16-bit. The serving-efficiency problem is batching: requests for different adapters share the base GEMMs but need different adapter GEMMs, and a naive per-adapter loop destroys continuous-batching throughput. The solution is batched heterogeneous adapter kernels---Punica's SGMV (segmented gather matrix--vector): all resident adapters sit in GPU memory, each request carries an adapter index, and one kernel launch computes every request's adapter product in a single grouped operation, keeping throughput within a few percent of single-adapter serving. S-LoRA extends this with unified paging (adapter weights share the paged pool with the KV cache) and async host-to-GPU prefetch, scaling to thousands of adapters. In practice I would use vLLM's multi-LoRA support, which implements this pattern with an LRU cache of GPU-resident adapter slots (\texttt{max\_loras}, \texttt{max\_lora\_rank}, \texttt{max\_cpu\_loras}) and per-request adapter selection. Operational design: tier the adapters (hot tenants GPU-resident; warm in host RAM, paged in on demand in tens of milliseconds; cold on disk), accept a cold-start latency hit on first request per adapter, cap the maximum rank at registration time since kernel buffers and paging granularity are sized by it, and monitor quality and latency per tenant. Trade-offs to state: unmerged costs a few percent latency versus merged; if one tenant carries most of the traffic, promote that tenant to a dedicated merged deployment and keep the long tail on the shared pool.
+
+\redflags
+\begin{itemize}
+    \item Proposing 100 model replicas or per-request merging without doing the memory math
+    \item Not knowing that requests using different adapters can be batched together (assuming one adapter per batch)
+    \item Ignoring the operational layer: adapter lifecycle, cold starts, per-tenant monitoring
+\end{itemize}
+
+\interviewtest{Whether you connect PEFT parameter math to serving economics, and whether you know the 2026 production pattern (S-LoRA/Punica-style kernels, vLLM multi-LoRA) rather than stopping at ``merge the weights.''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Shared unmerged base with the adapter memory math, knows merging is wrong for a fleet
+    \item \badgeLsix{L6} Explains SGMV-style heterogeneous batching, paging tiers with cold-start implications, names vLLM multi-LoRA configuration levers
+    \item \badgeLseven{L7} Fleet economics (cost per tenant vs.\ dedicated deployments, when to promote a tenant to merged), SLO isolation between tenants sharing a batch, interaction with base quantization, and the base-upgrade problem---adapters do not transfer across base versions, so an upgrade forces re-training and re-validating all 100
+\end{itemize}
+
+\followups{``One tenant has 100$\times$ the traffic of the rest---now what?'' ``You upgrade the base model---what happens to the 100 adapters?'' ``What if tenants need different ranks?'' ``How does this interact with prefix caching and speculative decoding?''}
 \end{interviewq}
