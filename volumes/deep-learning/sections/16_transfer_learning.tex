@@ -1,0 +1,1011 @@
+\chapter{Transfer Learning and Parameter-Efficient Fine-Tuning}
+\label{chap:transfer_learning}
+
+\begin{tldr}
+Transfer learning leverages knowledge from pre-trained models for new tasks. This chapter covers when and how to fine-tune (full vs. frozen backbone vs. layer-wise), and critically, parameter-efficient fine-tuning (PEFT) methods: LoRA, QLoRA, Adapters, Prefix Tuning, and Prompt Tuning. Understanding PEFT is essential for modern LLM applications and a frequent staff-level interview topic.
+\end{tldr}
+
+\section{Transfer Learning Fundamentals}
+\label{sec:transfer_fundamentals}
+
+\subsection{Why Transfer Learning Works}
+
+\textbf{Transfer Learning.} Using knowledge gained from solving one problem (source task) to improve learning on a different but related problem (target task).
+
+\textbf{Theoretical justification}:
+\begin{enumerate}
+    \item \textbf{Hierarchical representations}: Early layers learn general features (edges, textures, word frequencies), later layers learn task-specific features.
+    
+    \item \textbf{Inductive bias}: Pre-training provides useful inductive bias for target task.
+    
+    \item \textbf{Regularization}: Pre-trained weights act as implicit regularization, preventing overfitting on small target datasets.
+\end{enumerate}
+
+\subsection{When Transfer Learning Helps}
+
+\begin{table}[H]
+\centering
+\caption{Transfer learning effectiveness by scenario}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Scenario} & \textbf{Transfer Effectiveness} & \textbf{Reason} \\
+\midrule
+Similar domain, limited data & Very high & Direct knowledge transfer \\
+Similar domain, abundant data & Moderate & Can learn from scratch, but faster convergence \\
+Different domain, limited data & Moderate-high & Still better than random init \\
+Different domain, abundant data & Low-moderate & May not need transfer \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Negative Transfer}
+
+\textbf{Negative Transfer.} When transfer learning hurts performance compared to training from scratch.
+
+\textbf{Causes}:
+\begin{itemize}
+    \item Source and target domains too different
+    \item Pre-trained features actively misleading for target
+    \item Excessive fine-tuning destroys useful features
+\end{itemize}
+
+%==============================================================================
+\section{Fine-Tuning Strategies}
+\label{sec:finetuning_strategies}
+%==============================================================================
+
+\subsection{Strategy Overview}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, minimum width=1.5cm, minimum height=0.6cm, rounded corners, font=\small},
+    frozen/.style={box, fill=blue!20},
+    trainable/.style={box, fill=green!20}
+]
+    % Feature extraction
+    \begin{scope}[shift={(0,0)}]
+        \node[frozen] (f1) {Layer 1};
+        \node[frozen, above=0.2cm of f1] (f2) {Layer 2};
+        \node[frozen, above=0.2cm of f2] (f3) {...};
+        \node[frozen, above=0.2cm of f3] (f4) {Layer N};
+        \node[trainable, above=0.2cm of f4] (fh) {New Head};
+        \node[below=0.3cm of f1, font=\bfseries\small, align=center] {Feature\\Extraction};
+    \end{scope}
+    
+    % Full fine-tuning
+    \begin{scope}[shift={(3.5,0)}]
+        \node[trainable] (ff1) {Layer 1};
+        \node[trainable, above=0.2cm of ff1] (ff2) {Layer 2};
+        \node[trainable, above=0.2cm of ff2] (ff3) {...};
+        \node[trainable, above=0.2cm of ff3] (ff4) {Layer N};
+        \node[trainable, above=0.2cm of ff4] (ffh) {New Head};
+        \node[below=0.3cm of ff1, font=\bfseries\small, align=center] {Full\\Fine-tuning};
+    \end{scope}
+    
+    % Gradual unfreezing
+    \begin{scope}[shift={(7,0)}]
+        \node[frozen] (g1) {Layer 1};
+        \node[frozen, above=0.2cm of g1] (g2) {Layer 2};
+        \node[trainable, above=0.2cm of g2] (g3) {...};
+        \node[trainable, above=0.2cm of g3] (g4) {Layer N};
+        \node[trainable, above=0.2cm of g4] (gh) {New Head};
+        \node[below=0.3cm of g1, font=\bfseries\small, align=center] {Gradual\\Unfreeze};
+    \end{scope}
+    
+    % PEFT
+    \begin{scope}[shift={(10.5,0)}]
+        \node[frozen] (p1) {Layer 1};
+        \node[trainable, minimum width=0.5cm, right=0.1cm of p1] (a1) {\tiny+A};
+        \node[frozen, above=0.2cm of p1] (p2) {Layer 2};
+        \node[trainable, minimum width=0.5cm, right=0.1cm of p2] (a2) {\tiny+A};
+        \node[frozen, above=0.2cm of p2] (p3) {...};
+        \node[frozen, above=0.2cm of p3] (p4) {Layer N};
+        \node[trainable, minimum width=0.5cm, right=0.1cm of p4] (a4) {\tiny+A};
+        \node[trainable, above=0.2cm of p4] (ph) {New Head};
+        \node[below=0.3cm of p1, font=\bfseries\small, align=center] {PEFT\\(LoRA, etc.)};
+    \end{scope}
+    
+    % Legend
+    \node[frozen, minimum width=1cm] at (2, -2) {};
+    \node[right=0.3cm, font=\small] at (2.5, -2) {Frozen};
+    \node[trainable, minimum width=1cm] at (6, -2) {};
+    \node[right=0.3cm, font=\small] at (6.5, -2) {Trainable};
+\end{tikzpicture}
+\caption{Different fine-tuning strategies.}
+\label{fig:finetuning_strategies}
+\end{figure}
+
+\subsection{Feature Extraction (Frozen Backbone)}
+
+\textbf{Approach}: Freeze all pre-trained weights, only train new task head.
+
+\textbf{When to use}:
+\begin{itemize}
+    \item Very limited target data
+    \item Source and target domains very similar
+    \item Computational constraints
+    \item Avoid catastrophic forgetting
+\end{itemize}
+
+\textbf{Implementation}:
+\begin{lstlisting}[language=Python]
+# Freeze backbone
+for param in model.backbone.parameters():
+    param.requires_grad = False
+
+# Only head is trainable
+model.head = nn.Linear(hidden_size, num_classes)
+\end{lstlisting}
+
+\subsection{Full Fine-Tuning}
+
+\textbf{Approach}: Update all parameters on target task.
+
+\textbf{When to use}:
+\begin{itemize}
+    \item Sufficient target data
+    \item Domains differ significantly
+    \item Maximum performance needed
+\end{itemize}
+
+\textbf{Caution}: Can overfit or forget pre-trained knowledge.
+
+\subsection{Gradual Unfreezing}
+
+\textbf{Approach}: Start with frozen backbone, progressively unfreeze layers.
+
+\begin{algorithm}[H]
+\caption{Gradual Unfreezing (ULMFiT)}
+\begin{algorithmic}[1]
+\STATE Train only task head for $k$ epochs
+\FOR{$i = N$ down to 1}
+    \STATE Unfreeze layer $i$
+    \STATE Train for $k$ epochs with discriminative learning rates
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Discriminative learning rates}:
+\begin{equation}
+\eta_\ell = \eta_{base} \cdot \gamma^{L-\ell}
+\end{equation}
+Earlier layers get smaller learning rates ($\gamma \approx 0.9$).
+
+\subsection{Layer-wise Learning Rate Decay (LLRD)}
+
+\begin{equation}
+\eta_\ell = \eta_{base} \cdot \text{decay}^{L - \ell}
+\end{equation}
+
+\textbf{Typical values}:
+\begin{itemize}
+    \item BERT fine-tuning: decay = 0.95
+    \item Later layers (task-specific): Higher LR
+    \item Earlier layers (general features): Lower LR
+\end{itemize}
+
+\subsection{Strategy Selection}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, font=\small},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2cm, font=\small},
+    arrow/.style={->, thick}
+]
+    \node[decision] (data) {Target data size?};
+    
+    \node[result, below left=1.2cm and 0.5cm of data] (frozen) {Feature Extraction};
+    \node[decision, below right=1.2cm and 0.5cm of data] (domain) {Domain shift?};
+    
+    \node[result, below left=1cm and 0cm of domain] (gradual) {Gradual Unfreeze};
+    \node[result, below right=1cm and 0cm of domain] (full) {Full Fine-tuning};
+    
+    \draw[arrow] (data) -- node[above left, font=\small] {Small} (frozen);
+    \draw[arrow] (data) -- node[above right, font=\small] {Large} (domain);
+    \draw[arrow] (domain) -- node[left, font=\small] {Small} (gradual);
+    \draw[arrow] (domain) -- node[right, font=\small] {Large} (full);
+\end{tikzpicture}
+\caption{Fine-tuning strategy decision tree.}
+\label{fig:ft_decision}
+\end{figure}
+
+%==============================================================================
+\section{Parameter-Efficient Fine-Tuning (PEFT)}
+\label{sec:peft}
+%==============================================================================
+
+\subsection{Motivation}
+
+\textbf{The problem with full fine-tuning for LLMs}:
+\begin{itemize}
+    \item 7B model: 28 GB for weights alone (FP32)
+    \item Gradients and optimizer states: additional 84 GB (FP32 gradients 28 GB + Adam's two moments 56 GB)---$\sim$120 GB total once activations are included
+    \item Separate model copy per task
+    \item Deployment nightmare with multiple fine-tuned versions
+\end{itemize}
+
+\textbf{PEFT solution}: Train only a small number of additional parameters.
+
+\subsection{PEFT Method Taxonomy}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=2cm, minimum height=0.7cm, fill=lightblue, font=\small},
+    leaf/.style={rectangle, draw, rounded corners, minimum width=1.5cm, minimum height=0.5cm, fill=lightgreen, font=\footnotesize}
+]
+    \node[box] (root) {PEFT Methods};
+    
+    \node[box, below left=1cm and 1.5cm of root] (additive) {Additive};
+    \node[box, below=1cm of root] (selective) {Selective};
+    \node[box, below right=1cm and 1.5cm of root] (reparameter) {Reparameterization};
+    
+    \node[leaf, below=0.6cm of additive, xshift=-0.8cm] (adapter) {Adapters};
+    \node[leaf, below=0.6cm of additive, xshift=0.8cm] (prefix) {Prefix Tuning};
+    
+    \node[leaf, below=0.6cm of selective] (bitfit) {BitFit};
+    
+    \node[leaf, below=0.6cm of reparameter, xshift=-0.6cm] (lora) {LoRA};
+    \node[leaf, below=0.6cm of reparameter, xshift=0.6cm] (qlora) {QLoRA};
+    
+    \draw[-] (root) -- (additive);
+    \draw[-] (root) -- (selective);
+    \draw[-] (root) -- (reparameter);
+    \draw[-] (additive) -- (adapter);
+    \draw[-] (additive) -- (prefix);
+    \draw[-] (selective) -- (bitfit);
+    \draw[-] (reparameter) -- (lora);
+    \draw[-] (reparameter) -- (qlora);
+\end{tikzpicture}
+\caption{Taxonomy of PEFT methods.}
+\label{fig:peft_taxonomy}
+\end{figure}
+
+%------------------------------------------------------------------------------
+\subsection{LoRA: Low-Rank Adaptation}
+%------------------------------------------------------------------------------
+
+\subsubsection{Core Idea}
+
+Approximate weight updates with low-rank matrices.
+
+\begin{mathresult}{LoRA Reparameterization}
+For pre-trained weight $\mW_0 \in \R^{d \times k}$, instead of learning full $\Delta \mW$:
+\begin{equation}
+\mW = \mW_0 + \Delta \mW = \mW_0 + \mB \mA
+\end{equation}
+where $\mB \in \R^{d \times r}$, $\mA \in \R^{r \times k}$, and $r \ll \min(d, k)$.
+\end{mathresult}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, minimum width=1.5cm, minimum height=0.8cm, rounded corners}
+]
+    % Original path
+    \node (x) {$\vx$};
+    \node[box, fill=blue!20, right=1cm of x] (W0) {$\mW_0$};
+    \node[right=1cm of W0] (h1) {};
+    
+    % LoRA path
+    \node[box, fill=green!20, below=1.5cm of W0, xshift=-1cm, minimum width=0.8cm] (A) {$\mA$};
+    \node[box, fill=green!20, right=0.5cm of A, minimum width=0.8cm] (B) {$\mB$};
+    
+    % Output
+    \node[right=0.5cm of h1] (y) {$\vh$};
+    
+    % Edges
+    \draw[->] (x) -- (W0);
+    \draw[->] (W0) -- (h1);
+    \draw[->] (h1) -- node[above] {$+$} (y);
+    \draw[->] (x) |- (A);
+    \draw[->] (A) -- (B);
+    \draw[->] (B) -| (h1);
+    
+    % Labels
+    \node[above=0.3cm of W0, font=\small, blue] {Frozen};
+    \node[below=0.3cm of $(A)!0.5!(B)$, font=\small, green!70!black] {Trainable ($r \ll d$)};
+    
+    % Dimensions
+    \node[below=0.1cm of A, font=\tiny] {$r \times k$};
+    \node[below=0.1cm of B, font=\tiny] {$d \times r$};
+\end{tikzpicture}
+\caption{LoRA: Low-rank update path parallel to frozen weights.}
+\label{fig:lora}
+\end{figure}
+
+\subsubsection{Parameter Efficiency}
+
+For a weight matrix $\mW \in \R^{d \times k}$:
+\begin{itemize}
+    \item Full fine-tuning: $d \times k$ parameters
+    \item LoRA: $r \times (d + k)$ parameters
+    \item Reduction factor: $\frac{dk}{r(d+k)} \approx \frac{d}{2r}$ for $d = k$
+\end{itemize}
+
+\begin{example}
+For $d = k = 4096$, $r = 8$:
+\begin{itemize}
+    \item Full: $16.7M$ parameters per weight matrix
+    \item LoRA: $65.5K$ parameters
+    \item Reduction: $255\times$
+\end{itemize}
+\end{example}
+
+\subsubsection{Initialization}
+
+\begin{itemize}
+    \item $\mA$: Random Gaussian initialization
+    \item $\mB$: Zero initialization
+    \item At start: $\Delta \mW = \mB \mA = \bm{0}$ (no change from pre-trained)
+\end{itemize}
+
+\subsubsection{Scaling Factor}
+
+\begin{equation}
+\vh = \mW_0 \vx + \frac{\alpha}{r} \mB \mA \vx
+\end{equation}
+
+$\alpha$ is a scaling hyperparameter (often $\alpha = r$, so scale = 1).
+
+\subsubsection{Which Layers to Apply LoRA}
+
+\begin{table}[H]
+\centering
+\caption{LoRA target layers (empirical findings)}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Target} & \textbf{Recommendation} \\
+\midrule
+$\mW_q, \mW_v$ only & Good baseline, most efficient \\
+$\mW_q, \mW_k, \mW_v, \mW_o$ & Better performance \\
+All attention + FFN & Best but more parameters \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsubsection{Merging for Inference}
+
+At inference time, merge LoRA weights:
+\begin{equation}
+\mW_{merged} = \mW_0 + \mB \mA
+\end{equation}
+
+\textbf{Benefits}:
+\begin{itemize}
+    \item No additional inference latency
+    \item Can switch LoRA adapters by swapping small matrices
+    \item Multiple tasks: $\mW_0 + \mB_1 \mA_1$ or $\mW_0 + \mB_2 \mA_2$
+\end{itemize}
+
+%------------------------------------------------------------------------------
+\subsection{QLoRA: Quantized LoRA}
+%------------------------------------------------------------------------------
+
+\subsubsection{Key Innovation}
+
+Combine 4-bit quantization of base model with LoRA training.
+
+\begin{enumerate}
+    \item \textbf{4-bit NormalFloat (NF4)}: Information-theoretically optimal quantization for normally distributed weights
+    
+    \item \textbf{Double quantization}: Quantize the quantization constants
+    
+    \item \textbf{Paged optimizers}: Handle memory spikes with GPU→CPU offloading
+\end{enumerate}
+
+\subsubsection{Memory Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Memory requirements for fine-tuning 7B model}
+\begin{tabular}{lrr}
+\toprule
+\textbf{Method} & \textbf{Memory} & \textbf{Hardware} \\
+\midrule
+Full fine-tuning (FP32) & ~120 GB & Multi-GPU \\
+Full fine-tuning (FP16) & ~60 GB & Multi-GPU \\
+LoRA (FP16 base) & ~18 GB & Single A100 \\
+QLoRA (4-bit base) & ~6 GB & Single GPU (24GB) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsubsection{Training Process}
+
+\begin{enumerate}
+    \item Quantize pre-trained model to 4-bit
+    \item Add LoRA adapters (trained in BF16)
+    \item Forward: Dequantize on-the-fly → compute → back to 4-bit
+    \item Backward: Gradients flow through dequantized values
+    \item Only LoRA parameters updated
+\end{enumerate}
+
+%------------------------------------------------------------------------------
+\subsection{Adapters}
+%------------------------------------------------------------------------------
+
+\subsubsection{Architecture}
+
+Insert small trainable modules between transformer layers.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.6cm, rounded corners, font=\small},
+    frozen/.style={box, fill=blue!20},
+    adapter/.style={box, fill=green!20}
+]
+    % Standard block
+    \node[frozen] (attn) {Self-Attention};
+    \node[adapter, right=2cm of attn] (ada1) {Adapter};
+    \node[frozen, below=0.8cm of attn] (ffn) {FFN};
+    \node[adapter, right=2cm of ffn] (ada2) {Adapter};
+    
+    % Adapter detail
+    \node[box, fill=lightyellow, right=2cm of ada1, minimum width=1.2cm, minimum height=0.4cm] (down) {Down};
+    \node[box, fill=orange!30, below=0.3cm of down, minimum width=1.2cm, minimum height=0.4cm] (nonlin) {ReLU};
+    \node[box, fill=lightyellow, below=0.3cm of nonlin, minimum width=1.2cm, minimum height=0.4cm] (up) {Up};
+    
+    % Flow
+    \draw[->] (attn) -- (ada1);
+    \draw[->] (ada1) -- ++(0, -0.5) -| (ffn.north);
+    \draw[->] (ffn) -- (ada2);
+    
+    % Adapter internals
+    \draw[->] (down) -- (nonlin);
+    \draw[->] (nonlin) -- (up);
+    
+    % Skip connection
+    \draw[->] ($(down.west)+(-0.5,0)$) -- (down.west);
+    \draw[-] ($(down.west)+(-0.5,0)$) -- ++(0, -1.5);
+    \draw[->] ($(up.west)+(-0.5,-1.5)$) -- ($(up.east)+(0.3,0)$);
+    \draw ($(up.east)+(0.3,0)$) -- ++(0, 0.3) node[right, font=\tiny] {$+$};
+    
+    % Labels
+    \node[above=0.1cm of down, font=\small] {Adapter Module};
+    \node[below right=0.1cm and -0.5cm of up, font=\tiny] {$d \to r \to d$};
+\end{tikzpicture}
+\caption{Adapter modules: bottleneck architecture inserted after attention and FFN.}
+\label{fig:adapters}
+\end{figure}
+
+\subsubsection{Bottleneck Design}
+
+\begin{equation}
+\text{Adapter}(\vh) = \vh + f(\vh \mW_{down}) \mW_{up}
+\end{equation}
+
+where $\mW_{down} \in \R^{d \times r}$, $\mW_{up} \in \R^{r \times d}$, $r \ll d$.
+
+\subsubsection{Comparison with LoRA}
+
+\begin{table}[H]
+\centering
+\caption{LoRA vs. Adapters}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{LoRA} & \textbf{Adapters} \\
+\midrule
+Architecture change & None (reparameterization) & Adds modules \\
+Inference latency & None (can merge) & Small overhead \\
+Parameters & Slightly fewer & Slightly more \\
+Flexibility & Per-weight control & Per-layer control \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%------------------------------------------------------------------------------
+\subsection{Prefix Tuning}
+%------------------------------------------------------------------------------
+
+\subsubsection{Core Idea}
+
+Prepend learnable ``virtual tokens'' to keys and values in attention.
+
+\begin{equation}
+\text{Attention}(\mathbf{Q}, [\mathbf{P}_K; \mathbf{K}], [\mathbf{P}_V; \mathbf{V}])
+\end{equation}
+
+where $\mathbf{P}_K, \mathbf{P}_V \in \mathbb{R}^{L_p \times d}$ are learnable prefix embeddings.
+\subsubsection{Architecture}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, minimum width=1.2cm, minimum height=0.5cm, rounded corners, font=\small},
+    prefixbox/.style={box, fill=green!20},
+    token/.style={box, fill=blue!20}
+]
+    % Sequence
+    \node[prefixbox] (p1) {$p_1$};
+    \node[prefixbox, right=0.2cm of p1] (p2) {$p_2$};
+    \node[right=0.2cm of p2] (dots) {...};
+    \node[prefixbox, right=0.2cm of dots] (pL) {$p_L$};
+    \node[token, right=0.4cm of pL] (t1) {$t_1$};
+    \node[token, right=0.2cm of t1] (t2) {$t_2$};
+    \node[right=0.2cm of t2] (dots2) {...};
+    \node[token, right=0.2cm of dots2] (tN) {$t_N$};
+    
+    % Labels
+    \draw[decorate, decoration={brace, amplitude=5pt, raise=5pt}] (p1.north west) -- (pL.north east) node[midway, above=10pt, font=\small] {Learnable prefix};
+    \draw[decorate, decoration={brace, amplitude=5pt, raise=5pt}] (t1.north west) -- (tN.north east) node[midway, above=10pt, font=\small] {Input tokens (frozen embeddings)};
+\end{tikzpicture}
+\caption{Prefix tuning: learnable prefixes attend to input tokens.}
+\label{fig:prefix_tuning}
+\end{figure}
+
+\subsubsection{Implementation Detail}
+
+\textbf{Reparameterization for stability}:
+Instead of directly learning $\mathbf{P}$, learn through an MLP:
+\begin{equation}
+\mathbf{P} = \text{MLP}(\mathbf{P}')
+\end{equation}
+
+The MLP is discarded after training; only $\mathbf{P}$ is kept.
+
+%------------------------------------------------------------------------------
+\subsection{Prompt Tuning}
+%------------------------------------------------------------------------------
+
+\subsubsection{Simplest PEFT Method}
+
+Only tune embeddings of ``soft prompt'' tokens prepended to input.
+
+\begin{equation}
+\text{Input} = [e_1, e_2, \ldots, e_k, x_1, x_2, \ldots, x_n]
+\end{equation}
+
+where $e_i$ are learnable embeddings.
+
+\subsubsection{Key Findings}
+
+\begin{itemize}
+    \item Works well only for large models (10B+)
+    \item Performance gap with full fine-tuning closes with scale
+    \item Very parameter-efficient: Only $k \times d$ parameters
+\end{itemize}
+
+%------------------------------------------------------------------------------
+\subsection{PEFT Method Comparison}
+%------------------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Comprehensive PEFT method comparison}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Method} & \textbf{Params Added} & \textbf{Inference Cost} & \textbf{Quality} & \textbf{Best For} \\
+\midrule
+LoRA & 0.1-1\% & None (merge) & 95-99\% & General adaptation \\
+QLoRA & 0.1-1\% & None & 90-99\% (config-dep.) & Memory-limited \\
+Adapters & 1-5\% & Small & 95-99\% & Multi-task \\
+Prefix Tuning & ~1\% & Small & 90-95\% & Generation \\
+Prompt Tuning & 0.01\% & Small & 80-95\% & Large models only \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+QLoRA's quality figure is task- and configuration-dependent rather than a fixed penalty: with NF4, double quantization, and adapters on \textit{all} linear layers, the QLoRA paper reports matching 16-bit LoRA (and full fine-tuning) on its benchmarks, while narrower adapter placement or harder tasks can show a real gap. Verify against a 16-bit LoRA baseline on your task.
+
+%==============================================================================
+\section{Practical Guidelines}
+\label{sec:transfer_practical}
+%==============================================================================
+
+\subsection{Method Selection Flowchart}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, font=\small},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2cm, font=\small},
+    arrow/.style={->, thick}
+]
+    \node[decision] (memory) {Memory constrained?};
+    
+    \node[decision, below left=1.2cm and 0.5cm of memory] (quality) {Quality critical?};
+    \node[result, below right=1.2cm and 0.5cm of memory] (qlora) {QLoRA};
+    
+    \node[result, below left=1cm and 0cm of quality] (full) {Full FT / LoRA};
+    \node[result, below right=1cm and 0cm of quality] (lora) {LoRA};
+    
+    \draw[arrow] (memory) -- node[above left, font=\small] {No} (quality);
+    \draw[arrow] (memory) -- node[above right, font=\small] {Yes} (qlora);
+    \draw[arrow] (quality) -- node[left, font=\small] {Yes} (full);
+    \draw[arrow] (quality) -- node[right, font=\small] {No} (lora);
+\end{tikzpicture}
+\caption{PEFT method selection.}
+\label{fig:peft_selection}
+\end{figure}
+
+\subsection{LoRA Hyperparameters}
+
+\begin{table}[H]
+\centering
+\caption{Recommended LoRA hyperparameters}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Hyperparameter} & \textbf{Typical Range} & \textbf{Notes} \\
+\midrule
+Rank $r$ & 4-64 & 8-16 good starting point \\
+Alpha $\alpha$ & $r$ to $2r$ & Often set equal to $r$ \\
+Target modules & $\mW_q, \mW_v$ minimum & Add $\mW_k, \mW_o$, FFN for better quality \\
+Learning rate & 1e-4 to 3e-4 & Higher than full FT \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Common Pitfalls}
+
+\begin{enumerate}
+    \item \textbf{Rank too low}: Insufficient capacity for complex tasks
+    \item \textbf{Wrong target layers}: Missing key layers limits adaptation
+    \item \textbf{Learning rate too low}: PEFT often needs higher LR
+    \item \textbf{Forgetting quantization effects}: QLoRA can lose quality if misconfigured---verify against a 16-bit LoRA baseline
+\end{enumerate}
+
+\begin{warningbox}
+LoRA is not a drop-in replacement for full fine-tuning. For tasks that require significant distribution shift (e.g., fine-tuning an English model for Japanese), LoRA with small rank will underperform. In these cases, use higher rank (64+), target all linear layers (not just Q/V), or consider full fine-tuning with FSDP.
+\end{warningbox}
+
+%==============================================================================
+\section{Advanced PEFT Topics}
+\label{sec:peft_advanced}
+%==============================================================================
+
+\subsection{Why LoRA Works: The Low-Rank Hypothesis}
+
+The theoretical justification for LoRA rests on an empirical observation: the weight changes during fine-tuning occupy a low-dimensional subspace. Aghajanyan et al.\ (2021, ACL) showed that pre-trained models have a low ``intrinsic dimensionality''---you can project gradient updates into a random low-dimensional subspace and still recover most of the fine-tuning performance. For large models, this intrinsic dimension is surprisingly small relative to the total parameter count.
+
+\textbf{Why this matters for interviews}: The low-rank assumption means that $\Delta \mW = \mB \mA$ with $r \ll d$ captures the task-specific adaptation without needing to modify every direction in weight space. The pre-trained model has already learned a rich representation; fine-tuning only needs to ``steer'' it, which requires far fewer degrees of freedom than learning from scratch.
+
+\textbf{When the assumption breaks}: Tasks requiring fundamentally new knowledge (e.g., a new language the model never saw) or significant distribution shift need higher rank or full fine-tuning because the required $\Delta \mW$ is not low-rank.
+
+\subsection{LoRA Parameter Estimation}
+
+A common interview estimation: how many trainable parameters does LoRA add?
+
+\begin{mathresult}{LoRA Parameter Count}
+For a model with $L$ transformer layers, each containing $M$ target weight matrices of dimension $d \times d$, with LoRA rank $r$:
+\begin{equation}
+\text{LoRA params} = L \times M \times 2 \times d \times r
+\end{equation}
+The factor of 2 accounts for both $\mA \in \R^{r \times d}$ and $\mB \in \R^{d \times r}$.
+\end{mathresult}
+
+\begin{example}
+For LLaMA-7B ($L = 32$ layers, $d = 4096$), applying LoRA rank 16 to $\mW_q, \mW_k, \mW_v, \mW_o$ ($M = 4$):
+\begin{itemize}
+    \item LoRA params $= 32 \times 4 \times 2 \times 4096 \times 16 = 16{,}777{,}216 \approx 16.8M$
+    \item Base model: $\sim$6.7B parameters
+    \item Ratio: $16.8M / 6.7B \approx 0.25\%$ of base model
+\end{itemize}
+\end{example}
+
+\subsection{Negative Transfer: Detection and Prevention}
+
+Negative transfer occurs when a pre-trained model's learned representations actively hurt performance on the target task. It is more common than most practitioners realize, especially in cross-domain settings.
+
+\textbf{Detection signals}:
+\begin{itemize}
+    \item Fine-tuned model underperforms a randomly initialized model of the same architecture trained on the target data alone
+    \item Validation loss \textit{increases} during early fine-tuning epochs (the model must ``unlearn'' before it can learn)
+    \item Feature probing reveals that intermediate representations for the target task are worse with pre-trained weights than random initialization
+\end{itemize}
+
+\textbf{Prevention strategies}:
+\begin{enumerate}
+    \item \textbf{Domain similarity check}: Compute embedding similarity between source and target data before committing to transfer. Use CKA (Centered Kernel Alignment) or representation similarity analysis.
+    \item \textbf{Selective layer transfer}: Freeze or discard later layers (which are more task-specific) while keeping early layers (which tend to be general-purpose).
+    \item \textbf{Intermediate fine-tuning}: Fine-tune on an intermediate domain between source and target before the final adaptation (``task-adaptive pre-training'').
+    \item \textbf{Regularized fine-tuning}: Use L2-SP (L2 regularization toward the pre-trained weights) to prevent drifting too far from the pre-trained initialization when that drift is harmful.
+\end{enumerate}
+
+\subsection{Adapter Layers vs LoRA vs Prefix Tuning: Architectural Differences}
+
+\begin{table}[H]
+\centering
+\caption{PEFT architectural comparison: where modifications happen}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Dimension} & \textbf{Adapter Layers} & \textbf{LoRA} & \textbf{Prefix Tuning} \\
+\midrule
+Where inserted & After attention/FFN sublayers & Parallel to existing weight matrices & Prepended to key/value in attention \\
+Architecture change & Yes (adds new layers) & No (reparameterization) & No (modifies attention input) \\
+Inference overhead & Yes (extra forward pass through adapters) & None (merge into base weights) & Small (longer effective sequence) \\
+Per-task storage & Adapter weights ($\sim$1--5\% of base) & A and B matrices ($\sim$0.1--1\% of base) & Prefix embeddings ($\sim$0.1\% of base) \\
+Multi-task serving & Load different adapters per request & Swap or merge A/B matrices & Swap prefix embeddings \\
+Training stability & High (residual connection in adapter) & High (zero-init of B) & Lower (prefix reparameterization needed) \\
+Best regime & Multi-task with moderate data & General-purpose adaptation & Generation tasks, very large models \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Fine-Tuning Pipeline Design}
+
+A production fine-tuning pipeline for domain adaptation involves more than calling \texttt{trainer.train()}. The key stages:
+
+\begin{enumerate}
+    \item \textbf{Data preparation}: Clean, deduplicate, format into instruction/completion pairs. Quality filtering (perplexity-based filtering using the base model itself) dramatically outperforms quantity.
+    \item \textbf{Base model selection}: Choose the smallest model that meets the quality bar, weighing three factors: data volume (a few thousand examples can steer a model of any size via PEFT, but rarely justify the cost of adapting a very large one), task complexity (narrow formatting or classification tasks work with 1--8B models; open-ended generation or reasoning in a specialized domain often needs 7--70B), and serving budget (the fine-tuned model must fit the latency and cost envelope it will be deployed into). Validate with a quick LoRA run on a small model before scaling up.
+    \item \textbf{Method selection}: Full FT for $>$100K examples with compute; LoRA for 1K--100K; QLoRA if memory-constrained; prompt tuning only for $>$10B models with simple tasks.
+    \item \textbf{Hyperparameter tuning}: LoRA rank, learning rate, number of epochs. Use a small validation split. LoRA is relatively robust to hyperparameters compared to full FT.
+    \item \textbf{Evaluation}: Task-specific metrics on held-out data \textit{plus} general capability benchmarks to detect catastrophic forgetting. Always evaluate on both.
+    \item \textbf{Deployment}: Merge LoRA weights for zero-latency overhead, or keep separate for multi-task adapter switching.
+\end{enumerate}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:transfer_interview}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q: Estimate the number of trainable parameters for LoRA with rank 16 on a 7B model.}
+
+\badgeLfive{L5} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
+
+\stronganswer A 7B model like LLaMA-7B has 32 transformer layers with hidden dimension 4096. The standard LoRA targets are the Q, K, V, and O projection matrices in attention. Each projection is $4096 \times 4096$. For each target matrix, LoRA adds two matrices: $\mA \in \R^{16 \times 4096}$ and $\mB \in \R^{4096 \times 16}$, contributing $2 \times 4096 \times 16 = 131{,}072$ parameters per matrix. With 4 target matrices per layer and 32 layers: $32 \times 4 \times 131{,}072 = 16{,}777{,}216 \approx 16.8M$ parameters. This is about 0.25\% of the 6.7B base model parameters. If we also target the FFN up/down/gate projections (3 more matrices per layer, though dimensions differ---typically $4096 \times 11008$ for LLaMA), the total roughly triples to $\sim$50M, still under 1\%. In memory, 16.8M parameters at FP16 = $\sim$34 MB, negligible compared to the base model.
+
+\redflags
+\begin{itemize}
+    \item Forgetting the factor of 2 (both A and B matrices)
+    \item Not knowing the typical hidden dimension of a 7B model
+    \item Confusing total parameters with trainable parameters
+\end{itemize}
+
+\interviewtest{Can you do back-of-envelope math for model configuration? Do you know the internal dimensions of common architectures?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct calculation for attention projections, knows the formula
+    \item \badgeLsix{L6} Extends to FFN layers, discusses memory implications, notes that GQA models (e.g., LLaMA-2) have different K/V dimensions
+    \item \badgeLseven{L7} Connects parameter count to capacity---discusses whether rank 16 is sufficient for the target task, references the intrinsic dimensionality literature
+\end{itemize}
+
+\followups{``How would you decide if rank 16 is enough?'' ``What changes for a 70B model?'' ``How does this compare to full fine-tuning memory?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your LoRA fine-tuned model performs well on your test set but catastrophically forgets general capabilities. How do you fix it?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer LoRA is supposed to mitigate catastrophic forgetting by keeping base weights frozen, so if it is still happening, the issue is likely one of several causes. First, the LoRA rank may be too high or alpha too large, giving the adapter excessive capacity to override base model behavior---reduce rank from 64 to 8--16 and ensure $\alpha/r \leq 1$. Second, the learning rate may be too high---LoRA adapters should use 1e-4 to 3e-4, not the 1e-5 typical of full FT. Third, too many epochs on narrow domain data causes the adapters to overfit to that distribution---use early stopping based on a held-out set that includes both domain and general examples. Fourth, the training data itself may be too narrow---mix in a fraction (10--20\%) of general-purpose data to maintain broad capabilities. Fifth, evaluate whether the ``forgetting'' is real or a measurement artifact---run both domain-specific and general benchmarks (MMLU, HellaSwag) before and after. For production systems, the best defense is to maintain a general capability evaluation suite and gate deployment on both domain performance and general performance.
+
+\redflags
+\begin{itemize}
+    \item ``LoRA cannot cause catastrophic forgetting because the base weights are frozen''---the adapter itself can learn to override base model behavior
+    \item Suggesting full fine-tuning as the fix (this would make forgetting worse)
+    \item Not mentioning evaluation on general benchmarks
+\end{itemize}
+
+\interviewtest{Debugging methodology for fine-tuning. Understanding that PEFT reduces but does not eliminate forgetting. Practical production awareness.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies rank/LR/epochs as levers, suggests data mixing
+    \item \badgeLsix{L6} Explains why LoRA can still cause forgetting (adapter magnitude), proposes systematic evaluation with general benchmarks, mentions regularization toward base model outputs
+    \item \badgeLseven{L7} Discusses the trade-off between domain adaptation depth and general capability, proposes a gated deployment pipeline, references techniques like task arithmetic for controlled adapter merging
+\end{itemize}
+
+\followups{``How do you quantify catastrophic forgetting?'' ``What if you need aggressive domain adaptation AND general capabilities?'' ``Can you combine multiple LoRA adapters?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: LoRA vs QLoRA vs full fine-tuning vs prompt tuning---give a complete decision framework.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer The decision depends on four axes: data quantity, compute budget, quality requirements, and serving constraints. \textbf{Full fine-tuning}: use when you have $>$100K high-quality examples, multi-GPU infrastructure, and need maximum quality---for example, training a production model that justifies the cost. Achieves the best quality but requires 4--8$\times$ the memory of the model weights (optimizer states, gradients). \textbf{LoRA}: the default choice for most fine-tuning. Use with 1K--100K examples on a single GPU. Trains 0.1--1\% of parameters, achieves 95--99\% of full FT quality, and can merge adapters for zero inference overhead. The key advantage is multi-task serving: swap adapters without duplicating the base model. \textbf{QLoRA}: LoRA on a 4-bit quantized base model. Use when memory is the binding constraint---e.g., fine-tuning a 70B model on a single 24GB GPU. Buys a 3--4$\times$ memory reduction at a quality cost that is task- and configuration-dependent: with NF4, double quantization, and adapters on all linear layers, the QLoRA paper reports parity with 16-bit LoRA, while narrower adapter placement or harder tasks can show a few percent gap from quantization noise in the frozen base's forward pass. Benchmark against a 16-bit LoRA baseline rather than assuming a fixed penalty. \textbf{Prompt tuning}: trains only soft prompt embeddings ($<$0.01\% parameters). Use only for very large models ($>$10B) on simple tasks, or when you need hundreds of task-specific variants served from one base model with minimal per-task storage. Quality is significantly lower than LoRA for models under 10B.
+
+\redflags
+\begin{itemize}
+    \item Treating QLoRA as strictly better than LoRA (quality parity is configuration-dependent and must be verified per task)
+    \item Not mentioning the serving/deployment dimension
+    \item ``Always use full fine-tuning for best results'' without considering the cost-quality tradeoff
+\end{itemize}
+
+\interviewtest{Practical decision-making under constraints. Can you map business requirements to the right technical choice?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct comparison on memory/quality axes, knows the basic tradeoffs
+    \item \badgeLsix{L6} Adds the serving dimension (adapter merging, multi-task), discusses data quantity thresholds, mentions when prompt tuning is actually viable
+    \item \badgeLseven{L7} Considers the full lifecycle---training cost, serving cost, iteration speed, team capability---and gives a decision tree that accounts for organizational constraints
+\end{itemize}
+
+\followups{``What about adapter layers?'' ``When would you use DoRA or IA3?'' ``How do you decide LoRA rank?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design a fine-tuning pipeline for adapting a foundation model to a new domain with 10K examples.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer With 10K examples, I would use LoRA on a 7B--13B model. The pipeline has six stages. \textbf{Stage 1---Data preparation}: Clean and deduplicate the 10K examples. Format as instruction-completion pairs matching the model's chat template. Run quality filtering: compute perplexity under the base model and remove outliers (likely noisy examples). Split 80/10/10 for train/val/test. \textbf{Stage 2---Base model selection}: A 7B--13B model is the sweet spot here---not because a 70B model would overfit (with PEFT, larger models are generally \textit{more} sample-efficient), but because of cost, iteration speed, and serving: a 7B LoRA run finishes in hours on a single GPU, so you can iterate on data and hyperparameters many times, and the result is cheap to serve. A 1B model likely lacks capacity for a complex domain. Move up to 70B only if the smaller model's quality plateaus below the bar and the serving budget supports it. \textbf{Stage 3---LoRA configuration}: Rank 16 targeting Q, K, V, O, and FFN projections. Alpha = 16 (scale factor 1.0). Learning rate 2e-4 with cosine schedule and 10\% warmup. BF16 mixed precision. Gradient checkpointing to fit in a single 40GB GPU. \textbf{Stage 4---Training}: 3 epochs with early stopping on validation loss. Effective batch size 32 via gradient accumulation. Monitor for validation loss plateau. \textbf{Stage 5---Evaluation}: Domain-specific metrics on the held-out test set PLUS general capability benchmarks (MMLU, HellaSwag) to detect catastrophic forgetting. Only deploy if domain metrics improve and general metrics do not degrade beyond tolerance ($<$2\% drop). \textbf{Stage 6---Deployment}: Merge LoRA weights into base model for production serving with zero adapter overhead. Keep unmerged LoRA checkpoint for continued iteration.
+
+\redflags
+\begin{itemize}
+    \item Jumping to full fine-tuning with only 10K examples
+    \item Not mentioning data quality---10K curated examples far outperform 100K noisy ones
+    \item Skipping the general capability evaluation step
+\end{itemize}
+
+\interviewtest{End-to-end pipeline design. Do you think beyond model training to data preparation and deployment?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct method choice (LoRA), reasonable hyperparameters, train/val/test split
+    \item \badgeLsix{L6} Data quality pipeline, catastrophic forgetting evaluation, deployment considerations, model size justification
+    \item \badgeLseven{L7} Discusses data flywheel (using production logs to grow from 10K to 100K), active learning for labeling efficiency, A/B testing the fine-tuned model vs base model in production
+\end{itemize}
+
+\followups{``What if you only had 100 examples?'' ``How do you handle distribution shift between your 10K examples and production traffic?'' ``When would you switch to full fine-tuning?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What is negative transfer and how do you detect and prevent it?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer Negative transfer occurs when using a pre-trained model actually \textit{hurts} target task performance compared to training from scratch. It happens because the source domain's learned representations are misleading for the target task---the model must ``unlearn'' before it can learn, and this unlearning may be incomplete or harmful. \textbf{Detection}: Compare the fine-tuned pre-trained model against a randomly initialized model of the same architecture trained only on target data. If the random-init model wins, you have negative transfer. A subtler signal is that validation loss increases during the first few fine-tuning epochs before decreasing---the model is fighting its pre-trained features. You can also use linear probing: if a linear layer on top of frozen pre-trained features performs \textit{worse} than on random features for your target task, the pre-trained features are actively unhelpful. \textbf{Prevention}: (1) Check domain similarity before committing---use CKA or embedding-space overlap. (2) Use intermediate fine-tuning on a domain closer to the target (task-adaptive pre-training). (3) Selective layer transfer---keep early layers (general features) and reinitialize later layers. (4) L2-SP regularization: penalize distance from pre-trained weights to prevent catastrophic drift while allowing gradual adaptation.
+
+\redflags
+\begin{itemize}
+    \item Confusing negative transfer with catastrophic forgetting (they are different phenomena)
+    \item ``Negative transfer doesn't happen with modern models''---it does, especially cross-domain
+    \item Not having a concrete detection method
+\end{itemize}
+
+\interviewtest{Understanding of transfer learning limitations, not just the happy path. Ability to diagnose when transfer learning is the wrong choice.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Clear definition, gives at least one detection method, mentions domain similarity
+    \item \badgeLsix{L6} Multiple detection methods, discusses intermediate fine-tuning, knows L2-SP regularization
+    \item \badgeLseven{L7} Connects to representation learning theory, discusses task-adaptive pre-training pipeline at scale, mentions when to abandon transfer altogether
+\end{itemize}
+
+\followups{``Give an example where negative transfer would occur.'' ``How does this change with model scale?'' ``Is negative transfer more or less likely with PEFT methods?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why does LoRA work? What is the low-rank assumption about fine-tuning?}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer LoRA works because of an empirical finding: the weight changes needed during fine-tuning lie in a low-dimensional subspace. Aghajanyan et al.\ (2021) showed that pre-trained models have low ``intrinsic dimensionality''---you can project gradient updates into a random low-dimensional subspace and still recover most fine-tuning performance. For a 350M model, the intrinsic dimension can be as low as a few thousand, despite having hundreds of millions of parameters. The low-rank assumption says that $\Delta \mW$ during fine-tuning is approximately low-rank: it can be well-approximated by $\mB \mA$ where $r \ll d$. Intuitively, pre-training already positions the model in a rich representation space. Fine-tuning only needs to ``steer'' the model to a nearby task-specific solution, which requires adjusting only a few directions in weight space---not all of them. This is why rank 8--16 captures most of the fine-tuning benefit for many tasks. The assumption breaks when the target task requires fundamentally new knowledge not present in pre-training: new languages, entirely novel domains, or tasks requiring capabilities the base model lacks. In these cases, the required $\Delta \mW$ occupies a higher-rank subspace, and low-rank LoRA underperforms.
+
+\redflags
+\begin{itemize}
+    \item ``It works because it has fewer parameters'' (confuses regularization with the low-rank hypothesis)
+    \item Unable to explain why low rank is sufficient---just stating the formula
+    \item Claiming LoRA always matches full fine-tuning
+\end{itemize}
+
+\interviewtest{Do you understand \textit{why} the technique works, not just \textit{how} to use it? Can you connect empirical methods to theoretical justification?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains the low-rank factorization and gives the intuition about fine-tuning being a small perturbation
+    \item \badgeLsix{L6} Cites the intrinsic dimensionality result, explains when the assumption breaks, connects rank to task complexity
+    \item \badgeLseven{L7} Discusses the connection to matrix perturbation theory, explains why different layers may need different ranks, mentions recent work on adaptive rank selection (e.g., AdaLoRA)
+\end{itemize}
+
+\followups{``How would you determine the optimal rank empirically?'' ``Does the rank needed scale with model size?'' ``What does it mean if rank 4 and rank 64 give the same result?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Adapter layers vs LoRA vs prefix tuning---what are the architectural differences and when would you use each?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer These three PEFT methods modify the model at fundamentally different points. \textbf{Adapter layers} insert small bottleneck modules (down-project, nonlinearity, up-project with residual) \textit{after} each attention and FFN sublayer. They add new sequential computation to the forward pass, so they incur inference latency overhead that cannot be removed. They are well-suited for multi-task learning where you want to share a backbone and load different adapter modules per task. \textbf{LoRA} adds a low-rank factorized update \textit{in parallel} to existing weight matrices. Since $\mW_{new} = \mW_0 + \mB\mA$, you can merge the LoRA weights into the base weights at deployment, eliminating all inference overhead. This makes LoRA the best choice when serving latency matters. LoRA gives per-weight-matrix control, allowing you to adapt only specific projections (e.g., Q and V only). \textbf{Prefix tuning} prepends learnable virtual tokens to the key and value sequences in every attention layer. It does not modify any model weights; instead, it changes what the attention mechanism attends to. It introduces a small latency overhead proportional to prefix length. It works well for generation tasks where the prefix can act as a ``soft instruction,'' but struggles on discriminative tasks with smaller models. \textbf{Decision rule}: LoRA is the default for most scenarios due to zero inference overhead and strong quality. Use adapters when you need the flexibility of sequential computation (e.g., incorporating task-specific normalization). Use prefix tuning for generation with very large models where you need extremely low per-task parameter cost.
+
+\redflags
+\begin{itemize}
+    \item Not knowing that LoRA can be merged while adapters cannot
+    \item Treating all PEFT methods as interchangeable
+    \item Not mentioning inference latency differences
+\end{itemize}
+
+\interviewtest{Architectural understanding---where in the model each method operates and the practical implications for deployment.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct description of where each method modifies the model, knows LoRA can merge
+    \item \badgeLsix{L6} Discusses multi-task serving implications, training stability differences, and when each method excels
+    \item \badgeLseven{L7} Considers combining methods (e.g., LoRA + prefix tuning), discusses how the choice interacts with quantization (QLoRA), and mentions newer methods like DoRA and IA3
+\end{itemize}
+
+\followups{``Can you combine LoRA with adapters?'' ``How do you serve multiple LoRA adapters simultaneously?'' ``What is the memory overhead during training for each?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You need to fine-tune a 70B LLM for a customer's specific domain. You have access to a single A100 80GB GPU. What approach would you take?}
+
+\badgeLfive{L5} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer I would use QLoRA. Here is the memory budget: 70B parameters at 4-bit quantization (NF4) = $\sim$35 GB for the base model. LoRA adapters at rank 16 targeting Q, K, V, O projections: Llama-2-70B uses GQA, so K/V projections are $8192 \times 1024$ while Q/O are $8192 \times 8192$; across 80 layers that is $80 \times 16 \times (2 \times 16384 + 2 \times 9216) \approx 65$M parameters, at BF16 $\sim$130 MB. Optimizer states for LoRA params (Adam keeps 2 FP32 states per param): $\sim$0.5 GB. Activations and gradients with gradient checkpointing: $\sim$20--30 GB depending on batch size and sequence length. Total: $\sim$60 GB, fitting within the 80 GB A100. Configuration: 4-bit NF4 with double quantization, LoRA rank 16--64, $\alpha = r$, target all attention projections plus FFN up/down/gate. Training: learning rate 2e-4, batch size 1 with gradient accumulation to effective batch 32, 1--3 epochs depending on dataset size. Use gradient checkpointing and paged optimizers to handle memory spikes. Evaluation: domain-specific benchmarks plus MMLU/HellaSwag for general capability. Deployment: merge LoRA weights, re-quantize the merged model for serving (e.g., GPTQ or AWQ 4-bit), or serve with the separate adapter if multi-task switching is needed.
+
+\redflags
+\begin{itemize}
+    \item Suggesting full fine-tuning on a single 80GB GPU for a 70B model (impossible---needs $>$500 GB)
+    \item Not performing a memory budget calculation
+    \item Forgetting gradient checkpointing (without it, activations blow up memory)
+\end{itemize}
+
+\interviewtest{Can you map hardware constraints to feasible training configurations? Do you know the memory components during training?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct choice of QLoRA, reasonable configuration, fits in memory
+    \item \badgeLsix{L6} Detailed memory breakdown, discusses quality-memory trade-off of 4-bit vs 8-bit, mentions evaluation for catastrophic forgetting
+    \item \badgeLseven{L7} Discusses alternatives (FSDP with multiple GPUs if quality is paramount), deployment pipeline including re-quantization, cost-benefit analysis of the infrastructure decision
+\end{itemize}
+
+\followups{``How do you choose LoRA rank?'' ``What if the quality gap from 4-bit is unacceptable?'' ``Can you combine LoRA adapters from multiple tasks?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You fine-tuned a model and it performs well on your test set but poorly in production. What happened?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer There are four primary failure modes to investigate in order. \textbf{1. Distribution shift}: The test set does not represent production traffic. Maybe the test data was curated and clean while production inputs include typos, slang, adversarial inputs, or edge cases the model never trained on. Fix: evaluate on production-like data before deploying, use stratified sampling from production logs. \textbf{2. Catastrophic forgetting}: Aggressive fine-tuning destroyed the model's general capabilities. The model overfits to the narrow fine-tuning distribution and cannot handle the broader range of production inputs. Fix: lower learning rate, fewer epochs, use LoRA instead of full fine-tuning, mix in general-purpose data during training. \textbf{3. Data leakage}: The test set overlaps with or is too similar to the training data, inflating offline metrics. Fix: strict temporal splits, near-duplicate detection between train and test, never evaluate on data from the same time window as training. \textbf{4. Evaluation metric mismatch}: The offline metric (e.g., perplexity, accuracy) does not correlate with the production success metric (e.g., user satisfaction, task completion rate). High accuracy on clean inputs says nothing about robustness on adversarial inputs. Fix: align offline evaluation to the actual business metric, add adversarial and edge-case test sets.
+
+\redflags
+\begin{itemize}
+    \item Jumping to ``retrain with more data'' without diagnosing the root cause
+    \item Not considering distribution shift as the first hypothesis
+    \item Blaming ``the model isn't big enough'' without evidence
+\end{itemize}
+
+\interviewtest{Structured debugging, production maturity, understanding the gap between offline evaluation and real-world performance.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies distribution shift and data leakage as key causes, proposes concrete fixes
+    \item \badgeLsix{L6} Discusses catastrophic forgetting explicitly, proposes systematic evaluation protocol (production-like test sets, adversarial evaluation)
+    \item \badgeLseven{L7} Designs a deployment gate that prevents this from happening---shadow deployment, canary rollout, automated regression detection on production metrics before full launch
+\end{itemize}
+
+\followups{``How do you prevent catastrophic forgetting?'' ``How do you build a test set that represents production?'' ``What monitoring would you put in place to catch this earlier?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Compare LoRA, full fine-tuning, and prompt tuning. When would you use each?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer \textbf{Full fine-tuning}: updates all parameters. Best quality but highest cost---a 7B model needs $\sim$120 GB (FP32) or $\sim$60 GB (FP16) for weights, gradients, and optimizer states. Use when: abundant data ($>$100K examples), quality is paramount, and you can afford multi-GPU training. Typical scenario: building a flagship production model. Risk: catastrophic forgetting if not carefully regularized. \textbf{LoRA}: trains 0.1--1\% of parameters via low-rank updates. Achieves 95--99\% of full FT quality on most tasks. Fits a 7B model on a single GPU ($\sim$18 GB in FP16). Use when: moderate data (1K--100K examples), single-GPU budget, or you need to serve multiple task-specific adapters from one base model. The killer feature is zero inference overhead after merging. \textbf{Prompt tuning}: trains only soft prompt embeddings ($<$0.01\% of parameters). Quality gap with full FT closes at model scale ($>$10B) but remains significant for smaller models. Use when: you need hundreds of task variants served from one base model with minimal per-task storage, or when the task is simple enough that a few soft tokens can steer behavior. Not suitable for complex domain adaptation. \textbf{Decision rule}: default to LoRA. Upgrade to full FT only if LoRA quality is measurably insufficient on your specific task. Use prompt tuning only for lightweight customization at extreme scale.
+
+\redflags
+\begin{itemize}
+    \item ``Always use full fine-tuning for best results'' without considering constraints
+    \item Not knowing that prompt tuning has a quality gap for smaller models
+    \item Treating LoRA and full FT as equivalent in quality for all tasks
+\end{itemize}
+
+\interviewtest{Understanding of the PEFT landscape and practical decision-making under real-world constraints.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct comparison on memory, quality, and parameter count axes
+    \item \badgeLsix{L6} Adds serving dimension (adapter merging, multi-task), data quantity thresholds, knows prompt tuning scaling behavior
+    \item \badgeLseven{L7} Considers full lifecycle cost (training, serving, iteration speed, team expertise) and gives a decision tree for organizational contexts
+\end{itemize}
+
+\followups{``What about adapter layers vs LoRA?'' ``Does LoRA work for pre-training?'' ``How do you serve 100 different LoRA adapters efficiently?''}
+\end{interviewq}

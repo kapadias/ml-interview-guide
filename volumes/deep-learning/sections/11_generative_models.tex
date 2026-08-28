@@ -1,0 +1,778 @@
+\chapter{Generative Models}
+\label{chap:generative_models}
+
+\begin{tldr}
+Generative models learn to produce new data samples from a learned distribution. This chapter covers the three major paradigms: Variational Autoencoders (VAEs), Generative Adversarial Networks (GANs), and Diffusion Models. Understanding the trade-offs (sample quality vs. diversity vs. training stability) and when to use each approach is essential for modern ML roles.
+\end{tldr}
+
+\section{Generative Model Taxonomy}
+\label{sec:gen_taxonomy}
+
+\subsection{The Generative Modeling Problem}
+
+Given samples $\{x_1, \ldots, x_n\}$ from unknown distribution $p_{data}(x)$, learn a model $p_\theta(x)$ that:
+\begin{enumerate}
+    \item Approximates $p_{data}(x)$ well
+    \item Can generate new samples $x \sim p_\theta(x)$
+\end{enumerate}
+
+\subsection{Major Approaches}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    box/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.8cm, fill=lightblue, font=\small}
+]
+    \node[box] (explicit) {Explicit Density};
+    \node[box, right=3cm of explicit] (implicit) {Implicit Density};
+    
+    \node[box, below left=1cm and 0cm of explicit, fill=lightgreen] (tractable) {Tractable};
+    \node[box, below right=1cm and 0cm of explicit, fill=yellow!20] (approx) {Approximate};
+    
+    \node[below=0.5cm of tractable, font=\small, align=center] {Autoregressive\\PixelCNN, GPT\\Flows / Flow Matching};
+    \node[below=0.5cm of approx, font=\small, align=center] {VAE\\Diffusion};
+    \node[below=0.5cm of implicit, font=\small, align=center] {GAN};
+    
+    \draw[-] (explicit) -- (tractable);
+    \draw[-] (explicit) -- (approx);
+\end{tikzpicture}
+\caption{Taxonomy of generative models. Note that flow matching defines a continuous normalizing flow whose likelihood is computable (if expensive) via change of variables, so it sits on the explicit-density side---not with implicit-density GANs.}
+\end{figure}
+
+%==============================================================================
+\section{Variational Autoencoders (VAE)}
+\label{sec:vae}
+%==============================================================================
+
+\subsection{Architecture}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    box/.style={rectangle, draw, minimum width=1.8cm, minimum height=0.7cm, rounded corners, font=\small, align=center}
+]
+    \node (x) {$\mathbf{x}$};
+    \node[box, fill=lightblue, right=1cm of x] (enc) {Encoder\\$q_\phi(\mathbf{z}|\mathbf{x})$};
+    \node[right=1cm of enc] (z) {$\mathbf{z}$};
+    \node[box, fill=lightgreen, right=1cm of z] (dec) {Decoder\\$p_\theta(\mathbf{x}|\mathbf{z})$};
+    \node[right=1cm of dec] (xhat) {$\hat{\mathbf{x}}$};
+    
+    % Latent distribution
+    \node[above=0.5cm of z, font=\small] {$\mu, \sigma$};
+    \node[below=0.3cm of z, font=\small] {reparameterize};
+    
+    \draw[->] (x) -- (enc);
+    \draw[->] (enc) -- (z);
+    \draw[->] (z) -- (dec);
+    \draw[->] (dec) -- (xhat);
+\end{tikzpicture}
+\caption{VAE architecture: encode to distribution, sample, decode.}
+\end{figure}
+
+\subsection{The ELBO}
+
+We want to maximize $\log p_\theta(x)$ but it's intractable. Instead, maximize the Evidence Lower Bound (ELBO):
+
+\begin{mathresult}{ELBO}
+\begin{align}
+\log p_\theta(x) &\geq \mathcal{L}(\theta, \phi; x) \\
+&= \E_{q_\phi(z|x)}[\log p_\theta(x|z)] - D_{KL}(q_\phi(z|x) \| p(z))
+\end{align}
+\begin{itemize}
+    \item First term: \textbf{Reconstruction} (decoder quality)
+    \item Second term: \textbf{Regularization} (keep posterior close to prior)
+\end{itemize}
+\end{mathresult}
+
+\subsection{Reparameterization Trick}
+
+\textbf{Problem}: Can't backprop through sampling $z \sim q_\phi(z|x)$.
+
+\textbf{Solution}: Reparameterize as deterministic function of parameters and noise:
+\begin{equation}
+z = \mu_\phi(x) + \sigma_\phi(x) \odot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)
+\end{equation}
+
+Now gradients flow through $\mu$ and $\sigma$.
+
+\subsection{VAE Variants}
+
+\begin{table}[H]
+\centering
+\caption{VAE variants}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Variant} & \textbf{Key Modification} \\
+\midrule
+$\beta$-VAE & Weight KL term: $\beta \cdot D_{KL}$ for disentanglement \\
+VQ-VAE & Discrete latent codes via vector quantization \\
+Hierarchical VAE & Multiple levels of latent variables \\
+NVAE & Residual cells, batch norm, deep hierarchical \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{VAE Limitations}
+
+\begin{itemize}
+    \item \textbf{Blurry samples}: MSE reconstruction encourages averaging
+    \item \textbf{Posterior collapse}: Decoder ignores latent, KL goes to zero
+    \item \textbf{Limited expressivity}: Gaussian assumptions limit complexity
+\end{itemize}
+
+%==============================================================================
+\section{Generative Adversarial Networks (GAN)}
+\label{sec:gan}
+%==============================================================================
+
+\subsection{Framework}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.7cm, rounded corners, font=\small, align=center}
+]
+    % Generator path
+    \node (z) {$\mathbf{z} \sim p(z)$};
+    \node[box, fill=lightgreen, right=1cm of z] (G) {Generator\\$G_\theta$};
+    \node[right=1cm of G] (fake) {$G(\mathbf{z})$};
+    
+    % Real data
+    \node[above=1.5cm of fake] (real) {$\mathbf{x} \sim p_{data}$};
+    
+    % Discriminator
+    \node[box, fill=orange!30, right=1.5cm of fake] (D) {Discriminator\\$D_\phi$};
+    
+    % Outputs
+    \node[right=1cm of D] (out) {Real/Fake};
+    
+    \draw[->] (z) -- (G);
+    \draw[->] (G) -- (fake);
+    \draw[->] (fake) -- (D);
+    \draw[->] (real) -| (D);
+    \draw[->] (D) -- (out);
+    
+    % Adversarial arrows
+    \draw[<->, dashed, red, thick] (G.north) to[bend left=30] node[above, font=\small] {adversarial} (D.north);
+\end{tikzpicture}
+\caption{GAN framework: Generator tries to fool discriminator.}
+\end{figure}
+
+\subsection{Minimax Objective}
+
+\begin{mathresult}{GAN Objective}
+\begin{equation}
+\min_G \max_D V(D, G) = \E_{x \sim p_{data}}[\log D(x)] + \E_{z \sim p(z)}[\log(1 - D(G(z)))]
+\end{equation}
+\end{mathresult}
+
+\textbf{Interpretation}:
+\begin{itemize}
+    \item Discriminator maximizes: correctly classify real/fake
+    \item Generator minimizes: fool discriminator
+\end{itemize}
+
+\subsection{Training Challenges}
+
+\begin{enumerate}
+    \item \textbf{Mode collapse}: Generator produces limited variety
+    \item \textbf{Training instability}: Oscillation, divergence
+    \item \textbf{Vanishing gradients}: When D is too good
+    \item \textbf{Evaluation difficulty}: No likelihood, metrics are proxies
+\end{enumerate}
+
+\subsection{GAN Variants}
+
+\begin{table}[H]
+\centering
+\caption{Important GAN variants}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Model} & \textbf{Key Innovation} & \textbf{Benefit} \\
+\midrule
+DCGAN & Conv architecture, batch norm & Stable training \\
+WGAN & Wasserstein distance, weight clipping & Better gradients \\
+WGAN-GP & Gradient penalty instead of clipping & More stable \\
+Progressive GAN & Grow resolution during training & High-res images \\
+StyleGAN & Style-based generator, mapping network & Quality + control \\
+BigGAN & Large scale, class conditioning & ImageNet quality \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{WGAN: Wasserstein GAN}
+
+\textbf{Key insight}: Replace JS divergence with Wasserstein distance:
+\begin{equation}
+W(p_{data}, p_g) = \sup_{\|f\|_L \leq 1} \E_{x \sim p_{data}}[f(x)] - \E_{x \sim p_g}[f(x)]
+\end{equation}
+
+\textbf{Benefits}:
+\begin{itemize}
+    \item Meaningful loss (correlates with quality)
+    \item Gradients don't vanish when distributions don't overlap
+    \item More stable training
+\end{itemize}
+
+\subsection{StyleGAN}
+
+\textbf{What it is.} A style-based generator architecture that provides unprecedented control over image synthesis by separating high-level attributes (pose, identity) from stochastic variation (freckles, hair strands). StyleGAN and its successors represent the pinnacle of GAN-based generation quality.
+
+\textbf{Architecture overview.} StyleGAN replaces the traditional GAN generator (which feeds $z$ directly into a convolutional network) with two key components:
+
+\begin{enumerate}
+    \item \textbf{Mapping network}: An 8-layer MLP that transforms the input noise vector $z \in \mathcal{Z}$ into an intermediate latent vector $w \in \mathcal{W}$. The mapping $f: \mathcal{Z} \to \mathcal{W}$ disentangles the factors of variation, making $\mathcal{W}$ much more linear and separable than $\mathcal{Z}$.
+
+    \item \textbf{Synthesis network}: Generates the image starting from a learned constant $4 \times 4$ input, progressively upsampling through convolutional layers. At each layer, the style vector $w$ is injected via Adaptive Instance Normalization (AdaIN), and per-pixel noise is added for stochastic details.
+\end{enumerate}
+
+\textbf{Style injection via AdaIN.} The core mechanism that gives StyleGAN its controllability. At each layer $i$, the style vector $w$ is transformed by a learned affine layer into scale $y_{s,i}$ and bias $y_{b,i}$, then applied:
+
+\begin{mathresult}{Adaptive Instance Normalization (AdaIN)}
+\begin{equation}
+\text{AdaIN}(x_i, y) = y_{s,i} \cdot \frac{x_i - \mu(x_i)}{\sigma(x_i)} + y_{b,i}
+\end{equation}
+where $x_i$ is the feature map at layer $i$, and $\mu(x_i), \sigma(x_i)$ are the per-channel mean and standard deviation computed spatially (instance normalization).
+\end{mathresult}
+
+AdaIN first normalizes each feature map to zero mean and unit variance, then re-scales and re-shifts using style-derived parameters. This means the style vector controls the \textit{statistics} of each layer's features---effectively controlling ``what'' is generated at each resolution level.
+
+\begin{keyinsight}[Why the Mapping Network $z \to w$ Is Crucial]
+The input latent space $\mathcal{Z}$ is typically a hypersphere ($z \sim \mathcal{N}(0, I)$), and it must map to all possible face variations. This forces entanglement: moving in one direction in $\mathcal{Z}$ may simultaneously change both age and gender because the mapping from a spherical distribution to the non-convex data manifold must ``wrap around.'' The mapping network $f: \mathcal{Z} \to \mathcal{W}$ learns to unwarp this---$\mathcal{W}$ does not need to follow any fixed distribution, so it can allocate capacity to match the true factors of variation. Empirically, $\mathcal{W}$ is far more disentangled: linear interpolation in $\mathcal{W}$ produces smooth, semantically meaningful transitions (e.g., aging without changing identity).
+\end{keyinsight}
+
+\textbf{Progressive growing} (inherited from ProGAN). Training begins at $4 \times 4$ resolution and gradually adds upsampling layers until reaching $1024 \times 1024$. Each new resolution level is faded in with a learnable blending factor. This stabilizes training by learning coarse structure first, then progressively refining details. Without progressive growing, training directly at $1024 \times 1024$ with GANs is extremely unstable.
+
+\textbf{Stochastic variation.} Independent Gaussian noise is injected at each layer after convolution, scaled by a learned per-channel factor. This controls fine-grained stochastic details: hair strand placement, skin pores, freckles, background texture. Critically, noise affects stochastic details \textit{without} affecting pose, identity, or other high-level attributes---those are controlled solely by the style vector $w$.
+
+\textbf{Style mixing.} During training, a fraction of images are generated using two different $w$ vectors: $w_1$ controls the first $k$ layers (coarse styles) and $w_2$ controls the remaining layers (fine styles). This regularization prevents adjacent layers from becoming correlated and enables explicit control at inference:
+\begin{itemize}
+    \item \textbf{Coarse styles} (early layers, $4 \times 4$ to $8 \times 8$): Pose, face shape, hair style, eyeglasses
+    \item \textbf{Middle styles} ($16 \times 16$ to $32 \times 32$): Facial features, eye shape, nose
+    \item \textbf{Fine styles} (later layers, $64 \times 64$ to $1024 \times 1024$): Color scheme, skin texture, microstructure
+\end{itemize}
+
+\textbf{StyleGAN2 improvements.} StyleGAN produced characteristic ``blob'' artifacts caused by AdaIN's per-instance normalization destroying spatial information. StyleGAN2 introduced:
+\begin{itemize}
+    \item \textbf{Weight demodulation}: Replaces AdaIN with a modulation/demodulation scheme applied directly to convolution weights, removing the need for explicit normalization and eliminating blob artifacts.
+    \item \textbf{Path length regularization}: Encourages the mapping from $\mathcal{W}$ to images to have smooth, consistent step sizes---a small step in $\mathcal{W}$ produces a proportionally small change in the output, improving latent space smoothness.
+    \item \textbf{No progressive growing}: Replaces progressive training with skip connections and residual design, simplifying the training pipeline.
+\end{itemize}
+
+\textbf{StyleGAN3.} Addressed the problem that intermediate feature maps in StyleGAN2 are not equivariant to translation and rotation---features ``stick'' to pixel coordinates rather than moving with the content. StyleGAN3 introduces alias-free generation through careful signal processing (low-pass filtering, continuous-domain feature representations), producing feature maps that are equivariant to sub-pixel translation and rotation. This enables smooth, artifact-free video generation and animation.
+
+\textbf{Why it matters for interviews.} StyleGAN demonstrated that disentangled, controllable generation is achievable with GANs. Its ideas (learned latent spaces, style injection, progressive training) influenced subsequent architectures including diffusion model conditioning. Practical applications include face generation and editing, data augmentation for underrepresented classes, creative tools, and GAN inversion (projecting real images into $\mathcal{W}$ for editing).
+
+%==============================================================================
+\section{Diffusion Models}
+\label{sec:diffusion}
+%==============================================================================
+
+\subsection{Core Idea}
+
+\begin{enumerate}
+    \item \textbf{Forward process}: Gradually add noise until data becomes pure noise
+    \item \textbf{Reverse process}: Learn to denoise, step by step
+\end{enumerate}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    img/.style={rectangle, draw, minimum width=1cm, minimum height=1cm, font=\small}
+]
+    \node[img, fill=blue!20] (x0) {$x_0$};
+    \node[img, fill=blue!10, right=0.8cm of x0] (x1) {$x_1$};
+    \node[right=0.5cm of x1] (dots1) {...};
+    \node[img, fill=gray!20, right=0.5cm of dots1] (xT) {$x_T$};
+    
+    \draw[->] (x0) -- node[above, font=\tiny] {$q(x_t|x_{t-1})$} (x1);
+    \draw[->] (x1) -- (dots1);
+    \draw[->] (dots1) -- (xT);
+    
+    % Reverse
+    \draw[<-, red, thick] (x0.south) -- ++(0,-0.5) -| node[below, font=\tiny, pos=0.25] {$p_\theta(x_{t-1}|x_t)$} (xT.south);
+    
+    \node[below=1cm of x0, font=\small] {Data};
+    \node[below=1cm of xT, font=\small] {Noise};
+\end{tikzpicture}
+\caption{Diffusion: Forward adds noise, reverse denoises.}
+\end{figure}
+
+\subsection{Forward Process}
+
+\begin{mathresult}{Forward Diffusion}
+\begin{equation}
+q(x_t | x_{t-1}) = \mathcal{N}(x_t; \sqrt{1-\beta_t} x_{t-1}, \beta_t I)
+\end{equation}
+Closed form for any $t$:
+\begin{equation}
+q(x_t | x_0) = \mathcal{N}(x_t; \sqrt{\bar{\alpha}_t} x_0, (1-\bar{\alpha}_t) I)
+\end{equation}
+where $\alpha_t = 1 - \beta_t$ and $\bar{\alpha}_t = \prod_{s=1}^t \alpha_s$.
+\end{mathresult}
+
+\subsection{Training Objective}
+
+Train network to predict noise:
+\begin{equation}
+\mathcal{L} = \E_{t, x_0, \epsilon}\left[\|\epsilon - \epsilon_\theta(x_t, t)\|^2\right]
+\end{equation}
+
+where $x_t = \sqrt{\bar{\alpha}_t} x_0 + \sqrt{1-\bar{\alpha}_t} \epsilon$.
+
+\subsection{Sampling}
+
+Starting from $x_T \sim \mathcal{N}(0, I)$, iteratively denoise:
+\begin{equation}
+x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(x_t - \frac{1-\alpha_t}{\sqrt{1-\bar{\alpha}_t}} \epsilon_\theta(x_t, t)\right) + \sigma_t z
+\end{equation}
+
+\subsection{Key Models}
+
+\begin{table}[H]
+\centering
+\caption{Diffusion model evolution}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Model} & \textbf{Innovation} & \textbf{Impact} \\
+\midrule
+DDPM & Simplified training objective & Foundation \\
+DDIM & Deterministic sampling, fewer steps & 10-50× faster \\
+Stable Diffusion & Latent space diffusion & Efficient high-res \\
+DALL-E 2 & unCLIP: diffusion prior over CLIP image embeddings + diffusion decoder (CLIP \textit{guidance} was GLIDE) & Text-to-image \\
+Imagen & T5 text encoder, cascaded & Quality \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Latent Diffusion (Stable Diffusion)}
+
+\textbf{Key insight}: Do diffusion in latent space of pretrained VAE.
+
+\begin{enumerate}
+    \item Encode image: $z = E(x)$
+    \item Diffusion in latent space: $z_t \to z_{t-1}$
+    \item Decode: $x = D(z_0)$
+\end{enumerate}
+
+\textbf{Benefits}: With SD's $f{=}8$ autoencoder, $512 \times 512 \times 3$ pixels compress to a $64 \times 64 \times 4$ latent---$64\times$ fewer spatial positions and $48\times$ fewer dimensions overall, with the $O(n^2)$ attention layers benefiting even more. This makes high-resolution generation tractable.
+
+\subsection{Classifier-Free Guidance}
+
+\begin{equation}
+\tilde{\epsilon}_\theta(x_t, c) = \epsilon_\theta(x_t, \emptyset) + w \cdot (\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \emptyset))
+\end{equation}
+
+\textbf{Intuition}: Amplify the difference between conditional and unconditional predictions.
+
+\textbf{Guidance scale $w$}: Higher = more adherence to condition, lower diversity.
+
+%==============================================================================
+\section{Comparison and Selection}
+\label{sec:gen_comparison}
+%==============================================================================
+
+\begin{table}[H]
+\centering
+\caption{Generative model comparison}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Aspect} & \textbf{VAE} & \textbf{GAN} & \textbf{Diffusion} \\
+\midrule
+Sample quality & Medium & High & Very high \\
+Training stability & Stable & Unstable & Stable \\
+Mode coverage & Good & Poor (collapse) & Excellent \\
+Likelihood & Yes (ELBO) & No & Yes (approx) \\
+Sampling speed & Fast & Fast & Slow \\
+Latent space & Smooth & $\mathcal{Z}$ entangled; StyleGAN's $\mathcal{W}$ disentangled & None by default (latent diffusion's VAE space + DDIM inversion provide one) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{interviewq}
+\textbf{Q: Explain the reparameterization trick and why it's needed for VAE training. What happens without it?}
+
+\badgeLfive{L5} \quad \badgetype{First Principles} \quad \badgefreq{\freqhigh}
+
+\stronganswer The reparameterization trick solves a fundamental problem: how to backpropagate through a stochastic sampling operation.
+
+\textit{The problem.} In a VAE, the encoder outputs parameters $\mu$ and $\sigma$ of a Gaussian distribution $q_\phi(z|x) = \mathcal{N}(\mu_\phi(x), \sigma_\phi^2(x))$. We need to sample $z \sim q_\phi(z|x)$ to pass to the decoder, then compute the ELBO loss and backpropagate. But sampling is a non-differentiable operation---there's no gradient of ``draw a random number'' with respect to $\mu$ and $\sigma$. Without gradients, we can't train the encoder with standard backpropagation.
+
+\textit{The solution.} Instead of sampling $z \sim \mathcal{N}(\mu, \sigma^2)$ directly, reparameterize as a deterministic function of the parameters plus external randomness:
+$$z = \mu_\phi(x) + \sigma_\phi(x) \odot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+Now $z$ is a deterministic, differentiable function of $\mu$ and $\sigma$ (with fixed $\epsilon$). Gradients flow through $\mu$ and $\sigma$ via the chain rule: $\partial z / \partial \mu = I$ and $\partial z / \partial \sigma = \epsilon$. The stochasticity comes from $\epsilon$, which is independent of the parameters.
+
+\textit{Why it matters.} Without the reparameterization trick, we'd need to use high-variance REINFORCE-style gradient estimators (score function estimator): $\nabla_\phi \E_q[f(z)] = \E_q[f(z) \nabla_\phi \log q_\phi(z|x)]$. This works in theory but has extremely high variance, making training impractical. The reparameterization trick provides a low-variance gradient estimator that enables stable VAE training with standard SGD.
+
+\textit{Limitations.} Only works for distributions that can be expressed as deterministic transforms of a fixed base distribution. Works for Gaussians, but not directly for discrete distributions (which is why VQ-VAE uses a different approach with straight-through estimators).
+
+\redflags
+\begin{itemize}
+    \item ``It's just a mathematical convenience''---it's essential, training fails without it
+    \item Not knowing that the core issue is backpropagating through sampling
+    \item Confusing reparameterization with other variance reduction techniques
+\end{itemize}
+
+\interviewtest{Understanding of why the trick is \textit{needed} (not just what it does), connecting gradient flow to training feasibility.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the trick correctly and knows it enables backpropagation through sampling
+    \item \badgeLsix{L6} Explains why the alternative (REINFORCE) has high variance, discusses the gradient expressions $\partial z/\partial \mu$ and $\partial z/\partial \sigma$
+    \item \badgeLseven{L7} Connects to Gumbel-Softmax for discrete latents, discusses straight-through estimators in VQ-VAE, and mentions pathwise gradient estimators in modern variational inference
+\end{itemize}
+
+\followups{``How does VQ-VAE handle the non-differentiability of discrete codebook lookup?'' ``What is the Gumbel-Softmax trick?'' ``Can you apply reparameterization to non-Gaussian distributions?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Diffusion models vs GANs vs VAEs vs autoregressive models---give me a comparison table and decision framework for different generation tasks.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer Each generative model family has distinct strengths, and the right choice depends on the application constraints.
+
+\textit{Quality.} Diffusion models produce the highest quality images (lowest FID on ImageNet). GANs are close but suffer from mode collapse. VAEs produce blurrier outputs due to the MSE reconstruction + KL regularization tradeoff. Autoregressive models (PixelCNN, image GPT) produce good quality but are extremely slow for images.
+
+\textit{Diversity.} Diffusion models have the best mode coverage (no mode collapse by design---the forward process destroys modes uniformly). GANs are prone to mode collapse (generator ignores parts of the data distribution). VAEs have good coverage but smooth over fine details. Autoregressive models have good diversity.
+
+\textit{Sampling speed.} GANs are fastest: single forward pass ($\sim$10ms). VAEs are fast: encode + decode ($\sim$10ms). Autoregressive: slow, scales linearly with output size ($\sim$minutes for images). Diffusion: slow, requires 20--1000 denoising steps ($\sim$1--30 seconds). DDIM and consistency models reduce diffusion steps to 1--4 with quality tradeoff.
+
+\textit{Training stability.} VAEs: stable (straightforward ELBO optimization). Diffusion: stable (simple MSE denoising loss). Autoregressive: stable (cross-entropy). GANs: notoriously unstable (minimax game, mode collapse, vanishing gradients). WGAN-GP helps but doesn't fully solve instability.
+
+\textit{Controllability.} Diffusion models: excellent (classifier-free guidance, ControlNet, IP-Adapter). GANs: style control via StyleGAN's W-space, conditional generation. VAEs: smooth latent space enables interpolation. Autoregressive: conditioning via prompts.
+
+\textit{Decision framework:}
+\begin{itemize}
+    \item Text-to-image, maximum quality $\to$ Diffusion (Stable Diffusion, DALL-E 3)
+    \item Real-time generation ($<$50ms) $\to$ GAN (StyleGAN) or distilled diffusion
+    \item Representation learning, smooth latent $\to$ VAE
+    \item Likelihood estimation needed $\to$ VAE or autoregressive
+    \item Language generation $\to$ Autoregressive (GPT-style)
+    \item Training simplicity, no tuning $\to$ Diffusion or VAE
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item ``Diffusion is always best''---GANs are still unbeatable for single-step generation
+    \item Not knowing that GANs suffer from mode collapse
+    \item Ignoring sampling speed as a critical production constraint
+\end{itemize}
+
+\interviewtest{Comprehensive understanding of the generative model landscape and ability to make informed tradeoff decisions.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes the quality-speed-stability tradeoff for each family
+    \item \badgeLsix{L6} Provides a structured decision framework, discusses controllability and mode coverage
+    \item \badgeLseven{L7} Discusses convergence of paradigms (consistency models bridge diffusion and single-step generation, VQ-VAE + autoregressive combines VAE and AR), mentions flow matching as an emerging alternative
+\end{itemize}
+
+\followups{``What are consistency models and how do they relate to diffusion?'' ``When would you still choose a GAN in 2025?'' ``How does VQ-VAE + autoregressive (DALL-E 1) compare to latent diffusion (DALL-E 2/3)?''}
+\end{interviewq}
+
+\begin{warningbox}
+GAN training is notoriously unstable. Mode collapse (generator produces limited variety) and training divergence are common. If you're choosing between GANs and diffusion for a new project, default to diffusion unless you specifically need fast single-step generation.
+\end{warningbox}
+
+\begin{interviewq}
+\textbf{Q: Your diffusion model generates high-quality images overall but has mode collapse for certain categories (e.g., generates dogs well but all cats look the same). Diagnose and fix.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer Category-specific mode collapse in diffusion models is unusual (diffusion models are generally resistant to mode collapse), which points to data or conditioning issues rather than a fundamental model problem.
+
+\textit{Diagnosis 1: Data imbalance.} If the training data has 10$\times$ more dog images than cat images, the model learns the dog distribution much better. Check: count per-category examples. Solution: oversample underrepresented categories, use class-balanced sampling, or augment minority categories with synthetic data.
+
+\textit{Diagnosis 2: Conditioning failure.} If using text or class conditioning, the model may have learned a weak association between the ``cat'' condition and visual diversity. Check: does unconditional generation also show cat mode collapse? If yes, it's a data issue. If no (unconditional cats are diverse but conditional cats are repetitive), the conditioning pathway is the problem. Solution: verify text encoder representations distinguish cat subcategories, and \textit{strengthen} the conditional pathway for the weak classes---e.g., class-balanced sampling, or a \textit{lower} conditioning-dropout rate for underrepresented classes. (Beware the inverted remedy: raising the CFG dropout rate drops the conditioning more often, further weakening exactly the conditional pathway that is already undertrained.)
+
+\textit{Diagnosis 3: Noise schedule mismatch.} Different visual categories have different frequency characteristics. Fine-grained details (fur texture, facial features) are destroyed at different noise levels. If the noise schedule is tuned for the majority class, minority classes may not get adequate denoising at critical timesteps. Check: sample intermediate denoising steps and see if cat structure emerges but gets overridden. Solution: this is harder to fix---consider category-aware noise schedules or stratified timestep sampling.
+
+\textit{Diagnosis 4: Guidance scale sensitivity.} High classifier-free guidance ($w > 7$) can reduce diversity by amplifying the conditional signal too aggressively. For underrepresented categories where the model's conditional distribution is already narrow, high guidance compounds the problem. Check: try lower guidance scales for cat generation. Solution: use category-adaptive guidance scales.
+
+\textit{Fix priority:} (1) Verify data balance and fix if needed (highest impact, lowest effort). (2) Check conditioning quality. (3) Experiment with guidance scale. (4) Consider fine-tuning on a cat-focused dataset with LoRA.
+
+\redflags
+\begin{itemize}
+    \item ``Diffusion models don't have mode collapse''---they can, especially with data imbalance
+    \item Jumping to architecture changes without checking data first
+    \item Not considering guidance scale as a factor
+\end{itemize}
+
+\interviewtest{Debugging generative model failures with systematic hypothesis generation.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies data imbalance as the most likely cause
+    \item \badgeLsix{L6} Distinguishes conditional vs.\ unconditional mode collapse, discusses guidance scale
+    \item \badgeLseven{L7} Discusses noise schedule per-category analysis, proposes targeted fine-tuning strategies, and considers FID/diversity metrics per category as monitoring
+\end{itemize}
+
+\followups{``How do you measure diversity per category?'' ``What is FID and how would you compute it per-class?'' ``Could you use DreamBooth to fix the cat diversity problem?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design an image generation pipeline for a product photography application (e.g., placing products in realistic scenes).}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer Product photography generation requires controlled, high-quality image generation that preserves exact product appearance while varying the background and lighting. This is a constrained generation problem.
+
+\textit{Pipeline design.} (1) \textbf{Product segmentation}: Use SAM (Segment Anything Model) to extract the product from reference photos, producing a clean product cutout with alpha mask. (2) \textbf{Inpainting-based composition}: Use Stable Diffusion inpainting---place the product cutout on a blank canvas, mask the background, and generate a realistic scene around it. Text prompt controls the scene (``product on a marble kitchen counter, warm lighting''). (3) \textbf{ControlNet for consistency}: Use ControlNet with depth or edge conditioning to maintain the product's exact shape, size, and position. This prevents the diffusion model from modifying the product itself. (4) \textbf{IP-Adapter for style}: If a reference scene style is provided (``like this catalog photo''), IP-Adapter can condition on the reference image's style.
+
+\textit{Quality assurance.} Product fidelity is non-negotiable---the generated image must preserve exact product appearance (color, shape, branding, text). Automated checks: (1) Pixel-level difference and LPIPS between the generated image and the reference \textit{inside the preserved-product mask}---the masked region should be near-identical, and a perceptual threshold can be calibrated per catalog. (A global CLIP-similarity gate like ``$>0.95$'' is fragile: CLIP cosine scales are not calibrated per domain and CLIP is too coarse to catch a wrong logo color.) (2) OCR on product labels to verify text preservation. (3) Edge consistency between product mask and generated boundary (no visible artifacts).
+
+\textit{Fine-tuning for the domain.} Train a LoRA adapter on a curated dataset of professional product photography ($\sim$10K high-quality images). This teaches the model about typical product photography lighting, angles, and composition. Complement with DreamBooth for specific product lines that need exact preservation.
+
+\textit{Serving architecture.} Batch generation (not real-time): generate $N$ scene variations per product, human curators select the best. Generation time: $\sim$5--10 seconds per image on an A100 (50 diffusion steps with Stable Diffusion XL). For a catalog of 10K products $\times$ 5 variations = 50K images $\approx$ 70 GPU-hours.
+
+\redflags
+\begin{itemize}
+    \item Proposing unconstrained generation---product fidelity is critical
+    \item Not mentioning ControlNet or similar conditioning for product preservation
+    \item Ignoring quality assurance (products with wrong colors or distorted logos are useless)
+\end{itemize}
+
+\interviewtest{Practical system design for constrained image generation with quality requirements.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes Stable Diffusion with inpainting for product placement
+    \item \badgeLsix{L6} Designs the full pipeline with SAM + ControlNet + quality checks, discusses fine-tuning strategy
+    \item \badgeLseven{L7} Addresses automated quality assurance at scale, discusses the IP-Adapter for style control, and considers A/B testing the generated images against real photography for conversion rate
+\end{itemize}
+
+\followups{``How do you ensure the product text/logos are preserved?'' ``What's the ROI of generated vs.\ real product photography?'' ``How would you handle products that come in multiple colors?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What is classifier-free guidance and why does it improve generation quality in diffusion models?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer Classifier-free guidance (CFG) is a technique that improves the quality and condition-adherence of conditional diffusion models by amplifying the effect of the conditioning signal during sampling.
+
+\textit{Mechanism.} During training, the model learns both conditional and unconditional denoising: randomly drop the conditioning (text prompt) with probability $p$ (typically 10--20\%), replacing it with a null token. During inference, compute both the conditional and unconditional noise predictions, then extrapolate:
+$$\tilde{\epsilon}_\theta(x_t, c) = \epsilon_\theta(x_t, \emptyset) + w \cdot (\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \emptyset))$$
+where $w$ is the guidance scale (typically 5--15). The term $(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \emptyset))$ is the ``direction'' that the conditioning pushes the prediction. Multiplying by $w > 1$ amplifies this direction.
+
+\textit{Intuition.} Think of it as implicit classifier guidance. Ho \& Salimans (2022) showed that the CFG update is equivalent to using an implicit classifier $p(c|x_t) \propto p(x_t|c)/p(x_t)$. The guidance scale $w$ controls how strongly the model follows this implicit classifier. Higher $w$ means stronger conditioning adherence---images match the prompt more closely but lose diversity.
+
+\textit{Why it works.} Without guidance ($w = 1$), diffusion models produce diverse but sometimes off-topic samples. The conditional distribution $p(x|c)$ is broad. CFG sharpens this distribution, producing samples closer to the mode of $p(x|c)$. This trades diversity for quality and relevance---exactly the tradeoff users want for text-to-image generation.
+
+\textit{Guidance scale tradeoff.} $w = 1$: no guidance (pure conditional sampling). $w = 3$--$7$: balanced quality and diversity. $w = 7$--$15$: strong prompt adherence, reduced diversity. $w > 20$: oversaturation, artifacts, loss of coherence. Stable Diffusion defaults to $w = 7.5$.
+
+\textit{Why not classifier guidance?} Earlier work (Dhariwal \& Nichol, 2021) used a separately trained classifier to guide diffusion. CFG is superior because: (1) no extra classifier needed, (2) works with any conditioning (text, image, class label), (3) the conditioning comes from the same model, ensuring coherence.
+
+\redflags
+\begin{itemize}
+    \item Confusing classifier-free guidance with classifier guidance
+    \item Not knowing that it requires training with random conditioning dropout
+    \item Saying ``higher guidance is always better''---there's a quality-diversity tradeoff
+\end{itemize}
+
+\interviewtest{Understanding of a core diffusion model technique and its intuition.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the formula and knows it improves prompt adherence
+    \item \badgeLsix{L6} Explains the implicit classifier interpretation, discusses the guidance scale tradeoff with specific values
+    \item \badgeLseven{L7} Connects to the score function perspective: the guided score is \textit{defined} as $\tilde{s}(x) \coloneqq \nabla_x \log p(x) + w \nabla_x \log p(c|x)$, which by Bayes' rule equals the true conditional score $\nabla_x \log p(x|c)$ only at $w = 1$; for $w > 1$ it is the score of the tilted distribution $\propto p(x)\,p(c|x)^w$, not an identity. Also discusses limitations (CFG in latent space vs.\ pixel space) and mentions negative prompts as an extension
+\end{itemize}
+
+\followups{``How do negative prompts work with CFG?'' ``What guidance scale would you use for photorealism vs.\ artistic generation?'' ``How does CFG interact with the number of diffusion steps?''}
+\end{interviewq}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:gen_interview}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q: Explain the ELBO derivation for VAEs and why the model produces blurry images. What fixes exist?}
+
+\badgeLfive{L5} \quad \badgetype{First Principles} \quad \badgefreq{\freqhigh}
+
+\stronganswer The ELBO (Evidence Lower Bound) arises from the fact that the marginal likelihood $\log p_\theta(x) = \log \int p_\theta(x|z) p(z) dz$ is intractable (the integral has no closed form). We introduce an approximate posterior $q_\phi(z|x)$ and derive:
+
+$\log p_\theta(x) = \underbrace{\E_{q_\phi(z|x)}[\log p_\theta(x|z)] - \KL(q_\phi(z|x) \| p(z))}_{\text{ELBO}} + \underbrace{\KL(q_\phi(z|x) \| p_\theta(z|x))}_{\geq 0}$
+
+Since the last KL term is non-negative, the ELBO is a lower bound on $\log p(x)$. Maximizing the ELBO simultaneously: (1) maximizes the reconstruction quality (first term), (2) keeps the approximate posterior close to the prior (second term), and (3) tightens the bound (reduces the gap KL term).
+
+\textit{Why blurriness.} The reconstruction term $\E_{q(z|x)}[\log p(x|z)]$ with a Gaussian decoder and MSE loss computes $-\|x - \hat{x}\|^2$. When the model is uncertain (multiple valid outputs for a given $z$), MSE-optimal prediction is the \textit{mean} of all valid outputs---which is inherently blurry. Additionally, the KL term forces $q(z|x)$ toward $\mathcal{N}(0, I)$, compressing the latent space and reducing the model's ability to represent fine details. The combination means VAEs hedge their bets, producing the average of possible outputs rather than a sharp specific sample.
+
+\textit{Fixes:} (1) \textbf{Perceptual loss}: Replace MSE with a loss computed on VGG features, which penalizes structural differences rather than pixel differences. (2) \textbf{VAE-GAN}: Add a discriminator that penalizes blurriness directly. (3) \textbf{VQ-VAE}: Replace continuous latent with a discrete codebook, eliminating the Gaussian bottleneck. The straight-through estimator handles non-differentiability. (4) \textbf{Hierarchical VAE} (NVAE): Multiple levels of latent variables, with each level capturing different scales of detail. (5) \textbf{$\beta$-VAE}: Reduce the KL weight ($\beta < 1$) to prioritize reconstruction over regularization, at the cost of less regular latent space.
+
+\redflags
+\begin{itemize}
+    \item Stating the ELBO without deriving it or explaining where it comes from
+    \item Blaming blurriness solely on the KL term---MSE reconstruction is equally responsible
+    \item Not knowing about VQ-VAE as the primary solution to blurriness
+\end{itemize}
+
+\interviewtest{Mathematical understanding of variational inference and ability to connect theory (ELBO) to practice (blurry images).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the ELBO correctly with both terms, explains blurriness via MSE averaging
+    \item \badgeLsix{L6} Derives the ELBO from log-likelihood + Jensen's inequality, discusses VQ-VAE and perceptual loss as fixes
+    \item \badgeLseven{L7} Discusses posterior collapse (when the decoder ignores $z$ entirely), connects to the information preference property of autoencoders, and explains how hierarchical VAEs address the expressiveness limit
+\end{itemize}
+
+\followups{``What is posterior collapse and how do you detect it?'' ``How does VQ-VAE's codebook learning work?'' ``What's the relationship between the ELBO gap and the quality of the approximate posterior?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Estimate the inference cost (FLOPs and latency) for generating a $512 \times 512$ image with Stable Diffusion on an A100 GPU.}
+
+\badgeLseven{L7} \quad \badgetype{Estimation} \quad \badgefreq{\freqlow}
+
+\stronganswer Stable Diffusion operates in latent space with a U-Net denoiser. I'll estimate each component, flagging the classic trap up front: for \textit{convolutional} networks, cost $=$ per-position work $\times$ spatial positions---weights are reused at every location---so ``$2 \times \text{params}$'' shortcuts that work for a transformer processing one token undercount convnets by orders of magnitude.
+
+\textit{VAE encoding (if img2img):} Encode $512 \times 512 \times 3$ to a $64 \times 64 \times 4$ latent. Naively costing the $\sim$34M-parameter encoder by parameter count gives $\sim$0.1 GFLOPs---off by roughly three orders of magnitude, because its convolutions run at up to $512 \times 512$ resolution. Real cost: $\sim$0.5--1 TFLOPs.
+
+\textit{Text encoding:} CLIP ViT-L/14's text tower is an $\sim$85M-parameter transformer over 77 tokens: $2 \times 85\text{M} \times 77 \approx 13$ GFLOPs. Genuinely negligible.
+
+\textit{U-Net denoising (dominant over a multi-step run).} The SD 1.5 U-Net has $\sim$860M parameters operating on a $64 \times 64 \times 4$ latent ($4096$ positions). Here the naive transformer rule $2 \times 860\text{M} \times 4096 \approx 7$ TFLOPs per pass \textit{overestimates}, for the mirror-image reason: the U-Net is hierarchical, and most of its parameters sit in the downsampled $16 \times 16$ and $8 \times 8$ blocks where they see far fewer than 4096 positions. Measured cost is $\sim$1--2 TFLOPs per forward pass.
+
+With classifier-free guidance (CFG), we need \textbf{2 forward passes per step} (conditional + unconditional). With 50 denoising steps: $50 \times 2 \times 1.5\text{T} \approx 1.5 \times 10^{14}$ FLOPs $\approx$ 150 TFLOPs total.
+
+\textit{VAE decoding:} Decode $64 \times 64 \times 4$ to $512 \times 512 \times 3$: convolutions at full resolution again, so $\sim$1--2 TFLOPs---not the $\sim$0.5 GFLOPs its $\sim$50M parameters would suggest. That is only $\sim$1--2\% of a 50-step run, but for 1--4-step distilled models the decode becomes a major fraction of total compute.
+
+\textit{Latency estimate.} A100 BF16 peak: 312 TFLOPS---but batch-1 U-Net inference is memory-bandwidth- and kernel-launch-bound, so realistic utilization is $\sim$10--20\% MFU, i.e., $\sim$30--60 TFLOPS effective. Time: $1.5 \times 10^{14} / (3\text{--}6 \times 10^{13}) \approx 2.5$--$5$ seconds, matching the observed $\sim$3--5 seconds for SD 1.5 at 50 steps on an A100. The point is to land on the right latency with \textit{honest} components: a 10$\times$-inflated per-pass FLOP count ``rescued'' by an unrealistic 60\% utilization also gives seconds---compensating errors that an expert interviewer will dismantle line by line.
+
+\textit{Optimization:} DDIM with 20 steps instead of 50 $\to$ 2.5$\times$ speedup. Half-precision $\to$ already assumed. xFormers memory-efficient attention $\to$ 20--30\% speedup. Flash Attention $\to$ further improvement. Distillation to 1--4 steps (LCM, Consistency Distillation) $\to$ 10--50$\times$ speedup.
+
+\redflags
+\begin{itemize}
+    \item Forgetting the 2$\times$ multiplier from classifier-free guidance
+    \item Costing convolutional components (VAE, U-Net conv blocks) by parameter count alone, missing the spatial multiplier
+    \item Assuming near-peak GPU utilization for batch-1 inference (realistic MFU is $\sim$10--20\%)
+    \item Not knowing that the U-Net dominates a multi-step run (the VAE decode stops being negligible only at 1--4 distilled steps)
+\end{itemize}
+
+\interviewtest{Back-of-envelope estimation for generative model inference and understanding of where compute goes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Gets the right order of magnitude (seconds, not minutes)
+    \item \badgeLsix{L6} Breaks down by component, accounts for CFG doubling, provides a sanity check
+    \item \badgeLseven{L7} Discusses SDXL vs.\ SD1.5 cost difference (larger U-Net + higher resolution latent), estimates the cost of DiT-based architectures, and discusses the tradeoff between steps and quality (DDIM curve)
+\end{itemize}
+
+\followups{``How does SDXL compare in cost?'' ``What's the memory requirement for batch generation?'' ``How do consistency models reduce this cost?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Flow matching vs denoising diffusion---what changed and why is it considered the next evolution?}
+
+\badgeLseven{L7} \quad \badgetype{Conceptual} \quad \badgefreq{\freqlow}
+
+\stronganswer Flow matching and denoising diffusion are both methods for learning a generative process that transforms noise into data, but they differ in how they formulate and parameterize this transformation.
+
+\textit{Denoising diffusion (DDPM).} Defines a fixed forward process $q(x_t | x_0)$ that gradually adds Gaussian noise, and learns the reverse $p_\theta(x_{t-1} | x_t)$. The noise schedule (variance $\beta_t$) must be carefully designed. Training predicts the noise $\epsilon$ added at each step. Sampling requires many sequential denoising steps (20--1000) because each step makes a small correction.
+
+\textit{Flow matching (Lipman et al., 2023).} Instead of a noising-denoising process, flow matching learns a continuous-time flow (velocity field) that transports the noise distribution $p_0 = \mathcal{N}(0, I)$ directly to the data distribution $p_1 = p_{\text{data}}$. The training objective is:
+$$\loss = \E_{t, x_0, x_1}\left[\|v_\theta(x_t, t) - u_t(x_t | x_1)\|^2\right]$$
+where $v_\theta$ is the learned velocity field and $u_t$ is the conditional flow that transports $x_0$ to $x_1$ along a straight path: $x_t = (1-t)x_0 + t x_1$.
+
+\textit{Key differences:} (1) \textbf{Straight paths.} Flow matching uses straight interpolation paths between noise and data (optimal transport), while diffusion uses curved paths defined by the noise schedule. Straight paths are more efficient to traverse, requiring fewer ODE solver steps. (2) \textbf{Simpler training.} No noise schedule to design---just linear interpolation. The loss is a simple regression on the velocity field. (3) \textbf{Faster sampling.} Because paths are straighter, fewer integration steps are needed (1--5 steps with rectified flows vs.\ 20--50 for DDIM). (4) \textbf{Unified framework.} Flow matching generalizes diffusion---DDPM can be viewed as a special case with a specific (non-straight) path choice.
+
+\textit{Rectified flows.} An extension that iteratively straightens the flow paths: (1) train a flow model, (2) sample pairs $(x_0, x_1)$ by running the learned flow, (3) retrain with these paired samples to get straighter paths. After 2--3 iterations, paths are nearly straight, enabling high-quality 1--2 step generation.
+
+\textit{Impact.} Stable Diffusion 3 and Flux models use flow matching instead of DDPM, achieving better quality with fewer sampling steps. This is likely the default formulation going forward.
+
+\redflags
+\begin{itemize}
+    \item Saying flow matching is ``completely different'' from diffusion---it's a generalization
+    \item Not understanding why straight paths enable fewer steps
+    \item Confusing flow matching with normalizing flows (different concept)
+\end{itemize}
+
+\interviewtest{Awareness of cutting-edge generative model formulations and understanding of why they improve on DDPM.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows flow matching exists and uses velocity fields instead of noise prediction
+    \item \badgeLsix{L6} Explains straight vs.\ curved paths and the connection to fewer sampling steps
+    \item \badgeLseven{L7} Discusses optimal transport formulation, rectified flows for path straightening, and the connection to Stable Diffusion 3's architecture choices
+\end{itemize}
+
+\followups{``What is the relationship between flow matching and score matching?'' ``How do rectified flows work?'' ``Why is Flux using flow matching instead of DDPM?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: How does Stable Diffusion work end-to-end? Walk through the architecture from text prompt to generated image.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer Stable Diffusion is a latent diffusion model that performs the expensive denoising process in a compressed latent space rather than pixel space.
+
+\textit{Architecture components:} (1) \textbf{Text encoder} (CLIP ViT-L/14): Converts the text prompt into a sequence of embedding vectors ($77 \times 768$ for SD 1.5). These embeddings capture the semantic content of the prompt. (2) \textbf{VAE encoder/decoder}: Pre-trained autoencoder that compresses images $512 \times 512 \times 3 \to 64 \times 64 \times 4$ (8$\times$ spatial compression). The latent space preserves perceptual quality while being 48$\times$ smaller. (3) \textbf{U-Net denoiser} ($\sim$860M params): The core model that iteratively removes noise from the latent. Contains ResNet blocks, self-attention layers, and cross-attention layers (where text conditioning is injected). Conditioned on both the text embedding (via cross-attention) and the timestep $t$ (via sinusoidal embedding + adaptive layer norm).
+
+\textit{Inference pipeline:} (1) Encode text prompt to embeddings via CLIP. (2) Sample random noise in latent space: $z_T \sim \mathcal{N}(0, I)$ at shape $64 \times 64 \times 4$. (3) Iteratively denoise using the U-Net. At each step $t$, compute two noise predictions: $\epsilon_\theta(z_t, c)$ (conditional, with text) and $\epsilon_\theta(z_t, \emptyset)$ (unconditional, null text). (4) Apply classifier-free guidance: $\tilde{\epsilon} = \epsilon_\emptyset + w(\epsilon_c - \epsilon_\emptyset)$ with $w = 7.5$. (5) Update $z_t \to z_{t-1}$ using the DDPM or DDIM update rule. (6) After all steps (typically 20--50), decode the clean latent $z_0$ to pixel space: $x = \text{Decoder}(z_0)$ producing a $512 \times 512$ image.
+
+\textit{Why latent space?} Running diffusion in pixel space at $512 \times 512$ would require the U-Net to process $262\text{K}$ spatial positions per step---impractical. In latent space at $64 \times 64$, only $4\text{K}$ positions, which is $\sim$64$\times$ fewer operations and enables attention layers (which are $O(n^2)$).
+
+\textit{Fine-tuning methods:} LoRA (low-rank adaptation on U-Net attention layers) for style transfer, DreamBooth (few-shot personalization), textual inversion (learn new text embeddings for concepts), ControlNet (add spatial conditioning like edges, depth, pose).
+
+\redflags
+\begin{itemize}
+    \item Saying diffusion happens in pixel space---it's in latent space
+    \item Not mentioning cross-attention as the conditioning mechanism
+    \item Forgetting that CFG requires two forward passes per step
+\end{itemize}
+
+\interviewtest{Understanding of the most important generative AI system of recent years, at a level sufficient to reason about design decisions.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes the VAE + U-Net + CLIP pipeline, knows diffusion happens in latent space
+    \item \badgeLsix{L6} Explains classifier-free guidance, cross-attention conditioning, and the 64$\times$ compression benefit
+    \item \badgeLseven{L7} Discusses SDXL improvements (dual text encoders, refiner model), DiT as U-Net replacement, and the evolution toward Flux/SD3 with flow matching
+\end{itemize}
+
+\followups{``How does SDXL differ from SD 1.5?'' ``What is ControlNet and how does it work architecturally?'' ``How would you fine-tune SD for a specific art style?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Explain the WGAN loss and why Wasserstein distance solves GAN training instability.}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer The original GAN minimizes the Jensen-Shannon divergence between the generator and data distributions. WGAN replaces this with the Wasserstein-1 (Earth Mover's) distance, fixing two fundamental training problems.
+
+\textit{Problem 1: Vanishing gradients.} When the discriminator is well-trained (as it should be), the JS divergence saturates. For two distributions with non-overlapping support, $JS(p_{\text{data}} \| p_g) = \log 2$ regardless of how close the distributions are. This means the generator gets zero gradient information about \textit{how} to improve. The Wasserstein distance, by contrast, is a continuous metric even for non-overlapping distributions: $W(p_{\text{data}}, p_g)$ smoothly decreases as $p_g$ moves toward $p_{\text{data}}$.
+
+\textit{Problem 2: Mode collapse (partially addressed).} Be careful with the causal story here: JS saturation explains \textit{vanishing gradients} on disjoint supports, not mode collapse. Mode collapse is standardly attributed to the mode-seeking, reverse-KL-like character of the non-saturating generator objective and to the min-max dynamics---the generator can ``win'' the current round by concentrating on a few modes the critic scores well. Wasserstein distance helps because it charges for missing modes in proportion to their mass and transport distance, but the fix is partial: WGAN-GP models still exhibit mode collapse empirically.
+
+\textit{WGAN formulation.} Using the Kantorovich-Rubinstein duality:
+$$W(p_{\text{data}}, p_g) = \sup_{\|f\|_L \leq 1} \E_{x \sim p_{\text{data}}}[f(x)] - \E_{x \sim p_g}[f(x)]$$
+The critic $f$ (replacing the discriminator) must be 1-Lipschitz. Originally enforced by weight clipping ($|w| \leq c$), which leads to pathological behavior (critic weights cluster at $\pm c$). WGAN-GP (gradient penalty) is the practical solution:
+$$\loss_{\text{GP}} = \lambda \E_{\hat{x}}[(\|\nabla_{\hat{x}} f(\hat{x})\|_2 - 1)^2]$$
+where $\hat{x}$ is sampled along straight lines between real and generated samples.
+
+\textit{Practical impact.} (1) The critic loss now correlates with generation quality---you can monitor convergence (impossible with original GAN loss). (2) Training is more stable because the critic provides informative gradients even when it's well-trained. (3) Mode coverage often improves in practice because missing modes incur transport cost---though WGAN-GP does not eliminate collapse, and diffusion models were what ultimately solved coverage.
+
+\redflags
+\begin{itemize}
+    \item Confusing the critic with a discriminator (critic outputs a scalar score, not a probability)
+    \item Not knowing about the Lipschitz constraint and why it's needed
+    \item Saying WGAN completely solves GAN training---it helps but GANs remain finicky
+\end{itemize}
+
+\interviewtest{Understanding of why GAN training fails and how Wasserstein distance addresses the root cause.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows WGAN uses Wasserstein distance, which provides better gradients
+    \item \badgeLsix{L6} Explains the JS divergence saturation problem, derives the dual formulation, discusses GP vs.\ weight clipping
+    \item \badgeLseven{L7} Connects to optimal transport theory, discusses spectral normalization as an alternative Lipschitz constraint, and explains why diffusion models ultimately superseded GANs despite WGAN's improvements
+\end{itemize}
+
+\followups{``What is spectral normalization and how does it enforce the Lipschitz constraint?'' ``Why did diffusion models ultimately win over GANs despite WGAN's improvements?'' ``What role do GANs still play in modern generative AI?''}
+\end{interviewq}

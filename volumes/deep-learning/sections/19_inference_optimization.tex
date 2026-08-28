@@ -1,0 +1,902 @@
+\chapter{Inference Optimization and LLM Serving}
+\label{chap:inference_optimization}
+
+\begin{tldr}
+Inference optimization is where model quality meets production reality. A 70B model is worthless if it cannot serve responses within your latency budget and cost envelope. This chapter covers the core building blocks of modern LLM serving: KV cache mechanics and PagedAttention, continuous batching, speculative decoding, quantization for inference (GPTQ, AWQ, GGUF), the prefill vs.\ decode phase distinction (and why it matters for hardware utilization), and model parallelism strategies for serving. At Staff+ interviews, you are expected to reason about memory bandwidth, GPU utilization, and end-to-end serving system design---not just name techniques. If your answer to ``how would you serve this model'' is ``put it on a GPU,'' you will not pass.
+\end{tldr}
+
+%==============================================================================
+\section{The KV Cache}
+\label{sec:kv_cache}
+%==============================================================================
+
+\subsection{Why It Exists}
+
+Autoregressive LLM generation produces one token at a time. At each step, the model computes attention over \textit{all} previous tokens. Without caching, generating token $t$ requires recomputing the key and value projections for tokens $1$ through $t-1$---redundant work that grows quadratically with sequence length. The KV cache stores these projections so each token's keys and values are computed exactly once.
+
+\textbf{What is cached.} For each layer, the key and value tensors are appended as new tokens are generated. Queries are computed fresh for only the current token. The attention output for position $t$ is:
+\[
+\text{Attention}(\vq_t, \mK_{1:t}, \mV_{1:t}) = \softmax\!\left(\frac{\vq_t \mK_{1:t}^\top}{\sqrt{d_k}}\right) \mV_{1:t}
+\]
+where $\mK_{1:t}$ and $\mV_{1:t}$ are the cached keys and values for all positions up to $t$.
+
+\subsection{Memory Calculation}
+
+The KV cache is often the dominant memory consumer at inference time, especially for long contexts. You must be able to compute this on a whiteboard.
+
+\begin{mathresult}{KV Cache Memory}
+\[
+\text{KV memory (bytes)} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times \text{seq\_len} \times \text{bytes per element}
+\]
+The factor of 2 accounts for both keys and values.
+\end{mathresult}
+
+\textbf{Worked example: LLaMA-2 70B.}
+\begin{itemize}
+    \item $n_{\text{layers}} = 80$, $n_{\text{kv\_heads}} = 8$ (GQA), $d_{\text{head}} = 128$, FP16 (2 bytes)
+    \item Per-token KV: $2 \times 80 \times 8 \times 128 \times 2 = 327{,}680$ bytes $\approx 0.3$ MB
+    \item At 4K context: $0.3 \times 4{,}096 \approx 1.3$ GB per request
+    \item At 128K context: $0.3 \times 131{,}072 \approx 40$ GB per request
+\end{itemize}
+
+\textbf{Key takeaway.} With GQA (8 KV heads instead of 64), LLaMA-2 70B already reduces the KV cache by $8\times$ compared to multi-head attention. Without GQA, 4K context would cost over 10 GB per request---infeasible for concurrent serving.
+
+\begin{keyinsight}[GQA and MQA Exist Primarily for KV Cache Reduction]
+Grouped-query attention (GQA) and multi-query attention (MQA) share key-value heads across multiple query heads. This was not primarily about training efficiency---it was designed to shrink the KV cache at inference. MQA uses a single KV head (maximum compression, some quality loss); GQA uses a small group (e.g., 8 heads), striking a balance. Nearly every modern serving-optimized LLM uses GQA.
+\end{keyinsight}
+
+\subsection{MLA: Compressing the Cache Itself}
+\label{sec:mla_serving}
+
+GQA and MQA shrink the cache by cutting the number of KV heads. Multi-head Latent Attention (MLA; DeepSeek-AI, 2024, used in DeepSeek-V2/V3/R1) compresses the cache \textit{contents} instead: each token's K/V information is jointly projected into a low-rank latent ($d_c = 512$ in DeepSeek-V3) plus a small decoupled RoPE key ($d_r = 64$), and only those 576 elements per layer are cached---at decode, the reconstruction projections are absorbed into the query and output projections, so attention reads the latent directly. The mechanism, the RoPE complication, and the weight-absorption trick are covered in Chapter~\ref{chap:attention_transformers} (Section~\ref{sec:mla}); here is what it does to serving.
+
+\textbf{Per-token cache at DeepSeek-V3 scale} (61 layers, $n_h = 128$, $d_h = 128$, FP16):
+\begin{itemize}
+    \item \textbf{Full-MHA equivalent}: $2 \times 128 \times 128 = 32{,}768$ elements/layer $\to 32{,}768 \times 61 \times 2$ B $\approx 4.0$ MB/token
+    \item \textbf{GQA-8 equivalent}: $2 \times 8 \times 128 = 2{,}048$ elements/layer $\to 2{,}048 \times 61 \times 2$ B $\approx 250$ KB/token
+    \item \textbf{MLA}: $512 + 64 = 576$ elements/layer $\to 576 \times 61 \times 2$ B $\approx 70$ KB/token ($57\times$ below MHA, $3.6\times$ below GQA-8)
+\end{itemize}
+For calibration against the running example: LLaMA-2 70B with GQA-8 caches $\approx 0.3$ MB/token---MLA at V3 scale caches less than a quarter of that, despite V3 being a far larger model.
+
+\textbf{Concurrent-request ceiling.} At 32K context, one request's cache costs $\approx 131$ GB under the MHA-equivalent configuration---more than a single H100's entire 80 GB of HBM on its own---versus $\approx 8.2$ GB with GQA-8 and $\approx 2.3$ GB with MLA. Per 100 GB of KV budget, that is roughly 12 concurrent 32K requests with GQA-8 and 43 with MLA. Since decode throughput scales with batch size until KV memory (not compute) runs out, cache compression is directly a throughput multiplier.
+
+\textbf{Long-context economics.} At 128K context, MLA holds a request at $\approx 9$ GB (vs.\ $\approx 33$ GB GQA-8-equivalent and $\approx 524$ GB MHA-equivalent), which is what makes long-context serving of a frontier-scale model economically sane; it also shrinks the KV transfer volume in disaggregated prefill/decode setups by the same factor. FP8 KV-cache quantization stacks multiplicatively on top---the cached latent quantizes like any other KV tensor, halving the numbers above again. One serving-side caveat: the latent is shared by all attention heads, so under tensor parallelism it is replicated on every rank rather than sharded the way GQA's KV heads are---large MLA deployments therefore typically run attention data-parallel.
+
+\subsection{PagedAttention}
+
+\textbf{The problem.} Traditional KV cache implementations pre-allocate contiguous memory for the maximum possible sequence length of each request. If you allocate for 4K tokens but the request only uses 500, you waste 87\% of that memory. Across hundreds of concurrent requests, this waste is catastrophic for throughput.
+
+\textbf{The solution.} PagedAttention (Kwon et al., 2023; vLLM) borrows virtual memory concepts from operating systems. Instead of one contiguous buffer per request, the KV cache is divided into fixed-size \textit{pages} (blocks of, say, 16 tokens). Pages are allocated on demand as the sequence grows and stored in a non-contiguous page table. Different requests can share physical pages (e.g., for shared system prompts via copy-on-write).
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    block/.style={rectangle, draw, minimum width=1.4cm, minimum height=0.7cm, font=\small},
+    req/.style={block, fill=lightblue},
+    free/.style={block, fill=lightgray, dashed},
+    shared/.style={block, fill=lightgreen},
+    arrow/.style={->, thick, >=stealth},
+    label/.style={font=\small\bfseries}
+]
+    % Logical view
+    \node[label] at (0, 3.2) {Logical View};
+    \node[label] at (0, 2.6) {\small (per request)};
+
+    \node[req] (l0) at (-1.5, 1.8) {Page 0};
+    \node[req] (l1) at (0, 1.8) {Page 1};
+    \node[req] (l2) at (1.5, 1.8) {Page 2};
+    \draw[arrow] (l0) -- (l1);
+    \draw[arrow] (l1) -- (l2);
+    \node[font=\footnotesize, below=0.1cm of l0] {tokens 0--15};
+    \node[font=\footnotesize, below=0.1cm of l1] {tokens 16--31};
+    \node[font=\footnotesize, below=0.1cm of l2] {tokens 32--47};
+
+    % Physical view
+    \node[label] at (6.5, 3.2) {Physical GPU Memory};
+    \node[label] at (6.5, 2.6) {\small (non-contiguous blocks)};
+
+    \node[shared] (p3) at (4.5, 1.8) {Block 3};
+    \node[free]   (p7) at (5.8, 1.8) {Block 7};
+    \node[req]    (p1) at (7.1, 1.8) {Block 1};
+    \node[req]    (p9) at (8.4, 1.8) {Block 9};
+    \node[free]   (p2) at (4.5, 0.8) {Block 2};
+    \node[req]    (p5) at (5.8, 0.8) {Block 5};
+    \node[free]   (p4) at (7.1, 0.8) {Block 4};
+    \node[shared] (p6) at (8.4, 0.8) {Block 6};
+
+    % Page table arrows
+    \draw[arrow, deepblue] (l0.south) .. controls +(0,-0.8) and +(-1, 0.8) .. (p1.north);
+    \draw[arrow, deepblue] (l1.south) .. controls +(0.5,-1) and +(-0.5, 0.8) .. (p5.north);
+    \draw[arrow, deepblue] (l2.south) .. controls +(1.5,-0.5) and +(0, 0.8) .. (p9.north);
+
+    \node[font=\footnotesize\itshape, below=0.1cm of p2] {(free)};
+    \node[font=\footnotesize\itshape, below=0.1cm of p4] {(free)};
+\end{tikzpicture}
+\caption{PagedAttention: logical contiguous pages map to non-contiguous physical GPU memory blocks via a page table. Free blocks are reclaimed and reused across requests, eliminating memory fragmentation.}
+\label{fig:paged_attention}
+\end{figure}
+
+\textbf{Impact.} PagedAttention (vLLM) achieves near-zero waste of KV cache memory, increasing serving throughput by 2--4$\times$ compared to static allocation. It is now the standard approach in production LLM serving.
+
+\textbf{Pitfalls.} PagedAttention adds a level of indirection (page table lookups) that slightly increases per-token latency. The block size is a tuning parameter: too small increases page table overhead; too large increases internal fragmentation. Sixteen tokens per block is a common default.
+
+%==============================================================================
+\section{Continuous Batching}
+\label{sec:continuous_batching}
+%==============================================================================
+
+\textbf{The problem with static batching.} In naive serving, you collect a batch of $B$ requests and process them together. But requests finish at different times (different output lengths). With static batching, the entire batch waits for the longest request---short requests sit idle wasting GPU cycles after they finish.
+
+\textbf{Continuous batching} (also called \textit{iteration-level batching} or \textit{inflight batching}) inserts new requests into the batch as soon as any request completes. The batch is managed at the \textit{iteration} (single token generation step) level, not the request level.
+
+\begin{table}[H]
+\centering
+\caption{Static vs.\ continuous batching comparison}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Property} & \textbf{Static Batching} & \textbf{Continuous Batching} \\
+\midrule
+Batch composition & Fixed for entire generation & Changes every iteration \\
+New request handling & Waits for current batch to finish & Inserted at next iteration \\
+Short request behavior & Pads or idles until batch completes & Released immediately when done \\
+GPU utilization & Low (waiting on longest request) & High (slots always filled) \\
+Throughput & Limited by slowest request & 2--8$\times$ higher in practice \\
+Implementation & Trivial & Requires iteration-level scheduler \\
+Latency fairness & All requests have same latency & Short requests finish faster \\
+Adopted by & Older serving frameworks & vLLM, TGI, TensorRT-LLM \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{How it works in practice.} The serving engine maintains a \textit{running batch} and a \textit{waiting queue}. At each decode step: (1) generate one token for every request in the running batch, (2) remove any request that produced an EOS token or hit the length limit, (3) fill the freed slots with requests from the waiting queue. This maximizes GPU utilization because the batch stays full as long as there are queued requests.
+
+\begin{warningbox}
+Continuous batching interacts with prefill scheduling. A newly inserted request must run its prefill (processing all input tokens) before it can join the decode batch. If the new request has a long prompt, its prefill can stall the entire decode batch. Production systems solve this with \textit{chunked prefill}: split the prefill into smaller chunks and interleave them with decode steps from other requests, preventing latency spikes for in-flight requests.
+\end{warningbox}
+
+%==============================================================================
+\section{Speculative Decoding}
+\label{sec:speculative_decoding}
+%==============================================================================
+
+\subsection{The Core Idea}
+
+Autoregressive decoding is fundamentally sequential: you generate token $t$ before you can generate token $t+1$. Each step underutilizes the GPU because the decode phase is memory-bandwidth-bound (Section~\ref{sec:prefill_decode}), not compute-bound. The GPU has spare compute capacity sitting idle during each decode step.
+
+\textbf{Speculative decoding} exploits this spare capacity. A small, fast \textit{draft model} generates $K$ candidate tokens cheaply. The large \textit{target model} then verifies all $K$ tokens in a single forward pass (which is parallelizable, like prefill). Accepted tokens are kept; the first rejected token is resampled from the target model's distribution. The key guarantee: the output distribution is \textit{mathematically identical} to the target model alone---speculation introduces zero quality loss.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.3cm,
+    tok/.style={rectangle, draw, minimum width=1.6cm, minimum height=0.6cm, font=\small, rounded corners=2pt},
+    draft/.style={tok, fill=lightblue},
+    verify/.style={tok, fill=lightgreen},
+    accept/.style={tok, fill=green!30},
+    reject/.style={tok, fill=red!15},
+    arrow/.style={->, thick, >=stealth},
+    label/.style={font=\small\bfseries}
+]
+    % Draft phase
+    \node[label] at (-0.3, 2.2) {Draft model (fast):};
+    \node[draft] (d1) at (0, 1.4) {``The''};
+    \node[draft, right=0.3cm of d1] (d2) {``cat''};
+    \node[draft, right=0.3cm of d2] (d3) {``sat''};
+    \node[draft, right=0.3cm of d3] (d4) {``on''};
+    \node[draft, right=0.3cm of d4] (d5) {``a''};
+    \draw[arrow] (d1) -- (d2);
+    \draw[arrow] (d2) -- (d3);
+    \draw[arrow] (d3) -- (d4);
+    \draw[arrow] (d4) -- (d5);
+
+    % Verify phase
+    \node[label] at (-0.3, 0.2) {Target model (verify):};
+    \node[verify, below=0.8cm of d1] (v1) {``The''};
+    \node[verify, right=0.3cm of v1] (v2) {``cat''};
+    \node[verify, right=0.3cm of v2] (v3) {``sat''};
+    \node[verify, right=0.3cm of v3] (v4) {``on''};
+    \node[verify, right=0.3cm of v4] (v5) {``a''};
+
+    % Draw all 5 drafts going into verify in one pass
+    \draw[arrow, dashed, gray] (d5.south) -- ++(0, -0.2) -| (v1.north);
+    \node[font=\footnotesize\itshape, gray] at (5.5, 0.8) {single forward pass};
+
+    % Result
+    \node[label] at (-0.3, -1.2) {Result:};
+    \node[accept, below=0.8cm of v1] (r1) {``The''};
+    \node[accept, right=0.3cm of r1] (r2) {``cat''};
+    \node[accept, right=0.3cm of r2] (r3) {``sat''};
+    \node[reject, right=0.3cm of r3] (r4) {``upon''};
+    \node[font=\footnotesize, below=0.1cm of r4] {\itshape resampled};
+
+    \node[font=\small, right=0.5cm of r4] {$\rightarrow$ 4 tokens in 2 forward passes};
+\end{tikzpicture}
+\caption{Speculative decoding: the draft model proposes 5 tokens sequentially (cheap), the target model verifies them in one parallel pass (expensive but batched). Three are accepted; the first rejection is resampled from the target distribution. Net: 4 tokens for the cost of $\sim$2 target model passes.}
+\label{fig:speculative_decoding}
+\end{figure}
+
+\subsection{When It Helps (and When It Does Not)}
+
+\begin{table}[H]
+\centering
+\caption{Speculative decoding: conditions for speedup}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Factor} & \textbf{Helps (high speedup)} & \textbf{Hurts (low or no speedup)} \\
+\midrule
+Draft-target agreement & High (draft matches target often) & Low (most tokens rejected) \\
+Task predictability & Boilerplate, code, structured output & Creative writing, diverse sampling \\
+Batch size & Small (1--4 requests) & Large (GPU already saturated) \\
+Target model size & Large (more spare compute) & Small (already fast) \\
+Decode bottleneck & Memory-bandwidth-bound & Compute-bound \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Typical speedup.} 2--3$\times$ for single-request latency on large models. Diminishes with larger batch sizes because the GPU becomes compute-saturated, leaving no spare capacity for the verification pass.
+
+\textbf{Draft model variants.} The draft model can be a smaller version of the same architecture, a completely different architecture (e.g., a 2-layer transformer), or even a Medusa-style approach where extra prediction heads on the target model itself draft multiple tokens without a separate model.
+
+%==============================================================================
+\section{Quantization for Inference}
+\label{sec:quant_inference}
+%==============================================================================
+
+Quantization reduces the numerical precision of model weights (and optionally activations) from FP16/BF16 to INT8, INT4, or lower. For inference, the goal is to reduce memory footprint and increase throughput by fitting more data through the memory bus per cycle. See Chapter~\ref{chap:efficient_architectures} for quantization fundamentals; this section focuses on the practical methods used in LLM serving.
+
+\begin{mathresult}{Model Memory Estimate}
+\[
+\text{Model memory (GB)} \approx \frac{\text{params (billions)} \times \text{bits per weight}}{8}
+\]
+A 70B model in FP16 (16 bits): $\frac{70 \times 16}{8} = 140$ GB. In INT4 (4 bits): $\frac{70 \times 4}{8} = 35$ GB.
+\end{mathresult}
+
+\subsection{Method Comparison}
+
+\begin{table}[H]
+\centering
+\caption{LLM inference quantization methods}
+\begin{tabularx}{\textwidth}{lcccXX}
+\toprule
+\textbf{Method} & \textbf{Bits} & \textbf{Speed} & \textbf{Quality} & \textbf{Key Idea} & \textbf{Best For} \\
+\midrule
+GPTQ & 4/3 & Fast & High & Layer-wise Hessian-guided rounding & GPU serving (vLLM, TGI) \\
+AWQ & 4 & Fast & High & Protect salient channels by activation magnitude & GPU serving; faster calibration \\
+GGUF & 2--8 & Med & Mixed & Per-block mixed precision; CPU-optimized layout & CPU / Apple Silicon \\
+SmoothQuant & 8 & V.\ Fast & V.\ High & Shift quant difficulty from activations to weights & INT8 W8A8 on GPU \\
+FP8 & 8 & V.\ Fast & V.\ High & Native 8-bit float on H100+ & Drop-in for FP16 on H100+ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{GPTQ} (Frantar et al., 2023) quantizes weights layer by layer, using a second-order approximation (the Hessian of the layer-wise reconstruction error) to decide the optimal rounding direction and adjust remaining weights to compensate. Calibration requires 128--1024 samples and takes 1--4 hours for a 70B model. The resulting model runs at near-FP16 quality for most tasks at 4-bit.
+
+\textbf{AWQ} (Lin et al., 2024) observes that roughly 1\% of weight channels account for a disproportionate share of model quality---those corresponding to channels with large activation magnitudes. It scales these salient channels up before quantization (making them more robust to rounding) and compensates in the adjacent layer. Faster calibration than GPTQ with comparable results.
+
+\textbf{GGUF} is a file format (used by llama.cpp) that supports mixed-precision quantization per tensor block. Different layers or blocks can use different bit widths (e.g., attention projections at 6-bit, FFN at 4-bit). Optimized for CPU inference with SIMD instructions. The go-to for local inference on laptops and Apple Silicon.
+
+\textbf{Decision guide.}
+\begin{itemize}
+    \item \textbf{GPU serving, minimal quality loss:} FP8 on H100+ or SmoothQuant (INT8 W8A8). Near-lossless, simplest path.
+    \item \textbf{GPU serving, need to fit on fewer GPUs:} GPTQ or AWQ at 4-bit. Benchmark on \textit{your} task, not just perplexity.
+    \item \textbf{CPU/laptop inference:} GGUF via llama.cpp. Choose Q4\_K\_M or Q5\_K\_M for the quality-speed sweet spot.
+    \item \textbf{Sub-4-bit:} Experimental only. Quality degrades noticeably; larger models (70B+) tolerate it better than 7B.
+\end{itemize}
+
+\begin{warningbox}
+Quantization quality depends on model size. A 4-bit 70B model almost always outperforms a 4-bit 7B model---larger models have more redundant parameters that tolerate compression. The common mistake: choosing a smaller model at full precision over a larger model at 4-bit. Run the comparison on your actual task. Also: perplexity is an unreliable proxy for downstream quality after quantization. Always evaluate on your target benchmarks---quantization can selectively degrade reasoning, code generation, or long-context tasks while perplexity looks fine.
+\end{warningbox}
+
+%==============================================================================
+\section{Prefill vs.\ Decode Phases}
+\label{sec:prefill_decode}
+%==============================================================================
+
+LLM inference has two fundamentally different computational phases, and confusing them leads to wrong hardware choices and wrong optimization strategies.
+
+\subsection{The Two Phases}
+
+\textbf{Prefill} (also called the ``prompt processing'' phase): Process all input tokens in parallel to populate the KV cache. This is a single forward pass over the entire input sequence. Similar to training: large matrix multiplications, high arithmetic intensity, \textit{compute-bound}.
+
+\textbf{Decode} (also called the ``generation'' phase): Generate output tokens one at a time, reading the entire KV cache at each step. Each step involves small matrix multiplications (batch size $\approx$ 1 per request) that read far more data than they compute. Low arithmetic intensity, \textit{memory-bandwidth-bound}.
+
+\begin{table}[H]
+\centering
+\caption{Prefill vs.\ decode phase characteristics}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Property} & \textbf{Prefill Phase} & \textbf{Decode Phase} \\
+\midrule
+Tokens processed & All input tokens in parallel & One token at a time (per request) \\
+Bottleneck & Compute (FLOPS) & Memory bandwidth (GB/s) \\
+GPU utilization & High (large GEMM) & Low (small GEMM, large KV read) \\
+Arithmetic intensity & High ($\sim$100+ FLOPs/byte) & Low ($\sim$1--10 FLOPs/byte) \\
+Latency metric & TTFT (time to first token) & ITL (inter-token latency) / TPS \\
+Optimization lever & Faster GPU, tensor parallelism & More memory bandwidth, KV cache compression \\
+Duration & Short (one pass over prompt) & Long (one pass per output token) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{TTFT vs.\ Throughput}
+
+\textbf{TTFT (Time to First Token):} The time from receiving a request to producing the first output token. Dominated by the prefill phase. Users perceive TTFT as ``how long until the model starts responding.'' Sensitive to prompt length.
+
+\textbf{TPS (Tokens per Second) / Throughput:} The rate at which output tokens are generated during decode. Users perceive this as ``how fast does the response stream in.'' Sensitive to model size, batch size, and memory bandwidth.
+
+\textbf{Why this distinction matters for system design:}
+\begin{itemize}
+    \item A chatbot with a 200-token prompt and 500-token response spends most wall-clock time in decode. Optimize for TPS and memory bandwidth.
+    \item A summarization service with a 10K-token document and a 100-token summary is prefill-dominated. Optimize for compute throughput and TTFT.
+    \item Separating prefill and decode onto different hardware (\textit{disaggregated serving}) is an emerging pattern: use compute-dense GPUs for prefill, bandwidth-optimized GPUs for decode.
+\end{itemize}
+
+\begin{keyinsight}[Decode Is Memory-Bandwidth-Bound, Not Compute-Bound]
+During decode, generating one token for a 70B model requires reading $\sim$140 GB of weights from GPU memory, but only performs $\sim$140 billion multiply-adds. Using A100 numbers (2 TB/s bandwidth, 312 TFLOPS)---and noting that 140 GB exceeds a single A100's 80 GB, so read this as \textit{per aggregate GPU memory and bandwidth} across the GPUs holding the shards---the bandwidth time is $140/2000 = 70$ms but the compute time is $140\text{B}/312\text{T} = 0.4$ms. The GPU spends 99\% of its time waiting for memory reads. This is why quantization (reducing bytes read) and larger batch sizes (amortizing weight reads across requests) are the two most effective decode optimizations---they directly attack the bandwidth bottleneck.
+\end{keyinsight}
+
+%==============================================================================
+\section{Model Parallelism for Serving}
+\label{sec:serving_parallelism}
+%==============================================================================
+
+When a model does not fit on a single GPU, or when latency requirements demand it, you split the model across multiple GPUs. The two primary strategies have very different tradeoff profiles at serving time.
+
+\begin{table}[H]
+\centering
+\caption{Tensor parallelism vs.\ pipeline parallelism for serving}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Property} & \textbf{Tensor Parallelism (TP)} & \textbf{Pipeline Parallelism (PP)} \\
+\midrule
+What is split & Individual layers (weight matrices) & Groups of layers (stages) \\
+Communication pattern & All-reduce after every layer & Point-to-point between stages \\
+Communication volume & High (per-layer sync) & Low (only activations at boundaries) \\
+Interconnect requirement & NVLink (within node) & Can use InfiniBand (across nodes) \\
+Latency reduction & Yes (each GPU does less per layer) & No (sequential pipeline adds bubbles) \\
+Throughput scaling & Limited by communication & Good with micro-batching \\
+Typical degree & 2, 4, or 8 (within one node) & 2--8 stages (can span nodes) \\
+Best for & Reducing single-request latency & Fitting large models across nodes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Tensor parallelism} splits the weight matrices of each layer across GPUs. For a linear layer $\vy = \mW\vx$, you partition $\mW$ column-wise across $N$ GPUs, each computing a slice of the output. An all-reduce synchronizes the results. This reduces per-layer compute and memory by $N\times$, but requires low-latency, high-bandwidth interconnect (NVLink) because synchronization happens \textit{every layer}.
+
+\textbf{Pipeline parallelism} assigns different layers to different GPUs. GPU 0 runs layers 0--19, GPU 1 runs layers 20--39, and so on. Communication is only at stage boundaries (passing activations), so it can tolerate higher-latency interconnect. The downside: the pipeline has bubbles---GPUs earlier in the pipeline sit idle while later stages finish. Micro-batching reduces bubbles but does not eliminate them.
+
+\textbf{Serving decision guide:}
+\begin{itemize}
+    \item \textbf{Model fits on 1 GPU:} No parallelism needed. Serve directly.
+    \item \textbf{Model fits in 1 node (2--8 GPUs):} Use tensor parallelism with TP = number of GPUs. All communication stays on NVLink ($\sim$900 GB/s per H100). This is the standard for serving 70B models on a single 8-GPU node.
+    \item \textbf{Model exceeds 1 node:} Use TP within node + PP across nodes. TP handles the latency-sensitive per-layer sync; PP handles the less-frequent cross-node communication.
+    \item \textbf{Throughput-focused (many concurrent requests):} Consider data parallelism across nodes (replicate the model) instead of PP. Simpler, no pipeline bubbles, and the GPU utilization from a large request batch often outweighs the cost of duplication.
+\end{itemize}
+
+%==============================================================================
+\section{Putting It All Together: The LLM Serving Stack}
+\label{sec:serving_stack}
+%==============================================================================
+
+A production LLM serving system combines all of the above into a layered architecture:
+
+\begin{table}[H]
+\centering
+\caption{LLM serving stack: layers and responsibilities}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Layer} & \textbf{Component} & \textbf{Responsibility} \\
+\midrule
+API Gateway & Load balancer, rate limiter & Route requests, enforce quotas, handle auth \\
+Scheduler & Continuous batching engine & Manage request queue, batch formation, preemption \\
+KV Cache Mgr & PagedAttention & Allocate/free KV cache blocks, share prefixes \\
+Execution & Model runner + quantized weights & Forward pass (prefill and decode), TP communication \\
+Hardware & Multi-GPU node(s) & Compute (GEMMs), memory bandwidth (KV reads) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Key serving frameworks:}
+\begin{itemize}
+    \item \textbf{vLLM}: PagedAttention, continuous batching, prefix caching, GPTQ/AWQ support. Open-source standard for GPU serving.
+    \item \textbf{TensorRT-LLM}: NVIDIA's optimized runtime. Fused kernels, FP8 support, high raw performance but less flexible than vLLM.
+    \item \textbf{Text Generation Inference (TGI)}: Hugging Face's serving solution. Good integration with the HF ecosystem. Flash Attention, continuous batching, quantization.
+    \item \textbf{llama.cpp / GGUF}: CPU-optimized inference. The go-to for local or edge deployment on consumer hardware.
+\end{itemize}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:inference_interview}
+%==============================================================================
+
+%--- Rewritten Q1 (Architecture Design) ---
+
+\begin{interviewq}
+\textbf{Q: Design an LLM serving stack that handles 1,000 queries per second with a p99 latency of 2 seconds for a 70B parameter model.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Start with back-of-the-envelope sizing before touching architecture.
+
+\textbf{Sizing the model.} A 70B model in INT4 (AWQ/GPTQ) requires $\sim$35 GB for weights. With GQA and 4K average context, the KV cache per request is $\sim$1.3 GB (Section~\ref{sec:kv_cache}). On an 8$\times$H100 node (80 GB each, 640 GB total), the model with TP=8 leaves $\sim$600 GB of headroom for KV cache, supporting $\sim$400 concurrent requests per node.
+
+\textbf{Throughput estimation.} Run each node at its KV-memory limit of $\sim$400 active requests. At batch 400 the decode step is compute-bound: $400 \times 17.5$ GFLOPs per GPU $\approx 7$ TFLOPs per step, $\approx$14 ms at $\sim$495 effective TFLOPS---call it $\sim$25 ms ITL with real-world overhead, i.e., $\sim$40 tokens/sec/request and $\sim$16{,}000 tokens/sec aggregate per node. Assuming 200 output tokens on average, each request takes $\sim$5 seconds of decode. By Little's law, sustaining 1,000 QPS requires $\sim$5,000 concurrent requests; at $\sim$400 per node, that is $\sim$13 replica nodes.
+
+\textbf{Architecture.} (1) \textit{Load balancer}: least-connections routing across replicas with health checks. (2) \textit{Serving engine}: vLLM with continuous batching and PagedAttention; enable chunked prefill to avoid stalling decode batches. (3) \textit{Quantization}: AWQ 4-bit weights, FP16 KV cache---halves memory, doubles batch capacity. (4) \textit{Parallelism}: TP=8 within each node (NVLink); no PP needed since model fits in one node at INT4. (5) \textit{Prefix caching}: share system-prompt KV across requests. (6) \textit{Auto-scaling}: scale replicas on queue depth.
+
+\textbf{Meeting p99 = 2s.} TTFT (prefill) for 1K-token prompt on TP=8 H100s: $\sim$50--100ms. Decode: 200 tokens at $\sim$25ms ITL = $\sim$5 seconds---exceeds budget. To hit 2s: cap output length, use speculative decoding, or switch to FP8 for better throughput.
+
+\textbf{Monitoring.} TTFT, ITL, queue depth, GPU utilization, KV cache utilization, request success rate. Alert on KV OOM and p99 violations.
+
+\redflags
+\begin{itemize}
+    \item ``Just use vLLM'' without any sizing math---shows no systems thinking.
+    \item Forgetting the KV cache entirely and only sizing for model weights.
+    \item Proposing pipeline parallelism within a node when NVLink is available for TP.
+\end{itemize}
+
+\interviewtest{Ability to do back-of-the-envelope hardware sizing, awareness of all layers in the serving stack (not just the model), understanding of the compute-vs-bandwidth distinction, and practical knowledge of serving frameworks and their tradeoffs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the components (vLLM, PagedAttention, quantization) and gives rough sizing.
+    \item \badgeLsix{L6} Shows concrete math for memory, throughput, and concurrent capacity. Identifies the p99 latency gap and proposes mitigations.
+    \item \badgeLseven{L7} Discusses cost optimization (spot instances, right-sizing TP degree), failure modes (KV OOM cascades, cold-start latency), traffic-aware auto-scaling, and disaggregated prefill/decode as an advanced path.
+\end{itemize}
+
+\followups{``What if the average prompt is 10K tokens instead of 1K?'' ``How would you handle a 10$\times$ traffic spike?'' ``What if cost is the primary constraint?''}
+\end{interviewq}
+
+%--- Rewritten Q2 (Conceptual) ---
+
+\begin{interviewq}
+\textbf{Q: Explain speculative decoding. When would you use it and when would you not?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Speculative decoding uses a small, fast \textit{draft model} to propose $K$ candidate tokens, then the large \textit{target model} verifies all $K$ tokens in a single forward pass. The key insight: \textit{verification is parallel} (like a prefill pass), while naive autoregressive generation is sequential. If the draft model matches the target on most tokens, you generate $K$ tokens for roughly the cost of one target forward pass plus one cheap draft pass.
+
+The output distribution is \textit{mathematically identical} to the target model alone. At each position, if the draft token's probability under the target is at least as high as under the draft, accept it. Otherwise, accept with probability $p_{\text{target}} / p_{\text{draft}}$; if rejected, resample from a corrected distribution $\max(0, p_{\text{target}} - p_{\text{draft}})$. Zero quality degradation.
+
+\textbf{Use it when:} (1) Optimizing single-request latency on a large model. (2) Structured output (JSON, code) where draft acceptance is high. (3) Low-batch serving where the GPU is underutilized during decode.
+
+\textbf{Do not use it when:} (1) High-batch serving---GPU already compute-saturated, no spare capacity for the verification pass. (2) High-temperature creative generation---acceptance rate plummets. (3) No good draft model exists with $>$50\% per-token agreement.
+
+\redflags
+\begin{itemize}
+    \item ``Speculative decoding improves quality''---it guarantees \textit{identical} quality, not better.
+    \item ``It always speeds things up''---at high batch sizes it can be \textit{slower} due to the extra verification pass.
+    \item Confusing speculative decoding with beam search or parallel sampling.
+\end{itemize}
+
+\interviewtest{Understanding of why decode is slow (memory-bandwidth-bound, not compute-bound), the insight that verification is parallelizable, the acceptance/rejection mechanics that preserve the target distribution, and the practical conditions under which speculation helps versus hurts.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains the draft-verify loop and the distributional guarantee clearly.
+    \item \badgeLsix{L6} Quantifies the expected speedup ($\sim 1/(1-\alpha)$ tokens per step where $\alpha$ is acceptance rate), discusses Medusa and self-drafting variants, and explains why batch size matters.
+    \item \badgeLseven{L7} Analyzes interaction with continuous batching (speculation wastes batch slots on rejected tokens), discusses how to co-schedule draft and target on the same GPU, and reasons about when Medusa-style multi-head drafting beats a separate draft model.
+\end{itemize}
+
+\followups{``How do you choose or train the draft model?'' ``What acceptance rate do you need for a 2$\times$ speedup?'' ``Does speculative decoding help with throughput or just latency?''}
+\end{interviewq}
+
+%--- Rewritten Q3 (Debugging) ---
+
+\begin{interviewq}
+\textbf{Q: KV cache memory is your bottleneck---you are running out of GPU memory and dropping requests. What do you do?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+I would attack this from multiple angles, ordered by implementation difficulty and impact.
+
+\textbf{Immediate mitigations (no model changes):} (1) \textit{PagedAttention}: eliminates memory fragmentation from static pre-allocation, typically recovering 40--60\% of wasted KV memory. (2) \textit{Prefix caching}: if requests share a system prompt, cache the shared prefix KV across requests. (3) \textit{Admission control}: limit concurrent requests based on available KV memory; queue excess requests rather than OOMing. (4) \textit{Shorter contexts}: enforce max context length; truncate or summarize long inputs.
+
+\textbf{Compression techniques (moderate effort):} (1) \textit{KV cache quantization}: quantize KV to INT8 or FP8 (separate from weight quantization). The KV cache tolerates lower precision well because softmax is robust to small perturbations. 2$\times$ memory reduction with minimal quality impact. (2) \textit{Choose GQA/MQA models}: reduces KV cache by $n_{\text{heads}} / n_{\text{kv\_heads}}$ (training-time decision, but you can select a GQA model at serving time); MLA models (DeepSeek-V3/R1) go further still, caching a compressed latent $\approx 57\times$ smaller than the MHA-equivalent (Section~\ref{sec:mla_serving}). (3) \textit{Sliding window attention}: models like Mistral bound KV growth to the most recent $W$ tokens.
+
+\textbf{Advanced techniques:} (1) \textit{KV offloading}: spill older KV entries to CPU memory or SSD. (2) \textit{Token eviction}: evict KV for low-attention tokens (H2O: Heavy Hitter Oracle)---risky for long-range retrieval tasks. (3) \textit{More GPUs}: distribute KV cache via TP or data parallelism.
+
+Recommended order: PagedAttention first, then KV quantization, then prefix caching, then architectural changes.
+
+\redflags
+\begin{itemize}
+    \item Suggesting \textit{weight} quantization as a fix for \textit{KV cache} pressure---these are different memory pools.
+    \item ``Just add more GPUs'' as the first answer without exhausting software mitigations.
+    \item Ignoring the distinction between KV cache memory and model weight memory entirely.
+\end{itemize}
+
+\interviewtest{Whether you understand that the KV cache---not model weights---is the dominant memory consumer for long-context serving. The interviewer wants a structured approach: immediate mitigations, compression, and architecture-level solutions, in that order.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies PagedAttention and KV quantization as the primary tools. Knows the KV memory formula.
+    \item \badgeLsix{L6} Computes the KV cache size for the specific model on the spot, orders solutions by effort/impact, discusses quality tradeoffs of each compression method.
+    \item \badgeLseven{L7} Reasons about second-order effects---e.g., admission control causing queue buildup and cascading latency, KV offloading interacting poorly with speculative decoding, and when the right answer is to switch to a GQA (or MLA) model rather than patching the serving stack.
+\end{itemize}
+
+\followups{``How much memory does the KV cache use for your model at 32K context?'' ``What is the quality impact of KV cache quantization?'' ``Could you use RAG to reduce context length instead?''}
+\end{interviewq}
+
+%--- Estimation Q1 ---
+
+\begin{interviewq}
+\textbf{Q: Calculate the throughput (tokens/sec) of a 70B model on 8$\times$H100s with tensor parallelism.}
+
+\badgeLseven{L7} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+This requires reasoning about whether we are compute-bound or memory-bandwidth-bound, which depends on batch size.
+
+\textbf{Step 1: Model memory.} 70B params in FP16 = 140 GB. With TP=8, each GPU holds $140/8 = 17.5$ GB of weights.
+
+\textbf{Step 2: Decode (batch size 1) is memory-bandwidth-bound.} Each token requires reading all 140 GB of weights across the 8 GPUs. Each H100 has $\sim$3.35 TB/s HBM bandwidth. Reading 17.5 GB per GPU: $17.5 / 3{,}350 \approx 5.2$ ms. Add all-reduce overhead: TP requires \textit{two} all-reduces per layer (after the attention output projection and the MLP down projection), each latency-dominated at batch 1 ($\sim$10 $\mu$s on NVLink), so $\sim$20 $\mu$s per layer $\times$ 80 layers $\approx$ 1.6 ms. Effective single-token latency $\approx$ 6--7 ms, giving $\sim$140--170 tokens/sec for a single request. Note this is a roofline upper bound: production stacks typically observe $\sim$50--90 tokens/sec for a 70B at batch 1 on 8$\times$H100 once kernel-launch overhead, sampling, and scheduling are included.
+
+\textbf{Step 3: Decode (large batch) becomes compute-bound.} An H100 (SXM) delivers $\sim$1{,}979 TFLOPS FP16/BF16 only with 2:4 structured sparsity; the dense figure is $\sim$990 TFLOPS, and realistic utilization on decode GEMMs is $\sim$50\%, giving $\sim$495 effective TFLOPS. Per-token FLOPs for a 70B model $\approx 2 \times 70\text{B} = 140$ GFLOPs. Per GPU: $140 / 8 = 17.5$ GFLOPs. At batch $B$, total compute per step = $17.5 \times B$ GFLOPs. Compute time = $(17.5B) / 495{,}000$ seconds. Bandwidth time stays $\sim$5.2 ms (weights are read once regardless of batch size). The system becomes compute-bound when compute time exceeds bandwidth time: $17.5B / 495{,}000 > 0.0052$, which gives $B > 147$. So batches above $\sim$150 are compute-bound.
+
+\textbf{Step 4: Throughput at optimal batch.} At batch 128 (bandwidth-bound): $128 / 0.006 \approx 21{,}000$ tokens/sec total. At batch 256 (compute-bound): $256 \times 17.5\text{G} = 4.48$ TFLOPS per GPU; time = $4{,}480 / 495{,}000 \approx 9$ ms; throughput $= 256 / 0.009 \approx 28{,}000$ tokens/sec. In practice, with overhead, expect $\sim$15{,}000--25{,}000 output tokens/sec on 8$\times$H100 at high batch.
+
+\textbf{Step 5: Prefill throughput.} Prefill is compute-bound (large matrix multiply). At $\sim$495 effective TFLOPS per GPU ($\sim$990 TFLOPS dense peak), processing a 1K-token prompt: $1{,}000 \times 140\text{G} = 140$ TFLOPS total; per GPU = 17.5 TFLOPS; time = $17.5 / 495 \approx 35$ ms. In practice $\sim$50--100 ms with overhead.
+
+\redflags
+\begin{itemize}
+    \item Ignoring the compute-vs-bandwidth distinction and giving a single throughput number without specifying batch size.
+    \item Using peak FLOPS (with sparsity) as if all models use sparse compute---most do not.
+    \item Forgetting that TP introduces all-reduce communication overhead every layer.
+\end{itemize}
+
+\interviewtest{Whether you can derive throughput from first principles (memory bandwidth, compute FLOPS, communication overhead) rather than quoting benchmarks. The key is identifying the decode bandwidth bottleneck and the compute-bound crossover at high batch sizes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows decode is bandwidth-bound and gives a reasonable tokens/sec estimate for batch=1.
+    \item \badgeLsix{L6} Computes the bandwidth-to-compute crossover batch size, reasons about both phases (prefill vs.\ decode), and accounts for TP communication overhead.
+    \item \badgeLseven{L7} Discusses the roofline model, identifies that KV cache reads also consume bandwidth at high context lengths (not just weights), factors in NVLink bandwidth for the all-reduce, and knows that real throughput is 50--70\% of theoretical due to kernel efficiency, scheduler overhead, and memory controller contention.
+\end{itemize}
+
+\followups{``What changes at INT4 quantization?'' ``How does KV cache bandwidth factor in at 32K context?'' ``At what batch size does latency-per-token start degrading?''}
+\end{interviewq}
+
+%--- Estimation Q2 ---
+
+\begin{interviewq}
+\textbf{Q: How much memory savings does INT4 quantization give for a 70B model? What is the quality trade-off?}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Step 1: Memory calculation.} Model memory $\approx \text{params} \times \text{bits} / 8$. At FP16 (16 bits): $70\text{B} \times 16 / 8 = 140$ GB. At INT4 (4 bits): $70\text{B} \times 4 / 8 = 35$ GB. That is a 4$\times$ reduction---from 2 H100s (80 GB each) down to a single GPU with room to spare.
+
+\textbf{Step 2: Overhead.} INT4 methods like GPTQ and AWQ store quantization parameters (scales and zero-points) per group, typically with a group size of 128. Each group adds a FP16 scale and zero-point: $2 \times 2 = 4$ bytes per 128 weights. That is $4 / (128 \times 0.5) = 6.25\%$ overhead. Actual memory: $35 \times 1.0625 \approx 37.2$ GB. Still fits on a single 80 GB GPU.
+
+\textbf{Step 3: What is NOT reduced.} The KV cache is stored separately in FP16 (or FP8/INT8 with KV quantization). Activation memory during prefill is also FP16. For long-context serving, the KV cache can exceed the model weight memory, so INT4 weights alone do not solve memory pressure at 32K+ context lengths.
+
+\textbf{Step 4: Quality trade-off.} On standard benchmarks (MMLU, HumanEval, GSM8K), 4-bit 70B models typically show $<$1\% degradation versus FP16. However, quality impact is \textit{task-dependent and non-uniform}: (1) Perplexity increases by 0.1--0.5 points---small on average but can concentrate in specific domains. (2) Reasoning-heavy tasks (math, multi-step logic) degrade more than factual recall. (3) Long-context tasks can degrade because quantization errors compound across attention layers processing many tokens. (4) A 4-bit 70B model almost always outperforms a FP16 7B model---larger quantized beats smaller full-precision.
+
+\redflags
+\begin{itemize}
+    \item ``4$\times$ smaller, no quality loss''---there is always some loss; the question is whether it matters for your task.
+    \item Confusing weight quantization with KV cache quantization---they address different memory pools.
+    \item Claiming INT4 gives 4$\times$ \textit{speedup}---the speedup is less than 4$\times$ because dequantization kernels have overhead, and the bottleneck may be bandwidth, not memory capacity.
+\end{itemize}
+
+\interviewtest{Whether you can compute model memory on the spot, distinguish between memory capacity savings and throughput speedup, and reason critically about quality tradeoffs rather than giving a blanket ``it is fine.''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Computes the memory correctly, knows that quality loss is small for large models.
+    \item \badgeLsix{L6} Accounts for quantization parameter overhead, distinguishes weight memory from KV cache memory, and identifies task-dependent quality degradation (not just perplexity).
+    \item \badgeLseven{L7} Discusses the throughput implications (bandwidth savings, dequantization overhead), reasons about when FP8 is preferable to INT4 (H100 native support, less quality loss, simpler deployment), and proposes a validation strategy (eval on target task, not just perplexity).
+\end{itemize}
+
+\followups{``When would you choose FP8 over INT4?'' ``How would you evaluate quantization quality on your specific task?'' ``What about sub-4-bit quantization---when does quality fall off a cliff?''}
+\end{interviewq}
+
+%--- Estimation Q3 ---
+
+\begin{interviewq}
+\textbf{Q: Your LLM service needs to handle 500 concurrent users with 2-second time-to-first-token. Size the infrastructure.}
+
+\badgeLseven{L7} \quad \badgetype{Estimation} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+First, clarify assumptions. Assume a 70B model (INT4, $\sim$35 GB weights), average prompt length of 2K tokens, average output of 300 tokens, and a think time of 30 seconds between user messages (typical for chat).
+
+\textbf{Step 1: Concurrency model.} 500 concurrent users with 30s think time means requests arrive at $500 / 30 \approx 17$ QPS. Each request takes $\sim$300 tokens / 40 TPS $\approx 7.5$ seconds of generation. So at steady state: $17 \times 7.5 \approx 128$ requests actively generating at any moment.
+
+\textbf{Step 2: TTFT constraint drives prefill capacity.} TTFT = 2 seconds for a 2K-token prompt. On TP=8 H100s, prefill for 2K tokens takes $\sim$70--140 ms (compute-bound). This is well within the 2s budget even with queuing. The real risk is \textit{queuing delay}: if too many requests arrive while prefill slots are occupied, TTFT spikes. Need to ensure the prefill pipeline is not a bottleneck---chunked prefill helps by interleaving prefill chunks with ongoing decode.
+
+\textbf{Step 3: Memory sizing.} Per-request KV cache at 2K context (LLaMA-2 70B with GQA): $\sim$0.6 GB. For 128 concurrent active requests: $128 \times 0.6 = 77$ GB KV cache. Plus 35 GB model weights. Total $\approx 112$ GB. An 8$\times$H100 node has 640 GB, so one node can handle this with large headroom. Could support $\sim$800+ concurrent active requests before KV memory saturates.
+
+\textbf{Step 4: Compute check.} 128 active requests in decode: batch size 128 at $\sim$6 ms per step (bandwidth-bound) gives $\sim$21{,}000 tokens/sec aggregate. Needed: $128 \times 40 = 5{,}120$ tokens/sec. Easily satisfied on one node.
+
+\textbf{Step 5: Final sizing.} One 8$\times$H100 node is sufficient for 500 concurrent users under these assumptions. Add a second node for redundancy and burst handling. For production: deploy behind a load balancer with queue-based admission control and auto-scaling to a second node at 70\% KV utilization.
+
+\textbf{Step 6: Cost sanity check.} 8$\times$H100 on-demand $\approx$ \$25/hr on major clouds. For 500 users, that is $\sim$\$0.05/hr per user. Reasonable for a B2B product; expensive for consumer chat.
+
+\redflags
+\begin{itemize}
+    \item Sizing for 500 \textit{simultaneous} requests without modeling think time---massively over-provisions.
+    \item Forgetting to check whether TTFT is bottlenecked by queuing, not just raw prefill time.
+    \item Ignoring the difference between ``concurrent users'' and ``concurrent active requests.''
+\end{itemize}
+
+\interviewtest{Real-world capacity planning: translating user-facing requirements into hardware specifications. The key skill is making reasonable assumptions, showing the math, and identifying which constraint binds (memory, compute, or queuing).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Gives a reasonable estimate but may confuse concurrent users with concurrent requests.
+    \item \badgeLsix{L6} Models the concurrency correctly with think time, sizes memory and compute separately, identifies the binding constraint.
+    \item \badgeLseven{L7} Adds queuing theory reasoning (Little's law), considers tail-latency (p99 TTFT during burst), plans for redundancy and auto-scaling, and provides a cost estimate to validate feasibility.
+\end{itemize}
+
+\followups{``What if prompt length varies from 500 to 50K tokens?'' ``How do you handle the user who sends a 100K-token document?'' ``What is your auto-scaling policy?''}
+\end{interviewq}
+
+%--- Trade-off Q1 ---
+
+\begin{interviewq}
+\textbf{Q: GPTQ vs AWQ vs GGUF quantization---when would you use each?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+All three are post-training weight quantization methods, but they target different deployment scenarios.
+
+\textbf{GPTQ} (Frantar et al., 2023): Uses the Hessian of layer-wise reconstruction error to decide optimal rounding directions, then adjusts remaining weights to compensate. Calibration requires 128--1024 samples and takes 1--4 hours for a 70B model. Produces highly optimized GPU kernels. Best for: \textit{GPU serving at scale} where you can afford the one-time calibration cost and want maximum throughput via vLLM, TGI, or TensorRT-LLM.
+
+\textbf{AWQ} (Lin et al., 2024): Observes that $\sim$1\% of weight channels (those with large activation magnitudes) are disproportionately important. Scales these salient channels up before quantization and compensates in the adjacent layer. Faster calibration than GPTQ (minutes, not hours) with comparable quality. Best for: \textit{GPU serving when you need fast iteration}---same quality as GPTQ but you can re-quantize quickly when swapping models.
+
+\textbf{GGUF} (llama.cpp format): Per-block mixed-precision quantization. Different tensor blocks can use different bit widths (e.g., attention at 6-bit, FFN at 4-bit). Optimized for CPU inference with SIMD instructions and Apple Metal. Best for: \textit{local/edge inference on CPU, Apple Silicon, or consumer GPUs} where llama.cpp is the runtime.
+
+\textbf{Decision framework:}
+\begin{itemize}
+    \item GPU serving, maximizing throughput $\rightarrow$ AWQ or GPTQ (both supported by vLLM). AWQ for faster calibration; GPTQ when you want slightly more control over the quantization.
+    \item CPU/laptop inference $\rightarrow$ GGUF. No alternative---GPU quantization formats do not run efficiently on CPU.
+    \item Quick experimentation or model swapping $\rightarrow$ AWQ (minutes to quantize, not hours).
+    \item Sub-4-bit or mixed precision per layer $\rightarrow$ GGUF offers the most flexibility (Q2\_K through Q8\_0).
+    \item H100 with FP8 support $\rightarrow$ Skip all three; use FP8 natively. Near-lossless and no calibration needed.
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item Treating the three as interchangeable---they target fundamentally different runtimes.
+    \item ``GGUF is lower quality''---it is a \textit{format}, not a single quantization algorithm. Quality depends on the chosen bit width.
+    \item Forgetting that FP8 on H100+ often makes INT4 GPU quantization unnecessary.
+\end{itemize}
+
+\interviewtest{Whether you understand the deployment-target distinction (GPU serving vs.\ CPU/edge), the calibration cost tradeoff, and the practical ecosystem (which serving frameworks support which formats).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly identifies GPTQ/AWQ as GPU-focused and GGUF as CPU-focused.
+    \item \badgeLsix{L6} Explains the algorithmic differences (Hessian-based rounding vs.\ salient channel protection), compares calibration costs, and maps each to specific serving frameworks.
+    \item \badgeLseven{L7} Discusses when none of these are the right answer (FP8 on H100, SmoothQuant for W8A8), reasons about quality-per-bit tradeoffs for different model sizes, and considers the operational cost of maintaining quantized model variants.
+\end{itemize}
+
+\followups{``How do you evaluate quality after quantization?'' ``When would you choose FP8 over INT4?'' ``How does quantization interact with LoRA fine-tuning?''}
+\end{interviewq}
+
+%--- Trade-off Q2 ---
+
+\begin{interviewq}
+\textbf{Q: Tensor parallelism vs pipeline parallelism for inference---what is your decision framework?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The core distinction is \textit{what} you split and \textit{how often} you communicate.
+
+\textbf{Tensor parallelism (TP)} splits individual layers across GPUs. For $\vy = \mW\vx$, partition $\mW$ column-wise across $N$ GPUs. Each GPU computes a slice, then an all-reduce synchronizes every layer. This reduces per-layer latency by $N\times$ but requires high-bandwidth interconnect because communication happens \textit{at every layer}. With 80 layers, a single token generation triggers 80+ all-reduce operations.
+
+\textbf{Pipeline parallelism (PP)} assigns groups of layers to different GPUs. GPU 0 runs layers 0--19, GPU 1 runs 20--39, etc. Communication is only at stage boundaries (passing activations)---far less frequent than TP. But the pipeline introduces \textit{bubbles}: later stages idle while earlier stages process, and vice versa.
+
+\textbf{Decision framework:}
+\begin{itemize}
+    \item \textbf{Within a single node (NVLink available):} Always prefer TP. NVLink provides $\sim$900 GB/s per H100 (bidirectional), making per-layer all-reduce cheap ($<$1 ms for typical activations). TP reduces latency directly. This is the standard for serving 70B models on 8$\times$H100.
+    \item \textbf{Across nodes (InfiniBand only):} Use PP between nodes, TP within each node. InfiniBand ($\sim$50--100 GB/s) cannot sustain the per-layer all-reduce that TP demands. PP only communicates at stage boundaries---much more tolerant of higher latency.
+    \item \textbf{Latency-sensitive (chatbot):} Maximize TP degree to minimize per-token latency. Accept the communication overhead.
+    \item \textbf{Throughput-sensitive (batch processing):} Consider data parallelism (replicate the full model) instead of PP. At high batch sizes, each replica is well-utilized, and you avoid pipeline bubbles entirely.
+\end{itemize}
+
+\textbf{Quantitative intuition.} For a 70B FP16 model (140 GB), TP=8 on one 8$\times$H100 node: each GPU holds 17.5 GB of weights. There are \textit{two} all-reduces per layer (after the attention output projection and the MLP down projection), each sending $\sim$hidden\_size $\times$ bytes $= 8192 \times 2 \approx 16$ KB at batch=1. At these message sizes the cost is dominated by per-collective \textit{latency}, not bandwidth: on NVLink each collective completes in $\sim$10 $\mu$s, so $\sim$20 $\mu$s per layer and $\sim$1.6 ms over 80 layers---a tolerable fraction of a $\sim$5 ms decode step. Cross-node, the bandwidth-only math looks deceptively cheap (16 KB at 50 GB/s is well under a microsecond), but per-collective latency over InfiniBand is $\sim$10--20 $\mu$s; at $2 \times 80 = 160$ collectives per token, that is $\sim$2--4 ms of pure communication latency \textit{per token}---which is precisely why cross-node TP is avoided. At larger batch sizes, the all-reduce volume grows linearly, and the cross-node cost becomes worse still.
+
+\redflags
+\begin{itemize}
+    \item ``TP is always better''---it requires NVLink-class interconnect. Over InfiniBand, TP at high degree kills throughput.
+    \item Forgetting pipeline bubbles---PP looks free on paper but wastes 20--40\% of GPU cycles in practice without micro-batching.
+    \item Ignoring data parallelism as an alternative when you have enough memory per replica.
+\end{itemize}
+
+\interviewtest{Whether you reason from hardware constraints (interconnect bandwidth, latency) rather than memorizing rules. The key insight is that the communication pattern (per-layer all-reduce vs.\ per-stage point-to-point) dictates which interconnect topology is required.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows TP splits layers and PP splits layer groups. Correctly says TP needs fast interconnect.
+    \item \badgeLsix{L6} Gives the intra-node TP + inter-node PP recipe, explains why with bandwidth numbers, and discusses the latency-vs-throughput tradeoff.
+    \item \badgeLseven{L7} Quantifies the all-reduce volume, reasons about the crossover point where TP overhead exceeds PP bubble waste, and discusses expert parallelism (for MoE models) as a third axis and how it complicates the TP/PP decision.
+\end{itemize}
+
+\followups{``At what TP degree does communication overhead dominate?'' ``How do you handle a model that does not divide evenly across GPUs?'' ``What about expert parallelism for MoE models?''}
+\end{interviewq}
+
+%--- Trade-off Q3 ---
+
+\begin{interviewq}
+\textbf{Q: Prefill-optimized vs decode-optimized serving---when should you disaggregate them?}
+
+\badgeLseven{L7} \quad \badgetype{Trade-off} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Prefill and decode have fundamentally different hardware profiles (Section~\ref{sec:prefill_decode}). Prefill is compute-bound: large matrix multiplies with high arithmetic intensity. Decode is memory-bandwidth-bound: reading the full model weights and KV cache for a single-token output. When they share the same GPU, they interfere---a long prefill stalls the decode batch, causing latency spikes for in-flight requests. Chunked prefill mitigates this but does not eliminate it.
+
+\textbf{Disaggregated serving} separates prefill and decode onto different GPU pools. Prefill nodes process prompts and produce the KV cache, then transfer the KV cache to decode nodes that handle generation. Each pool can be independently optimized and scaled.
+
+\textbf{When to disaggregate:}
+\begin{itemize}
+    \item \textit{Workloads with long prompts and short outputs} (summarization, extraction): prefill dominates, and you need more prefill capacity. Disaggregation lets you scale prefill independently.
+    \item \textit{Strict TTFT SLAs}: prefill contention on shared GPUs causes unpredictable TTFT. Dedicated prefill nodes give deterministic TTFT.
+    \item \textit{Heterogeneous hardware}: use compute-dense GPUs (e.g., H100 SXM) for prefill and bandwidth-optimized or cheaper GPUs for decode.
+    \item \textit{Very large scale} ($>$100 GPUs): the operational benefits of independent scaling and independent failure domains justify the complexity.
+\end{itemize}
+
+\textbf{When NOT to disaggregate:}
+\begin{itemize}
+    \item \textit{Small scale} ($<$8 GPUs): the overhead of KV cache transfer between nodes outweighs the benefits. Chunked prefill on a unified serving stack is simpler and sufficient.
+    \item \textit{Short prompts, long outputs} (creative writing, code generation): decode dominates wall-clock time; the prefill interference is brief and infrequent.
+    \item \textit{Network bottleneck}: transferring the full KV cache between prefill and decode nodes requires high bandwidth. For a 70B GQA model at 4K context, the KV cache is $\sim$1.3 GB per request. At 100 requests/sec, that is 130 GB/s of KV transfer---requires fast networking.
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item ``Always disaggregate for best performance''---the KV transfer overhead and operational complexity are significant at small scale.
+    \item Not mentioning KV cache transfer as a cost---this is the primary engineering challenge of disaggregation.
+    \item Forgetting that chunked prefill solves 80\% of the interference problem on unified nodes.
+\end{itemize}
+
+\interviewtest{Whether you understand the root cause of prefill-decode interference (different bottleneck profiles competing for the same hardware), can articulate the tradeoff between simplicity and performance, and can identify the KV cache transfer problem as the key engineering challenge.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows prefill is compute-bound and decode is bandwidth-bound. Understands the concept.
+    \item \badgeLsix{L6} Articulates when disaggregation is worth the complexity, sizes the KV transfer bandwidth, and knows that chunked prefill is the simpler alternative.
+    \item \badgeLseven{L7} Reasons about heterogeneous hardware (different GPU SKUs for each phase), discusses KV cache compression before transfer, analyzes failure modes (what happens when a prefill node goes down---decode nodes stall), and considers the interaction with prefix caching (shared prefixes reduce transfer volume).
+\end{itemize}
+
+\followups{``How would you handle a KV cache that does not fit in a single network transfer?'' ``What is the break-even scale for disaggregation?'' ``How does prefix caching interact with disaggregated serving?''}
+\end{interviewq}
+
+%--- Debugging Q1 ---
+
+\begin{interviewq}
+\textbf{Q: Your LLM serving system's p99 latency is 10$\times$ the p50. Diagnose.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+A 10$\times$ p99/p50 ratio indicates a heavy tail---most requests are fast, but a small fraction are extremely slow. I would follow a structured diagnosis.
+
+\textbf{Symptoms to collect first:} (1) Is the latency spike in TTFT, decode, or total latency? (2) Correlate slow requests with their prompt length, output length, and arrival time. (3) Check GPU utilization and memory utilization timeseries for spikes.
+
+\textbf{Hypothesis 1: Long-prompt prefill blocking the decode batch.} If using a unified serving node without chunked prefill, a request with a 10K-token prompt causes a long prefill that stalls all in-flight decode requests. \textit{Experiment:} Check if slow requests coincide with the arrival of long-prompt requests. \textit{Resolution:} Enable chunked prefill, which interleaves prefill chunks with decode steps, capping the maximum stall duration.
+
+\textbf{Hypothesis 2: Highly variable output length.} If some requests generate 20 tokens and others generate 2,000, the long requests occupy batch slots for 100$\times$ longer. With static batching, all requests in the batch wait for the longest. Even with continuous batching, long requests may experience queuing delays as the batch fills up. \textit{Experiment:} Plot latency vs.\ output length. \textit{Resolution:} Set output length caps, use streaming to reduce perceived latency, and ensure continuous batching is enabled.
+
+\textbf{Hypothesis 3: KV cache pressure causing preemption.} When the KV cache fills up, the scheduler may preempt (evict) in-flight requests, forcing them to restart prefill from scratch. This causes massive latency spikes for the preempted requests. \textit{Experiment:} Monitor vLLM's preemption counter and KV cache utilization. \textit{Resolution:} Increase GPU memory, reduce max concurrent requests, enable KV cache quantization, or switch to KV offloading.
+
+\textbf{Hypothesis 4: GC pauses or host-side contention.} Python's garbage collector, CPU-side tokenization/detokenization, or network I/O can introduce unpredictable delays. These show up as latency spikes uncorrelated with prompt/output length. \textit{Experiment:} Profile host CPU and check for GC pauses in logs. \textit{Resolution:} Pin tokenization to dedicated CPU cores, tune Python GC thresholds, or use a compiled tokenizer (e.g., Rust-based).
+
+\textbf{Hypothesis 5: Batch size oscillation.} If the batch size swings between very small (few requests, fast per-token) and very large (many requests, slower per-token due to compute saturation), individual request latency becomes erratic. \textit{Experiment:} Log batch size per decode step. \textit{Resolution:} Smooth the batching policy; set maximum batch size caps.
+
+\redflags
+\begin{itemize}
+    \item ``The model is too slow''---this is a systems problem, not a model problem. The model serves p50 fine.
+    \item Jumping to ``add more GPUs'' without diagnosing the root cause---you may just be spreading the same problem across more nodes.
+    \item Ignoring preemption as a cause---it is one of the most common sources of tail latency in vLLM deployments.
+\end{itemize}
+
+\interviewtest{Structured debugging methodology (symptoms, hypotheses, experiments, resolution), knowledge of the serving stack's failure modes (chunked prefill, preemption, GC), and the ability to distinguish model-level from system-level issues.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies prompt-length variation and output-length variation as likely causes.
+    \item \badgeLsix{L6} Adds KV cache preemption and prefill blocking as hypotheses, and proposes specific monitoring metrics to distinguish them.
+    \item \badgeLseven{L7} Considers host-side contention (GC, tokenization), batch-size oscillation, and cross-request interference. Proposes per-request tracing with breakdown of time-in-queue, time-in-prefill, and time-in-decode to pinpoint the bottleneck.
+\end{itemize}
+
+\followups{``How would you set up monitoring to catch this proactively?'' ``What is an acceptable p99/p50 ratio?'' ``How does preemption interact with streaming responses?''}
+\end{interviewq}
+
+%--- Debugging Q2 ---
+
+\begin{interviewq}
+\textbf{Q: After quantizing your model to INT4, certain types of prompts give garbage output while others are fine. Why?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+This is a classic quantization failure pattern: non-uniform quality degradation. I would diagnose as follows.
+
+\textbf{Symptoms to collect first:} (1) Which prompt categories fail (math, code, long-context, multilingual, structured output)? (2) Compare the quantized model's output to the FP16 model on the same prompts. (3) Check if the failures are deterministic (same prompt always fails) or stochastic.
+
+\textbf{Hypothesis 1: Outlier channels in critical layers.} Transformer models have \textit{activation outliers}---a small number of channels with magnitudes 10--100$\times$ larger than the rest. GPTQ and basic round-to-nearest quantization can clip these outliers, destroying the information they carry. Certain prompt types (e.g., math reasoning, code) rely more heavily on precise numerical representations in these channels. \textit{Experiment:} Run the FP16 model and log per-channel activation magnitudes. Identify outlier channels. Check if the quantized model clips them. \textit{Resolution:} Switch to AWQ (which explicitly protects salient channels) or use mixed-precision quantization (keep outlier-heavy layers at higher bit width).
+
+\textbf{Hypothesis 2: Calibration data distribution mismatch.} GPTQ and AWQ require calibration data to determine quantization parameters. If the calibration set is English Wikipedia but the failing prompts are code or multilingual text, the quantization parameters are optimized for the wrong distribution. Tokens and patterns absent from calibration get quantized poorly. \textit{Experiment:} Re-calibrate on a dataset that includes the failing prompt types. \textit{Resolution:} Use diverse calibration data matching your production distribution. Even 256 well-chosen samples can significantly improve results.
+
+\textbf{Hypothesis 3: Per-group quantization granularity too coarse.} With group\_size=128 (the default), all 128 weights in a group share one scale and zero-point. If a group contains both large and small weights, the small weights lose precision. Certain layers (e.g., the first and last layers, or attention projection layers) are more sensitive. \textit{Experiment:} Try group\_size=64 or group\_size=32 and check if failing prompts recover. \textit{Resolution:} Use smaller group sizes (at the cost of slightly more memory for quantization parameters) or use per-channel quantization for sensitive layers.
+
+\textbf{Hypothesis 4: Interaction with specific attention patterns.} Some prompts trigger attention patterns (e.g., long-range retrieval, attention sinks at position 0) that amplify small quantization errors across many layers. The error compounds through the 80-layer stack. \textit{Experiment:} Compare attention maps between FP16 and INT4 for failing prompts. \textit{Resolution:} Keep attention projection weights at higher precision (mixed-precision GGUF supports this), or use KV cache at full FP16 even if weights are INT4.
+
+\redflags
+\begin{itemize}
+    \item ``INT4 is just too aggressive, go back to FP16''---this throws away the 4$\times$ memory saving without investigating the root cause.
+    \item ``Perplexity looked fine so quantization is not the issue''---perplexity is an average metric; it hides localized failures on specific prompt types.
+    \item Blaming the tokenizer or prompt formatting without checking quantization-specific artifacts.
+\end{itemize}
+
+\interviewtest{Understanding of \textit{why} quantization degrades non-uniformly (outlier channels, calibration mismatch, group granularity), and a structured approach to diagnosing and fixing quantization failures rather than giving up and reverting to full precision.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies calibration data mismatch as the most likely cause and proposes re-calibration.
+    \item \badgeLsix{L6} Adds outlier channel analysis, proposes mixed-precision quantization for sensitive layers, and knows that AWQ handles outliers better than naive GPTQ.
+    \item \badgeLseven{L7} Reasons about error accumulation across layers, proposes per-layer sensitivity analysis (quantize each layer individually and measure quality impact), and suggests keeping the first/last embedding layers at full precision as a standard practice.
+\end{itemize}
+
+\followups{``How would you do a per-layer sensitivity analysis?'' ``What is the role of the calibration dataset and how large does it need to be?'' ``How would you build an automated quality gate for quantized model releases?''}
+\end{interviewq}
+
+%--- Debugging Q3 ---
+
+\begin{interviewq}
+\textbf{Q: Your speculative decoding setup is slower than standard decoding. What went wrong?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Speculative decoding adds overhead (the draft model run + the verification pass) that must be recouped by accepting multiple tokens per step. If the net effect is negative, something in the setup is wrong. I would diagnose systematically.
+
+\textbf{Symptoms to collect:} (1) Measure the acceptance rate (tokens accepted per speculation step). (2) Measure the draft model latency and the verification pass latency separately. (3) Compare total wall-clock time for the same prompts with and without speculation. (4) Log the batch size during decode.
+
+\textbf{Hypothesis 1: Low acceptance rate.} If the draft model agrees with the target on fewer than $\sim$50\% of tokens, the overhead of running the draft plus the wasted verification compute exceeds the savings. Common causes: (a) the draft model is too different from the target (wrong architecture family, different training data), (b) high sampling temperature reduces token-level agreement, (c) the task is inherently unpredictable (creative writing, open-ended generation). \textit{Experiment:} Log per-token acceptance rate. If $<$60\%, speculation is unlikely to help. \textit{Resolution:} Use a better-matched draft model (e.g., same family but smaller), reduce temperature, or disable speculation for high-creativity tasks.
+
+\textbf{Hypothesis 2: Draft model is too large or too slow.} If the draft model takes 30\% of the target model's time per token, you need a very high acceptance rate to break even. The draft should be at least 5--10$\times$ faster than the target per token. \textit{Experiment:} Profile draft model latency independently. \textit{Resolution:} Use a smaller draft model (e.g., 1--2 layers with shared embeddings), or switch to Medusa-style multi-head speculation (no separate model, just extra prediction heads on the target).
+
+\textbf{Hypothesis 3: Large batch size.} At high batch sizes, the GPU is already compute-saturated during decode. The verification pass (which processes $K$ speculated positions per request) adds $K\times$ more compute per step than standard decode. Since there is no spare compute capacity to absorb this, every verification step takes proportionally longer. \textit{Experiment:} Run the comparison at batch=1 vs.\ batch=64. If speculation helps at batch=1 but hurts at batch=64, this is the cause. \textit{Resolution:} Disable speculation above a batch size threshold. Many production systems do this dynamically.
+
+\textbf{Hypothesis 4: Draft and target competing for GPU resources.} If both models run on the same GPU, the draft model's forward pass evicts the target model's weights from the GPU cache (L2/L1), causing cache thrashing. Alternatively, if the draft model consumes significant GPU memory, it reduces the KV cache capacity for the target, lowering the maximum batch size. \textit{Experiment:} Monitor GPU memory allocation for both models. Check if KV cache capacity is reduced with the draft model loaded. \textit{Resolution:} Use a tiny draft model ($<$5\% of target memory), offload the draft to a different device, or use self-speculation (Medusa/EAGLE) which adds negligible memory.
+
+\textbf{Hypothesis 5: Speculation length $K$ is too high.} If $K$ is set to 8 but the acceptance rate is only good for the first 3--4 tokens, the later speculated tokens are almost always rejected. The wasted verification compute for positions 5--8 adds latency without benefit. \textit{Experiment:} Plot acceptance rate by position (token 1, 2, ..., $K$). \textit{Resolution:} Reduce $K$ or use adaptive speculation length based on running acceptance statistics.
+
+\redflags
+\begin{itemize}
+    \item ``Speculative decoding always helps''---it has strict preconditions (low batch, good draft, predictable task).
+    \item Blaming the target model's quality---speculative decoding does not change the output distribution.
+    \item Not considering batch size---this is the single most common reason speculation fails in production.
+\end{itemize}
+
+\interviewtest{Whether you understand the cost model of speculative decoding (draft overhead + verification cost vs.\ accepted tokens saved) and can systematically identify which term in the cost equation is wrong. The key is reasoning about when the technique's preconditions are violated.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies low acceptance rate as the primary suspect and proposes checking it.
+    \item \badgeLsix{L6} Adds batch size as a critical factor, quantifies the draft-model overhead tradeoff, and suggests adaptive disabling of speculation.
+    \item \badgeLseven{L7} Reasons about GPU cache thrashing, adaptive speculation length, the interaction between speculation and continuous batching (rejected tokens waste batch-slot-seconds), and proposes Medusa/EAGLE as alternatives that avoid the separate-model overhead entirely.
+\end{itemize}
+
+\followups{``At what acceptance rate does speculation break even?'' ``How would you adaptively enable/disable speculation per request?'' ``What is the Medusa approach and when does it beat a separate draft model?''}
+\end{interviewq}

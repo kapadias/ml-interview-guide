@@ -1,0 +1,760 @@
+\chapter{Multimodal Learning}
+\label{chap:multimodal_learning}
+
+\begin{tldr}
+Multimodal learning combines information from different modalities---text, images, audio, video---into a unified representation or generation pipeline. This chapter covers fusion architectures (early, late, cross-attention and when each wins), vision-language models (CLIP, LLaVA, Flamingo, GPT-4V), text-to-image generation (Stable Diffusion pipeline, brief since diffusion is covered in Chapter~\ref{chap:generative_models}), and audio/speech models (Whisper, multimodal alignment). At Staff+ interviews, you must know how modalities are aligned, why contrastive pretraining works, and the architectural tradeoffs between adapter-based and natively multimodal designs. The recurring theme: the hard problem is not processing each modality---it is \textit{aligning} them into a shared space where cross-modal reasoning becomes possible.
+\end{tldr}
+
+%==============================================================================
+\section{Fusion Architectures}
+\label{sec:fusion_architectures}
+%==============================================================================
+
+The central design question in any multimodal system is \textit{where} and \textit{how} to combine information from different modalities. This choice affects model capacity, training cost, and what kinds of cross-modal reasoning the model can perform.
+
+\subsection{Three Fusion Paradigms}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.5cm,
+    box/.style={rectangle, draw, rounded corners=3pt, minimum width=1.6cm, minimum height=0.7cm, align=center, font=\small},
+    encoder/.style={box, fill=lightblue},
+    fusion/.style={box, fill=lightyellow, font=\small\bfseries},
+    head/.style={box, fill=lightgreen},
+    arrow/.style={->, thick, >=stealth}
+]
+    % Early Fusion
+    \node[font=\small\bfseries] at (0, 3.5) {Early Fusion};
+    \node[encoder] (ea) at (-0.8, 2.5) {Image};
+    \node[encoder] (eb) at (0.8, 2.5) {Text};
+    \node[fusion] (ef) at (0, 1.5) {Concat};
+    \node[encoder] (ej) at (0, 0.5) {Joint Encoder};
+    \node[head] (eo) at (0, -0.5) {Output};
+    \draw[arrow] (ea) -- (ef);
+    \draw[arrow] (eb) -- (ef);
+    \draw[arrow] (ef) -- (ej);
+    \draw[arrow] (ej) -- (eo);
+
+    % Late Fusion
+    \node[font=\small\bfseries] at (5, 3.5) {Late Fusion};
+    \node[encoder] (la) at (4.2, 2.5) {Image Enc.};
+    \node[encoder] (lb) at (5.8, 2.5) {Text Enc.};
+    \node[encoder] (la2) at (4.2, 1.5) {$\mathbf{z}_{\text{img}}$};
+    \node[encoder] (lb2) at (5.8, 1.5) {$\mathbf{z}_{\text{txt}}$};
+    \node[fusion] (lf) at (5, 0.5) {Merge};
+    \node[head] (lo) at (5, -0.5) {Output};
+    \draw[arrow] (la) -- (la2);
+    \draw[arrow] (lb) -- (lb2);
+    \draw[arrow] (la2) -- (lf);
+    \draw[arrow] (lb2) -- (lf);
+    \draw[arrow] (lf) -- (lo);
+
+    % Cross-Attention Fusion
+    \node[font=\small\bfseries] at (10.2, 3.5) {Cross-Attention};
+    \node[encoder] (ca) at (9.4, 2.5) {Image Enc.};
+    \node[encoder] (cb) at (11.0, 2.5) {Text Enc.};
+    \node[fusion] (cf) at (10.2, 1.5) {Cross-Attn};
+    \node[encoder] (cd) at (10.2, 0.5) {Decoder};
+    \node[head] (co) at (10.2, -0.5) {Output};
+    \draw[arrow] (ca) -- (cf);
+    \draw[arrow] (cb) -- (cf);
+    \draw[arrow] (cf) -- (cd);
+    \draw[arrow] (cd) -- (co);
+\end{tikzpicture}
+\caption{Three fusion paradigms. Early fusion concatenates raw or lightly processed inputs. Late fusion encodes modalities independently and merges final representations. Cross-attention fusion lets one modality attend to the other through dedicated attention layers.}
+\label{fig:fusion_paradigms}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Fusion architecture comparison}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Dimension} & \textbf{Early Fusion} & \textbf{Late Fusion} & \textbf{Cross-Attention} \\
+\midrule
+Where fusion happens & Input / first layers & Final representation & Intermediate layers \\
+Cross-modal interaction & Deepest (all layers) & Shallowest (merge only) & Selective (chosen layers) \\
+Modality-specific pretrain & Difficult (joint from start) & Easy (independent encoders) & Moderate (freeze encoders) \\
+Training cost & High (joint from scratch) & Low (reuse pretrained) & Medium \\
+Fine-grained reasoning & Strong & Weak & Strong \\
+Retrieval / matching & Poor (no separate embeddings) & Excellent (dual encoder) & Good \\
+Scalability to $N$ modalities & Poor ($N$-way concat grows fast) & Good (add encoders) & Good (add cross-attn) \\
+Example systems & ViLT, early VisualBERT & CLIP, SigLIP, ALIGN & Flamingo, LLaVA, GPT-4V \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Early fusion} concatenates raw tokens (or lightly projected features) from all modalities into a single sequence and processes them through a shared encoder. Every layer sees every modality, enabling the richest cross-modal interaction. The cost: you cannot pretrain modality-specific encoders independently, and the joint sequence is long and expensive.
+
+\textbf{Late fusion} processes each modality through its own pretrained encoder, producing a single embedding vector per modality. These vectors are then combined---typically via dot product (for retrieval), concatenation + MLP (for classification), or simple averaging. Late fusion excels at retrieval tasks where you need to index modalities independently, but it cannot perform fine-grained cross-modal reasoning because interaction happens only at the final representation.
+
+\textbf{Cross-attention fusion} is the dominant approach in modern VLMs. One modality's representations serve as queries, and the other modality's representations serve as keys and values in cross-attention layers. This allows token-level interaction between modalities while keeping the encoders modular.
+
+\begin{keyinsight}[Late Fusion for Retrieval, Cross-Attention for Reasoning]
+The choice between late and cross-attention fusion maps directly to the task. Retrieval tasks (image search, text-to-image matching) need independent per-modality embeddings that can be pre-computed and indexed---late fusion wins. Reasoning tasks (VQA, image captioning, instruction following) need token-level cross-modal grounding---cross-attention wins. Many production systems use both: a late-fusion retrieval stage (CLIP) to find candidates, then a cross-attention model to reason over them. In interviews, stating this two-stage pattern immediately signals systems-level thinking.
+\end{keyinsight}
+
+%==============================================================================
+\section{Vision-Language Models}
+\label{sec:vision_language_models}
+%==============================================================================
+
+Vision-language models (VLMs) are the most commercially important multimodal systems. They combine a visual encoder (typically a ViT) with a language model to enable image understanding, visual question answering, captioning, and multimodal reasoning.
+
+\subsection{CLIP: Contrastive Vision-Language Pretraining}
+
+\textbf{What it is.} CLIP (Radford et al., 2021, OpenAI) trains a dual-encoder model on 400M image-text pairs scraped from the internet. The image encoder (ViT or ResNet) and text encoder (Transformer) are trained to maximize the cosine similarity of matched pairs while minimizing similarity for unmatched pairs within a batch.
+
+\begin{mathresult}{CLIP Contrastive Loss (InfoNCE)}
+\begin{equation}
+\loss_{\text{CLIP}} = -\frac{1}{N}\sum_{i=1}^{N}\left[\log \frac{\exp(\text{sim}(\vx_i^{\text{img}}, \vx_i^{\text{txt}}) / \tau)}{\sum_{j=1}^{N}\exp(\text{sim}(\vx_i^{\text{img}}, \vx_j^{\text{txt}}) / \tau)}\right]
+\end{equation}
+where $\text{sim}(\cdot,\cdot)$ is cosine similarity, $\tau$ is a learned temperature, and $N$ is the batch size. The loss is computed symmetrically (image-to-text + text-to-image).
+\end{mathresult}
+
+\textbf{Why CLIP matters.} It creates a shared embedding space where images and text can be directly compared. This enables zero-shot image classification (compare image embedding to text embeddings of class names), image-text retrieval, and---critically---it serves as the visual backbone for most subsequent VLMs.
+
+\textbf{Key design choices:}
+\begin{itemize}
+    \item \textbf{Large batch size} ($\sim$32K): More in-batch negatives improve contrastive learning quality. Smaller batches degrade performance significantly.
+    \item \textbf{Learned temperature} $\tau$: Initialized at $\tau = 0.07$ and learned during training. Controls the sharpness of the softmax distribution.
+    \item \textbf{No hard negative mining}: Relies purely on in-batch negatives. This works because large batches provide enough diversity.
+\end{itemize}
+
+\textbf{Limitations.} CLIP understands images at the ``caption level''---it knows what is in the image but struggles with spatial relationships (``the cat is on the table'' vs.\ ``the table is on the cat''), counting, negation, and compositional reasoning. These are the known failure modes that later models address.
+
+\textbf{SigLIP} (Zhai et al., 2023, Google) replaces the softmax-based InfoNCE loss with a pairwise sigmoid loss, removing the need for a global softmax denominator across the batch. This simplifies distributed training (no all-gather required for the full batch) and enables larger effective batch sizes.
+
+\subsection{Bridging Vision Encoders to LLMs}
+
+The key architectural question for modern VLMs is: how do you connect a pretrained vision encoder (CLIP ViT) to a pretrained LLM so that the LLM can ``see''?
+
+\begin{table}[H]
+\centering
+\caption{Approaches to connecting vision encoders with LLMs}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Approach} & \textbf{Mechanism} & \textbf{Pros} & \textbf{Cons} \\
+\midrule
+Linear projection & Project ViT patch tokens to LLM dim & Simplest, fast to train & Limited alignment capacity \\
+MLP projection & 2-layer MLP maps ViT tokens & Better alignment, still cheap & Fixed number of visual tokens \\
+Cross-attention (Perceiver) & Learnable queries attend to visual features & Compresses visual tokens & Adds parameters, complexity \\
+Q-Former & Learned queries + cross-attn + self-attn & Strong compression + alignment & Expensive to pretrain \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{LLaVA: The Simplest Effective VLM}
+
+\textbf{What it is.} LLaVA (Liu et al., 2023) connects a frozen CLIP ViT-L/14 (at 224px, yielding $16 \times 16 = 256$ visual tokens) to a Vicuna LLM (an instruction-tuned LLaMA variant) using only a linear projection layer. The visual tokens from the ViT are projected into the LLM's embedding space and concatenated with the text tokens as a prefix.
+
+\textbf{Training is two-stage:}
+\begin{enumerate}
+    \item \textbf{Pretraining (alignment)}: Train only the linear projection on 595K image-caption pairs. The ViT and LLM stay frozen. This teaches the projection to map visual features into the LLM's token space.
+    \item \textbf{Instruction tuning}: Unfreeze the LLM (keep ViT frozen), fine-tune on 158K multimodal instruction-following examples generated by GPT-4. This teaches the model to follow instructions about images.
+\end{enumerate}
+
+\textbf{LLaVA-1.5} upgrades the linear projection to a 2-layer MLP, uses higher-resolution images (336px), and adds academic VQA data to the instruction tuning mix---achieving strong performance with minimal architectural changes.
+
+\textbf{Why LLaVA matters for interviews:} It demonstrates that a simple projection layer can bridge powerful pretrained models. The insight is that CLIP already encodes rich visual semantics and the LLM already has strong reasoning---the projection just needs to align their embedding spaces. No complex cross-attention machinery is needed.
+
+\begin{warningbox}
+The number of visual tokens is a critical bottleneck in VLMs. A CLIP ViT-L/14 at 336px resolution produces $24 \times 24 = 576$ patch tokens. These consume 576 positions in the LLM's context window. For high-resolution images or video (multiple frames), the visual token count can easily dominate the context, leaving little room for text. Solutions include: visual token compression (Perceiver Resampler), dynamic resolution (partition into tiles), and token merging/pruning. In system design interviews, always discuss the visual token budget explicitly.
+\end{warningbox}
+
+\subsection{Flamingo: Cross-Attention with Frozen LLM}
+
+\textbf{What it is.} Flamingo (Alayrac et al., 2022, DeepMind) injects visual information into a frozen LLM via \textit{gated cross-attention layers} inserted between existing LLM layers. A Perceiver Resampler compresses variable-length visual features into a fixed set of visual tokens (64), which then serve as keys and values in the cross-attention layers.
+
+\textbf{Key innovations:}
+\begin{itemize}
+    \item \textbf{Perceiver Resampler}: A set of learnable query tokens attend to the visual encoder output via cross-attention, compressing hundreds of patch tokens to a fixed number. This controls the computational cost regardless of image resolution.
+    \item \textbf{Gated cross-attention}: Each cross-attention layer has a learned gating parameter initialized to zero, so the model starts as the original LLM and gradually incorporates visual information during training. This stabilizes training.
+    \item \textbf{Interleaved image-text}: Flamingo natively handles documents with multiple images interleaved with text---essential for few-shot multimodal prompting.
+\end{itemize}
+
+\subsection{GPT-4V and Gemini: Natively Multimodal}
+
+Unlike adapter-based models (LLaVA, Flamingo), natively multimodal architectures process all modalities within a single unified model from pretraining.
+
+\textbf{GPT-4V} (OpenAI, 2023): Details are proprietary, but it likely uses a large-scale vision encoder tightly integrated with the GPT-4 decoder, with visual tokens fed directly into the transformer's input sequence. Training on massive multimodal data during pretraining (not just fine-tuning) enables stronger cross-modal reasoning.
+
+\textbf{Gemini} (Google, 2023): Confirmed natively multimodal---trained on interleaved text, image, audio, and video from the start. Uses a unified tokenization approach where visual and audio inputs are encoded into tokens within the same vocabulary/embedding space as text.
+
+\subsection{VLM Architecture Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Major vision-language model comparison}
+\begin{tabularx}{\textwidth}{lXcccc}
+\toprule
+\textbf{Model} & \textbf{Architecture} & \textbf{Fusion} & \textbf{LLM Frozen?} & \textbf{Vis.\ Tokens} & \textbf{Year} \\
+\midrule
+CLIP & Dual encoder, contrastive & Late & N/A & 1 (CLS) & 2021 \\
+Flamingo & Perceiver + gated cross-attn & Cross-attn & Yes & 64 & 2022 \\
+BLIP-2 & Q-Former + frozen LLM & Cross-attn & Yes & 32 & 2023 \\
+LLaVA & Linear projection (Vicuna) & Early & No (stage 2) & 256 & 2023 \\
+LLaVA-1.5 & MLP projection + hi-res & Early & No (stage 2) & 576 & 2023 \\
+GPT-4V & Native multimodal & Early & N/A & Unknown & 2023 \\
+Gemini & Native multimodal & Early & N/A & Unknown & 2023 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[Adapter-Based vs Natively Multimodal: The Key Tradeoff]
+Adapter-based VLMs (LLaVA, Flamingo, BLIP-2) are cheap to build---you reuse pretrained vision and language models and only train a small connector. But the modalities were pretrained independently, so alignment is limited by the connector's capacity. Natively multimodal models (Gemini, GPT-4V) are expensive to pretrain from scratch but learn deeper cross-modal representations because every layer processes all modalities jointly. The practical implication: adapter-based models work well for tasks CLIP already understands (object recognition, basic scene understanding), but natively multimodal models excel at tasks requiring deep spatial reasoning, counting, and compositional understanding. When asked ``which approach is better?'' in an interview, the answer is always ``it depends on budget and task complexity.''
+\end{keyinsight}
+
+%==============================================================================
+\section{Text-to-Image Generation}
+\label{sec:text_to_image}
+%==============================================================================
+
+Text-to-image generation is covered in depth in Chapter~\ref{chap:generative_models} (diffusion models). This section focuses on the multimodal aspects---how text conditioning is injected into the image generation pipeline.
+
+\subsection{Stable Diffusion Architecture Overview}
+
+Stable Diffusion (Rombach et al., 2022) operates in latent space rather than pixel space, using three main components:
+
+\begin{enumerate}
+    \item \textbf{VAE encoder/decoder}: Compresses a $512 \times 512$ image into a $64 \times 64 \times 4$ latent representation (and back). This $8\times$ spatial compression makes the diffusion process computationally feasible.
+
+    \item \textbf{Text encoder}: A frozen CLIP text encoder (or T5 in later versions) converts the text prompt into a sequence of embeddings. These embeddings condition the denoising process.
+
+    \item \textbf{U-Net denoiser}: Iteratively denoises the latent representation. Text conditioning enters via cross-attention layers within the U-Net---text embeddings serve as keys and values, and noisy latent features serve as queries.
+\end{enumerate}
+
+\textbf{Classifier-free guidance (CFG)} is the key inference technique. The model runs two forward passes per denoising step: one conditioned on the text prompt, one unconditional. The final prediction amplifies the difference:
+
+\begin{mathresult}{Classifier-Free Guidance}
+\begin{equation}
+\hat{\epsilon} = \epsilon_{\text{uncond}} + w \cdot (\epsilon_{\text{cond}} - \epsilon_{\text{uncond}})
+\end{equation}
+where $w$ is the guidance scale (typically 7--12). Higher $w$ increases text-image alignment at the cost of sample diversity.
+\end{mathresult}
+
+\textbf{Newer architectures:} DiT (Diffusion Transformer) replaces the U-Net with a transformer backbone, and models like DALL-E 3, Imagen, and Flux use larger text encoders (T5-XXL) for better text understanding, especially for compositional prompts and text rendering.
+
+\textbf{When to discuss this in interviews:} The multimodal fusion mechanism (cross-attention between text and image features) is the key point. Interviewers want to hear that you understand how text conditions the generation process, not the diffusion math itself.
+
+%==============================================================================
+\section{Audio and Speech}
+\label{sec:audio_speech}
+%==============================================================================
+
+\subsection{Whisper: Robust Speech Recognition}
+
+\textbf{What it is.} Whisper (Radford et al., 2022, OpenAI) is an encoder-decoder transformer trained on 680K hours of weakly supervised audio-text pairs scraped from the internet. It performs speech recognition, translation, language identification, and voice activity detection as a single multitask model.
+
+\textbf{Architecture:}
+\begin{itemize}
+    \item \textbf{Audio preprocessing}: Raw audio is converted to an 80-channel log-mel spectrogram with 25ms windows and 10ms stride. A 30-second audio segment becomes a $80 \times 3000$ spectrogram.
+    \item \textbf{Encoder}: Two initial convolution layers (stride 2, reducing the time dimension to 1500 frames), followed by standard transformer encoder layers with sinusoidal positional encodings.
+    \item \textbf{Decoder}: Standard autoregressive transformer decoder with cross-attention to the encoder output. Generates text tokens (BPE), language tags, timestamps, and special task tokens.
+\end{itemize}
+
+\textbf{Why Whisper matters:}
+\begin{itemize}
+    \item \textbf{Scale over specialization}: Instead of curated speech datasets, Whisper uses massive weakly supervised data. The noise in the labels is overcome by sheer scale.
+    \item \textbf{Multitask via prompting}: Task specification is done through special tokens in the decoder: $\langle$transcribe$\rangle$, $\langle$translate$\rangle$, $\langle$en$\rangle$, $\langle$timestamp$\rangle$. One model handles all tasks.
+    \item \textbf{Zero-shot robustness}: Whisper generalizes to accents, background noise, and domains it was never explicitly fine-tuned on---a direct benefit of diverse web-scale training.
+\end{itemize}
+
+\subsection{Multimodal Alignment Across Modalities}
+
+The challenge with adding audio (or video, or other modalities) to an existing vision-language framework is alignment---mapping all modalities into a shared representation space.
+
+\begin{table}[H]
+\centering
+\caption{Multimodal alignment strategies}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Strategy} & \textbf{Mechanism} & \textbf{Tradeoff} & \textbf{Example} \\
+\midrule
+Contrastive alignment & Paired encoders with InfoNCE & Separate embeddings; scalable & CLIP, CLAP, ImageBind \\
+Projection to LLM space & Project encoder output into LLM tokens & Simple; limited interaction & LLaVA, Whisper+LLM \\
+Unified tokenization & Tokenize all modalities into shared vocab & Deepest integration; hardest & Gemini, AnyGPT \\
+Shared decoder & Separate encoders, shared cross-attn decoder & Flexible; modular & Flamingo, PaLM-E \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{ImageBind} (Girdhar et al., 2023, Meta) deserves special mention. It aligns six modalities (image, text, audio, depth, thermal, IMU) into a shared embedding space by training each non-image modality to align with images using paired data. Because CLIP already aligns images with text, aligning audio to images transitively aligns audio to text---even without any audio-text paired data. This ``binding'' through a common image modality is elegant and data-efficient.
+
+\textbf{CLAP} (Contrastive Language-Audio Pretraining) applies the CLIP paradigm to audio-text pairs, creating an audio embedding space aligned with text. Combined with an image-text space (CLIP), this enables audio-image-text retrieval.
+
+\subsection{Audio Representation for ML Systems}
+
+\begin{table}[H]
+\centering
+\caption{Audio feature representations for deep learning}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Representation} & \textbf{What It Captures} & \textbf{Use Case} & \textbf{Shape} \\
+\midrule
+Raw waveform & Full signal (no information loss) & End-to-end models (WaveNet) & $1 \times T$ \\
+Mel spectrogram & Frequency content, perceptually weighted & Whisper, speech models & $F \times T'$ \\
+MFCC & Spectral envelope (compact) & Classical ASR, small models & $13 \times T'$ \\
+Learned embeddings & Task-specific (from pretrained model) & Transfer learning, retrieval & $d$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Mel spectrograms} are the standard input for modern speech and audio models. The mel scale warps frequencies to match human perception---lower frequencies get finer resolution because humans are more sensitive to pitch differences in speech range ($\sim$100--4000 Hz). Typical parameters: 80 mel bins, 25ms window, 10ms hop.
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:multimodal_interview}
+%==============================================================================
+
+%--- Rewritten Q1: Multimodal search system design ---
+
+\begin{interviewq}
+\textbf{Q: Design a multimodal content understanding system for a social media platform.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Step 1: Problem scoping.} A social media platform ingests posts with text, images, videos, and audio. The content understanding system must classify, moderate, recommend, and search across all modalities. Key use cases: content moderation (safety), recommendation (engagement), and search (retrieval). Latency: moderation must be near-real-time ($<$500ms); recommendation embeddings can be batch-computed.
+
+\textbf{Step 2: Shared embedding backbone.} Use a CLIP-style dual encoder (e.g., SigLIP) as the foundation for image-text alignment. For video, sample key frames and encode each with the image encoder; pool frame embeddings (mean or attention-weighted). For audio, use a CLAP encoder aligned to the same text space (or bridge through ImageBind). All modalities produce embeddings in a shared 768-dim space.
+
+\textbf{Step 3: Content moderation pipeline.}
+\begin{itemize}
+    \item \textbf{Image/video safety:} Fine-tune a classifier on top of the CLIP image embeddings for NSFW, violence, and hate symbol detection. Augment with OCR to catch text-in-image policy violations.
+    \item \textbf{Text safety:} Fine-tuned DistilBERT classifier for toxicity, hate speech, and spam.
+    \item \textbf{Cross-modal:} Some violations are only detectable cross-modally (benign text + harmful image, or sarcasm where text contradicts image). Use a cross-attention model (Flamingo-style) to catch these cases.
+    \item \textbf{Latency:} Parallel execution. Image classifier + text classifier run simultaneously ($\sim$20ms each on GPU); cross-modal check runs on flagged content only.
+\end{itemize}
+
+\textbf{Step 4: Recommendation embeddings.} Batch-compute multimodal embeddings for all posts. For recommendation, the embedding should capture both content semantics and engagement signals. Two-tower architecture: post embeddings (multimodal content) and user embeddings (engagement history). Serve via ANN index for candidate generation.
+
+\textbf{Step 5: Multimodal search.} Users search by text, image (reverse image search), or both. Use the shared CLIP embedding space for retrieval. Index: HNSW on the post embeddings. Re-rank with a cross-attention model for precision. Handle text-in-image via OCR indexing alongside semantic embeddings.
+
+\textbf{Step 6: Monitoring.} Track precision/recall for moderation classifiers weekly. Monitor embedding quality via retrieval metrics on a curated test set. A/B test recommendation changes.
+
+\redflags
+\begin{itemize}
+    \item Treating each modality in isolation---the system's value is in cross-modal understanding.
+    \item ``Use GPT-4V for everything''---a single VLM cannot handle the latency and throughput requirements of a social media platform.
+    \item Ignoring the cost of VLM inference at social-media scale (billions of posts/day).
+\end{itemize}
+
+\interviewtest{Can you design a multi-use-case system with shared infrastructure? Do you reason about latency, throughput, and cost at platform scale? Do you handle cross-modal reasoning (not just per-modality classification)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Designs a system for one use case (e.g., moderation) with reasonable architecture choices.
+    \item \badgeLsix{L6} Designs a shared embedding backbone that serves multiple use cases (moderation, recommendation, search), discusses cross-modal reasoning for edge cases, and provides latency/cost estimates.
+    \item \badgeLseven{L7} Discusses the platform-scale challenges (billions of posts, real-time processing), proposes a tiered architecture (fast classifiers for most content, expensive VLMs for ambiguous cases), and addresses adversarial robustness (users deliberately crafting posts to bypass moderation).
+\end{itemize}
+
+\followups{``How do you handle a new modality (e.g., 3D content)?'' ``What if users adversarially craft images to bypass moderation?'' ``How do you keep embeddings fresh as content trends change?''}
+\end{interviewq}
+
+%--- Rewritten Q2: LLaVA architecture ---
+
+\begin{interviewq}
+\textbf{Q: Adapter-based (LLaVA) vs natively multimodal (Gemini)---tradeoffs.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+These represent two fundamentally different philosophies for building vision-language models.
+
+\textbf{Adapter-based (LLaVA, Flamingo, BLIP-2):} Take separately pretrained components---a vision encoder (CLIP ViT) and an LLM (LLaMA)---and connect them with a lightweight adapter (linear projection, MLP, or cross-attention). Training cost is low: only the adapter (and optionally the LLM) is trained, on 100K--1M image-text pairs. The ViT stays frozen.
+
+\textit{Strengths:} (1) Cheap and fast to build---reuse best-in-class pretrained models. (2) Modular---swap the LLM or vision encoder independently. (3) Strong baselines with minimal data. LLaVA achieves competitive VQA with a 2-layer MLP adapter trained on 595K image-caption pairs + 158K instruction examples.
+
+\textit{Weaknesses:} (1) Alignment is limited by the adapter's capacity---subtle cross-modal relationships may not be captured by a linear projection. (2) The frozen ViT constrains visual understanding to what CLIP learned. If CLIP cannot encode spatial relationships (``left of,'' ``behind''), neither can LLaVA. (3) 576 visual tokens consume context; no flexibility to adjust visual token count dynamically.
+
+\textbf{Natively multimodal (Gemini, GPT-4V):} All modalities are processed within a single unified transformer from pretraining. Visual inputs are tokenized into the same vocabulary/embedding space as text. The model learns cross-modal representations at every layer during pretraining on interleaved multimodal data.
+
+\textit{Strengths:} (1) Deepest cross-modal integration---every layer processes all modalities jointly. (2) Better at spatial reasoning, counting, and compositional understanding because these are learned during pretraining, not retrofit via an adapter. (3) Can handle arbitrary interleaving of modalities (text, image, text, image, ...) naturally.
+
+\textit{Weaknesses:} (1) Extremely expensive to pretrain (requires multimodal data at web scale). (2) Not modular---cannot swap the vision encoder without full retraining. (3) Proprietary; hard to reproduce.
+
+\textbf{Decision:} Adapter-based if you need a VLM quickly with limited compute and the tasks align with what CLIP already understands. Natively multimodal if you need deep cross-modal reasoning, have the pretraining budget, or require capabilities beyond CLIP's representational limits.
+
+\redflags
+\begin{itemize}
+    \item ``Natively multimodal is always better''---adapter-based models are sufficient for most production VLM tasks and far cheaper.
+    \item Claiming LLaVA's projection layer ``fully aligns'' vision and language---it bridges them, but alignment is shallow compared to joint pretraining.
+    \item Not mentioning the visual token count problem as a practical bottleneck for adapter-based models.
+\end{itemize}
+
+\interviewtest{Understanding of the build-vs-compose tradeoff in multimodal systems. Can you articulate what each approach gains and loses? Do you know the practical implications (cost, capability, modularity)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes both approaches and names key differences (cost, depth of integration).
+    \item \badgeLsix{L6} Articulates the specific capability gap (spatial reasoning, counting, compositionality) and explains why adapter-based models struggle with these tasks. Discusses the visual token bottleneck.
+    \item \badgeLseven{L7} Discusses hybrid approaches (adapter-based with unfrozen ViT, progressive unfreezing), reasons about when the capability gap justifies native multimodal pretraining, and connects to the trend of open-source models closing the gap (InternVL, Qwen-VL).
+\end{itemize}
+
+\followups{``How would you improve LLaVA's spatial reasoning?'' ``What data is needed for native multimodal pretraining?'' ``Can you unfreeze the ViT in adapter-based models?''}
+\end{interviewq}
+
+%--- Rewritten Q3: Fusion comparison ---
+
+\begin{interviewq}
+\textbf{Q: How does CLIP's contrastive loss create a shared embedding space?}
+
+\badgeLfive{L5} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+CLIP trains two separate encoders---one for images, one for text---to produce embeddings in the \textit{same} vector space, such that matched image-text pairs have high cosine similarity and unmatched pairs have low similarity.
+
+\textbf{The mechanism (InfoNCE loss):} Given a batch of $N$ image-text pairs, CLIP computes the cosine similarity between every image embedding and every text embedding in the batch, producing an $N \times N$ similarity matrix. The loss treats the diagonal entries (matched pairs) as positives and all off-diagonal entries (unmatched pairs) as negatives. For each image, it applies a softmax over the $N$ text similarities and pushes the matched text to the top. Symmetrically, for each text, it pushes the matched image to the top. The temperature $\tau$ (learned, initialized at 0.07) controls the sharpness of this softmax.
+
+\textbf{Why this creates a shared space:} The contrastive loss forces the image encoder to produce embeddings that are ``close'' to the embeddings of their corresponding text descriptions. Over millions of such pairs, the two encoders learn to represent the same \textit{semantic concepts} in the same regions of the shared space. ``A photo of a dog'' and an actual photo of a dog end up near each other because the loss penalizes them being apart.
+
+\textbf{Why large batch sizes matter:} The quality of the contrastive signal depends on the number of negatives. In a batch of 32K pairs, each image is contrasted against 32K text candidates. More negatives make the task harder and force the encoders to produce more discriminative embeddings. CLIP used batches of 32,768---smaller batches significantly degrade embedding quality.
+
+\textbf{What emerges:} Zero-shot classification becomes possible. To classify an image, encode it and compare against text embeddings of class names (``a photo of a cat,'' ``a photo of a dog''). The class with the highest similarity wins. No task-specific fine-tuning needed---the shared space already captures the semantics.
+
+\redflags
+\begin{itemize}
+    \item Saying the encoders ``share weights''---they do not. They are completely separate architectures (ViT for images, Transformer for text) that share only the embedding space.
+    \item Confusing CLIP's contrastive loss with a classification loss---there are no fixed classes, only pair similarity.
+    \item Not mentioning the role of temperature $\tau$ or batch size.
+\end{itemize}
+
+\interviewtest{Can you explain the contrastive learning mechanism from first principles? Do you understand why the shared space emerges (gradient signal from matched/unmatched pairs) and what design choices enable it (large batches, learned temperature)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly explains that CLIP maximizes similarity for matched pairs and minimizes it for unmatched pairs.
+    \item \badgeLsix{L6} Explains the role of batch size as the source of negatives, discusses the learned temperature, and connects to zero-shot classification as an emergent capability.
+    \item \badgeLseven{L7} Discusses the theoretical connection to mutual information maximization (InfoNCE lower-bounds mutual information), explains how SigLIP removes the need for global softmax (pairwise sigmoid), and reasons about the limitations of the shared space (it captures ``caption-level'' semantics but not spatial or compositional relationships).
+\end{itemize}
+
+\followups{``Why does CLIP struggle with spatial relationships?'' ``What happens if you reduce the batch size to 256?'' ``How is SigLIP different from CLIP?''}
+\end{interviewq}
+
+%--- New Q4: CLIP vs SigLIP ---
+
+\begin{interviewq}
+\textbf{Q: CLIP vs SigLIP---what changed and why?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{CLIP (Radford et al., 2021):} Uses an InfoNCE contrastive loss with a softmax over the full $N \times N$ similarity matrix. For each image, the loss computes $\text{softmax}(\text{sim}(\vx_i^{\text{img}}, \vx_j^{\text{txt}}) / \tau)$ over all $j = 1 \ldots N$ texts in the batch. This requires computing the full $N \times N$ matrix and normalizing globally, which means every GPU must see the embeddings from every other GPU via an \texttt{all-gather} operation.
+
+\textbf{SigLIP (Zhai et al., 2023, Google):} Replaces the softmax-based loss with a pairwise sigmoid loss. Each (image, text) pair is scored independently: $\loss = -\log\sigma\big(z_{ij} \cdot (t \cdot \text{sim}(i,j) + b)\big)$ where $z_{ij} = +1$ for matched pairs and $z_{ij} = -1$ for unmatched, $t$ is a learned multiplicative temperature, and $b$ is a learned bias initialized to $\approx -10$ (so training starts with the overwhelmingly negative pairs already near-correctly classified). No global normalization is needed.
+
+\textbf{Why it matters:}
+\begin{itemize}
+    \item \textbf{Distributed training scalability:} CLIP's softmax requires \texttt{all-gather} to collect all embeddings onto every device for the global normalization. This communication cost grows with the number of GPUs and limits effective batch size. SigLIP's pairwise sigmoid loss can be computed locally---each device handles its own subset of pairs. This enables larger effective batch sizes and simpler distributed training.
+    \item \textbf{Better performance:} Surprisingly, SigLIP matches or exceeds CLIP quality at the same model size and dataset. The pairwise loss provides a stronger learning signal for hard negatives because the sigmoid does not suppress the gradient for individual pairs the way a softmax over 32K entries does.
+    \item \textbf{Simpler implementation:} No need for coordinated cross-device softmax computation.
+\end{itemize}
+
+\textbf{What stayed the same:} Both produce a shared image-text embedding space, both enable zero-shot classification, and both use a learned temperature parameter. The architectural encoders are identical---the only change is the loss function.
+
+\redflags
+\begin{itemize}
+    \item ``SigLIP uses a different architecture''---the change is purely in the loss function and training procedure.
+    \item Not understanding why the softmax requires global communication in distributed training.
+    \item Claiming SigLIP eliminates the need for large batch sizes---it still benefits from them; it just makes them easier to scale.
+\end{itemize}
+
+\interviewtest{Understanding of how the loss function choice impacts distributed training scalability, and the practical implications for training at scale.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly identifies that SigLIP replaces softmax with sigmoid and explains the basic tradeoff.
+    \item \badgeLsix{L6} Explains the distributed training implication (\texttt{all-gather} elimination), discusses why pairwise sigmoid provides better gradients for hard negatives, and knows that SigLIP matches CLIP quality.
+    \item \badgeLseven{L7} Connects to the broader trend of removing global normalization in contrastive losses, discusses the bias term $b$ in SigLIP (learned offset that replaces the implicit normalization of softmax), and reasons about when CLIP-style softmax might still be preferred (smaller scale, when you want calibrated similarity scores).
+\end{itemize}
+
+\followups{``How does removing the softmax affect the embedding space geometry?'' ``What batch size does SigLIP use?'' ``Can you use SigLIP as a drop-in replacement for CLIP in LLaVA?''}
+\end{interviewq}
+
+%--- New Q5: CLIP training compute estimation ---
+
+\begin{interviewq}
+\textbf{Q: Estimate the compute cost of training a CLIP model on 400M image-text pairs.}
+
+\badgeLseven{L7} \quad \badgetype{Estimation} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{Model setup:} CLIP ViT-L/14 has $\sim$300M parameters for the image encoder and $\sim$63M for the text encoder. Total $\sim$400M parameters. Training on 400M image-text pairs for 32 epochs = 12.8B samples seen.
+
+\textbf{FLOPs per sample:} For a transformer, the forward pass FLOPs $\approx 2 \times P$ per token, where $P$ is the number of parameters. Backward pass $\approx 2\times$ forward. Total: $\approx 6P$ per token.
+\begin{itemize}
+    \item Image encoder: ViT-L/14 at 224px produces $16 \times 16 = 256$ patches. FLOPs $\approx 6 \times 300\text{M} \times 256 \approx 4.6 \times 10^{11}$ FLOPs.
+    \item Text encoder: 77 tokens max. FLOPs $\approx 6 \times 63\text{M} \times 77 \approx 2.9 \times 10^{10}$ FLOPs.
+    \item Contrastive loss computation: $N \times N$ similarity matrix for batch size $N = 32{,}768$. This is $32{,}768^2 \times 768 \times 2 \approx 1.6 \times 10^{12}$ FLOPs per batch. Per sample: $\sim 5 \times 10^7$. Negligible compared to the encoders.
+    \item \textbf{Total per sample:} $\sim 5 \times 10^{11}$ FLOPs.
+\end{itemize}
+
+\textbf{Total training FLOPs:} $12.8 \times 10^9 \text{ samples} \times 5 \times 10^{11} \text{ FLOPs/sample} = 6.4 \times 10^{21}$ FLOPs.
+
+\textbf{Hardware time:} An A100 delivers $\sim$312 TFLOPS (BF16 tensor core peak), with $\sim$40\% MFU (model FLOPS utilization): $\sim$125 effective TFLOPS.
+\begin{itemize}
+    \item Single-GPU time: $6.4 \times 10^{21} / (1.25 \times 10^{14}) \approx 5.1 \times 10^7$ seconds $\approx 590$ days.
+    \item With 256 A100s: $\sim$2.3 days; with 1024 A100s: $\sim$14 hours.
+    \item Reality check: CLIP ViT-L/14 was actually trained on $\sim$256 V100 GPUs for $\sim$12 days---consistent with this estimate, since a V100 delivers roughly a third of an A100's effective throughput.
+\end{itemize}
+
+\textbf{Cost estimate:} 256 A100s $\times$ 2.3 days $\times$ \$2/GPU-hour $\approx$ \$28K. At 1024 GPUs for 14 hours $\approx$ \$29K. The dominant cost is the large batch size requirement (32K) which drives the minimum GPU count.
+
+\redflags
+\begin{itemize}
+    \item Forgetting to account for both encoders---the image encoder dominates compute, but the text encoder is non-trivial.
+    \item Using peak FLOPS without an MFU discount (real throughput is 30--50\% of peak).
+    \item Not recognizing that the batch size (32K) sets the \textit{minimum} GPU count regardless of total compute.
+\end{itemize}
+
+\interviewtest{Can you do back-of-envelope compute estimation for a training run? Do you know the key parameters (FLOPs per token, MFU, batch size constraints)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Gives a rough total FLOPs estimate and converts to GPU-hours.
+    \item \badgeLsix{L6} Breaks down FLOPs per encoder, accounts for MFU, and provides a cost estimate with realistic cloud pricing.
+    \item \badgeLseven{L7} Identifies the batch size as the binding constraint on minimum GPU count---not because of raw input bytes (a 224px RGB image is only $\sim$0.3--0.6 MB) but because of per-sample \textit{activation} memory in the encoders, which at tens of MB per sample forces the 32K batch to be data-parallel across hundreds of GPUs---discusses the communication cost of the contrastive loss (all-gather), and compares to SigLIP's reduced communication requirements.
+\end{itemize}
+
+\followups{``What is the minimum number of GPUs needed?'' ``How does SigLIP reduce the communication cost?'' ``What if you want to train at 384px resolution instead of 224px?''}
+\end{interviewq}
+
+%--- New Q6: VLM hallucination debugging ---
+
+\begin{interviewq}
+\textbf{Q: Your VLM hallucinates visual details that are not in the image. Why and how to fix?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Symptoms:} The model describes objects, text, or spatial relationships that do not exist in the input image. For example, it claims ``the sign reads `Welcome to Paris''' when the sign actually says something else, or describes a person wearing a red hat when no hat is present.
+
+\textbf{Root causes:}
+
+\textbf{1. LLM prior dominance.} The language model's parametric knowledge overrides weak visual signals. If the visual encoder produces embeddings that are ambiguous or low-confidence, the LLM falls back to its text-based priors (what is statistically likely given the prompt). This is the most common cause.
+
+\textbf{2. Resolution limitations.} The ViT operates at a fixed resolution (224px or 336px for LLaVA). Fine details---small text, distant objects, subtle colors---are lost during patch extraction. The model ``sees'' a blurry approximation and fills in details from its language model prior.
+
+\textbf{3. Training data bias.} Instruction-tuning data may contain captions with inaccurate visual descriptions (especially if generated by GPT-4 from captions without seeing the actual image, as in LLaVA v1). The model learns to generate plausible-sounding descriptions even when visual evidence is weak.
+
+\textbf{4. Shallow visual-text alignment.} In adapter-based VLMs, the projection layer provides only shallow alignment. The LLM may not ``trust'' the visual tokens when they conflict with its language priors, especially for unusual or uncommon visual content.
+
+\textbf{Fixes:}
+\begin{enumerate}
+    \item \textbf{Higher resolution.} Use dynamic resolution or multi-crop strategies (LLaVA-NeXT, InternVL). Partition the image into tiles, encode each tile separately, and concatenate the visual tokens. This captures fine details at the cost of more visual tokens.
+    \item \textbf{Grounding training.} Fine-tune on data with explicit visual grounding: bounding box annotations, pointing tasks, and visual referring expressions. This forces the model to attend to specific image regions rather than generating from priors.
+    \item \textbf{Visual token verification.} Add a post-generation step that verifies visual claims against the image: extract claims from the response, generate visual questions (``Is there a red hat in the image?''), and answer them using a separate VQA model or the same model with targeted prompting.
+    \item \textbf{Confidence-aware generation.} Modify the system prompt to instruct the model to only describe visual elements it is confident about: ``Describe only what you clearly see. If you are uncertain about a detail, say so.''
+    \item \textbf{Better training data.} Replace GPT-4-generated instruction data with human-verified visual descriptions, or use a stronger VLM to generate training data with actual image access.
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``Just lower the temperature''---temperature affects diversity, not the model's tendency to hallucinate visual details from language priors.
+    \item Blaming the LLM architecture---the root cause is typically data or alignment quality, not the base model.
+    \item Not distinguishing visual hallucination from text hallucination---they have different root causes and different fixes.
+\end{itemize}
+
+\interviewtest{Understanding of why VLMs hallucinate visual details (LLM prior vs.\ visual signal conflict), and ability to propose targeted fixes at the data, architecture, and inference levels.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies resolution limitations and LLM prior dominance as causes, proposes higher resolution.
+    \item \badgeLsix{L6} Distinguishes multiple root causes, proposes grounding training and visual verification, and discusses the LLM-prior vs.\ visual-signal tradeoff.
+    \item \badgeLseven{L7} Discusses the fundamental tension between fluency and visual fidelity in autoregressive VLMs, proposes multi-stage verification pipelines for production, and connects to the broader hallucination literature (the same problem affects text-only LLMs but is amplified by cross-modal alignment gaps).
+\end{itemize}
+
+\followups{``How do you evaluate visual hallucination rates?'' ``What is the tradeoff between resolution and visual token count?'' ``Can you fine-tune the ViT to reduce hallucination?''}
+\end{interviewq}
+
+%--- New Q7: Visual token reduction ---
+
+\begin{interviewq}
+\textbf{Q: Visual tokens consume 576 tokens of context. How do you reduce this cost?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+A CLIP ViT-L/14 at 336px produces $24 \times 24 = 576$ patch tokens. For high-resolution images or multi-image tasks, this can consume the majority of the LLM's context window. Multiple strategies exist to reduce the visual token count, each with different quality-cost tradeoffs.
+
+\textbf{1. Perceiver Resampler (Flamingo, BLIP-2):} Learn a fixed set of $M$ query tokens ($M = 32$--$64$) that attend to the $576$ visual tokens via cross-attention. Output: $M$ compressed visual tokens regardless of input resolution. Quality: good for global understanding, but fine-grained spatial detail is lost in the compression. Training: requires learning the resampler, typically pretrained on image-caption pairs.
+
+\textbf{2. Token merging/pruning:} After the ViT's forward pass, merge or prune redundant tokens. Token merging (ToMe) computes pairwise similarity between adjacent patch tokens and merges the most similar pairs (averaging their embeddings). This adaptively reduces token count based on image complexity (homogeneous regions merge aggressively; detailed regions retain tokens). Typical compression: 2--4$\times$ with minimal quality loss.
+
+\textbf{3. Adaptive resolution (LLaVA-NeXT, InternVL-1.5):} Instead of a fixed $336 \times 336$, dynamically select how many tiles to use based on image complexity. A simple image (solid background) gets 1 tile (144 tokens); a complex image (dense text, detailed scene) gets 4--6 tiles (576--864 tokens). The LLM receives fewer tokens for simple images and more for complex ones.
+
+\textbf{4. Downsampled visual features:} Apply spatial average pooling to the ViT's patch grid before projection. Reducing $24 \times 24$ to $12 \times 12$ gives 144 tokens (4$\times$ reduction). Simple but loses spatial resolution uniformly.
+
+\textbf{5. C-Abstractor / Honeybee:} Train a lightweight CNN on top of ViT features to learn a task-adaptive spatial compression. Preserves more spatial structure than linear pooling while achieving significant token reduction.
+
+\textbf{Decision framework:} For single-image understanding with a generous context window, 576 tokens is acceptable. For multi-image or video tasks, compression is essential. Perceiver Resampler for maximum compression (32 tokens); token merging for adaptive compression with minimal quality loss; adaptive resolution when you want to preserve detail for complex images. In system design interviews, always state the visual token budget and how it interacts with the text context budget.
+
+\redflags
+\begin{itemize}
+    \item ``Just increase the context window''---this increases latency quadratically and cost linearly per token.
+    \item Not mentioning the quality-compression tradeoff---aggressive compression loses spatial detail.
+    \item Treating all images identically---adaptive methods (token merging, dynamic resolution) are superior to fixed compression.
+\end{itemize}
+
+\interviewtest{Awareness of the visual token bottleneck as a first-class design constraint, and knowledge of multiple reduction strategies with their tradeoffs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Mentions Perceiver Resampler and spatial pooling as compression methods.
+    \item \badgeLsix{L6} Compares multiple approaches (Perceiver, token merging, adaptive resolution) with quality-compression tradeoffs and recommends based on use case.
+    \item \badgeLseven{L7} Quantifies the context window budget (e.g., 4K context with 576 visual tokens leaves only 3,424 for text), discusses video-specific strategies (sample key frames, temporal token merging), and reasons about the fundamental tradeoff between visual detail and context length for multi-turn visual conversations.
+\end{itemize}
+
+\followups{``How do you handle video input (60+ frames)?'' ``What is the quality impact of compressing to 64 tokens?'' ``How does visual token count interact with KV cache size at inference?''}
+\end{interviewq}
+
+%--- New Q8: Early/late/cross-attention comparison ---
+
+\begin{interviewq}
+\textbf{Q: Compare early, late, and cross-attention fusion for multimodal models. When would you use each?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The three fusion strategies differ in \textit{when} cross-modal interaction occurs, and this determines what tasks they excel at.
+
+\textbf{Late fusion} (e.g., CLIP, SigLIP): Each modality is encoded independently into a single embedding vector. Interaction happens only at the final similarity computation (dot product or cosine). \textit{Strength:} Pre-computable per-modality embeddings enable million-scale retrieval with ANN indexes. Modality-specific encoders can be pretrained independently. \textit{Weakness:} The single-vector bottleneck discards fine-grained spatial and temporal information. Cannot answer ``what color is the object to the left of the dog?''
+
+\textbf{Early fusion} (e.g., ViLT, Gemini, GPT-4V): All modalities are tokenized and concatenated into a single sequence processed by a shared transformer from layer one. Every attention layer attends across modalities. \textit{Strength:} Deepest possible cross-modal interaction; arbitrary relationships between visual regions and text. \textit{Weakness:} No independent per-modality embeddings (no pre-computation for retrieval); long concatenated sequences increase compute quadratically; cannot easily reuse separately pretrained encoders.
+
+\textbf{Cross-attention fusion} (e.g., Flamingo, BLIP-2, Stable Diffusion's U-Net): One modality's features serve as keys/values and the other's as queries in dedicated cross-attention layers. \textit{Strength:} Token-level cross-modal interaction while keeping encoders modular and reusable. Number of cross-attention layers controls the compute-quality tradeoff. \textit{Weakness:} More complex architecture; requires design decisions about where to insert cross-attention.
+
+\textbf{Decision framework:} Retrieval/search $\rightarrow$ late fusion (pre-computable embeddings). VQA/captioning/reasoning $\rightarrow$ cross-attention or early fusion. Generative conditioning (text-to-image) $\rightarrow$ cross-attention. Maximum quality with unlimited budget $\rightarrow$ early fusion (native multimodal). Limited budget with pretrained models $\rightarrow$ cross-attention fusion.
+
+Many production systems use a two-stage pattern: late fusion for candidate retrieval, then cross-attention for reasoning over candidates.
+
+\redflags
+\begin{itemize}
+    \item Listing pros and cons without connecting to specific use cases.
+    \item Not mentioning the pre-computability advantage of late fusion for retrieval.
+    \item ``Early fusion is always best''---it is the most expensive and least modular.
+\end{itemize}
+
+\interviewtest{Can you articulate the tradeoff between interaction depth and efficiency? The strongest signal is connecting each fusion type to specific use cases and mentioning the two-stage retrieval-then-reasoning pattern.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes all three approaches and gives correct examples of each.
+    \item \badgeLsix{L6} Maps each to specific tasks (retrieval vs.\ reasoning vs.\ generation) and mentions the two-stage production pattern.
+    \item \badgeLseven{L7} Quantifies the compute implications (early fusion: $O((n_{\text{img}} + n_{\text{txt}})^2)$; late: $O(n_{\text{img}}^2 + n_{\text{txt}}^2)$; cross-attn: $O(n_{\text{img}} \cdot n_{\text{txt}})$), and discusses hybrid systems like CoCa that combine contrastive (late) and generative (cross-attn) objectives in one model.
+\end{itemize}
+
+\followups{``Can you combine late and cross-attention fusion?'' ``How does the number of cross-attention layers affect quality?'' ``Compare the attention complexity of each approach.''}
+\end{interviewq}
+
+%--- New Q9: Multimodal search system ---
+
+\begin{interviewq}
+\textbf{Q: Design a multimodal search system that lets users search a product catalog using text or image queries.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Step 1: Problem formulation.} Cross-modal retrieval: users provide text or image queries and expect relevant product results. Core challenge: mapping text and images into a shared embedding space where similarity is meaningful.
+
+\textbf{Step 2: Embedding architecture.} CLIP-style dual encoder: image encoder (CLIP ViT-L/14 or SigLIP) encodes product images into 768-dim embeddings; text encoder encodes product titles, descriptions, and user text queries. Both pretrained on web-scale image-text pairs, then fine-tuned on our product catalog with in-batch contrastive loss and hard negative mining (negatives from the same product category).
+
+\textbf{Step 3: Indexing.} Offline: encode all product images and text descriptions. Store in a vector database (FAISS, Qdrant, or Pinecone) with HNSW or IVF-PQ indexing. Size estimate: 10M products $\times$ 768 dims $\times$ 4 bytes $\approx$ 30 GB FP32. Use PQ compression or FP16 to halve.
+
+\textbf{Step 4: Query pipeline.} Text query: encode with text encoder, ANN top-100. Image query: encode with image encoder, ANN top-100. Re-ranking: cross-attention model or lightweight MLP re-ranks top-100 using richer features (product metadata, user history, higher-resolution visual similarity). Final output: top 20 results.
+
+\textbf{Step 5: Domain fine-tuning.} CLIP's web pretraining may not distinguish product subcategories (running shoes vs.\ trail shoes). Fine-tune on product-specific image-text pairs with hard negatives from the same category. Evaluate: Recall@10, MRR on held-out query-product pairs.
+
+\textbf{Step 6: Serving.} Latency: embedding ($\sim$10ms GPU) + ANN ($\sim$5ms) + re-ranking ($\sim$20ms) = $\sim$35ms. Monitor embedding drift from seasonal catalog updates; re-index periodically. A/B test against text-only search.
+
+\redflags
+\begin{itemize}
+    \item Using a cross-attention model for the full catalog search---it cannot pre-compute embeddings, so it is too slow at retrieval scale.
+    \item ``Just use CLIP out of the box''---domain fine-tuning on product data is essential for distinguishing subcategories.
+    \item Not mentioning the two-stage retrieve-then-rerank pipeline.
+\end{itemize}
+
+\interviewtest{Can you design an end-to-end retrieval system? Key signals: choosing late fusion for retrieval efficiency, ANN indexing, two-stage pipeline, and domain fine-tuning.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes CLIP embeddings with ANN search and gets the basic pipeline right.
+    \item \badgeLsix{L6} Adds domain fine-tuning with hard negatives, two-stage reranking, and provides latency and storage estimates.
+    \item \badgeLseven{L7} Discusses scaling to 1B products (sharded index, multi-stage retrieval), handling multimodal queries (text + image combined), and embedding versioning when the model is retrained.
+\end{itemize}
+
+\followups{``How do you handle combined text + image queries?'' ``What if the catalog has 1B items?'' ``How do you evaluate embedding quality?''}
+\end{interviewq}
+
+%--- New Q10: Audio multimodal alignment ---
+
+\begin{interviewq}
+\textbf{Q: How would you add audio understanding to an existing vision-language model?}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+This is a modality extension problem. The goal is to add audio understanding to a VLM (e.g., LLaVA) without degrading its existing vision-language capabilities.
+
+\textbf{Approach 1: Audio adapter (lowest cost).} Add a pretrained audio encoder (Whisper encoder, CLAP, or BEATs) and a projection layer that maps audio embeddings into the LLM's token space, identical to how LLaVA maps visual tokens. The audio tokens are concatenated with text (and optionally visual) tokens as input to the LLM. Training: (1) Freeze the audio encoder and LLM; train only the audio projection on audio-caption pairs. (2) Unfreeze the LLM; fine-tune on multimodal instruction data that includes audio. Keep the ViT and its projection frozen to preserve vision capabilities.
+
+\textbf{Approach 2: Shared encoder space (medium cost).} Use ImageBind's transitive alignment: align the audio encoder to the CLIP image embedding space. Since the VLM already processes CLIP image embeddings, audio embeddings aligned to the same space can be fed through the existing visual projection without a separate audio adapter. Advantage: reuses the existing visual pathway; no architectural changes. Limitation: audio-image alignment may be lossy, especially for non-visual audio (abstract sounds, speech without visual context).
+
+\textbf{Approach 3: Native multimodal retraining (highest cost).} Add audio tokens to the unified token vocabulary and retrain the entire model on interleaved text-image-audio data. Best quality but requires massive multimodal pretraining budget. This is the Gemini approach.
+
+\textbf{Audio preprocessing:} Convert raw audio to 80-channel log-mel spectrograms (Whisper's format). Audio is typically chunked into 30-second segments. A 30-second segment produces $\sim$1,500 encoder frames; use a Perceiver-style compressor to reduce to 64--128 audio tokens for the LLM.
+
+\textbf{Decision framework:} For adding audio to an existing VLM quickly and cheaply, use Approach 1 (audio adapter). For retrieval tasks across all modalities, Approach 2 (ImageBind-style alignment). For the highest-quality multimodal understanding, Approach 3 (native retraining).
+
+\redflags
+\begin{itemize}
+    \item ``Just transcribe the audio to text and feed it to the LLM''---this discards paralinguistic information (tone, emotion, speaker identity, non-speech sounds) and adds ASR latency and errors.
+    \item Not addressing how to preserve existing vision-language capabilities when adding audio.
+    \item Ignoring the audio token count problem---raw Whisper encoder output is 1,500 frames, which is too many without compression.
+\end{itemize}
+
+\interviewtest{Can you extend a multimodal system to new modalities? Do you preserve existing capabilities? Do you handle the practical constraints (token count, alignment quality, training data)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes adding an audio encoder with a projection layer (adapter approach).
+    \item \badgeLsix{L6} Discusses multiple approaches (adapter vs.\ shared space vs.\ native), addresses token compression, and plans staged training to preserve existing capabilities.
+    \item \badgeLseven{L7} Discusses ImageBind's transitive alignment principle, reasons about which audio features are lost in each approach, and considers the training data mixture problem (how much audio data vs.\ vision data to prevent forgetting).
+\end{itemize}
+
+\followups{``How do you handle audio that is 10 minutes long?'' ``What information is lost by transcription vs.\ direct audio encoding?'' ``How do you prevent catastrophic forgetting of vision capabilities?''}
+\end{interviewq}
+
+%==============================================================================
+\section{Quick Reference}
+\label{sec:multimodal_cheatsheet}
+%==============================================================================
+
+\begin{table}[H]
+\centering
+\caption{Multimodal learning cheat sheet}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Task} & \textbf{Go-To Architecture} & \textbf{Key Decision} & \textbf{Watch Out For} \\
+\midrule
+Image-text retrieval & CLIP / SigLIP (late fusion) & Batch size, hard negatives & Domain gap from web data \\
+Visual QA / reasoning & LLaVA / Flamingo (cross-attn) & Visual token count & Context window exhaustion \\
+Text-to-image & Latent Diffusion + cross-attn & Guidance scale, text encoder & Compositional prompts fail \\
+Speech recognition & Whisper (encoder-decoder) & Model size vs.\ latency & Long-form audio chunking \\
+Multimodal search & Dual encoder + re-ranker & ANN index type & Embedding drift over time \\
+Any-to-any multimodal & Native multimodal (Gemini) & Training data mixture & Extreme compute cost \\
+\bottomrule
+\end{tabularx}
+\end{table}

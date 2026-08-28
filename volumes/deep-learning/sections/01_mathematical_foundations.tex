@@ -1,0 +1,807 @@
+\chapter{Mathematical Foundations}
+\label{chap:mathematical_foundations}
+
+\begin{tldr}
+This chapter covers the mathematical foundations essential for deep learning: linear algebra (matrix operations, eigenvalues, SVD), calculus (gradients, chain rule, Jacobians), probability (Bayes' theorem, distributions, MLE), and information theory (entropy, KL divergence, mutual information). These concepts underpin every architecture and training algorithm discussed in this guide.
+\end{tldr}
+
+Interviewers test math foundations to see if you can reason from first principles about model behavior, debug training issues, and estimate computational costs. Expect questions on eigenvalues and gradient flow, SVD and LoRA, KL divergence and its role in RLHF, and back-of-envelope memory/FLOPs estimation.
+
+\section{Linear Algebra for Deep Learning}
+\label{sec:linear_algebra}
+
+\subsection{Vectors and Matrix Operations}
+
+\subsubsection{Key Operations}
+
+\textbf{Dot Product.} For vectors $\vx, \vy \in \R^n$:
+\begin{equation}
+\vx \cdot \vy = \vx^T \vy = \sum_{i=1}^n x_i y_i = \|\vx\| \|\vy\| \cos\theta
+\end{equation}
+The geometric interpretation (cosine of the angle) is why cosine similarity works for embeddings.
+
+\textbf{Applications in DL}:
+\begin{itemize}
+    \item Similarity computation (embedding dot product)
+    \item Attention scores: $\vq^T \vk$
+    \item Linear layer output: $\vh = \mW \vx + \vb$
+\end{itemize}
+
+\subsubsection{Matrix Multiplication}
+
+For $\mA \in \R^{m \times n}$ and $\mB \in \R^{n \times p}$:
+\begin{equation}
+(\mA\mB)_{ij} = \sum_{k=1}^n A_{ik} B_{kj}
+\end{equation}
+
+\textbf{Computational complexity}: $O(mnp)$
+
+\textbf{Key insight}: Matrix multiplication is the core operation in neural networks. Understanding its cost is essential for analyzing model efficiency.
+
+\begin{interviewq}
+\textbf{Q: Estimate the FLOPs for multiplying two matrices of size $(1024, 4096)$ and $(4096, 1024)$.}
+
+\badgeLfive{L5} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Matrix multiplication of $\mA \in \R^{m \times n}$ and $\mB \in \R^{n \times p}$ requires computing $m \times p$ output elements, each requiring $n$ multiplications and $n-1$ additions. The standard convention counts each multiply-add as 2 FLOPs (one multiply + one add), giving $2mnp$ total FLOPs.
+
+For $(m, n, p) = (1024, 4096, 1024)$:
+$$\text{FLOPs} = 2 \times 1024 \times 4096 \times 1024 = 2 \times 2^{10} \times 2^{12} \times 2^{10} = 2^{33} \approx 8.6 \times 10^9 \approx 8.6 \text{ GFLOPs}$$
+
+\textbf{Context}: Be precise about what each dimension is: with $d_{\text{model}} = 1024$ and $d_{\text{ff}} = 4096$, this is one FFN projection applied to a \textit{batch of 1024 tokens}---the leading 1024 is the token (batch $\times$ sequence) dimension, not part of the weight matrix. The full FFN applies two such multiplications to those tokens. Interviewers probe exactly this batch/sequence-dimension sloppiness. A modern GPU (A100) has $\sim$312 TFLOPS (FP16 tensor core), so this single matmul takes about $8.6 \times 10^9 / 312 \times 10^{12} \approx 28$ microseconds at peak---in practice $2$--$5\times$ longer due to memory bandwidth and overhead.
+
+\textbf{Why this matters}: Most of a transformer's compute is matrix multiplications. Knowing how to estimate FLOPs lets you: (1) predict training time, (2) determine if you are compute-bound or memory-bound, (3) estimate cost of architecture changes (e.g., doubling $d_{\text{ff}}$ doubles FFN FLOPs).
+
+\redflags
+\begin{itemize}
+    \item Using $mnp$ instead of $2mnp$ (missing the multiply-add convention)
+    \item Not being able to do powers-of-2 arithmetic quickly
+    \item Confusing FLOPs (operations) with FLOPS (operations per second)
+\end{itemize}
+
+\interviewtest{Back-of-envelope computational reasoning and awareness of hardware capabilities.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct $2mnp$ calculation with order-of-magnitude result.
+    \item \badgeLsix{L6} Contextualizes within a transformer layer, estimates wall-clock time on specific hardware.
+    \item \badgeLseven{L7} Discusses compute-vs-memory-bound regimes (arithmetic intensity = FLOPs/bytes), how batch size affects utilization, and the roofline model for predicting whether a given matmul is compute- or memory-bound on specific hardware.
+\end{itemize}
+
+\followups{``Is this matmul compute-bound or memory-bound?'' (Compute arithmetic intensity: $2mnp / (2(mn + np + mp) \times \text{bytes})$. For large matrices, typically compute-bound.) ``How do FLOPs change for attention vs. FFN?'' (Attention: $O(n^2 d)$ where $n$ is sequence length; FFN: $O(n d^2)$. They cross over when $n \approx d$.)}
+\end{interviewq}
+
+\subsection{Eigenvalues and Eigenvectors}
+
+\textbf{Eigenpair.} For matrix $\mA \in \R^{n \times n}$, scalar $\lambda$ and vector $\vv \neq \bm{0}$ satisfy $\mA \vv = \lambda \vv$. The eigenvalue $\lambda$ tells you how $\mA$ scales along the direction $\vv$.
+
+\subsubsection{Relevance to Deep Learning}
+
+\begin{enumerate}
+    \item \textbf{Gradient flow analysis}: Eigenvalues of the Jacobian determine gradient behavior
+    \begin{itemize}
+        \item $|\lambda| > 1$: Gradients explode
+        \item $|\lambda| < 1$: Gradients vanish
+        \item $|\lambda| \approx 1$: Stable flow
+    \end{itemize}
+
+    \item \textbf{Condition number}: $\kappa(\mA) = \frac{\sigma_{max}}{\sigma_{min}}$
+    \begin{itemize}
+        \item High $\kappa$: Ill-conditioned, unstable optimization
+        \item BatchNorm improves conditioning
+    \end{itemize}
+
+    \item \textbf{PCA}: Eigenvectors of covariance matrix give principal components
+\end{enumerate}
+
+\begin{interviewq}
+\textbf{Q: What are eigenvalues and why do they matter for training neural networks?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+An eigenvalue $\lambda$ and eigenvector $\vv$ of a square matrix $\mA$ satisfy $\mA \vv = \lambda \vv$. The eigenvector is a direction that $\mA$ only scales (not rotates), and $\lambda$ is the scaling factor.
+
+Eigenvalues matter for neural network training in three key ways:
+
+\begin{enumerate}
+    \item \textbf{Gradient flow stability}: During backpropagation through $L$ layers, gradients are multiplied by Jacobians at each layer. If the Jacobian's eigenvalues have magnitude $|\lambda| > 1$, gradients grow exponentially (exploding). If $|\lambda| < 1$, they shrink exponentially (vanishing). Stable training requires $|\lambda| \approx 1$---this is exactly what orthogonal initialization and residual connections achieve.
+
+    \item \textbf{Loss landscape curvature}: The Hessian $\mH = \nabla^2 \loss$ has eigenvalues that describe curvature in each direction. Large eigenvalues mean sharp curvature (requiring small learning rate), small eigenvalues mean flat directions. The condition number $\kappa = \lambda_{\max}/\lambda_{\min}$ determines how difficult optimization is: high $\kappa$ means the loss landscape is an elongated valley, and gradient descent oscillates across it. Adaptive optimizers (Adam) and normalization techniques address this by improving conditioning.
+
+    \item \textbf{PCA and dimensionality reduction}: Eigenvectors of the covariance matrix give principal components---directions of maximum variance. This underlies feature whitening, which accelerates training by decorrelating inputs.
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item Confusing eigenvalues with singular values (eigenvalues are defined for square matrices; singular values for any matrix)
+    \item Not connecting eigenvalues to the practical problem of vanishing/exploding gradients
+    \item Stating eigenvalues without the geometric interpretation (scaling along eigenvector directions)
+\end{itemize}
+
+\interviewtest{Whether you can connect abstract linear algebra to concrete training phenomena (gradient flow, conditioning, initialization).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Defines eigenpair, connects to gradient flow (exploding/vanishing).
+    \item \badgeLsix{L6} Discusses Hessian eigenvalues, condition number, and how BatchNorm/Adam improve conditioning.
+    \item \badgeLseven{L7} Explains the edge of stability phenomenon (where the largest Hessian eigenvalue hovers near $2/\eta$ during training), and how the spectral properties of weight matrices change during training (progressive rank reduction, feature learning).
+\end{itemize}
+
+\followups{``How does residual connection help eigenvalues?'' (Jacobian becomes $\mI + \mJ_{\text{block}}$, so eigenvalues are $1 + \lambda_{\text{block}}$---centered around 1 instead of 0.) ``What does the Hessian spectrum look like for a trained neural net?'' (A few large eigenvalues, a bulk near zero---highly non-isotropic.)}
+\end{interviewq}
+
+\subsection{Singular Value Decomposition (SVD)}
+
+\begin{mathresult}{SVD}
+Any matrix $\mA \in \R^{m \times n}$ can be decomposed as:
+\begin{equation}
+\mA = \mU \bm{\Sigma} \mV^T
+\end{equation}
+where $\mU \in \R^{m \times m}$ and $\mV \in \R^{n \times n}$ are orthogonal, and $\bm{\Sigma} \in \R^{m \times n}$ is diagonal with singular values $\sigma_1 \geq \sigma_2 \geq \cdots \geq 0$.
+\end{mathresult}
+
+\subsubsection{Low-Rank Approximation}
+
+The best rank-$k$ approximation (minimizing Frobenius norm error):
+\begin{equation}
+\mA_k = \sum_{i=1}^k \sigma_i \vu_i \vv_i^T
+\end{equation}
+
+\textbf{Applications}:
+\begin{itemize}
+    \item LoRA: Low-rank adaptation of weight matrices
+    \item Matrix factorization in recommender systems
+    \item Compression of embedding matrices
+\end{itemize}
+
+\begin{interviewq}
+\textbf{Q: Explain SVD and give three applications in machine learning.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+SVD decomposes any matrix $\mA \in \R^{m \times n}$ as $\mA = \mU \bm{\Sigma} \mV^T$ where $\mU$ and $\mV$ are orthogonal and $\bm{\Sigma}$ is diagonal with singular values $\sigma_1 \geq \sigma_2 \geq \cdots \geq 0$. Geometrically, any linear transformation can be decomposed into a rotation ($\mV^T$), a scaling ($\bm{\Sigma}$), and another rotation ($\mU$).
+
+Three key ML applications:
+\begin{enumerate}
+    \item \textbf{LoRA}: Fine-tuning adds a low-rank update $\Delta \mW = \mB \mA$ where $\mB \in \R^{d \times r}$ and $\mA \in \R^{r \times d}$ with $r \ll d$. Motivated by the empirical observation that weight updates during fine-tuning lie in a low-dimensional subspace. This reduces trainable parameters from $d^2$ to $2dr$.
+    \item \textbf{Recommender systems}: The user-item interaction matrix is approximately low-rank (users cluster into types, items into genres). Matrix factorization learns truncated SVD-like factors.
+    \item \textbf{Model compression}: Replace a weight matrix $\mW \in \R^{m \times n}$ with its rank-$k$ approximation, reducing parameters from $mn$ to $k(m+n)$ and FLOPs proportionally. The Eckart-Young theorem guarantees this is optimal under Frobenius norm.
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item Confusing SVD with eigendecomposition (SVD works on any matrix; eigendecomposition requires square matrices)
+    \item Not knowing that truncated SVD gives the best rank-$k$ approximation (Eckart-Young theorem)
+    \item Claiming LoRA computes SVD (it learns the low-rank factors directly via gradient descent)
+\end{itemize}
+
+\interviewtest{Whether you understand dimensionality reduction beyond ``PCA'' and can connect linear algebra to practical ML systems like LoRA and recommenders.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the decomposition, names applications, knows it gives best low-rank approximation.
+    \item \badgeLsix{L6} Explains the geometric interpretation (rotate-scale-rotate), discusses how LoRA rank $r$ affects capacity vs. efficiency, mentions that SVD of the data matrix gives PCA.
+    \item \badgeLseven{L7} Discusses spectral decay of real weight matrices and why low-rank structure emerges during training, connects to implicit regularization and effective dimensionality of learned representations.
+\end{itemize}
+
+\followups{``What's the relationship between SVD and PCA?'' (PCA on centered data = SVD of the data matrix.) ``How do you choose the rank $k$?'' (Plot singular value spectrum; look for a gap or use explained variance threshold.) ``Time complexity of SVD?'' ($O(\min(mn^2, m^2n))$ for full SVD; randomized SVD is $O(mn \log k + (m+n)k^2)$ for rank-$k$---often quoted loosely as $O(mnk)$.)}
+\end{interviewq}
+
+\subsection{Norms}
+
+\textbf{Common Norms:}
+\begin{align}
+\|\vx\|_1 &= \sum_i |x_i| \quad \text{(L1: sparsity-inducing in regularization)} \\
+\|\vx\|_2 &= \sqrt{\sum_i x_i^2} \quad \text{(L2: gradient clipping, weight decay)} \\
+\|\vx\|_\infty &= \max_i |x_i| \quad \text{(Max norm: constraint-based regularization)}
+\end{align}
+
+\textbf{Matrix norms}:
+\begin{align}
+\|\mA\|_F &= \sqrt{\sum_{i,j} A_{ij}^2} = \sqrt{\tr(\mA^T\mA)} \quad \text{(Frobenius)} \\
+\|\mA\|_2 &= \sigma_{max}(\mA) \quad \text{(Spectral)}
+\end{align}
+
+%==============================================================================
+\section{Calculus for Optimization}
+\label{sec:calculus}
+%==============================================================================
+
+\subsection{Gradients}
+
+\textbf{Gradient.} For $f: \R^n \to \R$, the gradient $\nabla f(\vx)$ is the vector of partial derivatives. It points in the direction of steepest ascent; gradient descent moves in the opposite direction: $\vx \leftarrow \vx - \eta \nabla f(\vx)$.
+
+\subsection{The Chain Rule}
+
+\begin{mathresult}{Chain Rule}
+For composed functions $h = g \circ f$:
+\begin{equation}
+\frac{dh}{dx} = \frac{dg}{df} \cdot \frac{df}{dx}
+\end{equation}
+
+For vector functions $f: \R^n \to \R^m$ and $g: \R^m \to \R^p$:
+\begin{equation}
+\frac{\partial (g \circ f)}{\partial \vx} = \frac{\partial g}{\partial f} \cdot \frac{\partial f}{\partial \vx}
+\end{equation}
+(Jacobian multiplication)
+\end{mathresult}
+
+\textbf{This is backpropagation!} The backward pass computes:
+\begin{equation}
+\frac{\partial \mathcal{L}}{\partial \mW_\ell} = \frac{\partial \mathcal{L}}{\partial \vh_L} \cdot \prod_{k=L}^{\ell+1} \frac{\partial \vh_k}{\partial \vh_{k-1}} \cdot \frac{\partial \vh_\ell}{\partial \mW_\ell}
+\end{equation}
+
+\begin{interviewq}
+\textbf{Q: Why does the chain rule matter for backpropagation? Walk through a 3-layer example.}
+
+\badgeLfive{L5} \quad \badgetype{First Principles} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Backpropagation \textit{is} the chain rule applied systematically through a computational graph. Consider a 3-layer network: $\vh_1 = \sigma(\mW_1 \vx)$, $\vh_2 = \sigma(\mW_2 \vh_1)$, $\hat{y} = \mW_3 \vh_2$, with loss $\loss$.
+
+To compute $\frac{\partial \loss}{\partial \mW_1}$, the chain rule gives:
+$$\frac{\partial \loss}{\partial \mW_1} = \frac{\partial \loss}{\partial \hat{y}} \cdot \frac{\partial \hat{y}}{\partial \vh_2} \cdot \frac{\partial \vh_2}{\partial \vh_1} \cdot \frac{\partial \vh_1}{\partial \mW_1}$$
+
+Each factor is a Jacobian matrix. The backward pass computes this right-to-left, reusing intermediate results. The gradient at layer $\ell$ flows through all layers above it---this is why deep networks face vanishing/exploding gradients: the product of many Jacobians either shrinks or grows exponentially.
+
+Key efficiency insight: \textbf{reverse-mode} autodiff (backprop) computes gradients for all parameters in one backward pass (cost $\sim 2\times$ forward), while \textbf{forward-mode} would require one pass per parameter (prohibitive for millions of parameters). This is because reverse mode propagates a scalar (loss) backward, while forward mode propagates a perturbation forward.
+
+\redflags
+\begin{itemize}
+    \item Describing backprop as ``something different from the chain rule'' (it is literally the chain rule)
+    \item Not knowing why reverse mode is preferred over forward mode for neural networks
+    \item Forgetting that activations must be stored for the backward pass (memory cost of backprop)
+\end{itemize}
+
+\interviewtest{Fundamental understanding of how training works, not just ``call loss.backward().''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Walks through the 3-layer example correctly, identifies vanishing/exploding gradient connection.
+    \item \badgeLsix{L6} Explains forward vs. reverse mode autodiff, discusses activation memory cost, mentions gradient checkpointing as a trade-off.
+    \item \badgeLseven{L7} Discusses Jacobian-vector products (JVPs) vs. vector-Jacobian products (VJPs), how modern frameworks build dynamic computational graphs, and custom backward passes (straight-through estimators for non-differentiable operations).
+\end{itemize}
+
+\followups{``What is gradient checkpointing?'' (Trade compute for memory: recompute activations during backward pass instead of storing them. Reduces activation memory from $O(L)$ to $O(\sqrt{L})$.) ``When would you use forward-mode autodiff?'' (When you have few inputs and many outputs, e.g., computing a full Jacobian row.)}
+\end{interviewq}
+
+\subsection{Jacobian and Hessian}
+
+\textbf{Jacobian.} For $f: \R^n \to \R^m$, the Jacobian $\mJ \in \R^{m \times n}$ is the matrix of all partial derivatives. Each row is the gradient of one output. Backpropagation is repeated Jacobian-vector products.
+
+\textbf{Hessian.} For $f: \R^n \to \R$, the Hessian $\mH = \nabla^2 f$ is the matrix of second derivatives. It describes the \textit{curvature} of the loss landscape:
+\begin{itemize}
+    \item Positive definite $\mH$: Local minimum (bowl-shaped)
+    \item Negative definite: Local maximum
+    \item Indefinite (mixed eigenvalues): Saddle point
+    \item Eigenvalues of $\mH$: Curvature in eigenvector directions
+\end{itemize}
+
+\begin{keyinsight}[Why This Matters]
+In high-dimensional spaces, most critical points are saddle points, not local minima. SGD naturally escapes saddle points because gradient noise pushes it along negative curvature directions. This is one reason why SGD works well despite non-convex loss landscapes.
+\end{keyinsight}
+
+\begin{interviewq}
+\textbf{Q: Your gradient norms are 1000$\times$ larger in early layers than later layers. What is happening mathematically?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+This is \textbf{exploding gradients} in the early (input-facing) layers. Mathematically, the gradient at layer $\ell$ in an $L$-layer network is:
+$$\frac{\partial \loss}{\partial \mW_\ell} = \frac{\partial \loss}{\partial \vh_L} \prod_{k=\ell+1}^{L} \frac{\partial \vh_k}{\partial \vh_{k-1}} \cdot \frac{\partial \vh_\ell}{\partial \mW_\ell}$$
+
+The product of Jacobians $\prod_k \frac{\partial \vh_k}{\partial \vh_{k-1}}$ accumulates multiplicatively. If the spectral norm (largest singular value) of each Jacobian is $> 1$, the product grows exponentially with depth. Early layers have more Jacobian factors in the chain, so their gradients are larger.
+
+\textbf{Root causes to investigate}:
+\begin{enumerate}
+    \item \textbf{Bad initialization}: Weights initialized too large $\Rightarrow$ Jacobian norms $> 1$. Fix: use He (ReLU) or Xavier (tanh/sigmoid) initialization, which are designed to keep $\Var(\vh_\ell) \approx \Var(\vh_{\ell-1})$.
+    \item \textbf{Missing normalization}: Without BatchNorm/LayerNorm, activation magnitudes compound across layers.
+    \item \textbf{Activation function}: Unbounded activations (ReLU) can amplify signals. Check if using non-standard activations.
+    \item \textbf{Learning rate too high}: Can push weights into a regime where Jacobian norms grow.
+\end{enumerate}
+
+\textbf{Fixes}:
+\begin{itemize}
+    \item \textbf{Gradient clipping}: Clip by global norm (not per-parameter) to maintain gradient direction.
+    \item \textbf{Residual connections}: Jacobian becomes $\mI + \mJ_{\text{block}}$, eigenvalues shift toward 1.
+    \item \textbf{Proper initialization}: He init ensures $\Var(\vh_\ell) = \Var(\vh_{\ell-1})$ for ReLU.
+    \item \textbf{Normalization layers}: Constrain activation magnitudes.
+\end{itemize}
+
+Note: If gradients are 1000$\times$ \textit{smaller} in early layers, that is vanishing gradients---same mechanism, opposite direction (Jacobian norms $< 1$). Common with sigmoid/tanh activations whose derivatives are $< 1$.
+
+\redflags
+\begin{itemize}
+    \item Jumping to ``just clip gradients'' without diagnosing the root cause
+    \item Confusing exploding activations with exploding gradients (related but distinct)
+    \item Not knowing why early layers are affected more than later layers (more Jacobian factors)
+\end{itemize}
+
+\interviewtest{Can you diagnose training issues from mathematical first principles, not just pattern-match symptoms to fixes?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies exploding gradients, mentions gradient clipping and proper initialization.
+    \item \badgeLsix{L6} Explains the Jacobian product mechanism, discusses multiple root causes systematically, recommends diagnosis steps (log gradient norms per layer, check weight statistics).
+    \item \badgeLseven{L7} Discusses the spectral norm of weight matrices as the controlling quantity, connects to the mean field theory of initialization (dynamical isometry), and explains why transformers with pre-norm architecture avoid this issue (each block's Jacobian is $\mI + O(\epsilon)$).
+\end{itemize}
+
+\followups{``Should you clip by norm or by value?'' (By norm---preserves gradient direction. Value clipping distorts direction.) ``Why don't transformers have this problem?'' (Residual connections + LayerNorm keep Jacobian eigenvalues near 1; each layer contributes an additive update rather than a multiplicative one.)}
+\end{interviewq}
+
+\subsection{Common Derivatives in Deep Learning}
+
+\begin{table}[H]
+\centering
+\caption{Common derivatives}
+\begin{tabular}{ll}
+\toprule
+\textbf{Function} & \textbf{Derivative} \\
+\midrule
+$\sigma(x) = \frac{1}{1+e^{-x}}$ & $\sigma(x)(1-\sigma(x))$ \\
+$\tanh(x)$ & $1 - \tanh^2(x)$ \\
+$\text{ReLU}(x)$ & $\mathds{1}[x > 0]$ \\
+$\softmax(\vz)_i$ & $\softmax(\vz)_i(\delta_{ij} - \softmax(\vz)_j)$ \\
+$\log\softmax(\vz)_i$ & $\delta_{ij} - \softmax(\vz)_j$ \\
+$\|\vx\|_2^2$ & $2\vx$ \\
+$\vx^T \mA \vx$ & $(\mA + \mA^T)\vx$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
+\section{Probability and Statistics}
+\label{sec:probability}
+%==============================================================================
+
+\subsection{Probability Fundamentals}
+
+\textbf{Conditional Probability:} $P(A|B) = P(A \cap B) / P(B)$
+
+\begin{mathresult}{Bayes' Theorem}
+\begin{equation}
+P(\theta | D) = \frac{P(D | \theta) P(\theta)}{P(D)} = \frac{\text{likelihood} \times \text{prior}}{\text{evidence}}
+\end{equation}
+\end{mathresult}
+
+\textbf{Bayesian interpretation of regularization}:
+\begin{itemize}
+    \item Prior $P(\theta)$: Regularization term
+    \item Gaussian prior → L2 regularization
+    \item Laplace prior → L1 regularization
+\end{itemize}
+
+\subsection{Expectation and Variance}
+
+\begin{align}
+\E[X] &= \sum_x x \cdot P(X=x) = \int x \cdot p(x) dx \\
+\Var(X) &= \E[(X - \E[X])^2] = \E[X^2] - \E[X]^2
+\end{align}
+
+\textbf{Key identities}:
+\begin{align}
+\E[aX + b] &= a\E[X] + b \\
+\Var(aX + b) &= a^2 \Var(X) \\
+\Var(X + Y) &= \Var(X) + \Var(Y) + 2\Cov(X,Y)
+\end{align}
+
+\subsection{Important Distributions}
+
+\begin{table}[H]
+\centering
+\caption{Important distributions in deep learning}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Distribution} & \textbf{PDF/PMF} & \textbf{Use in DL} \\
+\midrule
+Bernoulli & $p^x(1-p)^{1-x}$ & Binary classification \\
+Categorical & $\prod_k p_k^{[y=k]}$ & Multi-class classification \\
+Gaussian & $\frac{1}{\sqrt{2\pi\sigma^2}}e^{-\frac{(x-\mu)^2}{2\sigma^2}}$ & Regression, VAE \\
+Laplace & $\frac{1}{2b}e^{-\frac{|x-\mu|}{b}}$ & L1 prior, robust regression \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Maximum Likelihood Estimation}
+
+\begin{mathresult}{MLE}
+\begin{equation}
+\theta_{MLE} = \argmax_\theta P(D|\theta) = \argmax_\theta \sum_{i=1}^N \log P(x_i|\theta)
+\end{equation}
+\end{mathresult}
+
+\textbf{Connection to cross-entropy}:
+For classification with categorical distribution:
+\begin{align}
+\theta_{MLE} &= \argmax_\theta \sum_i \log P(y_i|x_i; \theta) \\
+&= \argmin_\theta -\sum_i \log P(y_i|x_i; \theta) \\
+&= \argmin_\theta \mathcal{L}_{CE}
+\end{align}
+
+Cross-entropy loss = negative log-likelihood!
+
+%==============================================================================
+\section{Information Theory}
+\label{sec:information_theory}
+%==============================================================================
+
+\subsection{Entropy}
+
+\textbf{Entropy.} Measures average ``surprise'' or uncertainty:
+\begin{equation}
+H(X) = -\sum_x p(x) \log p(x) = -\E_p[\log p(X)]
+\end{equation}
+
+\textbf{Interpretation}: Average ``surprise'' or uncertainty.
+\begin{itemize}
+    \item $H = 0$: Deterministic (no uncertainty)
+    \item $H = \log K$: Uniform over $K$ outcomes (maximum uncertainty)
+\end{itemize}
+
+\subsection{Cross-Entropy}
+
+\textbf{Cross-Entropy.} Average surprise when using model $q$ to encode data from true distribution $p$:
+\begin{equation}
+H(p, q) = -\sum_x p(x) \log q(x) = -\E_p[\log q(X)]
+\end{equation}
+
+\textbf{Interpretation}: Average surprise when using $q$ to encode data from $p$.
+
+\textbf{Key property}: $H(p, q) \geq H(p)$, with equality iff $p = q$.
+
+\subsection{KL Divergence}
+
+\begin{mathresult}{KL Divergence}
+\begin{equation}
+D_{KL}(p \| q) = \sum_x p(x) \log \frac{p(x)}{q(x)} = H(p, q) - H(p)
+\end{equation}
+\end{mathresult}
+
+\textbf{Properties}:
+\begin{itemize}
+    \item $D_{KL}(p \| q) \geq 0$ (Gibbs' inequality)
+    \item $D_{KL}(p \| q) = 0$ iff $p = q$
+    \item \textbf{Not symmetric}: $D_{KL}(p \| q) \neq D_{KL}(q \| p)$
+\end{itemize}
+
+\textbf{Applications}:
+\begin{itemize}
+    \item VAE: KL between posterior and prior
+    \item Knowledge distillation: KL between teacher and student
+    \item Policy gradient: KL penalty for stability
+\end{itemize}
+
+\begin{interviewq}
+\textbf{Q: What is KL divergence? Why is it not a true distance metric? When do you use it in practice?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+KL divergence $\KL(p \| q) = \sum_x p(x) \log \frac{p(x)}{q(x)}$ measures the expected extra bits needed when using distribution $q$ to encode data drawn from $p$. It is non-negative (Gibbs' inequality) and zero iff $p = q$.
+
+It is \textbf{not} a true distance metric because it violates two properties:
+\begin{enumerate}
+    \item \textbf{Asymmetry}: $\KL(p \| q) \neq \KL(q \| p)$ in general.
+    \item \textbf{Triangle inequality}: Does not hold for KL.
+\end{enumerate}
+
+The asymmetry matters critically in practice:
+\begin{itemize}
+    \item \textbf{Forward KL} $\KL(p \| q)$: Mode-covering. Forces $q$ to have support everywhere $p$ does. Penalizes $q(x) \approx 0$ where $p(x) > 0$ (infinite cost). Used in: knowledge distillation (student must cover teacher), maximum likelihood / cross-entropy training (model must cover the data distribution).
+    \item \textbf{Reverse KL} $\KL(q \| p)$: Mode-seeking. Allows $q$ to ignore modes of $p$. Penalizes $q(x) > 0$ where $p(x) \approx 0$. Used in: variational inference---including the VAE ELBO term $\KL(q(z|x) \| p(z))$ (approximate posterior can be unimodal), RLHF/PPO (KL penalty keeps policy close to reference).
+\end{itemize}
+
+\textbf{Connection to cross-entropy}: $H(p, q) = H(p) + \KL(p \| q)$. Since $H(p)$ is constant w.r.t. model parameters, minimizing cross-entropy is equivalent to minimizing KL divergence.
+
+\redflags
+\begin{itemize}
+    \item Saying KL is symmetric
+    \item Not knowing the forward vs. reverse distinction or their practical implications
+    \item Confusing KL divergence with cross-entropy (they differ by the constant $H(p)$)
+\end{itemize}
+
+\interviewtest{Information theory fundamentals and ability to connect mathematical properties (asymmetry) to practical design choices (VAE, RLHF, distillation).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Defines KL, explains asymmetry, names applications.
+    \item \badgeLsix{L6} Explains mode-covering vs. mode-seeking behavior with concrete examples, connects to cross-entropy loss.
+    \item \badgeLseven{L7} Discusses how the choice of KL direction affects training dynamics in RLHF (reverse KL in PPO prevents reward hacking by penalizing policy divergence), and mentions Jensen-Shannon divergence as a symmetric alternative.
+\end{itemize}
+
+\followups{``Which KL direction does the VAE's ELBO term use?'' (Reverse: the term is $\KL(q(z|x) \| p(z))$ with the approximate posterior $q$ in front---VAEs are variational inference, so the penalty is mode-seeking in $q$.) ``What is the connection between KL and mutual information?'' ($I(X;Y) = \KL(p(x,y) \| p(x)p(y))$.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: KL divergence is not symmetric. When does this matter in practice?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+The asymmetry of KL divergence ($\KL(p \| q) \neq \KL(q \| p)$) has concrete consequences because the two directions optimize for fundamentally different behaviors:
+
+\textbf{Forward KL} $\KL(p \| q)$ is \textbf{mode-covering} (also called ``mean-seeking''):
+\begin{itemize}
+    \item Heavily penalizes $q(x) \approx 0$ where $p(x) > 0$ (the $p \log(p/q)$ term blows up)
+    \item Forces $q$ to spread mass everywhere $p$ has support
+    \item Result: $q$ covers all modes of $p$, but may place mass in low-probability regions
+    \item Used in: knowledge distillation (student must capture all teacher knowledge), maximum likelihood / cross-entropy training (model must cover the data distribution)
+\end{itemize}
+
+\textbf{Reverse KL} $\KL(q \| p)$ is \textbf{mode-seeking} (also called ``mode-collapsing''):
+\begin{itemize}
+    \item Heavily penalizes $q(x) > 0$ where $p(x) \approx 0$
+    \item Allows $q$ to ignore modes of $p$ entirely
+    \item Result: $q$ concentrates on one mode of $p$, giving a sharp but incomplete approximation
+    \item Used in: variational inference, including the VAE ELBO term $\KL(q(z|x) \| p(z))$ (when unimodal approximation is acceptable), RLHF/PPO (KL penalty $\KL(\pi_\theta \| \pi_{\text{ref}})$ keeps policy from straying too far from reference)
+\end{itemize}
+
+\textbf{Practical example}: Consider a bimodal target $p$ and a unimodal Gaussian $q$. Forward KL places $q$ between the modes (covering both, fitting neither well). Reverse KL places $q$ on one mode (fitting it well, ignoring the other).
+
+In RLHF, using \textbf{reverse} KL as the penalty is critical: it prevents the policy from generating text that the reference model would assign near-zero probability to, which serves as a safety mechanism against reward hacking.
+
+\redflags
+\begin{itemize}
+    \item Knowing KL is asymmetric but not being able to explain what each direction does
+    \item Saying ``just use Jensen-Shannon divergence'' without explaining when forward vs. reverse KL is actually the right choice
+    \item Confusing which direction is used in which application
+\end{itemize}
+
+\interviewtest{Deep information theory understanding and the ability to connect mathematical properties to system design decisions.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains mode-covering vs. mode-seeking with examples.
+    \item \badgeLsix{L6} Maps each direction to specific applications (VAE, distillation, RLHF) and explains why that direction was chosen.
+    \item \badgeLseven{L7} Discusses alternatives (Jensen-Shannon, Renyi divergence), explains how the KL penalty coefficient in RLHF affects exploration-exploitation, and connects to the ELBO derivation in VAEs.
+\end{itemize}
+
+\followups{``Why not use a symmetric divergence everywhere?'' (Sometimes asymmetry is the feature, not the bug---e.g., in RLHF you specifically want mode-seeking behavior.) ``What is Jensen-Shannon divergence?'' ($\text{JSD}(p, q) = \frac{1}{2}\KL(p \| m) + \frac{1}{2}\KL(q \| m)$ where $m = \frac{p+q}{2}$; bounded, symmetric, used in the original GAN.)}
+\end{interviewq}
+
+\subsection{Mutual Information}
+
+\textbf{Mutual Information.} How much knowing $Y$ reduces uncertainty about $X$:
+\begin{equation}
+I(X; Y) = D_{KL}(p(x,y) \| p(x)p(y)) = H(X) - H(X|Y) = H(Y) - H(Y|X)
+\end{equation}
+
+\textbf{Interpretation}: How much knowing $Y$ reduces uncertainty about $X$.
+
+\textbf{Properties}:
+\begin{itemize}
+    \item $I(X; Y) \geq 0$
+    \item $I(X; Y) = 0$ iff $X \indep Y$
+    \item $I(X; Y) = I(Y; X)$ (symmetric)
+\end{itemize}
+
+\textbf{Applications}:
+\begin{itemize}
+    \item InfoNCE loss: Maximizes lower bound on MI
+    \item Information bottleneck: Trade-off compression vs. prediction
+    \item Feature selection: High MI with target
+\end{itemize}
+
+\subsection{Information Bottleneck Principle}
+
+\begin{keyinsight}[Information Bottleneck]
+Good representations should:
+\begin{enumerate}
+    \item \textbf{Compress}: Minimize $I(X; Z)$ --- discard irrelevant information
+    \item \textbf{Predict}: Maximize $I(Z; Y)$ --- retain task-relevant information
+\end{enumerate}
+
+Objective: $\min_Z I(X; Z) - \beta I(Z; Y)$
+\end{keyinsight}
+
+This offers one motivation for the hourglass shape of autoencoders and lower-dimensional intermediate layers. Caveat: the claimed ``compression phase'' during training is contested---replications (Saxe et al., 2018) found it depends on the activation function and the mutual-information estimator---so present the information bottleneck as a useful lens, not a settled explanation.
+
+%==============================================================================
+\section{Numerical Considerations}
+\label{sec:numerical}
+%==============================================================================
+
+\subsection{Floating Point Formats}
+
+\begin{table}[H]
+\centering
+\caption{Floating point formats in deep learning}
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Format} & \textbf{Bits} & \textbf{Range} & \textbf{Precision} & \textbf{Use} \\
+\midrule
+FP32 & 32 & $\pm 3.4 \times 10^{38}$ & ~7 digits & Default training \\
+FP16 & 16 & $\pm 65504$ & ~3 digits & Mixed precision \\
+BF16 & 16 & $\pm 3.4 \times 10^{38}$ & ~2 digits & Modern training \\
+INT8 & 8 & $-128$ to $127$ & Exact & Inference \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{interviewq}
+\textbf{Q: Estimate the memory for storing a 50K $\times$ 768 embedding matrix in FP32, FP16, and INT8.}
+
+\badgeLfive{L5} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+The embedding matrix has $50{,}000 \times 768 = 38{,}400{,}000$ elements (approximately 38.4M parameters).
+
+Memory per format:
+\begin{itemize}
+    \item \textbf{FP32} (4 bytes/element): $38.4\text{M} \times 4 = 153.6$ MB
+    \item \textbf{FP16} (2 bytes/element): $38.4\text{M} \times 2 = 76.8$ MB
+    \item \textbf{INT8} (1 byte/element): $38.4\text{M} \times 1 = 38.4$ MB
+\end{itemize}
+
+For context: this is roughly the embedding table of BERT-base ($\text{vocab}=30\text{K}$, $d=768$). GPT-2's embedding table ($\text{vocab}=50\text{K}$, $d=768$) is exactly this size. In a 110M parameter model like BERT-base, the embedding table alone accounts for $\sim$23M parameters ($\sim$21\% of the model).
+
+\textbf{Practical considerations}: Embedding tables are often the largest single tensor in smaller models. Quantizing embeddings to INT8 with a lookup table is straightforward since embeddings are accessed via indexing (no matrix multiply), but you lose fine-grained semantic distinctions. Weight tying (sharing input/output embeddings) halves the embedding memory.
+
+\redflags
+\begin{itemize}
+    \item Getting the bytes-per-format wrong (e.g., thinking FP16 = 1 byte)
+    \item Forgetting that INT8 quantization requires storing scale/zero-point metadata (small overhead per group)
+    \item Not being able to do basic multiplication quickly---practice back-of-envelope math
+\end{itemize}
+
+\interviewtest{Numerical fluency with memory estimation, understanding of data types, and awareness of how model components contribute to total memory.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct arithmetic, knows bytes per format.
+    \item \badgeLsix{L6} Adds context (fraction of model size, weight tying), mentions quantization practicalities.
+    \item \badgeLseven{L7} Discusses total training memory with explicit per-parameter byte accounting (BF16 weights $2$ + FP32 master weights $4$ + Adam $m,v$ states $8$ + BF16 gradients $2$ = $16$ bytes/param, before activations), and when embedding tables become the bottleneck (large-vocab multilingual models).
+\end{itemize}
+
+\followups{``How much GPU memory does training this model require?'' ($\sim$16 bytes per parameter for mixed-precision Adam: BF16 weights (2) + FP32 master copy (4) + Adam $m,v$ (8) + BF16 gradients (2)---so a 7B model needs $\sim$112 GB before activations.) ``How would you reduce embedding memory for a 250K-token multilingual vocabulary?'' (Subword factorization, hash embeddings, or adaptive embeddings with variable dimensions.)}
+\end{interviewq}
+
+\subsection{Numerical Stability Tricks}
+
+\textbf{LogSumExp}:
+\begin{equation}
+\log \sum_i e^{x_i} = m + \log \sum_i e^{x_i - m}, \quad m = \max_i x_i
+\end{equation}
+
+\textbf{Softmax stability}:
+\begin{equation}
+\softmax(\vx)_i = \frac{e^{x_i - \max(\vx)}}{\sum_j e^{x_j - \max(\vx)}}
+\end{equation}
+
+\textbf{Log-space operations}:
+\begin{equation}
+\log(ab) = \log a + \log b, \quad \log\frac{a}{b} = \log a - \log b
+\end{equation}
+
+\begin{warningbox}
+\textbf{Common numerical pitfalls}:
+\begin{itemize}
+    \item $\log(0)$: Always add small $\epsilon$ or use clamp
+    \item $\exp(\text{large})$: Use LogSumExp
+    \item $0/0$: Check for edge cases in normalization
+    \item Gradient of $\sqrt{x}$ at $x=0$: Add $\epsilon$ inside sqrt
+\end{itemize}
+\end{warningbox}
+
+\begin{warningbox}
+\textbf{BF16 vs FP16}: BF16 has the same range as FP32 (8 exponent bits) but lower precision (7 mantissa bits vs 10 in FP16). Use BF16 for training: its FP32-scale dynamic range keeps gradients from under/overflowing, which is exactly what makes \textit{loss scaling unnecessary}---loss scaling is the FP16-specific workaround, not a reason to use BF16. FP16 survives mainly in legacy setups and some inference kernels where its extra mantissa bits help. For reductions (gradient accumulation, metrics, softmax/norm statistics), accumulate in FP32 regardless of the storage format. Most modern LLM training uses BF16.
+\end{warningbox}
+
+%==============================================================================
+\section{Softmax Cross-Entropy Gradient}
+\label{sec:softmax_ce_gradient}
+%==============================================================================
+
+The combined gradient of softmax followed by cross-entropy loss is one of the most elegant results in deep learning. Given logits $\vz \in \R^K$ and one-hot target $\vy$, the cross-entropy loss is $\loss = -\sum_k y_k \log \softmax(\vz)_k$. The gradient with respect to the logits simplifies remarkably:
+
+\begin{mathresult}{Softmax Cross-Entropy Gradient}
+\begin{equation}
+\frac{\partial \loss}{\partial z_i} = \softmax(\vz)_i - y_i = \hat{y}_i - y_i
+\end{equation}
+In vector form: $\nabla_{\vz} \loss = \hat{\vy} - \vy$ (predicted minus target).
+\end{mathresult}
+
+\textbf{Derivation sketch.} Let $p_i = \softmax(\vz)_i$. The softmax Jacobian is $\frac{\partial p_i}{\partial z_j} = p_i(\delta_{ij} - p_j)$. Applying the chain rule through cross-entropy:
+\begin{align}
+\frac{\partial \loss}{\partial z_j} &= -\sum_i \frac{y_i}{p_i} \cdot p_i(\delta_{ij} - p_j) = -\sum_i y_i(\delta_{ij} - p_j) = -y_j + p_j \sum_i y_i = p_j - y_j
+\end{align}
+where $\sum_i y_i = 1$ for a valid probability target. This clean result is why frameworks compute softmax and cross-entropy together rather than separately---it avoids numerical issues and yields a simpler gradient.
+
+\begin{interviewq}
+\textbf{Q: Derive the gradient of softmax cross-entropy loss with respect to the logits.}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Given logits $\vz \in \R^K$, softmax probabilities $p_i = \softmax(\vz)_i = \frac{e^{z_i}}{\sum_k e^{z_k}}$, and one-hot target $\vy$, the cross-entropy loss is:
+$$\loss = -\sum_i y_i \log p_i$$
+
+\textbf{Step 1}: Softmax Jacobian. $\frac{\partial p_i}{\partial z_j} = p_i(\delta_{ij} - p_j)$.
+
+\textbf{Step 2}: Chain rule through cross-entropy.
+$$\frac{\partial \loss}{\partial z_j} = -\sum_i \frac{y_i}{p_i} \cdot \frac{\partial p_i}{\partial z_j} = -\sum_i \frac{y_i}{p_i} \cdot p_i(\delta_{ij} - p_j) = -\sum_i y_i(\delta_{ij} - p_j)$$
+
+\textbf{Step 3}: Simplify using $\sum_i y_i = 1$.
+$$= -y_j + p_j \sum_i y_i = p_j - y_j$$
+
+\textbf{Final result}: $\nabla_{\vz} \loss = \hat{\vy} - \vy$ (predicted minus target).
+
+This is remarkably clean: the gradient is simply the difference between the predicted distribution and the true distribution. This is why frameworks fuse softmax + cross-entropy into a single kernel---the combined backward pass is simpler and more numerically stable than computing them separately (avoids taking $\log$ of very small softmax outputs, then dividing by them in the backward pass).
+
+\redflags
+\begin{itemize}
+    \item Not knowing the final clean form $\hat{\vy} - \vy$
+    \item Skipping the softmax Jacobian step (it is the key intermediate result)
+    \item Confusing the gradient w.r.t. logits with gradient w.r.t. probabilities
+\end{itemize}
+
+\interviewtest{Can you derive a fundamental result from scratch on a whiteboard? Do you understand why frameworks fuse these operations?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the result $\hat{\vy} - \vy$ and explains why it is useful.
+    \item \badgeLsix{L6} Derives it step by step, explains numerical stability motivation for fusing softmax + CE.
+    \item \badgeLseven{L7} Discusses the connection to exponential family canonical form (softmax CE is the canonical link), extends to label smoothing ($\vy$ is no longer one-hot), and discusses temperature scaling effects on the gradient magnitude.
+\end{itemize}
+
+\followups{``What happens with label smoothing?'' (Target becomes $\vy' = (1-\alpha)\vy + \alpha/K$; gradient is $\hat{\vy} - \vy'$, which prevents overconfident predictions.) ``Why is this numerically unstable if computed separately?'' (Softmax outputs can be very small, then $\log(\text{tiny})$ is very negative, and $1/\text{tiny}$ in the backward pass overflows.)}
+\end{interviewq}
+
+%==============================================================================
+\section{Matrix Rank and Attention}
+\label{sec:rank_attention}
+%==============================================================================
+
+The \textbf{rank} of a matrix is the number of linearly independent rows (or columns). For an attention weight matrix $\mA = \softmax(\mQ \mK^T / \sqrt{d_k}) \in \R^{n \times n}$ where $\mQ, \mK \in \R^{n \times d_k}$:
+
+The pre-softmax logit matrix $\mQ \mK^T$ has rank at most $\min(n, d_k)$. In standard transformers, $d_k = d_{\text{model}} / h$ where $h$ is the number of heads. For a typical setup ($d_k = 64$, sequence length $n = 4096$), the logit matrix has rank at most 64---far below $n$. Be careful about what happens next: \textbf{softmax is nonlinear} (elementwise exponential followed by row normalization), so it does \textit{not} preserve this rank bound---the exponential of a low-rank matrix is generically full rank, and the post-softmax attention matrix is therefore generically full rank in exact arithmetic. The honest statement is that $\mA$ is \textbf{numerically near-low-rank}: it inherits fast spectral decay (small stable rank) from its rank-$\leq d_k$ logits. This has two important implications:
+
+\begin{enumerate}
+    \item \textbf{Efficiency opportunity}: Low-rank and kernelized attention methods (Linformer, linear attention) exploit this approximate structure to reduce $O(n^2)$ complexity to $O(n \cdot d_k)$.
+    \item \textbf{Expressiveness limitation}: A single attention head's token mixing is driven by at most $d_k$ directions of query--key variation, so it cannot produce arbitrary $n \times n$ attention patterns. Multiple heads compensate by combining different low-rank patterns, and deeper layers compose these.
+\end{enumerate}
+
+Softmax also reshapes the spectrum in a second way: it makes attention patterns peakier (approaching one-hot for large logits), concentrating each row's mass on a few entries.
+
+\begin{interviewq}
+\textbf{Q: What is the rank of the attention matrix and why does this matter for efficiency?}
+
+\badgeLseven{L7} \quad \badgetype{First Principles} \quad \badgefreq{\freqlow}
+
+\stronganswer
+The attention weight matrix is $\mA = \softmax(\mQ \mK^T / \sqrt{d_k}) \in \R^{n \times n}$, where $\mQ, \mK \in \R^{n \times d_k}$.
+
+The pre-softmax logit matrix $\mQ \mK^T$ has rank at most $\min(n, d_k)$. In standard transformers, $d_k = d_{\text{model}} / h$ (e.g., $d_k = 64$ for $d_{\text{model}} = 512$, $h = 8$). For sequences of length $n = 4096$, the logit matrix has rank $\leq 64$, far below $n$. The softmax is nonlinear (exponential + row normalization) and generically destroys this exact bound---post-softmax, $\mA$ is full rank in exact arithmetic---but $\mA$ remains \textbf{numerically near-low-rank}, with fast spectral decay inherited from the low-rank logits.
+
+\textbf{Why this matters for efficiency}:
+\begin{enumerate}
+    \item \textbf{Linear attention}: If the attention matrix is low-rank, we can approximate $\softmax(\mQ \mK^T)\mV$ without materializing the $n \times n$ matrix. Using kernel decomposition $\phi(\mQ) \phi(\mK)^T$, we compute $\phi(\mQ)(\phi(\mK)^T \mV)$ in $O(n \cdot d_k^2)$ instead of $O(n^2 \cdot d_k)$---right-to-left associativity avoids the $n \times n$ matrix entirely.
+    \item \textbf{Linformer}: Projects keys and values to lower dimension: $\bar{\mK} = \mE \mK \in \R^{k \times d}$ where $k \ll n$, making attention $O(nk)$.
+    \item \textbf{Expressiveness}: A single head with $d_k = 64$ cannot produce arbitrary $n \times n$ attention patterns. Multi-head attention compensates---but be precise: heads are \textit{concatenated and output-projected}, not summed as attention matrices. The layer's token-mixing operator is a sum over heads of $\mA_h$ composed with per-head value/output maps, so its effective rank can reach $h \cdot d_k = d_{\text{model}}$.
+\end{enumerate}
+
+\textbf{Caveat}: Do not claim that softmax preserves the rank bound---it is nonlinear, and the exponential of even a rank-1 matrix is generically full rank. The correct framing is exact rank vs.\ effective rank: exactly full rank post-softmax, but with spectral decay fast enough that low-rank approximation works. Softmax also makes each row's distribution peakier (a few entries dominate), further concentrating the spectrum.
+
+Empirical studies show that attention matrices in trained transformers have effective (stable) rank far below even $d_k$, with most singular values near zero. This is why efficient attention methods work well in practice despite being approximations.
+
+\redflags
+\begin{itemize}
+    \item Claiming softmax preserves the low-rank bound of the logits (it is nonlinear---post-softmax the matrix is generically full rank; the low-rank structure is approximate/numerical, not exact)
+    \item Not knowing what rank means or how it relates to matrix dimensions
+    \item Discussing efficient attention methods without understanding \textit{why} they work (the low-rank structure)
+\end{itemize}
+
+\interviewtest{Deep linear algebra intuition applied to a core DL mechanism, and ability to connect theory (rank) to practice (efficient attention).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows attention is $O(n^2)$ and that efficient methods exist.
+    \item \badgeLsix{L6} Explains the rank bound from $d_k$, describes how linear attention exploits this.
+    \item \badgeLseven{L7} Discusses the spectral properties of trained attention matrices, why flash attention takes a different approach (IO-aware exact attention rather than approximation), and the trade-off between approximation quality and efficiency at different sequence lengths.
+\end{itemize}
+
+\followups{``Why does flash attention not use low-rank approximation?'' (Flash attention is exact---it exploits GPU memory hierarchy (SRAM vs. HBM) rather than mathematical approximation. For current sequence lengths, the approximation error from linear attention often hurts quality more than the speedup helps.) ``How does multi-head attention increase expressiveness?'' (Heads are concatenated and output-projected; the layer's token mixing sums each head's attention pattern composed with its own value/output map, so effective rank can reach $\min(n, h \cdot d_k)$.)}
+\end{interviewq}

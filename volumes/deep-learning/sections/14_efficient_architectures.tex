@@ -1,0 +1,1032 @@
+\chapter{Efficient Architectures}
+\label{chap:efficient_architectures}
+
+\begin{tldr}
+Efficiency is the bridge between research breakthroughs and production impact. This chapter covers the full spectrum: efficient CNN designs (depthwise separable convolutions, MobileNet, EfficientNet), Mixture of Experts for scaling parameters without proportional compute, state space models (Mamba) as sub-quadratic alternatives to transformers, quantization (PTQ, QAT, GPTQ, AWQ), pruning, knowledge distillation, and neural architecture search. The recurring theme: every efficiency technique trades something---accuracy, training complexity, hardware compatibility, or engineering effort. Knowing \textit{what} is traded and \textit{when} the trade is worth it separates staff-level answers from textbook recitations.
+\end{tldr}
+
+%==============================================================================
+\section{Efficient Convolutional Architectures}
+\label{sec:efficient_cnns}
+%==============================================================================
+
+\subsection{Depthwise Separable Convolutions}
+
+\textbf{What it is.} A factorization of the standard convolution into two cheaper operations: a \textit{depthwise convolution} that filters each input channel independently, followed by a \textit{pointwise convolution} ($1 \times 1$) that mixes channels. The standard convolution simultaneously handles spatial filtering and channel mixing in one step. Depthwise separable convolutions decompose these two responsibilities.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    box/.style={rectangle, draw, minimum width=1.8cm, minimum height=0.8cm, rounded corners, font=\small},
+    input/.style={box, fill=lightgray},
+    dw/.style={box, fill=lightblue},
+    pw/.style={box, fill=lightgreen},
+    arrow/.style={->, thick}
+]
+    % Standard convolution
+    \node[input] (in1) {Input $C_{in} \times H \times W$};
+    \node[box, fill=orange!30, right=1.5cm of in1] (std) {$k \times k$ Conv};
+    \node[input, right=1.5cm of std] (out1) {Output $C_{out} \times H \times W$};
+    \draw[arrow] (in1) -- (std);
+    \draw[arrow] (std) -- (out1);
+    \node[above=0.15cm of std, font=\small\itshape] {Standard: $k^2 \cdot C_{in} \cdot C_{out}$ params};
+
+    % Depthwise separable
+    \node[input, below=1.8cm of in1] (in2) {Input $C_{in} \times H \times W$};
+    \node[dw, right=1cm of in2] (dw) {$k \times k$ DW Conv};
+    \node[pw, right=0.8cm of dw] (pw) {$1 \times 1$ Conv};
+    \node[input, right=0.8cm of pw] (out2) {Output $C_{out} \times H \times W$};
+    \draw[arrow] (in2) -- (dw);
+    \draw[arrow] (dw) -- (pw);
+    \draw[arrow] (pw) -- (out2);
+    \node[above=0.15cm of dw, font=\small\itshape] {$k^2 \cdot C_{in}$};
+    \node[above=0.15cm of pw, font=\small\itshape] {$C_{in} \cdot C_{out}$};
+\end{tikzpicture}
+\caption{Standard convolution (top) vs.\ depthwise separable convolution (bottom). The separable variant factorizes spatial and channel operations.}
+\label{fig:depthwise_separable}
+\end{figure}
+
+\begin{keyinsight}[Depthwise Separable = Spatial Filtering + Channel Mixing, Decomposed]
+A standard $3 \times 3$ convolution from 256 to 256 channels requires $3^2 \times 256 \times 256 = 589{,}824$ parameters. The depthwise separable version requires $3^2 \times 256 + 256 \times 256 = 67{,}840$ parameters---an $8.7\times$ reduction. The general reduction factor is approximately $\frac{1}{C_{out}} + \frac{1}{k^2}$, which for $k=3$ and large $C_{out}$ approaches $\sim 9\times$.
+\end{keyinsight}
+
+\textbf{When to use.} Mobile and edge deployment, any setting where FLOPs or parameter count must be minimized while preserving spatial feature extraction.
+
+\textbf{Pitfalls.} Depthwise convolutions have low arithmetic intensity (few operations per memory access), so the theoretical FLOP reduction does not always translate to proportional wall-clock speedup on GPUs. They are more efficient on CPUs and specialized mobile hardware.
+
+%------------------------------------------------------------------------------
+\subsection{MobileNet Family}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} A family of architectures designed for mobile and embedded inference, built on depthwise separable convolutions with progressive refinements across versions.
+
+\subsubsection*{MobileNetV1: Depthwise Separable Convolutions Throughout}
+
+\textbf{MobileNetV1} (2017) replaced every standard convolution in the network with a depthwise separable convolution. The cost reduction is significant:
+
+\begin{mathresult}{Depthwise Separable Cost Reduction}
+\begin{equation}
+\text{Standard conv cost:} \quad D_K^2 \cdot M \cdot N \cdot D_F^2
+\end{equation}
+\begin{equation}
+\text{Depthwise separable cost:} \quad D_K^2 \cdot M \cdot D_F^2 + M \cdot N \cdot D_F^2
+\end{equation}
+\begin{equation}
+\text{Reduction factor:} \quad \frac{1}{N} + \frac{1}{D_K^2}
+\end{equation}
+where $D_K$ is kernel size, $M$ is input channels, $N$ is output channels, and $D_F$ is feature map spatial size. For $3 \times 3$ convolutions with typical channel counts ($N \gg 1$): reduction $\approx \frac{1}{9} + \frac{1}{N} \approx 8$--$9\times$ fewer FLOPs.
+\end{mathresult}
+
+\textbf{Width multiplier $\alpha$ and resolution multiplier $\rho$.} Two hyperparameters for tuning the accuracy-latency tradeoff without redesigning the architecture:
+\begin{itemize}
+    \item \textbf{Width multiplier $\alpha \in (0, 1]$}: Scales the number of channels at every layer by $\alpha$. Cost scales as $\alpha^2$ (both input and output channels shrink). Common settings: $\alpha \in \{1.0, 0.75, 0.5, 0.25\}$.
+    \item \textbf{Resolution multiplier $\rho \in (0, 1]$}: Scales the input resolution. Cost scales as $\rho^2$ (spatial dimensions shrink). Common settings: $224, 192, 160, 128$.
+\end{itemize}
+Together, they provide a smooth Pareto curve from high-accuracy to ultra-low-latency operating points.
+
+\subsubsection*{MobileNetV2: Inverted Residual Blocks}
+
+\textbf{MobileNetV2} (2018) introduced the \textit{inverted residual block}, which reverses the standard bottleneck structure:
+\begin{enumerate}
+    \item \textbf{Expand}: $1 \times 1$ pointwise convolution expands channels by expansion factor $t$ (typically $t = 6$)
+    \item \textbf{Depthwise}: $3 \times 3$ depthwise convolution operates in the high-dimensional expanded space
+    \item \textbf{Project}: $1 \times 1$ pointwise convolution projects back to a low-dimensional bottleneck
+\end{enumerate}
+The residual (skip) connection bridges the \textit{narrow} bottleneck layers---the opposite of a standard ResNet residual block, which skips across the wide layers. This is why it is called ``inverted.''
+
+\textbf{Linear bottleneck.} The projection layer (step 3) uses \textit{no activation function}---no ReLU, no nonlinearity. This is critical: ReLU sets negative values to zero, which irreversibly destroys information. In high-dimensional expanded spaces (step 1--2), the information can survive ReLU because it is spread across many channels. But in the low-dimensional bottleneck, even a few zeroed channels cause significant information loss. Removing the activation at the projection preserves the full representational capacity of the bottleneck.
+
+\begin{keyinsight}[Why Inverted Residuals Work]
+The key insight is the combination of where skip connections go and where nonlinearities are applied. Skip connections on the \textit{low-dimensional} bottleneck preserve information across layers (low-dimensional signals are fragile and benefit from residual shortcuts). The \textit{high-dimensional} expanded intermediate layers provide the expressiveness needed for complex feature transformations---there is enough capacity here for ReLU6 to discard redundant information without harm. This design maximizes representational power per FLOP: expensive operations (depthwise conv, ReLU) happen in the expanded space where they are useful, while cheap skip connections protect the compact representation.
+\end{keyinsight}
+
+\subsubsection*{MobileNetV3: NAS + Manual Refinements}
+
+\textbf{MobileNetV3} (2019) used a two-stage approach to architecture design:
+\begin{itemize}
+    \item \textbf{Neural Architecture Search (NAS)}: Platform-aware NAS (MnasNet-style) optimized for real device latency, searching over block types, kernel sizes, expansion ratios, and channel counts.
+    \item \textbf{NetAdapt}: Layer-wise fine-tuning of channel counts to meet a specific latency target, applied on top of the NAS-found architecture.
+    \item \textbf{Squeeze-and-excitation (SE) blocks}: Added channel attention in select blocks---each channel is re-weighted by a learned function of the global average-pooled features. Added only where the accuracy gain justifies the latency cost.
+    \item \textbf{h-swish activation}: $x \cdot \frac{\text{ReLU6}(x+3)}{6}$, a hardware-efficient piecewise-linear approximation of Swish ($x \cdot \sigma(x)$). Avoids the expensive sigmoid computation while retaining the smooth, non-monotonic shape that benefits optimization.
+\end{itemize}
+
+\begin{warningbox}
+Depthwise convolutions are \textit{memory-bandwidth bound}, not compute-bound. They have very low arithmetic intensity (FLOPs per byte of memory accessed): each filter has only $D_K^2$ parameters but must be loaded from memory for every spatial position. On GPUs optimized for high arithmetic intensity (many FLOPs per memory access), depthwise convolutions dramatically underutilize compute. A model with $8 \times$ fewer FLOPs may only be $2$--$3 \times$ faster on a GPU. Depthwise separable convolutions are most efficient on CPUs, mobile NPUs, and DSPs, which have lower arithmetic intensity ceilings and benefit directly from FLOP reduction.
+\end{warningbox}
+
+\textbf{When to use each version:}
+\begin{itemize}
+    \item \textbf{MobileNetV1}: When extreme simplicity is needed (easy to implement, port, and debug) or as a teaching baseline. Outclassed by V2/V3 on the accuracy-latency Pareto frontier.
+    \item \textbf{MobileNetV2}: The best general-purpose mobile backbone. Excellent trade-off between accuracy, latency, and implementation complexity. Widely supported across all mobile inference runtimes. The default choice for most mobile deployment scenarios.
+    \item \textbf{MobileNetV3}: When maximum accuracy within a mobile latency budget is required and the deployment target supports all required operators (SE, h-swish). Particularly strong for detection and segmentation backbones (MobileNetV3 + SSDLite, MobileNetV3 + DeepLabV3).
+\end{itemize}
+
+%------------------------------------------------------------------------------
+\subsection{EfficientNet}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} A family of models that systematically scales network width, depth, and resolution together using a \textit{compound scaling} rule, rather than scaling each dimension independently.
+
+\textbf{Key idea.} Given a baseline architecture (found via NAS), scale all three dimensions simultaneously with a compound coefficient $\phi$:
+\begin{itemize}
+    \item Depth: $d = \alpha^\phi$
+    \item Width: $w = \beta^\phi$
+    \item Resolution: $r = \gamma^\phi$
+    \item Subject to: $\alpha \cdot \beta^2 \cdot \gamma^2 \approx 2$ (roughly doubles FLOPs per unit increase in $\phi$)
+\end{itemize}
+
+The baseline EfficientNet-B0 uses MobileNetV2-style inverted residual blocks with SE attention.
+
+\begin{table}[H]
+\centering
+\caption{Efficient CNN architecture comparison}
+\begin{tabularx}{\textwidth}{lXcccc}
+\toprule
+\textbf{Model} & \textbf{Key Innovation} & \textbf{Params} & \textbf{FLOPs} & \textbf{Top-1 Acc} & \textbf{Year} \\
+\midrule
+MobileNetV1 & Depthwise separable & 4.2M & 569M & 70.6\% & 2017 \\
+MobileNetV2 & Inverted residuals & 3.4M & 300M & 72.0\% & 2018 \\
+MobileNetV3-L & NAS + SE + h-swish & 5.4M & 219M & 75.2\% & 2019 \\
+EfficientNet-B0 & Compound scaling & 5.3M & 390M & 77.3\% & 2019 \\
+EfficientNet-B7 & Compound scaling & 66M & 37B & 84.3\% & 2019 \\
+ConvNeXt-T & Modernized ResNet & 29M & 4.5B & 82.1\% & 2022 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{When to use.} EfficientNet when you need a strong accuracy-efficiency Pareto curve and can tolerate longer training. MobileNets when you need sub-10ms inference on mobile CPUs/NPUs. ConvNeXt when you want a modern pure-CNN that competes with vision transformers at larger scales.
+
+\textbf{Pitfalls.} EfficientNet's compound scaling assumes the base architecture is well-designed---scaling a poor base still yields poor models. EfficientNet-B7 training is notoriously slow due to large resolution (600px). MobileNets underperform at larger scales where compute budgets allow heavier architectures.
+
+%==============================================================================
+\section{Mixture of Experts (MoE)}
+\label{sec:moe}
+%==============================================================================
+
+\subsection{Core Idea}
+
+\textbf{What it is.} Instead of routing every token through every parameter, MoE models have multiple ``expert'' subnetworks (typically FFN layers) and a learned \textit{router} that selects a sparse subset of experts per input. This decouples parameter count from per-token compute cost: a model can have hundreds of billions of parameters but activate only a fraction for each token.
+
+\begin{keyinsight}[MoE Gives You More Parameters Without Proportional Compute]
+A dense 7B model processes every token through all 7B parameters. A MoE model with 8 experts and top-2 routing (Mixtral 8x7B) has 46.7B total parameters but activates only $\sim$12.9B per token---achieving dense-model quality at a fraction of the per-token cost. The tradeoff: you still need enough memory to hold all 46.7B parameters.
+\end{keyinsight}
+
+\subsection{Gating Mechanism}
+
+The router produces a probability distribution over experts, then selects the top-$k$:
+
+\begin{mathresult}{MoE Router}
+\begin{equation}
+G(\vx) = \text{TopK}\bigl(\softmax(\mW_g \vx)\bigr), \quad \text{output} = \sum_{i \in \text{TopK}} G(\vx)_i \cdot E_i(\vx)
+\end{equation}
+where $\mW_g \in \R^{N_{experts} \times d}$ is the router weight matrix, $E_i$ is expert $i$, and the output is a weighted sum of the selected experts.
+\end{mathresult}
+
+Typical choices in the 2023-era designs covered here: $N_{experts} = 8\text{--}64$, $k = 1\text{--}2$ (newer fine-grained MoEs push to far higher expert counts with larger $k$). The router is a simple linear layer---complexity is in the load balancing, not the routing itself.
+
+\subsection{Load Balancing: The Central Challenge}
+
+\begin{warningbox}
+Expert load balancing is the \#1 MoE training challenge. Without explicit balancing, the router collapses: a few ``popular'' experts get all the tokens, become better, attract even more tokens (rich-get-richer), while other experts receive nothing and waste parameters. This failure mode can silently degrade model quality.
+\end{warningbox}
+
+\textbf{Solutions to load imbalance:}
+
+\begin{enumerate}
+    \item \textbf{Auxiliary load-balancing loss.} Add a loss term that penalizes uneven token distribution across experts:
+    \begin{equation}
+    \loss_{\text{balance}} = \alpha \cdot N \cdot \sum_{i=1}^{N} f_i \cdot P_i
+    \end{equation}
+    where $f_i$ is the fraction of tokens routed to expert $i$, $P_i$ is the mean router probability for expert $i$, and $\alpha$ is a small coefficient (typically $0.01$). Minimizing $\sum f_i P_i$ encourages uniform routing.
+
+    \item \textbf{Expert capacity factor.} Cap the maximum number of tokens any expert can process. Overflow tokens are either dropped or sent to a shared fallback expert.
+
+    \item \textbf{Expert choice routing} (Zhou et al., 2022). Invert the routing: instead of tokens choosing experts, each expert selects its top-$k$ tokens. This guarantees perfect load balance by construction.
+
+    \item \textbf{Noise injection.} Add Gaussian noise to router logits during training ($\vz + \epsilon$, $\epsilon \sim \mathcal{N}(0, \sigma^2)$) to encourage exploration of underused experts.
+\end{enumerate}
+
+\subsection{Key MoE Architectures}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of major MoE architectures}
+\begin{tabularx}{\textwidth}{lXXXc}
+\toprule
+\textbf{Model} & \textbf{Routing} & \textbf{Experts} & \textbf{Key Innovation} & \textbf{Year} \\
+\midrule
+Switch Transformer & Top-1 & 128 & Simplified routing, capacity factor & 2021 \\
+GShard & Top-2 & 2048 & Expert parallelism at scale & 2020 \\
+Mixtral 8x7B & Top-2 & 8 & Open-weight, every-layer MoE & 2024 \\
+DeepSeek-MoE & Top-2 & 64 fine + 2 shared & Shared + routed experts & 2024 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Switch Transformer} showed that top-1 routing (single expert per token) works well and simplifies implementation. Each token goes to exactly one expert, halving communication overhead compared to top-2.
+
+\textbf{Mixtral 8x7B} demonstrated that moderate-scale MoE (8 experts, top-2) can match or exceed a dense 70B model while activating only $\sim$12.9B of its 46.7B parameters per token. Every transformer layer is a MoE layer (no dense layers interspersed).
+
+\textbf{DeepSeek-MoE} introduced a hybrid design with shared experts (always active, every token) plus routed experts (sparse, token-specific). The shared experts capture common knowledge; routed experts specialize.
+
+\textbf{When to use MoE.} When you need to scale model capacity but inference compute or latency is constrained. MoE is particularly effective for language modeling where different tokens genuinely benefit from specialized processing.
+
+\textbf{Pitfalls.} Memory footprint equals total parameters (all experts must be in memory even if only 2 are active). Expert parallelism requires all-to-all communication, which is expensive across nodes. Batch size interacts with capacity factor---small batches can lead to many dropped tokens. Fine-tuning MoE models often requires care to avoid routing collapse.
+
+%==============================================================================
+\section{State Space Models (SSMs)}
+\label{sec:ssms}
+%==============================================================================
+
+\subsection{The Motivation}
+
+Transformers have $O(n^2)$ attention complexity, making very long sequences (100K+ tokens) expensive. RNNs are $O(n)$ but cannot be parallelized during training and struggle with long-range dependencies. State space models aim for the best of both: $O(n)$ or $O(n \log n)$ complexity with parallelizable training \textit{and} effective long-range modeling.
+
+\subsection{From Continuous SSMs to Mamba}
+
+\textbf{Classical SSM.} The continuous state space model maps an input sequence $u(t)$ to an output $y(t)$ through a latent state $\vh(t)$:
+\begin{align}
+\vh'(t) &= \mA\vh(t) + \mB u(t) \notag \\
+y(t) &= \mC\vh(t) + D u(t) \notag
+\end{align}
+where $\mA$ is the state transition matrix. After discretization and with specific structured initializations (HiPPO), this becomes the S4 model.
+
+\textbf{S4} (Gu et al., 2022) showed that with a carefully initialized $\mA$ matrix (HiPPO initialization) and efficient computation via the convolution view, SSMs can model very long-range dependencies. But S4 uses fixed, input-independent dynamics---the same $\mA, \mB, \mC$ for every token.
+
+\subsection{Mamba: Selective State Spaces}
+
+\textbf{What it is.} Mamba (Gu and Dao, 2023) makes the SSM parameters \textit{input-dependent}, enabling the model to selectively focus on or ignore information based on content. This is the key insight that makes SSMs competitive with transformers for language modeling.
+
+\begin{keyinsight}[Mamba's Selective Mechanism]
+In S4, the state transition matrices $\mB, \mC, \Delta$ are fixed---the model processes every token the same way. Mamba makes them functions of the input: $\mB(\vx), \mC(\vx), \Delta(\vx)$. This allows the model to ``decide'' what to remember and what to forget at each timestep---analogous to the gating in LSTMs, but within the SSM framework. The selection mechanism is what bridges the gap between SSMs and attention: content-aware, dynamic processing.
+\end{keyinsight}
+
+\textbf{Computational trick.} Making parameters input-dependent breaks the convolution view that made S4 efficient. Mamba uses a hardware-aware parallel scan algorithm (leveraging GPU SRAM, similar in spirit to Flash Attention) to maintain efficient $O(n)$ computation despite the input dependence.
+
+\subsection{Transformer vs SSM vs RNN Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Sequence model family comparison}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Property} & \textbf{Transformer} & \textbf{SSM (Mamba)} & \textbf{LSTM/GRU} & \textbf{Hybrid (Jamba)} \\
+\midrule
+Training complexity & $O(n^2 d)$ & $O(n d s)$ & $O(n d^2)$ & Mixed \\
+Inference (per step) & $O(nd)$ + KV cache & $O(d s)$ constant & $O(d^2)$ constant & Mixed \\
+Memory at inference & KV cache grows with $n$ & Fixed state size & Fixed state size & Reduced KV cache \\
+Parallelizable training & Yes (full) & Yes (scan) & No (sequential) & Yes \\
+Long-range modeling & Strong (attention) & Strong (selective) & Weak (vanishing grad) & Strong \\
+In-context learning & Excellent & Emerging & Poor & Good \\
+Mature ecosystem & Extensive & Growing & Mature & Early \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Here $n$ is sequence length, $d$ is model dimension, and $s$ is state size (typically 16).
+
+\subsection{When SSMs Beat Transformers (and When They Don't)}
+
+\textbf{SSMs excel when:}
+\begin{itemize}
+    \item Sequence length is very long (100K+ tokens) and quadratic attention is prohibitive
+    \item Inference is streaming or real-time (constant memory per step vs.\ growing KV cache)
+    \item The task primarily requires sequential processing of continuous signals (audio, time series, DNA)
+\end{itemize}
+
+\textbf{Transformers still win when:}
+\begin{itemize}
+    \item The task requires precise retrieval from context (``copy this exact substring from position 50K'')---attention can do exact lookup; SSM state is lossy
+    \item In-context learning is critical (few-shot prompting, complex instruction following)
+    \item You need the mature ecosystem: Flash Attention, KV caching, speculative decoding, quantization tooling
+    \item Model scale is the priority---transformer scaling laws are better understood
+\end{itemize}
+
+\textbf{The hybrid approach.} Jamba (AI21, 2024) interleaves transformer layers with Mamba layers, getting the best of both: attention layers for retrieval-heavy processing, SSM layers for efficient long-range modeling. This is likely the direction the field is moving.
+
+%==============================================================================
+\section{Quantization}
+\label{sec:quantization}
+%==============================================================================
+
+\subsection{Core Idea}
+
+\textbf{What it is.} Represent model weights (and optionally activations) in lower-precision formats (INT8, INT4, FP8) instead of FP16/FP32. This reduces memory footprint, increases throughput (more operations per memory transfer), and can enable deployment on hardware that cannot hold the full-precision model.
+
+\textbf{Key formula.} Uniform quantization maps a floating-point value $x$ to a discrete integer:
+
+\begin{mathresult}{Uniform Quantization}
+\begin{equation}
+x_q = \text{round}\!\left(\frac{x - z}{s}\right), \quad \hat{x} = s \cdot x_q + z
+\end{equation}
+where $s$ (scale) and $z$ (zero-point) define the mapping, and $\hat{x}$ is the dequantized approximation.
+\end{mathresult}
+
+\subsection{Post-Training Quantization (PTQ) vs Quantization-Aware Training (QAT)}
+
+\begin{table}[H]
+\centering
+\caption{PTQ vs QAT comparison}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{PTQ} & \textbf{QAT} \\
+\midrule
+When applied & After training (no retraining) & During training (simulate quantization) \\
+Compute cost & Minutes to hours (calibration set) & Full training run \\
+Accuracy at INT8 & Near-lossless for most models & Slightly better than PTQ \\
+Accuracy at INT4 & Noticeable degradation & Significantly better than PTQ \\
+Use case & Quick deployment, INT8 targets & When INT4 is needed or PTQ drops too much \\
+Implementation & Calibration pass + quantize & Insert fake-quantize ops in training graph \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{PTQ} requires only a small calibration dataset (128--1024 samples) to determine scale and zero-point per tensor or per channel. No gradient computation needed.
+
+\textbf{QAT} inserts simulated quantization (``fake quantize'') nodes during training. The forward pass uses quantized values; gradients flow through using the straight-through estimator (STE): $\frac{\partial \hat{x}}{\partial x} \approx 1$ in the quantization range.
+
+\subsection{Practical Quantization Methods for LLMs}
+
+\begin{table}[H]
+\centering
+\caption{LLM quantization methods comparison}
+\begin{tabularx}{\textwidth}{lccXX}
+\toprule
+\textbf{Method} & \textbf{Bits} & \textbf{Type} & \textbf{Key Idea} & \textbf{Trade-off} \\
+\midrule
+Naive PTQ & 8/4 & PTQ & Per-tensor or per-channel rounding & Fast but INT4 quality is poor \\
+SmoothQuant & 8 & PTQ & Migrate quantization difficulty from activations to weights via math-equivalent scaling & Strong INT8 for both weights and activations \\
+GPTQ & 4/3 & PTQ & Layer-wise quantization using approximate second-order information (Hessian) & Good 4-bit quality; slow calibration \\
+AWQ & 4 & PTQ & Protect salient weight channels (identified by activation magnitude) & Faster than GPTQ; comparable quality \\
+GGUF & 2--8 & PTQ & CPU-optimized mixed quantization with per-block scales & Enables LLM inference on consumer CPUs \\
+FP8 (E4M3) & 8 & PTQ/QAT & 8-bit floating point; drop-in for training and inference on H100+ & Minimal accuracy loss; native HW support \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{GPTQ} quantizes one layer at a time, using the Hessian (approximated from calibration data) to decide which weights to quantize first and how to adjust remaining weights to compensate for the error. It produces high-quality 4-bit and even 3-bit models but calibration takes 1--4 hours for a 70B model.
+
+\textbf{AWQ} observes that a small fraction ($\sim$1\%) of weight channels are disproportionately important (corresponding to channels with large activation magnitudes). It protects these salient channels by scaling them up before quantization, then compensating in the adjacent layer. Faster than GPTQ with comparable results.
+
+\begin{warningbox}
+Quantization sensitivity is layer- and channel-specific---measure it rather than assuming a blanket rule. Attention logits can be sensitive (small Q/K errors shift the softmax distribution), but outlier channels also concentrate at FFN inputs and down-projections, and many production recipes protect \texttt{down\_proj} and the first/last (boundary) layers rather than attention. When doing mixed-precision quantization, profile per-layer quantization error on your task and keep the empirically sensitive layers at higher precision.
+\end{warningbox}
+
+\textbf{When to use.} INT8 quantization (SmoothQuant, FP8) is nearly free---use it by default for inference. INT4 (GPTQ, AWQ) when you need to fit a model on fewer GPUs or when memory bandwidth is the bottleneck. Sub-4-bit only for experimental or extreme edge deployment.
+
+\textbf{Pitfalls.} Quantization interacts with model size: smaller models degrade more from quantization (fewer redundant parameters). A quantized 70B model almost always outperforms a quantized 7B model at the same bit width. Always benchmark on \textit{your} task, not just perplexity---quantization can selectively degrade reasoning, code generation, or long-context tasks while perplexity looks fine.
+
+%==============================================================================
+\section{Pruning and Knowledge Distillation}
+\label{sec:pruning_distillation}
+%==============================================================================
+
+\subsection{Pruning}
+
+\textbf{What it is.} Remove unnecessary weights or structures from a trained model to reduce size and compute. The lottery ticket hypothesis (Frankle and Carbin, 2019) suggests that dense networks contain sparse subnetworks that can match the full model's performance.
+
+\subsubsection{Structured vs Unstructured Pruning}
+
+\begin{table}[H]
+\centering
+\caption{Structured vs unstructured pruning comparison}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Unstructured} & \textbf{Structured} \\
+\midrule
+What is removed & Individual weights (anywhere) & Entire rows/columns, channels, heads, or layers \\
+Sparsity pattern & Irregular (scattered zeros) & Regular (entire dimensions removed) \\
+Achievable sparsity & Very high (90--99\%) & Moderate (30--70\%) \\
+Hardware speedup & Requires sparse hardware (limited) & Direct speedup on standard GPUs \\
+Implementation & Sparse matrix formats needed & Standard dense operations on smaller tensors \\
+Quality at same sparsity & Better (more flexible) & Worse (coarser granularity) \\
+Practical impact & Limited unless hardware supports it & Immediate, real speedup \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[Unstructured Pruning's Dirty Secret]
+You can prune 90\% of weights with minimal accuracy loss, but you often cannot actually run the pruned model faster on a GPU. GPUs are optimized for dense matrix operations; irregular sparsity patterns do not map to efficient hardware execution. Structured pruning removes less but delivers real speedups because the resulting model is just a smaller dense model. N:M sparsity (e.g., 2:4 on NVIDIA Ampere+) is the exception---it achieves $2\times$ speedup with 50\% unstructured sparsity via dedicated hardware support.
+\end{keyinsight}
+
+\textbf{SparseGPT} (Frantar and Alistarh, 2023): One-shot pruning for LLMs. Prunes each layer independently using approximate second-order information (similar approach to GPTQ but for sparsity). Can achieve 50--60\% unstructured sparsity on LLMs with minimal perplexity increase. Compatible with N:M sparsity for actual hardware speedup.
+
+%------------------------------------------------------------------------------
+\subsection{Knowledge Distillation}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} Train a smaller ``student'' model to mimic a larger ``teacher'' model's behavior. The teacher's soft probability outputs carry richer information than hard labels---they encode inter-class similarities (e.g., ``a 3 looks somewhat like an 8'') that hard labels discard.
+
+\begin{mathresult}{Knowledge Distillation Loss}
+\begin{equation}
+\loss_{\text{KD}} = \alpha T^2 \cdot \KL\!\left(\softmax\!\left(\frac{\vz_T}{T}\right) \;\bigg\|\; \softmax\!\left(\frac{\vz_S}{T}\right)\right) + (1 - \alpha) \cdot \loss_{\text{CE}}(\vy, \vz_S)
+\end{equation}
+where $\vz_T, \vz_S$ are teacher and student logits, $T$ is temperature, and $\alpha$ balances soft and hard targets.
+\end{mathresult}
+
+\textbf{Why $T^2$ scaling?} When temperature $T > 1$, the gradients of the KL term are scaled down by $\frac{1}{T^2}$ relative to the hard label loss. Multiplying by $T^2$ compensates, keeping the two loss terms at comparable magnitudes regardless of temperature choice.
+
+\textbf{Typical hyperparameters:} $T \in [3, 20]$, $\alpha \in [0.5, 0.9]$. Higher $T$ reveals more inter-class structure but dilutes the teacher's confidence signal.
+
+\textbf{Modern distillation for LLMs} often skips the KL-on-logits approach entirely and instead distills at the \textit{data level}: generate high-quality training data from the teacher model, then train the student on this synthetic data with standard cross-entropy. This is simpler, requires no access to teacher internals, and works well in practice (e.g., Alpaca, Vicuna, Orca, Phi models).
+
+%------------------------------------------------------------------------------
+\subsection{When to Prune vs Distill vs Quantize}
+%------------------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Compression technique selection guide}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Consideration} & \textbf{Quantization} & \textbf{Pruning} & \textbf{Distillation} \\
+\midrule
+Implementation effort & Low (tool-based) & Medium & High (need teacher) \\
+Accuracy loss (typical) & Minimal at INT8 & Moderate & Low (student can be strong) \\
+Memory reduction & $2$--$4\times$ & Up to $10\times$ (unstructured) & Depends on student size \\
+Latency reduction & $1.5$--$2\times$ & $1$--$2\times$ (structured) & Depends on student architecture \\
+Combinable & Yes (with pruning, distillation) & Yes (with quantization) & Yes (with quantization) \\
+Best for & Inference deployment & Removing redundancy & Architectural change \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Decision guidance:}
+\begin{enumerate}
+    \item \textbf{Start with quantization.} It is nearly free at INT8 and should be the default for any deployment. Apply first, benchmark, and see if you need more.
+    \item \textbf{Add structured pruning} if you need further latency reduction and can tolerate accuracy loss or have budget for fine-tuning the pruned model.
+    \item \textbf{Use distillation} when you need a fundamentally different (smaller) architecture---e.g., replacing a 70B model with a 7B model, or replacing a transformer with a CNN for edge deployment.
+    \item \textbf{Combine all three} for maximum compression: distill into a smaller architecture, prune it, then quantize. This is the standard pipeline for extreme deployment targets (mobile, IoT).
+\end{enumerate}
+
+%==============================================================================
+\section{Neural Architecture Search (NAS)}
+\label{sec:nas}
+%==============================================================================
+
+\subsection{Overview}
+
+\textbf{What it is.} Automate the design of neural network architectures by searching over a space of possible designs. NAS has three components:
+
+\begin{enumerate}
+    \item \textbf{Search space:} What architectures are possible? (operations, connections, layer types, hyperparameters)
+    \item \textbf{Search strategy:} How to explore the space? (reinforcement learning, evolutionary algorithms, gradient-based, Bayesian optimization)
+    \item \textbf{Performance estimation:} How to evaluate each candidate? (full training, weight sharing, proxy tasks, predictors)
+\end{enumerate}
+
+\subsection{One-Shot NAS vs Full NAS}
+
+\begin{table}[H]
+\centering
+\caption{One-shot NAS vs full NAS}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Full NAS} & \textbf{One-Shot / Supernet NAS} \\
+\midrule
+Approach & Train each candidate from scratch & Train one supernet containing all candidates \\
+Compute cost & Thousands of GPU-hours & Comparable to training one large model \\
+Search time & Days to weeks & Hours to days \\
+Quality & Gold standard (each candidate fully trained) & Approximation (weight sharing introduces coupling) \\
+Example methods & NASNet (RL), AmoebaNet (evolutionary) & DARTS (gradient-based), Once-for-All, FBNet \\
+Practical usage & Research exploration & Production architecture design \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{DARTS} (Differentiable Architecture Search) is the most influential one-shot method. It relaxes the discrete architecture choice into a continuous one, allowing gradient-based optimization of both architecture parameters and network weights simultaneously. The search completes in a single training run.
+
+\textbf{Practical guidance:}
+\begin{itemize}
+    \item NAS found the base architectures for EfficientNet, MobileNetV3, and MnasNet---its main legacy is those specific architectures, which are now used directly.
+    \item For most practitioners, using a NAS-derived architecture (EfficientNet, MobileNetV3) off the shelf is more practical than running NAS yourself.
+    \item Custom NAS is worthwhile when you have unusual hardware constraints (e.g., specific NPU, FPGA) where standard architectures are suboptimal.
+    \item Hardware-aware NAS (measuring actual latency, not just FLOPs) is essential---FLOP count is a poor proxy for real-world speed due to memory bandwidth, parallelism, and operator support differences.
+\end{itemize}
+
+\textbf{Pitfalls.} NAS can overfit to the search proxy (e.g., optimize for FLOPs but not actual latency). DARTS is known to be unstable and can converge to degenerate architectures (e.g., dominated by skip connections). Search space design matters more than search algorithm---a well-designed space with random search often beats a poorly designed space with sophisticated search.
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:efficient_arch_interview}
+%==============================================================================
+
+%--- Question 1: Architecture Design - Mobile deployment ---
+\begin{interviewq}
+\textbf{Q: Design an efficient architecture for on-device ML (phone, $<$100ms latency, $<$50MB model).}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+I would use a staged approach, starting from the highest-impact techniques and checking against the constraints at each step.
+
+\textbf{Step 1: Architecture selection.} Start with a MobileNetV3-based backbone (or EfficientNet-B0 for vision, or TinyBERT/MobileBERT for NLP). These architectures are \textit{designed} for mobile from the ground up---depthwise separable convolutions, inverted residual blocks, hardware-efficient activations (h-swish), and squeeze-and-excitation attention. Key principle: it is far better to start with a mobile-native architecture than to compress a large model.
+
+\textbf{Step 2: Knowledge distillation.} Train a large teacher model (e.g., ResNet-152 for vision, BERT-large for NLP) on the target task. Distill into the mobile architecture using task-specific distillation: the teacher's soft logits provide richer supervision than hard labels. Temperature $T \in [4, 10]$, $\alpha = 0.7$ for the soft target weight. This typically recovers 2--5\% accuracy over training the small model from scratch.
+
+\textbf{Step 3: Quantization.} Apply INT8 post-training quantization (PTQ). For mobile CPUs, INT8 is well-supported and provides $1.5$--$2\times$ speedup with $<$1\% accuracy loss. This cuts the model from $\sim$20MB (FP32) to $\sim$5MB (INT8). If further compression is needed, use INT4 weight-only quantization (weights INT4, activations INT8 at compute time).
+
+\textbf{Step 4: Structured pruning (if needed).} Remove redundant channels or attention heads. Fine-tune after pruning. Target 20--30\% channel reduction. Unlike unstructured pruning, this directly reduces the dense tensor dimensions and gives real speedup on mobile hardware.
+
+\textbf{Step 5: Runtime optimization.} Export to a mobile inference runtime: CoreML (iOS), TFLite (Android), or ONNX Runtime Mobile (cross-platform). These runtimes provide: operator fusion (Conv+BN+ReLU into a single kernel), hardware delegation (NPU, GPU, DSP when available), and optimized memory management. The runtime can contribute $2$--$3\times$ speedup beyond the model compression.
+
+\textbf{Budget check for a vision task:} MobileNetV3-Small ($\sim$2.5M params) + INT8 quantization = $\sim$2.5MB model, $\sim$5--15ms on modern phone CPUs. Well within both the 50MB and 100ms constraints. For NLP: TinyBERT (14.5M params) + INT8 = $\sim$14MB, $\sim$10--30ms for short sequences on mobile.
+
+\redflags
+\begin{itemize}
+    \item ``Take a large model and just quantize it to INT4''---compression alone cannot make a 7B model fit in 50MB. Architecture choice comes first.
+    \item ``FLOPs determine latency''---mobile latency depends on memory bandwidth, operator support, and hardware delegation. Depthwise convolutions have low FLOPs but poor arithmetic intensity on some hardware.
+    \item Skipping the runtime optimization step---this is often the largest speedup source and candidates who ignore it miss easy wins.
+\end{itemize}
+
+\interviewtest{Systematic compression thinking (not jumping to one technique), awareness of the accuracy-latency-size Pareto curve, practical deployment knowledge (runtimes, export formats), and willingness to start with a mobile-native architecture rather than compressing a large model.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Mentions distillation, quantization, and a mobile-friendly architecture. Gets the basic pipeline right.
+    \item \badgeLsix{L6} Starts with architecture selection (MobileNet, EfficientNet), provides specific model sizes and latency estimates, discusses the runtime optimization step, and checks the solution against constraints at each step.
+    \item \badgeLseven{L7} Discusses hardware-aware NAS for custom hardware targets, NPU/DSP delegation strategies, mixed-precision quantization (keep sensitive layers at higher precision), and the tradeoff between on-device inference vs.\ edge server deployment. Knows about specific mobile ML frameworks (CoreML, TFLite, ExecuTorch) and their relative strengths.
+\end{itemize}
+
+\followups{``How do you decide between distillation and pruning?'' ``What if the model needs to handle 512-token inputs?'' ``How would you measure quality regression from compression?'' ``What changes if the target is a server GPU instead of mobile?''}
+\end{interviewq}
+
+%--- Question 2: Trade-off - MoE vs dense ---
+\begin{interviewq}
+\textbf{Q: When would you choose MoE over dense scaling, and vice versa?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The decision depends on the deployment constraints, training infrastructure, and task characteristics.
+
+\textbf{Choose MoE when:}
+\begin{itemize}
+    \item You have the memory budget to hold all experts but need to keep per-token compute (and thus latency) low. A Mixtral 8x7B has 46.7B total params but only $\sim$12.9B active per token---faster than a dense 34B model at comparable quality.
+    \item Your workload is diverse. MoE naturally specializes experts for different input types (code, math, languages). Multilingual models benefit strongly from MoE.
+    \item You can afford the training infrastructure for expert parallelism (all-to-all communication across GPUs).
+\end{itemize}
+
+\textbf{Choose dense scaling when:}
+\begin{itemize}
+    \item Memory is the binding constraint, not compute. A dense 7B model needs $\sim$14GB; a MoE with comparable quality needs 46.7B params in memory ($\sim$93GB), even though per-token compute is similar.
+    \item You need fine-tuning simplicity. Dense models are straightforward to fine-tune; MoE models require careful handling to avoid routing collapse during fine-tuning.
+    \item Serving infrastructure is simple. Dense models need standard tensor parallelism; MoE needs expert parallelism with all-to-all communication.
+    \item Batch sizes are very small. MoE load balancing degrades with small batches (fewer tokens to distribute). Single-request latency often favors dense models.
+\end{itemize}
+
+\textbf{Rule of thumb:} If you are training from scratch at large scale with good infrastructure, MoE gives you better quality per FLOP. If you are deploying a single model on limited hardware, dense is simpler and often more memory-efficient.
+
+\redflags
+\begin{itemize}
+    \item ``MoE has more parameters so it's always better''---MoE's parameters are not free; they all consume memory even though only a subset is activated per token.
+    \item ``MoE and dense models have the same memory footprint if they have the same active parameters''---total parameters must be stored; MoE's memory is $3$--$4\times$ higher than its active parameter count suggests.
+    \item Ignoring the infrastructure complexity---MoE training requires expert parallelism with all-to-all communication, which is significantly harder to implement and tune than standard data or tensor parallelism.
+\end{itemize}
+
+\interviewtest{Understanding that MoE's ``free parameters'' are not truly free (memory cost), awareness of the systems implications (expert parallelism, communication), and ability to map architectural choices to deployment constraints.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows MoE decouples parameter count from compute cost. Can name a MoE model (Mixtral, Switch Transformer). Understands the basic memory vs.\ compute tradeoff.
+    \item \badgeLsix{L6} Provides a concrete decision framework based on constraints (memory-bound vs.\ compute-bound). Discusses load balancing, routing collapse during fine-tuning, and the MoE effect on serving infrastructure. Knows that KV cache is unaffected by MoE (shared attention).
+    \item \badgeLseven{L7} Discusses shared expert designs (DeepSeek-MoE), expert merging for serving (reduce memory by combining similar experts), and the interaction between MoE and quantization (can you quantize experts independently?). Reasons about MoE scaling laws vs.\ dense scaling laws and when MoE's compute-optimal frontier is favorable.
+\end{itemize}
+
+\followups{``How does MoE affect the KV cache?'' ``What happens if you fine-tune a MoE model on a narrow domain?'' ``How would you serve a MoE model on consumer hardware?'' ``Can you combine MoE with quantization?''}
+\end{interviewq}
+
+%--- Question 3: Trade-off - Transformer vs Mamba ---
+\begin{interviewq}
+\textbf{Q: You're building a system that processes 100K-token documents. Compare transformer vs Mamba for this use case.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+At 100K tokens, the choice depends on what the task requires from those long contexts.
+
+\textbf{Transformer at 100K tokens:}
+\begin{itemize}
+    \item Quadratic attention: $100\text{K}^2 = 10^{10}$ elements in the attention matrix. Even with Flash Attention (which eliminates the memory bottleneck), the compute cost is significant.
+    \item KV cache at inference: $2 \times \text{layers} \times \text{kv\_heads} \times \text{head\_dim} \times \text{seq\_len} \times \text{bytes}$. For a 7B model (32 layers, head dim 128) with GQA (8 KV heads), 100K context in FP16: $2 \times 32 \times 8 \times 128 \times 100\text{K} \times 2\text{B} \approx 13$GB per sequence---and it would be $\sim$52GB with full MHA (32 KV heads), which is exactly why GQA matters at this scale. Either way, the cache (not the $\sim$14GB of weights) dominates per-request memory growth.
+    \item Strength: Precise retrieval. If the task is ``find the contract clause on page 47 that contradicts page 3,'' attention can directly look up exact positions.
+\end{itemize}
+
+\textbf{Mamba at 100K tokens:}
+\begin{itemize}
+    \item Linear complexity: $O(n \cdot d \cdot s)$ where $s \approx 16$. At 100K tokens, this is orders of magnitude cheaper than quadratic attention.
+    \item Fixed-size state at inference: Memory does not grow with context length. The state is a compressed summary, not a full cache.
+    \item Weakness: The fixed-size state is lossy. Information from early tokens must be compressed into the state. Precise retrieval from arbitrary positions degrades compared to attention.
+\end{itemize}
+
+\textbf{My recommendation for 100K-token documents:}
+\begin{enumerate}
+    \item \textbf{Summarization, classification, overall comprehension:} Mamba or a hybrid. These tasks require aggregating information across the full document but do not need precise positional retrieval.
+    \item \textbf{Question answering requiring exact retrieval:} Transformer with efficient attention (sliding window + global tokens, or chunked attention with cross-chunk retrieval).
+    \item \textbf{Best of both worlds:} A hybrid architecture (Jamba-style) with Mamba layers for efficient long-range propagation and a few attention layers for retrieval-critical processing.
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``Transformers can't handle 100K tokens''---they can with Flash Attention and RoPE extensions, it is just expensive. The question is whether the cost is justified.
+    \item ``Mamba is always better for long sequences''---Mamba's fixed state is lossy. For precise retrieval tasks, attention's exact lookup is irreplaceable.
+    \item Ignoring the hybrid option---in practice, the field is converging on hybrid architectures that combine SSM and attention layers.
+\end{itemize}
+
+\interviewtest{Whether you understand the fundamental tradeoff (attention = precise but quadratic; SSM = efficient but lossy), can match architecture to task requirements, and know the practical systems implications (KV cache memory, actual throughput, not just theoretical complexity).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows transformers are quadratic and SSMs are linear. Understands the basic precision-efficiency tradeoff. Can recommend the right choice for simple scenarios.
+    \item \badgeLsix{L6} Quantifies the KV cache size for a 100K-context transformer. Explains why Mamba's state is lossy (fixed-size compression of history). Proposes hybrid architectures and knows Jamba. Discusses the RAG alternative (chunking + retrieval may be more practical than any single-model solution at 100K tokens).
+    \item \badgeLseven{L7} Discusses ring attention and context parallelism for distributing long-context attention across GPUs. Knows about Mamba-2's structured state space duality and its improved hardware efficiency. Can reason about when the ``long context'' is actually needed vs.\ when retrieval/summarization pipelines are better engineering solutions.
+\end{itemize}
+
+\followups{``What is the KV cache size for a 100K-context transformer?'' ``How does Mamba handle in-context learning?'' ``Could you use RAG instead of processing the full 100K context?'' ``What is Jamba and why is it interesting?''}
+\end{interviewq}
+
+%--- Question 4: Estimation - MoE compute savings ---
+\begin{interviewq}
+\textbf{Q: Estimate the compute savings of a MoE model with 8 experts, top-2 routing, vs a dense model of the same quality.}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Let me work through this with concrete numbers, using Mixtral 8x7B as a reference.
+
+\textbf{Parameter accounting:} In a transformer, each layer has two main components: attention (Q/K/V projections + output projection) and FFN (two or three linear layers). In Mixtral-style MoE, only the FFN is replicated across experts; the attention parameters are \textit{shared} across all tokens.
+
+Using Mixtral's actual configuration (32 layers, $d_{model} = 4096$, FFN dim 14336, GQA attention):
+\begin{itemize}
+    \item \textbf{Shared parameters} (embeddings + attention): $\sim$1.7B params---attention is only $\sim$1.3B because GQA shrinks the K/V projections. Every token uses these.
+    \item \textbf{Expert parameters} (8 FFN experts, each $\sim$5.6B: $32 \times 3 \times 4096 \times 14336$): $8 \times 5.6\text{B} \approx 45\text{B}$ params.
+    \item \textbf{Total parameters:} 46.7B.
+    \item \textbf{Active parameters per token:} Shared ($\sim$1.7B) + top-2 experts ($2 \times 5.6\text{B} = 11.2\text{B}$) $\approx$ 12.9B.
+\end{itemize}
+
+\textbf{Compute comparison:}
+\begin{itemize}
+    \item \textbf{Dense 45B model:} Every token activates all 45B parameters. Per-token FLOPs $\approx 2P = 90\text{B FLOPs}$ (forward pass).
+    \item \textbf{MoE 8x7B (top-2):} Per-token FLOPs $\approx 2 \times 12.9\text{B} \approx 26\text{B FLOPs}$ (forward pass).
+    \item \textbf{Compute savings:} $\frac{90\text{B}}{26\text{B}} \approx 3.5\times$ less compute per token.
+\end{itemize}
+
+\textbf{However, the savings are not ``free'':}
+\begin{itemize}
+    \item \textbf{Memory:} You still store all 46.7B params ($\sim$93GB in FP16), not just the 12.9B active ones.
+    \item \textbf{Communication:} Expert parallelism requires all-to-all communication to route tokens to the correct GPU holding each expert. This overhead reduces the theoretical $3.5\times$ speedup to roughly $2$--$2.5\times$ in practice.
+    \item \textbf{Router overhead:} Small (a single linear layer per MoE layer), typically $<$1\% of total compute.
+    \item \textbf{Load imbalance:} If experts are unevenly loaded, some GPUs wait while others finish. The effective throughput is limited by the slowest expert.
+\end{itemize}
+
+\textbf{General formula:} For $N$ experts with top-$k$ routing, the compute reduction vs.\ a dense model with equivalent total parameters is approximately $\frac{N}{k}$ for the FFN portion. Since FFN is $\sim$2/3 of transformer FLOPs, the overall speedup is roughly $\frac{1}{1/3 + (2/3) \cdot (k/N)}$. For $N=8, k=2$: $\frac{1}{1/3 + 2/3 \cdot 1/4} = \frac{1}{1/3 + 1/6} = \frac{1}{1/2} = 2\times$. Mixtral beats this generic $2\times$ (the worked $\approx 3.5\times$ above) because its FFN share of compute is far higher than 2/3: GQA shrinks attention while the expert FFNs are wide.
+
+\redflags
+\begin{itemize}
+    \item ``$8\times$ compute savings because only 1/8 of experts are used''---top-2 routing means $2/8 = 1/4$ of experts, and attention parameters are shared (not reduced at all).
+    \item Forgetting that attention is shared and only FFN is sparse---this is the most common estimation error.
+    \item ``Memory savings too''---memory is the \textit{opposite} of saved; you need to hold all experts in memory.
+\end{itemize}
+
+\interviewtest{Can you decompose a system into its components (shared attention vs.\ sparse FFN) and estimate each correctly? Do you understand the distinction between compute savings and memory costs?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows MoE activates a subset of experts and correctly identifies that top-2 from 8 experts means 2/8 of FFN is active. Gets the rough magnitude right.
+    \item \badgeLsix{L6} Separates shared attention from sparse FFN in the calculation. Provides the general formula. Discusses the gap between theoretical speedup and practical speedup (communication overhead, load imbalance).
+    \item \badgeLseven{L7} Reasons about the interaction between MoE sparsity and hardware utilization (small expert FFNs may not saturate GPU compute, reducing the effective speedup). Discusses expert parallelism communication costs quantitatively (all-to-all volume $\propto$ batch\_size $\times$ hidden\_dim). Knows about capacity factor and dropped token tradeoffs.
+\end{itemize}
+
+\followups{``What if we use top-1 instead of top-2?'' ``How does this change for training vs.\ inference?'' ``How does expert parallelism affect the actual wall-clock speedup?'' ``What is the memory overhead of MoE vs.\ the compute savings?''}
+\end{interviewq}
+
+%--- Question 5: Trade-off - INT8 vs INT4 vs FP8 ---
+\begin{interviewq}
+\textbf{Q: INT8 vs INT4 vs FP8 quantization---what is your decision framework?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The choice depends on three factors: target hardware, acceptable accuracy loss, and whether you are quantizing for inference or training.
+
+\begin{table}[H]
+\centering
+\caption{Quantization format decision matrix}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Property} & \textbf{INT8} & \textbf{INT4} & \textbf{FP8 (E4M3)} \\
+\midrule
+Memory reduction & $2\times$ (vs.\ FP16) & $4\times$ (vs.\ FP16) & $2\times$ (vs.\ FP16) \\
+Accuracy loss & Near-zero ($<$0.5\% perplexity) & Moderate (1--3\% perplexity) & Near-zero (similar to INT8) \\
+Hardware support & Broad (A100, V100, CPU) & Limited (needs dequant kernels) & H100+ only \\
+Calibration effort & Minimal (SmoothQuant) & Moderate (GPTQ/AWQ, hours) & Minimal (per-tensor scaling) \\
+Best method & SmoothQuant, W8A8 & GPTQ, AWQ, GGUF & Native FP8 (torch.float8) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{INT8} is the default for inference. SmoothQuant enables both weight and activation quantization (W8A8) by migrating quantization difficulty from activations (which have outlier channels) to weights (which are easier to quantize). Near-zero accuracy loss on most models. Use it on any hardware that supports INT8 tensor cores.
+
+\textbf{INT4} is for memory-constrained deployment. GPTQ uses approximate second-order information (Hessian) to quantize weights layer-by-layer, adjusting remaining weights to compensate for quantization error. AWQ is faster---it identifies and protects the $\sim$1\% of weight channels that correspond to large activation magnitudes. Both produce high-quality 4-bit models, but accuracy degrades more on reasoning, code generation, and math than on general text.
+
+\textbf{FP8} is the new default for H100+ inference (and increasingly training). E4M3 format (4 exponent, 3 mantissa bits) provides better dynamic range than INT8 for the same 8-bit budget. Per-tensor dynamic scaling handles outliers without the need for SmoothQuant-style preprocessing. Native hardware support means minimal kernel engineering.
+
+\textbf{Decision framework:}
+\begin{enumerate}
+    \item H100+ hardware $\to$ FP8 (E4M3) by default---simplest and fastest
+    \item A100/older GPU $\to$ INT8 (SmoothQuant) by default
+    \item Need to fit a larger model on fewer GPUs $\to$ INT4 (AWQ or GPTQ)
+    \item CPU inference (llama.cpp) $\to$ GGUF with mixed precision (important layers at Q5/Q6, others at Q4)
+    \item Training $\to$ FP8 on H100+ for $\sim$$2\times$ throughput; otherwise BF16
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``INT4 is always better because it uses less memory''---INT4 has meaningful accuracy degradation, especially on reasoning tasks. The right precision depends on your accuracy budget.
+    \item ``FP8 and INT8 are the same thing in different formats''---FP8 has floating-point dynamic range (can represent very small and very large values); INT8 has fixed range determined by the scale/zero-point. FP8 handles activation outliers more naturally.
+    \item ``Quantization doesn't affect model quality''---it does, especially at INT4 and below. Always benchmark on your specific task, not just perplexity.
+\end{itemize}
+
+\interviewtest{Do you understand the tradeoff space (memory vs.\ accuracy vs.\ hardware support)? Can you make a practical recommendation based on deployment constraints rather than defaulting to ``lower is better''?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows INT8 is nearly lossless and INT4 degrades quality. Can name at least one method per precision level (GPTQ, SmoothQuant).
+    \item \badgeLsix{L6} Provides the decision framework above. Understands the difference between weight-only quantization (W4A16) and weight+activation quantization (W8A8). Knows that quantization sensitivity is layer- and channel-specific (outlier channels, boundary layers) and should be measured per layer. Discusses FP8's per-tensor scaling mechanism.
+    \item \badgeLseven{L7} Discusses mixed-precision quantization strategies (keep sensitive layers at higher precision, identified by Hessian-based sensitivity analysis). Knows about the SmoothQuant insight (migrating quantization difficulty via mathematically equivalent scaling). Can reason about when quantization-aware training (QAT) is worth the cost vs.\ PTQ.
+\end{itemize}
+
+\followups{``How does SmoothQuant handle activation outliers?'' ``Why does INT4 degrade math and code more than general text?'' ``Can you combine INT4 weights with INT8 activations?'' ``What is the GGUF format and why does it matter for CPU inference?''}
+\end{interviewq}
+
+%--- Question 6: Debugging - Quantized model domain failure ---
+\begin{interviewq}
+\textbf{Q: Your quantized model performs well on benchmarks but fails on specific domains (code, math). Why?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+This is a common and insidious failure mode of quantization. The root cause is that \textbf{quantization is not uniformly harmful---it disproportionately affects tasks requiring precise numerical reasoning and token-level accuracy}.
+
+\textbf{Why code and math are more sensitive:}
+\begin{itemize}
+    \item \textbf{No room for approximation.} In natural language, replacing ``very happy'' with ``happy'' preserves meaning. In code, replacing \texttt{<=} with \texttt{<} is a bug. Quantization introduces small perturbations that are tolerated in language but catastrophic in code/math.
+    \item \textbf{Long reasoning chains.} Math and code require multi-step logical reasoning where errors compound. A small quantization-induced error in step 3 can cascade into a completely wrong answer by step 10. General text generation is more local---each token prediction is relatively independent.
+    \item \textbf{Activation outliers in reasoning heads.} Recent work (e.g., Dettmers et al., 2022) showed that a small number of attention heads have extremely large activation magnitudes. These ``outlier features'' are disproportionately important for reasoning tasks. Aggressive quantization clips these outliers, destroying the reasoning signal while leaving general language capabilities intact.
+    \item \textbf{Precision-sensitive operations.} Softmax over attention logits amplifies small differences---a 0.1 change in a logit can shift the attention distribution significantly. In reasoning tasks where attention must precisely focus on relevant context (e.g., variable bindings in code), this perturbation matters more.
+\end{itemize}
+
+\textbf{How to diagnose:}
+\begin{enumerate}
+    \item Compare quantized vs.\ full-precision performance on domain-specific benchmarks (HumanEval for code, GSM8K for math) rather than general ones (MMLU, perplexity).
+    \item Profile per-layer quantization error: compute the mean squared error between quantized and full-precision outputs at each layer. Layers with high error are candidates for higher precision.
+    \item Check activation histograms for outlier channels---if the distribution has long tails, per-channel or per-token quantization is needed instead of per-tensor.
+\end{enumerate}
+
+\textbf{How to fix:}
+\begin{enumerate}
+    \item \textbf{Mixed-precision quantization:} Keep the layers your per-layer error profile flags as sensitive at INT8 while quantizing the rest to INT4---commonly the first and last few layers and FFN down-projections, sometimes the attention projections.
+    \item \textbf{Use AWQ over naive PTQ:} AWQ specifically protects the salient channels that affect reasoning.
+    \item \textbf{Increase quantization granularity:} Move from per-tensor to per-channel or per-group quantization. GPTQ with 128-element group size significantly outperforms per-tensor INT4.
+    \item \textbf{Quantization-aware training (QAT):} If the accuracy gap is unacceptable, QAT with fine-tuning on domain-specific data can recover most of the loss. This is expensive but effective.
+    \item \textbf{Use a larger base model:} A 70B model quantized to INT4 almost always outperforms a 7B model at FP16 on reasoning tasks. Larger models have more redundancy to absorb quantization error.
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``Quantization affects all tasks equally''---this contradicts well-established empirical findings. Reasoning and structured output tasks are disproportionately affected.
+    \item ``Just use lower-bit quantization and fine-tune''---fine-tuning after quantization helps general quality but does not specifically address the domain sensitivity without domain-specific data.
+    \item ``Perplexity is a good proxy for domain performance''---perplexity can look fine while code pass rates drop by 20\%. Always use task-specific metrics.
+\end{itemize}
+
+\interviewtest{Do you understand that quantization is not a uniform quality degradation? Can you reason about \textit{why} certain tasks are more sensitive? Can you propose targeted fixes rather than generic ``use more bits'' advice?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows that quantization affects different tasks differently and that reasoning tasks are more sensitive. Proposes using higher precision as a fix.
+    \item \badgeLsix{L6} Explains the mechanistic reasons (activation outliers, error compounding in reasoning chains, attention sensitivity). Proposes mixed-precision quantization and per-layer sensitivity analysis as targeted solutions.
+    \item \badgeLseven{L7} Discusses the connection between outlier features and quantization difficulty (Dettmers' LLM.int8() work). Knows about SmoothQuant's migration technique as a principled solution. Can reason about the interaction between model size and quantization robustness (larger models are more robust) and its implications for model selection.
+\end{itemize}
+
+\followups{``How would you identify which layers to keep at higher precision?'' ``Does quantization-aware training help with this?'' ``Is it better to quantize a larger model to INT4 or use a smaller model at FP16?'' ``How do activation outliers form during training?''}
+\end{interviewq}
+
+%--- Question 7: Architecture Design - Knowledge distillation pipeline ---
+\begin{interviewq}
+\textbf{Q: Knowledge distillation: design a pipeline to compress a 70B teacher to a 7B student.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+For LLM distillation at this scale, the \textbf{data-level distillation} approach (generate training data from the teacher, then train the student on it) dominates the classical logit-matching approach, primarily because it does not require simultaneous forward passes through both the 70B teacher and the 7B student.
+
+\textbf{Step 1: Choose the student architecture.}
+Use a well-designed 7B architecture (e.g., Llama-style: 32 layers, 32 heads, GQA with 8 KV heads, SwiGLU FFN, RoPE, RMS norm). \textit{Do not} try to derive the student from the teacher by removing layers---start from a proven architecture. The student should use the same tokenizer as the teacher to enable direct logit comparison if needed.
+
+\textbf{Step 2: Generate distillation data.}
+Run the 70B teacher on a diverse prompt set to generate high-quality completions:
+\begin{itemize}
+    \item \textbf{Scale:} 1--10M examples covering the target task distribution (instruction following, code, math, reasoning, multilingual).
+    \item \textbf{Quality control:} Use nucleus sampling ($p = 0.95$, $T = 0.7$) for diversity. Filter outputs with a reward model or rule-based quality checks.
+    \item \textbf{Chain-of-thought:} For reasoning tasks, generate step-by-step solutions. The student learns the reasoning \textit{process}, not just the final answer---this is the key advantage of distillation over fine-tuning on human data.
+    \item \textbf{Prompt diversity:} Use Self-Instruct or Evol-Instruct to expand the prompt distribution and avoid mode collapse.
+\end{itemize}
+
+\textbf{Step 3: Train the student.}
+\begin{itemize}
+    \item \textbf{Phase 1: Pretraining (optional).} If starting from scratch, pretrain the 7B model on general text data (1--2T tokens). More commonly, start from an existing pretrained 7B checkpoint.
+    \item \textbf{Phase 2: Supervised fine-tuning on teacher data.} Train on the teacher-generated data using standard causal language modeling loss. Learning rate: $2 \times 10^{-5}$, cosine schedule with warmup, 2--3 epochs.
+    \item \textbf{Phase 3 (optional): Logit-matching refinement.} If you have the compute budget, add a KL divergence loss between teacher and student logits on a subset of data. This requires running both models simultaneously, which is expensive at 70B scale but can improve the student by 1--2\% on benchmarks.
+\end{itemize}
+
+\textbf{Step 4: Evaluate and iterate.}
+Benchmark on held-out tasks (MMLU, HumanEval, GSM8K, MT-Bench). The student should recover 85--95\% of the teacher's quality. Common failure modes: repetitive outputs (increase data diversity), degraded reasoning (increase chain-of-thought examples), or poor instruction following (add more instruction-formatted examples).
+
+\textbf{Step 5: Post-training optimization.}
+Apply INT8 quantization to the distilled 7B model for deployment. The 7B student + INT8 quantization gives a $\sim$$10\times$ model size reduction from the 70B teacher with $\sim$5--15\% quality loss.
+
+\redflags
+\begin{itemize}
+    \item ``Match logits between teacher and student for every training example''---this requires running the 70B model on every forward pass, which is prohibitively expensive. Data-level distillation avoids this.
+    \item ``Just train the student on the same data as the teacher''---the student benefits from the teacher's \textit{output distribution}, not the same input data. The teacher's soft labels encode richer information.
+    \item ``Layer-by-layer distillation from 70B to 7B''---the architectures have different depths, widths, and hidden dimensions. Layer matching does not apply cleanly across scale differences this large.
+\end{itemize}
+
+\interviewtest{Do you know the modern LLM distillation pipeline (data generation, not logit matching)? Can you design a complete pipeline with practical details (data diversity, quality filtering, training schedule)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the concept of knowledge distillation and that it involves training a smaller model to mimic a larger one. Can describe the basic KL-based loss.
+    \item \badgeLsix{L6} Proposes data-level distillation as the primary approach for LLM-to-LLM compression. Discusses data diversity, chain-of-thought generation, and quality filtering. Provides a multi-phase training pipeline with concrete hyperparameters.
+    \item \badgeLseven{L7} Discusses the tradeoff between data-level and logit-level distillation quantitatively. Knows about on-policy distillation (generate student completions, have teacher score them, train on teacher-preferred outputs). References successful examples (Orca, Phi, Alpaca) and their specific innovations. Considers the legal/licensing implications of distilling from proprietary models.
+\end{itemize}
+
+\followups{``How much data do you need?'' ``How do you ensure the student doesn't just memorize the teacher's outputs?'' ``Can you distill reasoning ability or just surface-level patterns?'' ``What is the difference between distillation and fine-tuning on synthetic data?''}
+\end{interviewq}
+
+%--- Question 8: Debugging - MoE routing collapse ---
+\begin{interviewq}
+\textbf{Q: MoE routing collapse: what is it, how do you detect it, and how do you fix it?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{What routing collapse is.} During training, the router learns to send most or all tokens to a small subset of ``popular'' experts while the remaining experts receive little to no data. This creates a positive feedback loop: popular experts train on more data, become better, and attract even more tokens. Starved experts never improve and waste parameters. In the extreme case, a MoE with 8 experts degenerates into a model using 1--2 experts, losing the capacity advantage entirely.
+
+\textbf{How to detect it.} Monitor these metrics during training:
+\begin{itemize}
+    \item \textbf{Expert utilization:} Fraction of tokens routed to each expert per batch. Healthy: roughly uniform ($1/N \pm 10\%$). Collapsed: one expert gets $>$50\% of tokens.
+    \item \textbf{Router entropy:} Entropy of the router's softmax distribution. Healthy: close to $\log(N)$ (uniform). Collapsed: close to 0 (deterministic routing).
+    \item \textbf{Expert weight norms:} If some experts have much larger norms than others, the popular experts have trained more. Starved experts often retain near-initialization weights.
+    \item \textbf{Loss plateau:} Routing collapse often manifests as a training loss plateau---the model cannot improve because it is effectively using fewer parameters than a dense model of the same active size.
+\end{itemize}
+
+\textbf{Root causes:}
+\begin{itemize}
+    \item \textbf{Rich-get-richer dynamics.} The router gradient pushes tokens toward experts that process them well, which are the experts that have seen the most data. Without explicit counterbalancing, this is unstable.
+    \item \textbf{Small batch size.} With few tokens per batch, the load balancing loss provides weak signal (not enough tokens to distribute).
+    \item \textbf{Fine-tuning on narrow domains.} A pretrained MoE fine-tuned on domain-specific data (e.g., only code) may collapse because the domain does not need all experts.
+\end{itemize}
+
+\textbf{How to fix it:}
+\begin{enumerate}
+    \item \textbf{Auxiliary load-balancing loss.} Add $\loss_{\text{balance}} = \alpha \cdot N \cdot \sum_i f_i \cdot P_i$ where $f_i$ is the token fraction and $P_i$ is the mean router probability for expert $i$. Coefficient $\alpha = 0.01$ is typical. This is the standard fix.
+    \item \textbf{Expert capacity factor.} Cap the maximum tokens per expert (e.g., $1.25 \times \text{average}$). Overflow tokens go to a fallback expert or are dropped. Forces utilization of underused experts.
+    \item \textbf{Expert choice routing.} Invert the routing: each expert selects its top-$k$ tokens (instead of tokens choosing experts). This guarantees perfect load balance by construction. Used in some Google MoE work.
+    \item \textbf{Noise injection.} Add Gaussian noise to router logits during training to encourage exploration of underused experts.
+    \item \textbf{Router z-loss.} Penalize the magnitude of router logits to prevent overconfident routing: $\loss_z = \frac{1}{B} \sum_b (\log \sum_i \exp(z_i^{(b)}))^2$. This keeps the router distribution soft and explorative.
+    \item \textbf{For fine-tuning specifically:} Freeze the router weights (use pretrained routing) and only fine-tune expert parameters. Or merge experts before fine-tuning and use a dense model.
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``Just increase the load balancing loss coefficient''---too high a coefficient forces uniform routing at the expense of specialization, which is worse than mild imbalance. The tradeoff is specialization vs.\ utilization.
+    \item ``Routing collapse doesn't matter if the model loss is decreasing''---the model may converge to a poor solution where it effectively uses only 2 of 8 experts, wasting 75\% of its parameters.
+    \item Not monitoring expert utilization during training---routing collapse is silent unless you track per-expert statistics.
+\end{itemize}
+
+\interviewtest{Do you understand the training dynamics of MoE models beyond just the architecture? Can you diagnose a subtle failure mode from symptoms? Do you know multiple mitigation strategies and their tradeoffs?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows routing collapse exists and that it means some experts are underutilized. Can describe the load balancing loss as a solution.
+    \item \badgeLsix{L6} Explains the rich-get-richer dynamics mechanistically. Lists multiple detection methods (utilization tracking, router entropy, weight norms). Provides several fixes with tradeoffs (balancing loss coefficient tuning, expert choice routing, noise injection).
+    \item \badgeLseven{L7} Discusses expert choice routing and its guarantees. Knows about the router z-loss and its interaction with the balancing loss. Understands the fine-tuning-specific collapse problem and proposes router freezing or expert merging. Can reason about the relationship between batch size and load balancing stability.
+\end{itemize}
+
+\followups{``What is the expert capacity factor?'' ``How does expert choice routing differ from token choice routing?'' ``What happens to the dropped tokens when expert capacity is exceeded?'' ``How do you balance specialization vs.\ utilization?''}
+\end{interviewq}
+
+%--- Question 9: Trade-off - Structured vs unstructured pruning ---
+\begin{interviewq}
+\textbf{Q: Structured vs unstructured pruning---which actually gives real speedup?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The short answer is: \textbf{structured pruning gives real speedup on current hardware; unstructured pruning mostly does not}---unless you have specialized sparse hardware support.
+
+\textbf{Unstructured pruning} sets individual weights to zero anywhere in the weight matrix. It achieves very high sparsity (90--99\%) with minimal accuracy loss because the model can choose the optimal weights to remove. However, the resulting sparse matrices have \textit{irregular} sparsity patterns. GPUs are optimized for dense matrix multiplications via tensor cores---irregular sparsity breaks the memory access patterns that make tensor cores fast. A 90\% sparse matrix stored in CSR format often runs \textit{slower} than the dense original on a GPU because of the indexing overhead.
+
+\textbf{The exception: N:M sparsity.} NVIDIA Ampere+ GPUs (A100, H100) support 2:4 structured sparsity in hardware: for every 4 consecutive elements, exactly 2 are zero. The sparse tensor core skips zero elements, giving $2\times$ speedup with 50\% sparsity. This is the only form of ``unstructured'' pruning that delivers real hardware speedup, and it is technically a semi-structured pattern.
+
+\textbf{Structured pruning} removes entire rows, columns, channels, attention heads, or layers. The result is a \textit{smaller dense model}---no sparse matrix formats needed. A model with 30\% of channels pruned is simply a model with 70\% as many channels, running at full GPU utilization. The tradeoff: structured pruning is coarser-grained, so achieving the same sparsity level as unstructured pruning degrades accuracy more.
+
+\textbf{Practical comparison:}
+\begin{itemize}
+    \item \textbf{90\% unstructured sparsity:} Impressive on paper; no speedup on standard GPUs. Useful only if you have sparse hardware or need to reduce model storage size (not inference speed).
+    \item \textbf{2:4 N:M sparsity:} $2\times$ speedup, $\sim$1\% accuracy loss. Supported by SparseGPT, ASP (Automatic Sparsity) in NVIDIA libraries.
+    \item \textbf{30--50\% structured pruning (channels/heads):} $1.3$--$2\times$ real speedup. Requires fine-tuning after pruning. Accuracy loss depends on task and pruning granularity.
+    \item \textbf{Layer removal:} Removing 20--30\% of layers from deep transformers (with fine-tuning) can give proportional speedup with moderate accuracy loss. ShortGPT and layer-pruning work has shown this is viable for overparameterized models.
+\end{itemize}
+
+\textbf{Decision framework:}
+\begin{enumerate}
+    \item Need $2\times$ speedup with minimal effort $\to$ 2:4 N:M sparsity (if on Ampere+)
+    \item Need proportional speedup on any hardware $\to$ structured pruning (channels, heads, layers)
+    \item Need maximum compression ratio for storage $\to$ unstructured pruning
+    \item Want the best compression pipeline $\to$ structured pruning $+$ quantization (combine both)
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``90\% sparsity means $10\times$ speedup''---unstructured sparsity does not translate to speedup on dense hardware. This is the most common misconception.
+    \item ``Pruning is free---just remove small weights''---pruning requires fine-tuning to recover accuracy, and identifying which weights to prune (magnitude, gradient, Hessian-based) is itself nontrivial.
+    \item Treating all pruning methods as equivalent without distinguishing structured from unstructured.
+\end{itemize}
+
+\interviewtest{Do you understand the gap between theoretical sparsity and actual hardware speedup? Can you reason about why hardware architecture determines which compression techniques are effective?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the difference between structured and unstructured pruning. Understands that structured pruning produces smaller dense tensors while unstructured produces sparse matrices.
+    \item \badgeLsix{L6} Explains why unstructured pruning does not give GPU speedup (irregular memory access, tensor core assumptions). Knows about N:M sparsity as the hardware exception. Provides the decision framework above with concrete speedup numbers.
+    \item \badgeLseven{L7} Discusses the interaction between pruning and quantization (prune first, then quantize). Knows about SparseGPT and its Hessian-based approach. Can reason about the lottery ticket hypothesis and its practical implications (sparse subnetworks exist but finding them is expensive). Discusses emerging sparse hardware beyond N:M (e.g., Cerebras, Graphcore support for general sparsity).
+\end{itemize}
+
+\followups{``What is 2:4 sparsity and how does it work in hardware?'' ``Can you combine pruning with quantization?'' ``What is SparseGPT?'' ``How do you decide which channels or heads to prune?''}
+\end{interviewq}
+
+%--- Question 10: Architecture Design - On-device efficient architecture ---
+\begin{interviewq}
+\textbf{Q: Design an efficient architecture for real-time video understanding on edge devices.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Video understanding on edge devices (e.g., smart cameras, drones, AR glasses) requires processing temporal sequences of frames under extreme latency and power constraints. This is fundamentally harder than image classification because of the temporal dimension.
+
+\textbf{Step 1: Problem decomposition.}
+Split the problem into spatial (per-frame) and temporal (cross-frame) processing:
+\begin{itemize}
+    \item \textbf{Spatial backbone:} MobileNetV3-Small or EfficientNet-B0 for per-frame feature extraction. These are well-optimized for mobile hardware.
+    \item \textbf{Temporal module:} Lightweight temporal aggregation over frame features. Options: (a) temporal shift module (TSM---shifts feature channels across time with zero extra compute), (b) lightweight 1D temporal convolution over frame features, (c) causal moving average (for streaming).
+\end{itemize}
+
+\textbf{Step 2: Reduce temporal redundancy.}
+Video frames are $>$90\% redundant between consecutive frames. Exploit this:
+\begin{itemize}
+    \item \textbf{Key frame + delta:} Run the full spatial backbone only on key frames (every 5--10 frames). For intermediate frames, compute only the difference from the previous key frame embedding using a lightweight delta network.
+    \item \textbf{Early exit:} If the classification confidence is high on the current key frame, skip the temporal module entirely.
+    \item \textbf{Dynamic resolution:} Process early layers at full resolution, later layers at reduced resolution. Or dynamically lower resolution when the scene is static.
+\end{itemize}
+
+\textbf{Step 3: Quantization and compilation.}
+INT8 quantization of both spatial and temporal modules. Export via TFLite or CoreML with hardware delegation (NPU for convolutions, DSP for integer operations). Profile on target hardware---mobile NPUs can process 30+ INT8 MobileNetV3 inferences per second.
+
+\textbf{Step 4: Latency budget.}
+For 30fps video at $<$100ms latency per action classification:
+\begin{itemize}
+    \item Spatial backbone: 5--10ms per frame (MobileNetV3-Small + INT8)
+    \item Process 1 key frame per 5 frames $\to$ 6 key frames per second
+    \item Temporal module over last 16 key frames: $<$2ms (lightweight 1D conv)
+    \item Total: $\sim$8--12ms per classification step, well within budget
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item ``Use a 3D CNN (C3D, SlowFast) on the edge''---3D convolutions are extremely compute-intensive and not feasible on edge devices. The temporal shift module achieves comparable accuracy at zero extra FLOPs.
+    \item ``Process every frame through the full model''---this ignores temporal redundancy and wastes 90\% of compute on nearly identical frames.
+    \item ``Use a Vision Transformer for each frame''---ViT variants are 5--10$\times$ more expensive than MobileNets at comparable accuracy on mobile hardware.
+\end{itemize}
+
+\interviewtest{Can you design a system under extreme resource constraints? Do you understand that efficiency requires architectural innovation (temporal shift, key frame selection), not just model compression? Can you provide concrete latency estimates?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes a mobile-friendly backbone and mentions quantization. Understands that video adds a temporal dimension that must be handled efficiently.
+    \item \badgeLsix{L6} Designs the spatial-temporal decomposition. Proposes temporal redundancy reduction (key frame strategy). Provides concrete latency estimates for the target hardware. Knows about TSM and its zero-cost temporal modeling.
+    \item \badgeLseven{L7} Designs dynamic compute allocation (early exit, adaptive resolution). Discusses the key frame selection policy (how to trigger a full recompute---scene change detection, confidence drop). Knows about neural architecture search for edge video models (e.g., X3D, MoViNet). Considers power consumption alongside latency (important for battery-powered devices).
+\end{itemize}
+
+\followups{``How do you handle scene changes in the key frame approach?'' ``What is the temporal shift module and why is it zero-cost?'' ``How would you adapt this for action detection (localization, not just classification)?'' ``What hardware acceleration is available on modern phones for this?''}
+\end{interviewq}

@@ -1,0 +1,1584 @@
+\chapter{Loss Functions: The Interview Playbook}
+\label{chap:loss_functions}
+
+\begin{tldr}
+Loss functions translate your learning objective into a mathematical optimization problem. The choice of loss function determines what your model learns to prioritize. This chapter covers classification losses (cross-entropy, focal, asymmetric), metric learning losses (contrastive, triplet, InfoNCE, ArcFace), ranking losses (BPR, LambdaRank), regression losses, and specialized losses for generation, segmentation, and knowledge distillation. Understanding \textit{when} to use each loss is as important as understanding the mathematics.
+\end{tldr}
+
+\section{The Philosophy of Loss Functions}
+\label{sec:loss_philosophy}
+
+\subsection{What Loss Functions Actually Do}
+
+A loss function $\loss: \mathcal{Y} \times \mathcal{Y} \to \R_{\geq 0}$ measures the discrepancy between predictions $\hat{y}$ and targets $y$. The goal of training is to find parameters $\theta^*$ that minimize the expected loss:
+\begin{equation}
+\theta^* = \argmin_\theta \E_{(x,y) \sim \mathcal{D}}[\loss(f_\theta(x), y)]
+\end{equation}
+
+Four things to keep in mind at the whiteboard:
+
+\begin{enumerate}
+    \item \textbf{Proxy vs. True Objective}: The loss is almost always a \textit{proxy} for what we actually care about. We minimize cross-entropy but care about accuracy. We minimize MSE but care about perceptual quality.
+
+    \item \textbf{Gradient Properties}: The loss must provide useful gradients. A loss that is flat everywhere or extremely sharp provides no useful learning signal.
+
+    \item \textbf{Probabilistic Interpretation}: Many losses correspond to maximum likelihood estimation under specific distributional assumptions.
+
+    \item \textbf{Implicit Regularization}: Different losses implicitly regularize differently. Cross-entropy with softmax encourages confidence; label smoothing penalizes it.
+\end{enumerate}
+
+\begin{keyinsight}
+The loss function is how you communicate your objective to the optimizer. If you choose the wrong loss, you optimize for the wrong thing---even if training ``succeeds.'' A model trained with the wrong loss may achieve low training loss while failing at the actual task.
+\end{keyinsight}
+
+\subsection{A Taxonomy of Loss Functions}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    every node/.style={font=\small},
+    box/.style={rectangle, draw, rounded corners, minimum width=2.5cm, minimum height=0.8cm, align=center},
+    rootbox/.style={box, fill=lightblue, font=\bfseries},
+    level1/.style={box, fill=lightgreen},
+    level2/.style={box, fill=lightyellow, minimum width=2cm, font=\footnotesize}
+]
+    % Root
+    \node[rootbox] (root) {Loss Functions};
+
+    % Level 1
+    \node[level1, below left=1.5cm and 3cm of root] (class) {Classification};
+    \node[level1, below left=1.5cm and 0cm of root] (metric) {Metric Learning};
+    \node[level1, below right=1.5cm and 0cm of root] (ranking) {Ranking};
+    \node[level1, below right=1.5cm and 3cm of root] (other) {Specialized};
+
+    % Level 2 - Classification
+    \node[level2, below=0.8cm of class, xshift=-1.2cm] (ce) {Cross-Entropy};
+    \node[level2, below=0.8cm of class, xshift=1.2cm] (focal) {Focal};
+    \node[level2, below=1.8cm of class, xshift=-1.2cm] (bce) {BCE};
+    \node[level2, below=1.8cm of class, xshift=1.2cm] (asym) {Asymmetric};
+
+    % Level 2 - Metric
+    \node[level2, below=0.8cm of metric, xshift=-1cm] (contr) {Contrastive};
+    \node[level2, below=0.8cm of metric, xshift=1cm] (triplet) {Triplet};
+    \node[level2, below=1.8cm of metric, xshift=-1cm] (infonce) {InfoNCE};
+    \node[level2, below=1.8cm of metric, xshift=1cm] (arcface) {ArcFace};
+
+    % Level 2 - Ranking
+    \node[level2, below=0.8cm of ranking, xshift=-0.8cm] (bpr) {BPR};
+    \node[level2, below=0.8cm of ranking, xshift=0.8cm] (lambda) {Lambda};
+    \node[level2, below=1.8cm of ranking] (listwise) {Listwise};
+
+    % Level 2 - Other
+    \node[level2, below=0.8cm of other, xshift=-0.8cm] (mse) {MSE/MAE};
+    \node[level2, below=0.8cm of other, xshift=0.8cm] (ctc) {CTC};
+    \node[level2, below=1.8cm of other, xshift=-0.8cm] (dice) {Dice/IoU};
+    \node[level2, below=1.8cm of other, xshift=0.8cm] (kd) {Distillation};
+
+    % Edges
+    \draw[-] (root) -- (class);
+    \draw[-] (root) -- (metric);
+    \draw[-] (root) -- (ranking);
+    \draw[-] (root) -- (other);
+
+    \draw[-] (class) -- (ce);
+    \draw[-] (class) -- (focal);
+    \draw[-] (class) -- (bce);
+    \draw[-] (class) -- (asym);
+
+    \draw[-] (metric) -- (contr);
+    \draw[-] (metric) -- (triplet);
+    \draw[-] (metric) -- (infonce);
+    \draw[-] (metric) -- (arcface);
+
+    \draw[-] (ranking) -- (bpr);
+    \draw[-] (ranking) -- (lambda);
+    \draw[-] (ranking) -- (listwise);
+
+    \draw[-] (other) -- (mse);
+    \draw[-] (other) -- (ctc);
+    \draw[-] (other) -- (dice);
+    \draw[-] (other) -- (kd);
+\end{tikzpicture}
+\caption{Taxonomy of loss functions covered in this chapter.}
+\label{fig:loss_taxonomy}
+\end{figure}
+
+%==============================================================================
+\section{Classification Losses}
+\label{sec:classification_losses}
+%==============================================================================
+
+\subsection{Cross-Entropy Loss: The Foundation}
+
+\textbf{What it is.} The default loss for multi-class classification. It measures how far your predicted probability distribution is from the true label. Cross-entropy equals minimizing KL divergence between true and predicted distributions.
+
+\textbf{Key formula.} For $K$ classes, one-hot label $\vy$, and predictions $\hat{\vy} = \softmax(\vz)$:
+
+\begin{mathresult}{Cross-Entropy Loss}
+\begin{equation}
+\loss_{\text{CE}}(\vy, \hat{\vy}) = -\sum_{k=1}^{K} y_k \log \hat{y}_k = -\log \hat{y}_c
+\end{equation}
+where $c$ is the index of the true class (i.e., $y_c = 1$).
+\end{mathresult}
+
+In terms of logits $\vz$ with true class $c$:
+\begin{equation}
+\loss_{\text{CE}}(\vz, c) = -z_c + \log\sum_{k=1}^{K} e^{z_k} = \log\sum_{k=1}^{K} e^{z_k} - z_c
+\label{eq:ce_logits}
+\end{equation}
+
+\begin{keyinsight}
+Minimizing cross-entropy is equivalent to minimizing KL divergence between the true distribution and the predicted distribution. Since entropy of a one-hot target is zero, the entire gap between the two distributions comes from the model's predictions.
+\end{keyinsight}
+
+\textbf{Gradient properties you should know:}
+\begin{itemize}
+    \item The gradient is simply $\hat{y}_k - y_k$: the difference between prediction and target.
+    \item For the correct class, gradient magnitude is $|1 - \hat{y}_c|$---large when wrong, small when right. Self-correcting.
+    \item Gradients for incorrect classes push their logits down proportionally to their predicted probability.
+    \item Gradients \textit{with respect to the logits} are bounded in $[-1, 1]$, so the loss itself never injects exploding values. Caveat: this does not bound \textit{parameter} gradients---backpropagation multiplies the logit gradient by activations, so gradients can still explode upstream of the loss.
+\end{itemize}
+
+\subsubsection{Numerical Stability}
+
+Direct computation of $\log(\softmax(\vz))$ is numerically unstable. The LogSumExp trick provides stability:
+\begin{equation}
+\log\sum_k e^{z_k} = m + \log\sum_k e^{z_k - m}, \quad m = \max_k z_k
+\end{equation}
+
+Now all exponents are $\leq 0$, preventing overflow. This is implemented as \texttt{log\_softmax} in modern frameworks.
+
+\begin{warningbox}
+Always use \texttt{CrossEntropyLoss} with raw logits or \texttt{log\_softmax} + \texttt{NLLLoss}. Never compute \texttt{softmax} followed by \texttt{log}---this loses numerical precision and can cause NaN gradients.
+\end{warningbox}
+
+\textbf{When to use.} Standard multi-class classification where exactly one class is correct.
+
+\textbf{Pitfalls.} Sensitive to class imbalance (majority class dominates the gradient); encourages overconfidence on training data; the logit-based form is essential for numerical stability.
+
+%------------------------------------------------------------------------------
+\subsection{Binary Cross-Entropy (BCE)}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} Cross-entropy for binary or multi-label problems, applied independently per output.
+
+\begin{mathresult}{Binary Cross-Entropy}
+\begin{equation}
+\loss_{\text{BCE}}(y, \hat{y}) = -y \log(\hat{y}) - (1-y) \log(1-\hat{y})
+\end{equation}
+where $y \in \{0, 1\}$ and $\hat{y} = \sigma(z) \in (0, 1)$.
+\end{mathresult}
+
+\textbf{Logits form.} Always use the logits form (\texttt{BCEWithLogitsLoss}) for numerical stability:
+\begin{equation}
+\loss_{\text{BCE-logits}}(y, z) = \max(z, 0) - yz + \log(1 + e^{-|z|})
+\end{equation}
+
+This fuses the sigmoid and log operations to avoid computing $\log(0)$.
+
+\subsubsection{Multi-Label Classification}
+
+For $K$ independent labels, apply BCE to each:
+\begin{equation}
+\loss_{\text{multi-label}} = \frac{1}{K}\sum_{k=1}^{K} \loss_{\text{BCE}}(y_k, \hat{y}_k)
+\end{equation}
+
+\begin{interviewq}
+\textbf{Q: When do you use softmax cross-entropy vs.\ sigmoid BCE?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer The choice hinges on whether classes are \textbf{mutually exclusive}. Softmax CE assumes exactly one correct class and enforces $\sum_k \hat{y}_k = 1$, coupling all outputs through the normalization denominator. Sigmoid BCE treats each output independently: each logit passes through its own sigmoid, so outputs are decoupled and any combination of labels can be active simultaneously.
+
+Use softmax CE for single-label classification (``is this a cat, dog, or bird?''). Use sigmoid BCE for multi-label classification (``does this image contain a cat? a dog? a bird?''). Using softmax for multi-label is a common bug: it forces the model to allocate probability mass across labels that are not actually competing, suppressing co-occurring labels.
+
+At scale (10K+ classes), softmax CE still works but becomes expensive. The denominator $\sum_k e^{z_k}$ requires computing all logits. Techniques like sampled softmax, noise-contrastive estimation (NCE), or hierarchical softmax reduce this cost. Sigmoid BCE scales naturally because each output is independent.
+
+For hierarchical labels (e.g., ``animal $\to$ dog $\to$ retriever''), neither vanilla softmax nor sigmoid is ideal. Options include: (1) sigmoid BCE with a hierarchy-aware loss that penalizes violations of the hierarchy, (2) separate softmax heads at each level with consistency constraints, or (3) treating it as multi-label with sigmoid BCE and accepting redundant labels.
+
+\redflags
+\begin{itemize}
+    \item ``Softmax and sigmoid are interchangeable for binary classification'' --- this ignores the coupling in softmax across outputs.
+    \item ``I always use softmax because it gives probabilities'' --- sigmoid outputs are also valid probabilities; the distinction is about independence, not probability.
+\end{itemize}
+
+\interviewtest{Whether you understand the structural assumption (mutual exclusivity) baked into softmax normalization and can map problem structure to loss choice. This also probes awareness of scaling issues and hierarchical label structures.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly identifies mutual exclusivity as the deciding factor, gives concrete examples.
+    \item \badgeLsix{L6} Discusses scaling challenges with large label spaces, mentions sampled softmax or NCE. Explains gradient coupling in softmax.
+    \item \badgeLseven{L7} Addresses hierarchical and partial label settings, discusses calibration differences between the two formulations, connects to real system design decisions.
+\end{itemize}
+
+\followups{``What if you have 10,000 classes---does softmax still work?'' ``How do you handle hierarchical labels?'' ``Can you use sigmoid BCE for single-label classification?''}
+\end{interviewq}
+
+\textbf{When to use.} Binary classification, multi-label classification, any setting where labels are independent.
+
+\textbf{Pitfalls.} Must use logits form for stability; easy to accidentally apply softmax CE to a multi-label problem (a common bug).
+
+%------------------------------------------------------------------------------
+\subsection{Focal Loss}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} A modification of cross-entropy that down-weights easy examples so the model focuses on hard ones. Invented for object detection where 99.9\% of anchors are background.
+
+\begin{mathresult}{Focal Loss}
+\begin{equation}
+\loss_{\text{FL}}(p_t) = -\alpha_t (1 - p_t)^\gamma \log(p_t)
+\end{equation}
+where $p_t = \hat{y}$ if $y=1$ else $1-\hat{y}$ (predicted probability for the true class), $\gamma \geq 0$ is the focusing parameter, and $\alpha_t$ is a class-balancing weight.
+\end{mathresult}
+
+\subsubsection{How the Modulating Factor Works}
+
+The factor $(1-p_t)^\gamma$ does the heavy lifting:
+
+\begin{itemize}
+    \item \textbf{Easy examples} ($p_t \to 1$): Factor $\to 0$, loss heavily down-weighted
+    \item \textbf{Hard examples} ($p_t \to 0$): Factor $\to 1$, full loss contribution
+    \item \textbf{$\gamma = 0$}: Reduces to standard cross-entropy
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Effect of focal loss modulating factor for different $\gamma$ values}
+\begin{tabular}{c|cccc}
+\toprule
+$p_t$ & $\gamma=0$ & $\gamma=1$ & $\gamma=2$ & $\gamma=5$ \\
+\midrule
+0.9 & 1.0 & 0.1 & 0.01 & 0.00001 \\
+0.5 & 1.0 & 0.5 & 0.25 & 0.03125 \\
+0.1 & 1.0 & 0.9 & 0.81 & 0.59049 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+With $\gamma = 2$, an easy example with $p_t = 0.9$ contributes only 1\% of its original loss, while a hard example with $p_t = 0.1$ retains 81\%.
+
+\subsubsection{When to Use Focal Loss}
+
+\begin{itemize}
+    \item \textbf{Extreme class imbalance}: Object detection (99.9\% background)
+    \item \textbf{Dense prediction}: Semantic segmentation with rare classes
+    \item \textbf{Multi-label with rare positives}: When positive rate per label is very low
+\end{itemize}
+
+\begin{warningbox}
+Focal loss can under-optimize ``easy'' positive examples. If all positive examples matter equally (not just hard ones), standard cross-entropy with class weights may be preferable.
+\end{warningbox}
+
+\textbf{Pitfalls.} $\gamma$ is sensitive---too high and the model ignores everything except the hardest cases (which may include mislabeled data). Start with $\gamma = 2$, $\alpha = 0.25$.
+
+\begin{keyinsight}
+The default $\alpha = 0.25$ is a classic interview gotcha: the \textit{rare} foreground class gets the \textit{lower} weight ($\alpha_t = 0.25$ for positives, $0.75$ for negatives)---the opposite of inverse-frequency weighting. The reason is that $(1-p_t)^\gamma$ already suppresses the abundant easy negatives so aggressively that positives would otherwise dominate the loss; $\alpha$ rebalances slightly back toward negatives. $\alpha$ and $\gamma$ must therefore be tuned together, not independently.
+\end{keyinsight}
+
+%------------------------------------------------------------------------------
+\subsection{Label Smoothing}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} Replace hard one-hot targets with soft targets that put a small amount of probability on every class. This prevents the model from becoming pathologically overconfident.
+
+\textbf{Key formula:}
+\begin{equation}
+y_k^{\text{smooth}} = \begin{cases}
+1 - \epsilon + \frac{\epsilon}{K} & \text{if } k = c \\
+\frac{\epsilon}{K} & \text{otherwise}
+\end{cases}
+\end{equation}
+
+\begin{example}
+With $K=4$ classes, $\epsilon=0.1$:
+\begin{itemize}
+    \item Hard target: $[0, 0, 1, 0]$
+    \item Smoothed target: $[0.025, 0.025, 0.925, 0.025]$
+\end{itemize}
+\end{example}
+
+Label smoothing adds an entropy regularization term that prevents overconfidence.
+
+\subsubsection{Effects of Label Smoothing}
+
+\begin{enumerate}
+    \item \textbf{Prevents overconfidence}: The model cannot achieve zero loss, limiting how extreme logits can become.
+
+    \item \textbf{Better calibration}: Predictions become more calibrated (confidence matches accuracy).
+
+    \item \textbf{Regularization}: Encourages more uniform (less confident) predictions, acting as regularization.
+
+    \item \textbf{Softer decision boundaries}: Penalizes being ``too sure'' even when correct.
+\end{enumerate}
+
+\subsubsection{When to Use Label Smoothing}
+
+\begin{itemize}
+    \item Large models prone to overconfidence
+    \item When calibrated probabilities matter (not just rankings)
+    \item \textbf{Caution with knowledge distillation}: M\"uller et al.\ (2019) showed that label-smoothed \textit{teachers} distill \textit{worse}---smoothing collapses the fine-grained logit geometry (relative probabilities among wrong classes) that distillation transfers. Do not smooth the teacher just because you plan to distill.
+    \item \textbf{Multi-label}: Well-defined (smooth each BCE target: $y \to y(1-\epsilon) + \epsilon/2$) but much less standard than in the softmax setting
+\end{itemize}
+
+\textbf{Pitfalls.} Typical $\epsilon = 0.1$. Too large and you destroy the signal; too small and it has no effect. Not appropriate when you genuinely need the model to be highly confident.
+
+%------------------------------------------------------------------------------
+\subsection{Asymmetric Loss for Multi-Label}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} A focal-loss variant designed for multi-label classification, where each label independently has far more negatives than positives. It applies stronger down-weighting to easy negatives than to easy positives.
+
+\begin{mathresult}{Asymmetric Loss}
+\begin{equation}
+\loss_{\text{ASL}} = \begin{cases}
+-(1-p)^{\gamma_+} \log(p) & \text{if } y = 1 \\
+-(p_m)^{\gamma_-} \log(1-p_m) & \text{if } y = 0
+\end{cases}
+\end{equation}
+where $p = \sigma(z)$, $p_m = \max(p - m, 0)$ is probability shifted by margin $m$, $\gamma_+$ is focusing for positives, and $\gamma_- > \gamma_+$ is (stronger) focusing for negatives.
+\end{mathresult}
+
+\subsubsection{Components}
+
+\begin{enumerate}
+    \item \textbf{Asymmetric focusing}: $\gamma_- > \gamma_+$ down-weights easy negatives more than easy positives.
+
+    \item \textbf{Probability shifting}: The margin $m$ (typically 0.05) means very easy negatives ($p < m$) are completely ignored.
+\end{enumerate}
+
+\subsubsection{Typical Hyperparameters}
+
+\begin{itemize}
+    \item $\gamma_+ = 0$ (no focusing on positives)
+    \item $\gamma_- = 4$ (strong focusing on negatives)
+    \item $m = 0.05$ (ignore negatives with $p < 0.05$)
+\end{itemize}
+
+\textbf{When to use.} Multi-label classification with long-tail label distributions (e.g., image tagging, document categorization).
+
+\textbf{Pitfalls.} Three hyperparameters to tune ($\gamma_+$, $\gamma_-$, $m$). Start with the defaults above.
+
+%------------------------------------------------------------------------------
+\subsection{Class-Weighted Cross-Entropy}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} Weight the loss by inverse class frequency so rare classes get proportionally louder gradients.
+
+\begin{equation}
+\loss_{\text{weighted}} = -w_c \log\hat{y}_c
+\end{equation}
+
+\subsubsection{Common Weighting Schemes}
+
+\begin{enumerate}
+    \item \textbf{Inverse frequency}: $w_c = \frac{N}{N_c}$ where $N_c$ is count of class $c$
+
+    \item \textbf{Inverse square root}: $w_c = \sqrt{\frac{N}{N_c}}$ (less aggressive)
+
+    \item \textbf{Effective number}: $w_c = \frac{1-\beta}{1-\beta^{N_c}}$ for $\beta \in [0,1)$
+\end{enumerate}
+
+\begin{warningbox}
+Extreme weights (e.g., 1000:1 for rare classes) can cause training instability. Consider combining with focal loss or using the effective number formulation with $\beta = 0.9999$.
+\end{warningbox}
+
+\textbf{When to use.} Moderate class imbalance where you want a simple, interpretable fix.
+
+\textbf{Pitfalls.} Weights are dataset-level, not example-level---they don't distinguish hard from easy examples within a class (focal loss does).
+
+\begin{interviewq}
+\textbf{Q: Your model's training loss is decreasing but validation loss curves show the model is increasingly miscalibrated. What loss function issue could cause this?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Symptoms:} Training loss decreasing normally. Validation accuracy may be fine or even improving. But reliability diagrams show the model is overconfident: predicted probabilities do not match empirical frequencies (e.g., when the model says 90\% confidence, it is correct only 75\% of the time). Expected Calibration Error (ECE) is increasing.
+
+\textbf{Hypotheses (ranked by likelihood):}
+
+\textit{H1: Standard cross-entropy without regularization.} Cross-entropy rewards confidence---there is no penalty for being overconfident as long as the prediction is correct. As training progresses, the model pushes logits to larger magnitudes, driving predicted probabilities toward 0 or 1. This reduces loss but destroys calibration. The loss keeps decreasing because $-\log(0.999) < -\log(0.95)$, even though both predictions are correct.
+
+\textit{H2: Class imbalance amplifying miscalibration.} If the dataset is imbalanced, the model becomes overconfident on the majority class. The loss is dominated by majority-class examples, and the model learns to predict high confidence for the majority class regardless of the input.
+
+\textit{H3: Temperature of the softmax is implicitly too low.} The model's logit magnitudes grow during training, effectively lowering the temperature of the softmax distribution and producing sharper (overconfident) predictions.
+
+\textbf{Experiments to confirm:}
+\begin{enumerate}
+    \item Plot reliability diagrams (calibration curves) at different training checkpoints to confirm calibration is degrading over time
+    \item Monitor logit magnitude statistics (mean, max, variance) during training---if they grow unboundedly, this confirms the overconfidence hypothesis
+    \item Compare ECE at early stopping checkpoint vs.\ final checkpoint
+\end{enumerate}
+
+\textbf{Resolution:}
+\begin{itemize}
+    \item \textbf{Label smoothing} ($\epsilon = 0.1$): Prevents logits from growing without bound because the target is no longer a one-hot vector. The model cannot achieve zero loss, which caps logit magnitudes.
+    \item \textbf{Post-hoc temperature scaling}: Train a single temperature parameter $T$ on a validation set to minimize NLL: $p_{\text{calibrated}} = \softmax(\vz / T)$. This is the simplest and most effective calibration fix.
+    \item \textbf{Focal loss}: Down-weights easy (already confident) examples, reducing the incentive to push already-correct predictions to extreme confidence.
+    \item \textbf{Mixup / CutMix}: Creates soft targets naturally, similar effect to label smoothing.
+    \item For class imbalance specifically: class-balanced weighting or focal loss with $\alpha_t$ balancing.
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item ``Just add dropout'' --- dropout is a general regularizer but does not specifically address calibration; the model can still be overconfident with dropout.
+    \item ``Miscalibration doesn't matter if accuracy is good'' --- in many production settings (medical diagnosis, ad bidding, cascaded systems), calibrated probabilities are more important than accuracy.
+\end{itemize}
+
+\interviewtest{Whether you understand the distinction between accuracy and calibration, can diagnose why cross-entropy drives overconfidence, and know specific interventions (label smoothing, temperature scaling, focal loss) with their trade-offs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies overconfidence as the problem, suggests label smoothing or early stopping.
+    \item \badgeLsix{L6} Explains the mechanism (logit magnitude growth, CE rewarding confidence), distinguishes train-time fixes (label smoothing, focal loss) from post-hoc fixes (temperature scaling), and proposes concrete diagnostic experiments.
+    \item \badgeLseven{L7} Discusses when calibration matters vs.\ when it does not (ranking vs.\ thresholding vs.\ bidding), connects to the Platt scaling / isotonic regression literature, and considers second-order effects like how miscalibration propagates through multi-stage systems.
+\end{itemize}
+
+\followups{``How does label smoothing improve calibration mechanically?'' ``What is the difference between temperature scaling and Platt scaling?'' ``Can you be well-calibrated but have poor accuracy?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Cross-entropy vs.\ focal loss vs.\ class-balanced loss for imbalanced classification---what is your decision framework?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer The choice depends on the \textbf{degree of imbalance}, whether you care more about \textbf{hard examples vs.\ rare classes}, and your \textbf{tolerance for hyperparameter tuning}.
+
+\textbf{Standard cross-entropy} works when imbalance is mild ($<$5:1 ratio). It implicitly weights by class frequency (majority class contributes more gradients), but the model can still learn minority classes if there are enough examples.
+
+\textbf{Class-weighted cross-entropy} ($\loss = -w_c \log \hat{y}_c$) directly addresses class frequency imbalance by upweighting rare classes. Weights can be inverse frequency ($w_c = N/N_c$), inverse square root ($w_c = \sqrt{N/N_c}$), or the effective number formulation ($w_c = (1-\beta)/(1-\beta^{N_c})$). This is the simplest intervention: one extra hyperparameter (or none, if using inverse frequency). However, it treats all examples within a class equally---it does not distinguish hard from easy examples.
+
+\textbf{Focal loss} ($\loss = -\alpha_t(1-p_t)^\gamma \log p_t$) addresses a different problem: the \textbf{dominance of easy examples} in the gradient. The $(1-p_t)^\gamma$ factor down-weights examples the model already classifies correctly with high confidence. This is critical when the majority class is not just more frequent but also trivially easy (e.g., background in object detection, where 99.9\% of anchors are easy negatives). Focal loss has two hyperparameters: $\gamma$ (focusing) and $\alpha$ (class balance).
+
+\textbf{Decision framework:}
+\begin{table}[H]
+\centering
+\caption{Imbalanced classification loss decision framework}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Scenario} & \textbf{Recommended} & \textbf{Why} \\
+\midrule
+Mild imbalance ($<$5:1) & Cross-entropy & Simple, sufficient \\
+Moderate imbalance (5:1--100:1) & Weighted cross-entropy & Addresses frequency directly \\
+Extreme imbalance ($>$100:1) & Focal loss & Easy examples dominate gradient \\
+Extreme + long-tail classes & Focal + effective number weights & Addresses both frequency and difficulty \\
+Multi-label with rare positives & Asymmetric loss & Per-label imbalance \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Important nuance:} Class weighting and focal loss are \textit{orthogonal}. Weighting addresses how much each \textit{class} contributes; focal loss addresses how much each \textit{example} (by difficulty) contributes. They can and often should be combined.
+
+\redflags
+\begin{itemize}
+    \item ``Always use focal loss for imbalanced data'' --- focal loss is designed for easy-example dominance, not all forms of imbalance. For moderate imbalance without easy-example dominance, weighted CE is simpler and equally effective.
+    \item ``Just oversample the minority class'' --- oversampling is a data-level intervention, not a loss-level intervention; they are complementary, and the question specifically asks about loss functions.
+\end{itemize}
+
+\interviewtest{Whether you understand the \textit{different} problems that class weighting and focal loss solve, can match the intervention to the problem severity, and recognize that these techniques are orthogonal and composable.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes all three losses, gives a reasonable recommendation based on imbalance severity.
+    \item \badgeLsix{L6} Distinguishes class-frequency imbalance from easy-example dominance as two separate problems, explains when each intervention is most appropriate, and mentions the effective number formulation.
+    \item \badgeLseven{L7} Discusses how the choice interacts with evaluation metrics (optimizing for recall vs.\ precision vs.\ F1 changes the answer), mentions data-level vs.\ loss-level interventions as complementary, and considers downstream effects (e.g., how focal loss affects calibration).
+\end{itemize}
+
+\followups{``How does focal loss affect model calibration?'' ``What about oversampling or data augmentation---when is that better than loss modification?'' ``How do you choose $\gamma$ for focal loss?''}
+\end{interviewq}
+
+%==============================================================================
+\section{Metric Learning / Embedding Losses}
+\label{sec:metric_losses}
+%==============================================================================
+
+Metric learning losses train embedding spaces where similar items are close and dissimilar items are far apart.
+
+\subsection{Contrastive Loss}
+
+\textbf{What it is.} The original pairwise metric learning loss. Takes pairs of items and pushes similar ones together, dissimilar ones apart (up to a margin).
+
+\begin{mathresult}{Contrastive Loss}
+For a pair $(x_i, x_j)$ with similarity label $y \in \{0, 1\}$ (1 = similar):
+\begin{equation}
+\loss_{\text{contrastive}} = y \cdot d(f(x_i), f(x_j))^2 + (1-y) \cdot \max(0, m - d(f(x_i), f(x_j)))^2
+\end{equation}
+where $d(\cdot, \cdot)$ is a distance metric (typically Euclidean) and $m$ is the margin.
+\end{mathresult}
+
+\subsubsection{Behavior Analysis}
+
+\begin{itemize}
+    \item \textbf{Similar pairs} ($y=1$): Loss = $d^2$. Minimize distance directly.
+    \item \textbf{Dissimilar pairs} ($y=0$): Loss = $\max(0, m-d)^2$. Push apart until $d > m$.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+    \begin{axis}[
+        xlabel={Distance $d$},
+        ylabel={Loss},
+        xmin=0, xmax=3,
+        ymin=0, ymax=5,
+        legend pos=north east,
+        width=10cm,
+        height=6cm
+    ]
+    % Similar pairs
+    \addplot[domain=0:3, samples=100, thick, blue] {x^2};
+    \addlegendentry{Similar ($y=1$)}
+
+    % Dissimilar pairs (margin=2)
+    \addplot[domain=0:3, samples=100, thick, red] {max(0, 2-x)^2};
+    \addlegendentry{Dissimilar ($y=0$, $m=2$)}
+
+    \end{axis}
+\end{tikzpicture}
+\caption{Contrastive loss as a function of distance for similar and dissimilar pairs.}
+\end{figure}
+
+\subsubsection{Limitations}
+
+\begin{itemize}
+    \item Requires careful pair sampling (balanced positives/negatives)
+    \item Random pairs often trivially satisfied (uninformative)
+    \item Only considers pairwise relationships
+\end{itemize}
+
+\textbf{When to use.} Verification tasks (same/different), small-scale metric learning.
+
+\textbf{Pitfalls.} Largely superseded by triplet loss and InfoNCE for most applications. Margin $m$ is hard to tune.
+
+%------------------------------------------------------------------------------
+\subsection{Triplet Loss}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} Operates on triplets: anchor ($a$), positive ($p$), negative ($n$). Enforces that the anchor is closer to the positive than to the negative by at least a margin.
+
+\begin{mathresult}{Triplet Loss}
+\begin{equation}
+\loss_{\text{triplet}} = \max(0, d(f(a), f(p)) - d(f(a), f(n)) + m)
+\end{equation}
+where $m > 0$ is the margin.
+\end{mathresult}
+
+\subsubsection{Geometric Interpretation}
+
+The loss enforces: $d(a, n) > d(a, p) + m$
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.5]
+    % Points
+    \fill[blue] (0,0) circle (2pt) node[above] {$a$};
+    \fill[green!70!black] (1,0.5) circle (2pt) node[above] {$p$};
+    \fill[red] (2.5, -0.3) circle (2pt) node[above] {$n$};
+
+    % Distances
+    \draw[blue, thick] (0,0) -- (1,0.5) node[midway, above, font=\small] {$d(a,p)$};
+    \draw[red, thick] (0,0) -- (2.5,-0.3) node[midway, below, font=\small] {$d(a,n)$};
+
+    % Margin visualization
+    \draw[dashed, gray] (0,0) circle (1.118);
+    \node[gray, font=\small] at (0.8, -1.3) {Positive radius};
+
+    \draw[dashed, orange] (0,0) circle (1.618);
+    \node[orange, font=\small] at (1.3, -1.8) {Negative must be outside};
+\end{tikzpicture}
+\caption{Triplet loss geometry: negative must be farther than positive by at least margin $m$.}
+\end{figure}
+
+\subsubsection{Triplet Mining Strategies}
+
+The choice of triplets critically affects learning:
+
+\textbf{Triplet Types.} Let $d_p = d(a, p)$ and $d_n = d(a, n)$.
+\begin{itemize}
+    \item \textbf{Easy}: $d_n > d_p + m$ (already satisfied, zero loss)
+    \item \textbf{Hard}: $d_n < d_p$ (negative closer than positive!)
+    \item \textbf{Semi-hard}: $d_p < d_n < d_p + m$ (violated but negative still farther)
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Triplet mining strategies}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Strategy} & \textbf{Description} & \textbf{Trade-off} \\
+\midrule
+Random & Select random valid triplets & Many easy triplets, slow learning \\
+Batch Hard & Hardest positive and negative per anchor in batch & Can cause collapse \\
+Batch Semi-Hard & Hardest semi-hard negative per anchor & Best balance for most cases \\
+Batch All & All valid triplets in batch & Computationally expensive \\
+Offline Hard & Mine hard negatives periodically from full dataset & Expensive but effective \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}
+\textbf{Semi-hard mining is usually best.} Easy triplets provide no gradient. Hard triplets can be too hard (e.g., mislabeled data) and cause training collapse. Semi-hard triplets are informative but not destabilizing.
+\end{keyinsight}
+
+\subsubsection{Margin Selection}
+
+The margin $m$ controls the embedding space geometry:
+\begin{itemize}
+    \item \textbf{Small $m$}: Classes can be close, easier to satisfy
+    \item \textbf{Large $m$}: Classes must be well-separated, may be hard to achieve
+    \item \textbf{Typical}: $m \in [0.1, 1.0]$ for normalized embeddings
+\end{itemize}
+
+\textbf{When to use.} Retrieval, face verification, any setting where you have explicit positive/negative relationships and want fine-grained control over the embedding geometry.
+
+\textbf{Pitfalls.} Training is fragile---mining strategy matters more than the loss formula itself. Requires large batches for effective in-batch mining.
+
+%------------------------------------------------------------------------------
+\subsection{InfoNCE / NT-Xent Loss}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} The workhorse of modern contrastive learning (SimCLR, CLIP, MoCo). Treats one positive pair against all other samples in the batch as negatives, forming a softmax-style classification over the batch.
+
+\begin{mathresult}{InfoNCE / NT-Xent Loss}
+For a positive pair $(x_i, x_j)$ among $N$ samples:
+\begin{equation}
+\loss_{\text{InfoNCE}} = -\log \frac{\exp(\text{sim}(z_i, z_j) / \tau)}{\sum_{k \neq i} \exp(\text{sim}(z_i, z_k) / \tau)}
+\end{equation}
+where $z = f(x)$ is the embedding, $\text{sim}$ is similarity (typically cosine), and $\tau$ is temperature.
+\end{mathresult}
+
+InfoNCE provides a lower bound on mutual information between views. Minimizing the loss maximizes a lower bound on mutual information, which tightens as the number of negatives increases.
+
+\subsubsection{Temperature Analysis}
+
+The temperature $\tau$ controls the ``hardness'' of the contrastive task:
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+    \begin{axis}[
+        xlabel={Similarity},
+        ylabel={Softmax weight},
+        xmin=-1, xmax=1,
+        ymin=0, ymax=1,
+        legend pos=north west,
+        width=10cm,
+        height=6cm
+    ]
+    % High temperature
+    \addplot[domain=-1:1, samples=100, thick, blue] {exp(x/1) / (exp(x/1) + 4*exp(0/1))};
+    \addlegendentry{$\tau=1.0$ (soft)}
+
+    % Medium temperature
+    \addplot[domain=-1:1, samples=100, thick, orange] {exp(x/0.1) / (exp(x/0.1) + 4*exp(0/0.1))};
+    \addlegendentry{$\tau=0.1$ (medium)}
+
+    % Low temperature
+    \addplot[domain=-1:1, samples=100, thick, red] {exp(x/0.01) / (exp(x/0.01) + 4*exp(0/0.01))};
+    \addlegendentry{$\tau=0.01$ (hard)}
+
+    \end{axis}
+\end{tikzpicture}
+\caption{Effect of temperature on attention to similarities. Lower $\tau$ makes the loss focus on hard negatives.}
+\end{figure}
+
+\begin{itemize}
+    \item \textbf{Low $\tau$ (0.01-0.1)}: Sharp distribution, dominated by hardest negatives
+    \item \textbf{High $\tau$ (0.5-1.0)}: Soft distribution, all negatives contribute
+    \item \textbf{Typical}: $\tau = 0.1$ (SimCLR), $\tau = 0.07$ (MoCo). CLIP does not fix $\tau$: it \textit{learns} the temperature (initialized at $0.07$, with the logit scale $1/\tau$ clamped at 100)
+\end{itemize}
+
+\subsubsection{In-Batch Negatives}
+
+A key efficiency of InfoNCE: negatives come from other samples in the batch.
+
+For batch size $B$:
+\begin{itemize}
+    \item Each sample has 1 positive (its augmented version)
+    \item Each sample has $2(B-1)$ negatives (all other samples and their augmentations)
+\end{itemize}
+
+This makes training efficient but requires large batch sizes for sufficient negatives.
+
+\begin{warningbox}
+Large batch sizes in contrastive learning can cause GPU memory issues. Gradient accumulation does NOT help because you need all negatives in the same forward pass to compute the softmax denominator. Use gradient caching (decouple embedding computation from loss computation) instead.
+\end{warningbox}
+
+\begin{interviewq}
+\textbf{Q: Why does SimCLR need large batch sizes, and what are the alternatives?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer SimCLR uses InfoNCE with in-batch negatives: for each positive pair, every other sample in the batch serves as a negative. The softmax denominator $\sum_{k \neq i} \exp(\text{sim}(z_i, z_k)/\tau)$ is computed over the batch, so \textbf{batch size directly controls the number of negatives and thus the tightness of the mutual information bound}.
+
+With small batches (e.g., 256), there are few negatives, making the contrastive task trivially easy. The model can achieve low loss by learning simple features (e.g., color histograms) that happen to distinguish the small set of negatives. Large batches (4096--8192) provide diverse, hard negatives that force the model to learn semantic features. SimCLR's original paper showed accuracy improving log-linearly with batch size up to 8192.
+
+Critically, \textbf{gradient accumulation does not help} because all negatives must be in the same forward pass to compute the softmax denominator. You cannot split the denominator across micro-batches.
+
+Alternatives that decouple negative count from batch size: (1) \textbf{MoCo} maintains a momentum-updated queue of embeddings (65K negatives with batch size 256). The momentum encoder provides consistent targets despite the queue spanning many batches. (2) \textbf{BYOL/SimSiam} eliminate negatives entirely, using a predictor network + stop-gradient to avoid collapse. (3) \textbf{Gradient caching} (GradCache) decouples embedding computation from loss computation, enabling large effective batches with limited GPU memory.
+
+\redflags
+\begin{itemize}
+    \item ``Just use gradient accumulation to simulate large batches'' --- this does not work for in-batch contrastive losses because the denominator requires all negatives simultaneously.
+    \item ``Larger batches are always better'' --- beyond a point, returns diminish and training becomes less stable; also, very large batches can cause false negatives (two samples of the same class treated as negatives).
+\end{itemize}
+
+\interviewtest{Whether you understand the connection between batch size and the quality of the contrastive objective, the specific failure mode of gradient accumulation with in-batch negatives, and awareness of alternative architectures.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains in-batch negatives, correctly states large batches provide harder negatives, mentions MoCo as an alternative.
+    \item \badgeLsix{L6} Explains why gradient accumulation fails, discusses the mutual information bound tightening with more negatives, and contrasts MoCo/BYOL approaches.
+    \item \badgeLseven{L7} Discusses false negative problem at very large batch sizes, gradient caching as a systems solution, and the broader question of whether contrastive learning even needs negatives (BYOL/Barlow Twins).
+\end{itemize}
+
+\followups{``What's the memory cost of large batches?'' ``How does MoCo's momentum encoder avoid collapse?'' ``How does BYOL work without negatives at all?''}
+\end{interviewq}
+
+\textbf{When to use.} Self-supervised pretraining (SimCLR, MoCo, CLIP), any contrastive learning setup where you have augmented views or paired data.
+
+\textbf{Pitfalls.} Temperature $\tau$ is critical---too low and training becomes unstable; too high and the loss is too easy. Batch size directly affects quality of the bound.
+
+%------------------------------------------------------------------------------
+\subsection{ArcFace, CosFace, and SphereFace}
+%------------------------------------------------------------------------------
+
+\textbf{What it is.} Angular margin losses for highly discriminative embeddings. Standard softmax CE only requires the correct class logit to be the largest. Angular margin losses require it to be larger \textit{by a margin in angular space}, producing tighter, more separable clusters. They work by normalizing both weights and embeddings so the logit becomes $s \cdot \cos\theta$, where $\theta$ is the angle between the embedding and the class center, then adding a penalty margin.
+
+\begin{mathresult}{Angular Margin Losses}
+\begin{align}
+\text{SphereFace (multiplicative):} \quad & \loss = -\log \frac{e^{s \cos(m\theta_c)}}{e^{s \cos(m\theta_c)} + \sum_{j \neq c} e^{s \cos\theta_j}} \\
+\text{CosFace (additive cosine):} \quad & \loss = -\log \frac{e^{s(\cos\theta_c - m)}}{e^{s(\cos\theta_c - m)} + \sum_{j \neq c} e^{s \cos\theta_j}} \\
+\text{ArcFace (additive angular):} \quad & \loss = -\log \frac{e^{s \cos(\theta_c + m)}}{e^{s \cos(\theta_c + m)} + \sum_{j \neq c} e^{s \cos\theta_j}}
+\end{align}
+\end{mathresult}
+
+\subsubsection{Geometric Interpretation}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=2]
+    % Unit circle
+    \draw[gray, thin] (0,0) circle (1);
+
+    % Class centers
+    \draw[thick, ->] (0,0) -- (0.866, 0.5) node[right] {$W_1$};
+    \draw[thick, ->] (0,0) -- (0.866, -0.5) node[right] {$W_2$};
+
+    % Decision boundary without margin
+    \draw[blue, dashed] (0,0) -- (1.2, 0) node[right, font=\small] {No margin};
+
+    % Decision boundary with margin
+    \draw[red, thick] (0,0) -- ({cos(15)}, {sin(15)}) node[above right, font=\small] {With margin $m$};
+    \draw[red, thick] (0,0) -- ({cos(-15)}, {sin(-15)});
+
+    % Margin angle
+    \draw[<->, orange] (0.5, 0) arc (0:15:0.5) node[midway, right, font=\small] {$m$};
+    \draw[<->, orange] (0.5, 0) arc (0:-15:0.5);
+
+    % Sample embedding
+    \fill[green!70!black] ({0.9*cos(20)}, {0.9*sin(20)}) circle (1pt) node[above, font=\small] {$f$};
+\end{tikzpicture}
+\caption{ArcFace adds an angular margin $m$, requiring the embedding to be closer to its class center by angle $m$ to achieve the same loss.}
+\end{figure}
+
+\subsubsection{Comparison}
+
+\begin{table}[H]
+\centering
+\caption{Comparison of margin-based losses}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Loss} & \textbf{Margin Type} & \textbf{Typical $m$} & \textbf{Notes} \\
+\midrule
+SphereFace & Multiplicative angular & 4 & Hard to train \\
+CosFace & Additive cosine & 0.35 & Easier to train \\
+ArcFace & Additive angular & 0.5 & Best performance, most common \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{keyinsight}
+ArcFace is generally preferred because:
+\begin{enumerate}
+    \item The margin has constant effect across all angles (unlike CosFace where cosine is nonlinear)
+    \item More stable training than SphereFace
+    \item Clear geometric interpretation: ``embedding must be $m$ radians closer to correct class''
+\end{enumerate}
+\end{keyinsight}
+
+\subsubsection{Scale Parameter}
+
+The scale $s$ (typically 30-64) controls the concentration of the distribution:
+\begin{itemize}
+    \item Small $s$: Soft distribution, less discriminative
+    \item Large $s$: Sharp distribution, more discriminative but may overfit
+\end{itemize}
+
+\textbf{When to use.} Face recognition, person re-identification, fine-grained visual retrieval---any problem with a fixed, large class set and where you need maximally discriminative embeddings.
+
+\textbf{Pitfalls.} Requires a classification head during training (one weight vector per class), which doesn't scale to millions of classes without tricks (e.g., partial FC). Not suitable for open-set problems where classes change constantly.
+
+\begin{interviewq}
+\textbf{Q: You're building a visual search system for an e-commerce platform with 10M products. What loss function would you use for training the embedding model?}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer The choice depends on catalog dynamics and supervision quality. I would evaluate three approaches:
+
+\textbf{Option 1: ArcFace} if we have a relatively stable catalog with clean class labels (each product = class). ArcFace's angular margin produces highly discriminative embeddings for fine-grained visual similarity. However, 10M classes require Partial FC (sample a subset of class centers per batch) to fit the classification head in memory. Re-training is needed when the catalog changes significantly.
+
+\textbf{Option 2: InfoNCE with hard negative mining} if products change frequently or labels are noisy. In-batch negatives scale naturally---no classification head needed. Pair with hard negative mining (e.g., retrieve near-misses from an ANN index periodically) to improve fine-grained discrimination. The disadvantage is that without margins, embeddings may not be as tightly clustered per-class as ArcFace.
+
+\textbf{Option 3: Two-stage approach (recommended).} Pre-train a backbone with InfoNCE on large, loosely labeled data (e.g., product category pairs). Then fine-tune with ArcFace on a curated subset of the catalog where class labels are clean. This gives the generalization of contrastive pre-training with the discriminative power of angular margin fine-tuning.
+
+For production, I would also consider: (1) multi-modal InfoNCE (CLIP-style) if text descriptions are available, enabling text-to-image search; (2) online hard negative mining using the serving index to find near-duplicates; (3) embedding dimensionality (128--256d for the ANN index, balancing retrieval speed vs.\ quality).
+
+\redflags
+\begin{itemize}
+    \item ``Just use triplet loss'' --- triplet loss is fragile at this scale, requires expensive mining, and has been largely superseded by InfoNCE and ArcFace for production retrieval.
+    \item ``Train ArcFace with 10M classes directly'' --- ignoring the memory cost of a 10M-class fully connected head (at 256d, that is a 2.56B parameter layer).
+\end{itemize}
+
+\interviewtest{Can you match loss functions to real-world system constraints? Do you think about scale (10M classes), catalog dynamics (products added/removed), supervision quality, and production requirements (embedding size, index updates)?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies ArcFace or InfoNCE as reasonable choices, explains the trade-off between classification-based and contrastive losses.
+    \item \badgeLsix{L6} Discusses Partial FC for scaling ArcFace, hard negative mining for InfoNCE, and the two-stage training approach. Mentions embedding dimensionality trade-offs.
+    \item \badgeLseven{L7} Addresses catalog dynamics (new products daily), multi-modal search (CLIP-style), continuous learning / index refresh strategies, and how the loss choice affects serving infrastructure.
+\end{itemize}
+
+\followups{``How do you handle new products added daily?'' ``What about multi-modal search (text + image)?'' ``How do you evaluate embedding quality offline before deploying?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your contrastive learning model's loss suddenly jumps mid-training and doesn't recover. Diagnose.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{Symptoms:} Loss has been decreasing steadily, then at some epoch (say epoch 40 of 100) the InfoNCE/NT-Xent loss spikes sharply and either stays high or oscillates. Embeddings may collapse to a small region of the hypersphere, and downstream probe accuracy drops to random chance.
+
+\textbf{Hypotheses (ranked by likelihood):}
+
+\textit{H1: Representation collapse.} The encoder has started mapping all inputs to the same (or very similar) embeddings. When all embeddings are nearly identical, the cosine similarities in the InfoNCE denominator become uniform, and the loss jumps to approximately $\log(2B-1)$ (random chance for batch size $B$). Collapse can be triggered by: learning rate too high, sudden change in data distribution, or loss of the stop-gradient / momentum encoder mechanism.
+
+\textit{H2: Temperature instability.} If temperature $\tau$ is a learned parameter (as in CLIP), a gradient spike can push $\tau$ to an extreme value. Very small $\tau$ makes the softmax extremely sharp, causing gradient explosion; very large $\tau$ makes all similarities equal, providing no learning signal. Either scenario causes loss to spike.
+
+\textit{H3: Hard negative mining catastrophe.} If using online hard negative mining with periodic index refresh, a refresh at epoch 40 could introduce a batch of false negatives (same-class items treated as negatives). The model receives contradictory gradients: pull together and push apart the same pairs.
+
+\textit{H4: Batch composition shift.} If the data loader reshuffles or a new data shard is introduced, the batch may suddenly contain many semantically similar items, creating a high rate of false negatives within the batch.
+
+\textbf{Experiments to confirm:}
+\begin{enumerate}
+    \item Compute embedding statistics: if standard deviation of pairwise cosine similarities drops near zero, collapse is confirmed
+    \item Check $\tau$ value trajectory if it is learned---a sudden change correlates with the spike
+    \item Inspect the specific batch/epoch where the spike occurred---look for data pipeline anomalies (corrupted shard, shuffle reset)
+    \item Visualize embeddings (t-SNE/UMAP) before and after the spike
+    \item Monitor gradient norms of the projection head---a spike in gradient norm often precedes loss collapse
+\end{enumerate}
+
+\textbf{Resolution:}
+\begin{itemize}
+    \item \textbf{For collapse}: Add gradient clipping (norm $\leq 1.0$), reduce learning rate, use a warmup schedule, add weight decay. If using BYOL-style architecture, verify the stop-gradient and EMA update are functioning correctly.
+    \item \textbf{For temperature}: Clamp $\tau$ to a safe range (e.g., $[0.01, 0.5]$), or fix it as a hyperparameter instead of learning it.
+    \item \textbf{For false negatives}: Filter negatives by checking label overlap (if labels are available), or use a momentum queue (MoCo) to reduce within-batch false negative rate.
+    \item \textbf{General}: Save checkpoints frequently. If collapse happens, restart from the last healthy checkpoint with a lower learning rate.
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item ``Just increase the batch size'' --- this does not address collapse and may worsen false negative rates.
+    \item ``The loss is noisy, just keep training'' --- a sudden persistent spike is fundamentally different from normal training noise; ignoring it wastes compute and may never recover.
+\end{itemize}
+
+\interviewtest{Systematic debugging of a non-standard training failure. Can you enumerate hypotheses, propose diagnostic experiments, and apply targeted fixes? This also tests depth of understanding of contrastive learning mechanics (temperature, collapse modes, negative quality).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies representation collapse as the most likely cause, suggests reducing learning rate.
+    \item \badgeLsix{L6} Enumerates multiple hypotheses (collapse, temperature, false negatives), proposes specific diagnostic experiments (embedding statistics, gradient norms), and distinguishes the fixes for each root cause.
+    \item \badgeLseven{L7} Discusses the interaction between batch composition and false negatives, connects to broader stability issues in self-supervised learning (why BYOL's stop-gradient prevents collapse, how VICReg's variance term guards against it), and proposes monitoring infrastructure to catch collapse early.
+\end{itemize}
+
+\followups{``How would you detect collapse automatically in a training pipeline?'' ``Why does BYOL not collapse without negatives?'' ``How does the choice of projection head dimension affect collapse risk?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You need to train an embedding model for semantic search across 100M documents. Which loss function and why?}
+
+\badgeLfive{L5} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer For semantic search at 100M-document scale, the loss must: (1) produce high-quality embeddings where semantic similarity maps to vector proximity, (2) scale to hundreds of millions of training pairs, and (3) generalize to unseen queries and documents.
+
+\textbf{Recommended: Multi-stage training with different losses at each stage.}
+
+\textbf{Stage 1: Contrastive pre-training with InfoNCE.} Start from a pre-trained language model (e.g., BERT, sentence-T5) and fine-tune with InfoNCE on large-scale (query, passage) pairs:
+$$\loss = -\log \frac{\exp(\text{sim}(q, d^+)/\tau)}{\sum_{d \in \text{batch}} \exp(\text{sim}(q, d)/\tau)}$$
+Use large batch sizes (2048--8192) with in-batch negatives for efficiency. This stage learns the general notion of semantic relevance. The temperature $\tau$ (typically 0.05--0.1) controls the trade-off between hard and easy negative focus.
+
+\textbf{Stage 2: Hard negative fine-tuning.} Mine hard negatives from the Stage 1 model's ANN index: for each query, retrieve the top-$k$ non-relevant documents. Fine-tune with InfoNCE or a cross-entropy loss over (query, positive, hard negatives). This stage teaches the model to make fine-grained distinctions that in-batch negatives miss.
+
+\textbf{Stage 3 (optional): Knowledge distillation from a cross-encoder.} Train a cross-encoder reranker (which sees query and document jointly and is much more accurate but too slow for retrieval) and distill its scores into the bi-encoder using a KL divergence or MSE loss on score distributions. This is a key technique used in models like ColBERT and many production systems.
+
+\textbf{Why not triplet loss?} Triplet loss requires explicit triplet mining, is fragile (mining strategy matters more than the loss), and is less sample-efficient than InfoNCE. InfoNCE uses all $B-1$ negatives per query, while triplet loss uses only one.
+
+\textbf{Why not ArcFace?} ArcFace requires a fixed class set and a classification head. For semantic search, queries and documents are open-ended---there is no fixed class taxonomy. ArcFace also does not naturally handle the asymmetry between queries and documents.
+
+\textbf{Scaling considerations:}
+\begin{itemize}
+    \item Use gradient caching to enable large effective batch sizes with limited GPU memory
+    \item Shard the document collection for distributed hard negative mining
+    \item The embedding dimension (typically 768 or 1024) affects both quality and ANN index cost at 100M scale; consider dimensionality reduction via Matryoshka representation learning
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item ``Use triplet loss with random negatives'' --- random negatives at 100M scale are almost always trivially easy, providing no learning signal.
+    \item ``Train a cross-encoder for retrieval'' --- cross-encoders require query-document joint encoding, which is $O(N)$ per query at serving time. At 100M documents, this is computationally infeasible for retrieval.
+\end{itemize}
+
+\interviewtest{Whether you can design a training pipeline (not just pick a loss), understand the staged approach to embedding training, and reason about the specific constraints of large-scale retrieval.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Chooses InfoNCE with in-batch negatives, explains why contrastive learning is appropriate for embeddings, mentions hard negative mining.
+    \item \badgeLsix{L6} Describes the multi-stage pipeline (pre-training $\to$ hard negatives $\to$ distillation), explains why triplet loss and ArcFace are less suitable, discusses batch size and temperature trade-offs.
+    \item \badgeLseven{L7} Addresses distillation from a cross-encoder, discusses Matryoshka representations for flexible dimensionality, considers the serving infrastructure implications (ANN index size at 100M $\times$ 768d), and mentions data curation strategies for the training pairs.
+\end{itemize}
+
+\followups{``How do you mine hard negatives at this scale?'' ``What is the serving latency budget and how does it constrain the embedding model?'' ``How do you evaluate retrieval quality offline?''}
+\end{interviewq}
+
+%==============================================================================
+\section{Ranking Losses}
+\label{sec:ranking_losses}
+%==============================================================================
+
+Ranking losses optimize the \textit{order} of items rather than absolute scores.
+
+\subsection{Pairwise Ranking Loss}
+
+\textbf{What it is.} A margin-based loss that ensures preferred items score higher than non-preferred items.
+
+\begin{mathresult}{Margin Ranking Loss}
+For preferred item $i$ over item $j$:
+\begin{equation}
+\loss = \max(0, -y(s_i - s_j) + m)
+\end{equation}
+where $y \in \{-1, +1\}$ indicates which item should rank higher, $s_i, s_j$ are scores, and $m$ is the margin.
+\end{mathresult}
+
+\textbf{When to use.} Simple ranking problems with explicit pairwise preferences.
+
+\textbf{Pitfalls.} All pairs weighted equally---a swap at position 1 costs the same as a swap at position 1000.
+
+\subsection{BPR Loss (Bayesian Personalized Ranking)}
+
+\textbf{What it is.} Designed specifically for implicit feedback in recommender systems. Models the probability that a user prefers an interacted item over a non-interacted item.
+
+\begin{mathresult}{BPR Loss}
+For user $u$ with positive item $i$ and negative item $j$:
+\begin{equation}
+\loss_{\text{BPR}} = -\log \sigma(s_{ui} - s_{uj})
+\end{equation}
+where $\sigma$ is sigmoid and $s_{ui}$ is the predicted score for user-item pair.
+\end{mathresult}
+
+\textbf{When to use.} Recommender systems with implicit feedback (clicks, views, purchases). BPR only assumes clicked items are preferred over unclicked---it does not assume unclicked items are negative.
+
+\textbf{Pitfalls.} Requires effective negative sampling. Uniform random negatives become too easy as training progresses; consider popularity-based or hard negative sampling.
+
+\subsection{Listwise Losses}
+
+\textbf{What they are.} Listwise approaches optimize entire rankings rather than individual pairs.
+
+\subsubsection{ListNet}
+
+Uses the top-one probability approximation from the Plackett-Luce model:
+\begin{equation}
+P(i \text{ ranked first} | s) = \frac{e^{s_i}}{\sum_j e^{s_j}}
+\end{equation}
+
+Loss is cross-entropy between predicted and true top-one probabilities.
+
+\subsubsection{LambdaRank}
+
+Key innovation: Weight pairwise gradients by the change in NDCG if items were swapped.
+
+\begin{equation}
+\lambda_{ij} = \frac{\partial \loss}{\partial s_i} = -\sigma(s_j - s_i) \cdot |\Delta\text{NDCG}_{ij}|
+\end{equation}
+
+\begin{keyinsight}
+LambdaRank directly optimizes ranking metrics (NDCG) even though they're not differentiable. The $|\Delta\text{NDCG}_{ij}|$ weighting makes the model care more about swaps at the top of the ranking.
+\end{keyinsight}
+
+\textbf{When to use.} Search ranking, any setting where you care about NDCG or another position-sensitive metric.
+
+\textbf{Pitfalls.} More complex to implement than pointwise/pairwise losses. The $\Delta\text{NDCG}$ computation adds overhead.
+
+\begin{warningbox}
+Ranking losses optimize \textit{order}, not \textit{scores}. If you need calibrated scores (e.g., click-through rate prediction for bidding), use pointwise cross-entropy with calibration, not a ranking loss.
+\end{warningbox}
+
+\begin{interviewq}
+\textbf{Q: Pointwise vs.\ pairwise vs.\ listwise ranking losses---when do you use each?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer The three families optimize increasingly global objectives, trading simplicity for alignment with ranking metrics.
+
+\textbf{Pointwise losses} (e.g., cross-entropy predicting click probability, MSE predicting relevance score) treat each item independently: the model predicts a score for each item, and the loss depends only on that item's label. The ranking is derived by sorting scores.
+\begin{itemize}
+    \item \textbf{Strengths}: Simple, well-understood, naturally calibrated (scores are probabilities). Easy to add features, debug, and interpret.
+    \item \textbf{Weaknesses}: Does not directly optimize ranking quality. Treats a score error at position 1 the same as at position 1000. Score calibration is good but ranking quality may be suboptimal.
+    \item \textbf{Use when}: You need calibrated scores (e.g., click-through rate prediction for ad bidding), or as a baseline.
+\end{itemize}
+
+\textbf{Pairwise losses} (e.g., BPR, margin ranking loss, RankNet) optimize the relative order of item pairs: given items $i$ and $j$ where $i$ is more relevant, the loss penalizes $s_i < s_j$.
+\begin{itemize}
+    \item \textbf{Strengths}: Directly optimizes ordering, which is closer to what ranking metrics measure. Works well with implicit feedback where only pairwise preferences are available.
+    \item \textbf{Weaknesses}: All pairs are weighted equally---a swap between positions 1 and 2 costs the same as a swap between positions 99 and 100. Does not account for position-dependent importance. The number of pairs grows as $O(n^2)$ for $n$ items per query.
+    \item \textbf{Use when}: Implicit feedback (clicks), recommendation systems, retrieval where you only have pairwise preference data.
+\end{itemize}
+
+\textbf{Listwise losses} (e.g., LambdaRank, ListNet, ListMLE, SoftmaxRank) optimize the entire ranked list.
+\begin{itemize}
+    \item \textbf{Strengths}: LambdaRank directly optimizes NDCG by weighting pair gradients by $|\Delta\text{NDCG}|$, making swaps at the top of the ranking cost more. Most aligned with actual ranking metrics.
+    \item \textbf{Weaknesses}: More complex to implement and debug. Requires graded relevance labels (not just binary). $\Delta\text{NDCG}$ computation adds overhead. Can be unstable with very long lists.
+    \item \textbf{Use when}: Search ranking with graded relevance labels, where NDCG is the primary metric and you have editorial labels.
+\end{itemize}
+
+\textbf{Decision framework:}
+\begin{table}[H]
+\centering
+\caption{Ranking loss family selection}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Signal type} & \textbf{Primary concern} & \textbf{Recommended} \\
+\midrule
+Calibrated scores needed & Bidding, thresholding & Pointwise (CE) \\
+Binary implicit feedback & Ordering quality & Pairwise (BPR) \\
+Graded relevance labels & NDCG optimization & Listwise (LambdaRank) \\
+Two-stage system (retrieval) & Recall at $k$ & Pairwise or InfoNCE \\
+Two-stage system (ranker) & NDCG at top-$k$ & Listwise or pointwise \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\redflags
+\begin{itemize}
+    \item ``Listwise is always better because it's more sophisticated'' --- listwise losses require graded relevance labels and add complexity; for implicit feedback with binary signals, pairwise losses are more appropriate.
+    \item ``Pointwise losses can't do ranking'' --- pointwise losses produce scores that can be sorted into rankings. They just don't directly optimize the ranking quality metric.
+\end{itemize}
+
+\interviewtest{Whether you understand the hierarchy of ranking loss families, can match the loss to the available supervision signal (binary vs.\ graded), and reason about the trade-off between simplicity/calibration (pointwise) and ranking quality (listwise).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly describes all three families with examples, identifies when each is appropriate.
+    \item \badgeLsix{L6} Explains why pairwise losses are position-agnostic and how LambdaRank fixes this with $\Delta\text{NDCG}$ weighting. Discusses the two-stage system design with different losses at each stage.
+    \item \badgeLseven{L7} Discusses calibration vs.\ ranking trade-off (pointwise gives calibrated probabilities needed for bidding but suboptimal ranking), connects to production systems where you need both (calibrated ranker + listwise reranker), and mentions recent approaches like unbiased LambdaMART for addressing position bias.
+\end{itemize}
+
+\followups{``How does LambdaRank approximate NDCG optimization?'' ``Can you combine pointwise and pairwise losses?'' ``How do you handle position bias in click data for ranking?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design the loss function for a retrieval system where you have click data (implicit feedback) but no explicit relevance labels.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer Click data is \textbf{noisy implicit feedback}: a click suggests interest but not necessarily relevance, and absence of a click does not mean irrelevance (the user may not have seen the item). The loss design must account for this noise.
+
+\textbf{Step 1: Define the supervision signal.} From click logs, extract:
+\begin{itemize}
+    \item \textbf{Positive pairs}: (query, clicked document)
+    \item \textbf{Negative pairs}: (query, impressed-but-not-clicked document) --- stronger signal than random negatives
+    \item \textbf{Hard negatives}: documents shown in positions 2--5 but not clicked while position 1 was clicked
+\end{itemize}
+
+\textbf{Step 2: Choose the loss.} For a two-tower retrieval model (query encoder + document encoder):
+
+\textbf{Option A: InfoNCE with in-batch negatives.}
+$$\loss = -\log \frac{\exp(\text{sim}(q, d^+)/\tau)}{\exp(\text{sim}(q, d^+)/\tau) + \sum_{d^- \in \text{batch}} \exp(\text{sim}(q, d^-)/\tau)}$$
+In-batch negatives are efficient and provide diverse negatives. For batch size $B$, each query gets $B-1$ negatives for free. Augment with hard negatives mined from the ANN index.
+
+\textbf{Option B: BPR loss with impression-based negatives.}
+$$\loss = -\log\sigma(\text{sim}(q, d^+) - \text{sim}(q, d^-))$$
+Use impressed-but-not-clicked documents as negatives (stronger signal than random).
+
+\textbf{Step 3: Handle click noise.}
+\begin{itemize}
+    \item \textbf{Position bias correction}: Items at position 1 get 3--10$\times$ more clicks regardless of relevance. Apply inverse propensity weighting: $w_i = 1/P(\text{click} | \text{position}_i)$, where propensity is estimated via randomization experiments or a position-bias model.
+    \item \textbf{Dwell time as quality signal}: Weight positive examples by engagement depth: short clicks ($<$5s) are likely misclicks; long clicks indicate genuine interest.
+    \item \textbf{Skip-above as negative signal}: If a user clicks position 3 but not position 1, position 1 is a strong negative (the user saw it and chose not to click).
+\end{itemize}
+
+\textbf{Step 4: Training curriculum.}
+\begin{enumerate}
+    \item Start with random negatives (easy, stable training)
+    \item Transition to hard negatives from ANN index after warmup
+    \item Periodically refresh the ANN index with updated embeddings
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``Treat all clicks as equally relevant'' --- ignores click quality (dwell time, engagement depth) and position bias.
+    \item ``Use cross-entropy to predict click/no-click'' --- treating this as binary classification ignores the missing-data problem (not-clicked $\neq$ irrelevant) and position bias.
+\end{itemize}
+
+\interviewtest{Whether you can reason about noisy supervision, handle the specific biases in click data (position bias, click quality), and design a complete loss pipeline that accounts for these practical considerations.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Chooses an appropriate contrastive or pairwise loss, explains why clicks are noisy implicit feedback.
+    \item \badgeLsix{L6} Addresses position bias correction with inverse propensity weighting, discusses negative sampling strategy (in-batch vs.\ impression-based vs.\ hard negatives), and mentions dwell time as a quality signal.
+    \item \badgeLseven{L7} Designs the full training curriculum (random $\to$ hard negatives), discusses feedback loops (model bias amplifying click patterns), proposes online metric monitoring (does recall@$k$ improve on held-out editorial labels?), and considers how to combine this with a cross-encoder reranker that uses a different loss.
+\end{itemize}
+
+\followups{``How do you estimate position bias propensity?'' ``What if users click but immediately bounce back?'' ``How do you evaluate this system offline without editorial labels?''}
+\end{interviewq}
+
+%==============================================================================
+\section{Regression Losses}
+\label{sec:regression_losses}
+%==============================================================================
+
+\subsection{Mean Squared Error (MSE / L2 Loss)}
+
+\textbf{What it is.} The default regression loss. Penalizes errors quadratically, so large errors are penalized much more than small ones. Corresponds to assuming Gaussian noise.
+
+\begin{mathresult}{MSE Loss}
+\begin{equation}
+\loss_{\text{MSE}} = \frac{1}{N}\sum_{i=1}^{N}(y_i - \hat{y}_i)^2
+\end{equation}
+\end{mathresult}
+
+\textbf{Properties:}
+\begin{itemize}
+    \item \textbf{Outlier sensitive}: Squared errors penalize outliers heavily
+    \item \textbf{Smooth everywhere}: Differentiable, stable gradients
+    \item \textbf{Gradient}: $\frac{\partial \loss}{\partial \hat{y}} = -2(y - \hat{y})$ (linear in error)
+    \item \textbf{Optimizes}: The conditional mean $\E[y | x]$
+\end{itemize}
+
+\subsection{Mean Absolute Error (MAE / L1 Loss)}
+
+\textbf{What it is.} Linear penalty on errors. More robust to outliers than MSE. Corresponds to assuming Laplacian noise.
+
+\begin{mathresult}{MAE Loss}
+\begin{equation}
+\loss_{\text{MAE}} = \frac{1}{N}\sum_{i=1}^{N}|y_i - \hat{y}_i|
+\end{equation}
+\end{mathresult}
+
+\textbf{Properties:}
+\begin{itemize}
+    \item \textbf{Outlier robust}: Linear penalty, less sensitive than MSE
+    \item \textbf{Non-smooth at zero}: Gradient undefined at $y = \hat{y}$
+    \item \textbf{Gradient}: $\frac{\partial \loss}{\partial \hat{y}} = -\text{sign}(y - \hat{y})$ (constant magnitude)
+    \item \textbf{Optimizes}: The conditional median
+\end{itemize}
+
+\begin{warningbox}
+MSE optimizes the conditional mean, MAE optimizes the conditional median. If your target distribution is skewed (e.g., house prices, ad revenue), these give very different predictions. Choose based on what your business actually needs.
+\end{warningbox}
+
+\subsection{Huber Loss (Smooth L1)}
+
+\textbf{What it is.} Best of both worlds: quadratic for small errors (smooth gradients, stable training), linear for large errors (outlier robust).
+
+\begin{mathresult}{Huber Loss}
+\begin{equation}
+\loss_{\text{Huber}}(y, \hat{y}) = \begin{cases}
+\frac{1}{2}(y - \hat{y})^2 & \text{if } |y - \hat{y}| \leq \delta \\
+\delta|y - \hat{y}| - \frac{1}{2}\delta^2 & \text{otherwise}
+\end{cases}
+\end{equation}
+\end{mathresult}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+    \begin{axis}[
+        xlabel={Error $(y - \hat{y})$},
+        ylabel={Loss},
+        xmin=-3, xmax=3,
+        ymin=0, ymax=2.5,
+        legend pos=north west,
+        width=10cm,
+        height=6cm
+    ]
+    % MSE
+    \addplot[domain=-3:3, samples=100, thick, blue] {0.5*x^2};
+    \addlegendentry{MSE (L2)}
+
+    % MAE
+    \addplot[domain=-3:3, samples=100, thick, red] {abs(x)};
+    \addlegendentry{MAE (L1)}
+
+    % Huber (delta=1)
+    \addplot[domain=-3:-1, samples=50, thick, green!70!black] {abs(x) - 0.5};
+    \addplot[domain=-1:1, samples=50, thick, green!70!black] {0.5*x^2};
+    \addplot[domain=1:3, samples=50, thick, green!70!black] {abs(x) - 0.5};
+    \addlegendentry{Huber ($\delta=1$)}
+
+    \end{axis}
+\end{tikzpicture}
+\caption{Comparison of regression losses. Huber is quadratic near zero, linear for large errors.}
+\end{figure}
+
+\textbf{When to use.} Regression with noisy data or potential outliers. Also used in DQN (reinforcement learning) for stable value function training.
+
+\textbf{Pitfalls.} The threshold $\delta$ is an extra hyperparameter. Default $\delta = 1$ is reasonable for standardized targets.
+
+\subsection{Quantile Loss}
+
+\textbf{What it is.} Asymmetric loss for predicting specific quantiles of the target distribution. Essential for uncertainty estimation and prediction intervals.
+
+\begin{mathresult}{Quantile Loss}
+\begin{equation}
+\loss_\tau(y, \hat{y}) = \begin{cases}
+\tau(y - \hat{y}) & \text{if } y \geq \hat{y} \\
+(1-\tau)(\hat{y} - y) & \text{if } y < \hat{y}
+\end{cases}
+\end{equation}
+where $\tau \in (0, 1)$ is the target quantile.
+\end{mathresult}
+
+\begin{itemize}
+    \item $\tau = 0.5$: Median regression (equivalent to MAE)
+    \item $\tau = 0.9$: 90th percentile (penalizes under-prediction more)
+    \item $\tau = 0.1$: 10th percentile (penalizes over-prediction more)
+\end{itemize}
+
+Use multiple quantiles ($\tau = 0.1, 0.5, 0.9$) to get prediction intervals.
+
+\textbf{When to use.} Forecasting with uncertainty bounds, risk-sensitive applications, any setting where you need prediction intervals.
+
+\textbf{Pitfalls.} Quantile crossing---the 90th percentile prediction can end up below the 10th percentile. Use monotonic constraints or post-hoc sorting.
+
+%==============================================================================
+\section{Specialized Losses}
+\label{sec:specialized_losses}
+%==============================================================================
+
+\subsection{CTC Loss (Connectionist Temporal Classification)}
+
+\textbf{What it is.} For sequence-to-sequence tasks without explicit alignment (speech recognition, OCR). Marginalizes over all possible alignments between input and output.
+
+\begin{mathresult}{CTC Loss}
+\begin{equation}
+\loss_{\text{CTC}} = -\log p(y | x) = -\log \sum_{\pi \in \mathcal{B}^{-1}(y)} p(\pi | x)
+\end{equation}
+where $\mathcal{B}$ is a mapping that removes blanks and repeated characters, and the sum is over all valid alignments.
+\end{mathresult}
+
+\subsubsection{Key Concepts}
+
+\begin{enumerate}
+    \item \textbf{Blank token}: Special token allowing ``no output'' at each timestep
+    \item \textbf{Many-to-one mapping}: Multiple paths collapse to same output
+    \item \textbf{Dynamic programming}: Efficient computation via forward-backward algorithm
+\end{enumerate}
+
+\begin{example}
+Input: Audio of ``cat'' (100 frames)\\
+Valid alignments:
+\begin{itemize}
+    \item c-c-c-a-a-t-t-t-$\epsilon$-$\epsilon$... $\to$ ``cat''
+    \item $\epsilon$-c-$\epsilon$-a-$\epsilon$-t-$\epsilon$... $\to$ ``cat''
+    \item c-a-a-a-t-$\epsilon$-$\epsilon$-$\epsilon$... $\to$ ``cat''
+\end{itemize}
+CTC sums probabilities over ALL valid alignments.
+\end{example}
+
+\textbf{When to use.} Speech recognition, OCR, any sequence labeling where input and output lengths differ and alignment is unknown.
+
+\textbf{Pitfalls.} Assumes conditional independence between output tokens at each timestep (no language model built in). Often paired with an external language model at inference.
+
+\subsection{Dice Loss / IoU Loss}
+
+\textbf{What it is.} Region-overlap losses for segmentation. Unlike cross-entropy (which treats each pixel independently), Dice loss considers global overlap between prediction and ground truth.
+
+\begin{mathresult}{Dice Loss}
+\begin{equation}
+\loss_{\text{Dice}} = 1 - \frac{2|A \cap B|}{|A| + |B|} = 1 - \frac{2\sum_i p_i g_i}{\sum_i p_i + \sum_i g_i}
+\end{equation}
+where $p$ is predicted probability and $g$ is ground truth.
+\end{mathresult}
+
+\subsubsection{Comparison with Cross-Entropy}
+
+\begin{table}[H]
+\centering
+\caption{Cross-Entropy vs. Dice for segmentation}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Cross-Entropy} & \textbf{Dice} \\
+\midrule
+Pixel independence & Treats each pixel independently & Considers global overlap \\
+Class imbalance & Sensitive (background dominates) & Robust (ratio-based) \\
+Gradients & Well-behaved everywhere & Can be noisy for small objects \\
+Common practice & Combine: $\loss = \loss_{\text{CE}} + \lambda\loss_{\text{Dice}}$ & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{When to use.} Medical image segmentation, any segmentation task with significant class imbalance.
+
+\textbf{Pitfalls.} Gradient is noisy when the predicted region is very small. Combine with CE for stable training.
+
+\subsection{Knowledge Distillation Loss}
+
+\textbf{What it is.} Transfer ``dark knowledge'' from a large teacher model to a small student model. The teacher's soft predictions reveal structure (e.g., ``dogs are more like cats than cars'') that hard labels miss.
+
+\begin{mathresult}{Knowledge Distillation Loss}
+\begin{equation}
+\loss_{\text{KD}} = \alpha T^2 \cdot \KL(p_T^{(T)} \| p_S^{(T)}) + (1-\alpha) \cdot \loss_{\text{CE}}(y, p_S)
+\end{equation}
+where $p^{(T)} = \softmax(z/T)$ are temperature-scaled probabilities, $T$ is temperature, and $\alpha$ balances soft and hard targets.
+\end{mathresult}
+
+\subsubsection{Why Temperature Scaling?}
+
+\begin{itemize}
+    \item Teacher's hard predictions contain little information beyond the label
+    \item Soft predictions reveal ``dark knowledge'': relative probabilities of wrong classes
+    \item Higher $T$ produces softer distributions, revealing more structure
+    \item $T^2$ scaling compensates for reduced gradient magnitude
+\end{itemize}
+
+\begin{example}
+Teacher output (hard): ``dog'' = 0.99, ``cat'' = 0.008, ``car'' = 0.002\\
+Teacher output ($T=4$): ``dog'' = 0.7, ``cat'' = 0.2, ``car'' = 0.1\\
+
+The soft output tells the student: ``dogs and cats are similar, cars are different.''
+\end{example}
+
+\textbf{When to use.} Model compression, deploying large models to mobile/edge, training small models that punch above their weight.
+
+\textbf{Pitfalls.} Temperature $T$ is critical: too low and soft targets look like hard labels (no benefit); too high and the distribution is uniform (no signal). Typical $T \in [3, 20]$. The $\alpha$ balance also matters---start with $\alpha = 0.5$.
+
+%==============================================================================
+\section{Loss Function Selection Guide}
+\label{sec:loss_selection}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q: Your classification model gets 95\% accuracy but the loss curve shows the model is still decreasing slowly. Should you keep training?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer Not necessarily. The key insight is that \textbf{loss and accuracy are different objectives}, and continued training after accuracy plateaus has specific consequences.
+
+\textbf{Why loss keeps decreasing:} Cross-entropy loss rewards confidence. Once the model classifies most examples correctly, further loss reduction comes from increasing logit magnitude on already-correct predictions (pushing $\hat{y}_c$ from 0.95 to 0.99 to 0.999). Accuracy does not change, but loss does.
+
+\textbf{Check validation loss first.} If training loss decreases but validation loss increases, you are overfitting. This is the classic train/val divergence signal for early stopping.
+
+\textbf{Calibration degrades.} Continued training typically makes the model overconfident. The predicted probabilities no longer reflect true class frequencies (e.g., the model says 99\% confidence but is correct only 95\% of the time). This matters for: (1) downstream ranking by confidence, (2) medical/safety applications, (3) ensemble methods, (4) any setting where probabilities are used for decisions.
+
+\textbf{Decision framework:}
+\begin{enumerate}
+    \item Define your actual evaluation metric (accuracy, F1, calibration error, NDCG, etc.)
+    \item Monitor that metric on validation data, not training loss
+    \item Use early stopping on the metric you care about
+    \item If you need both accuracy and calibration, train for accuracy and post-hoc calibrate with temperature scaling or Platt scaling
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``Yes, always keep training until loss converges'' --- this ignores overfitting, calibration degradation, and the proxy-metric gap.
+    \item ``Loss and accuracy measure the same thing'' --- they are related but not equivalent; loss measures confidence, accuracy measures correctness.
+\end{itemize}
+
+\interviewtest{Understanding of the proxy-metric gap (loss vs.\ the metric you actually care about), overfitting awareness, calibration vs.\ accuracy trade-offs, and practical training decisions.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies overfitting risk, mentions checking validation loss, suggests early stopping.
+    \item \badgeLsix{L6} Explains \textit{why} loss decreases after accuracy plateaus (confidence sharpening), discusses calibration as a concrete downstream risk, mentions temperature scaling.
+    \item \badgeLseven{L7} Connects to the broader question of what metric the business actually cares about, discusses when overconfidence is actively harmful (ranking, cascaded systems), and proposes the ``train for accuracy, calibrate post-hoc'' strategy.
+\end{itemize}
+
+\followups{``How would you improve calibration?'' ``What if you need both accuracy and calibration?'' ``How does label smoothing interact with this phenomenon?''}
+\end{interviewq}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    every node/.style={font=\small},
+    decision/.style={diamond, draw, aspect=2, inner sep=2pt, fill=lightyellow},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2cm},
+    arrow/.style={->, thick}
+]
+    % Start
+    \node[decision] (task) {Task type?};
+
+    % Level 1
+    \node[decision, below left=1.5cm and 2cm of task] (class) {Multi-class or multi-label?};
+    \node[decision, below=1.5cm of task] (sim) {Pairwise or set-based?};
+    \node[decision, below right=1.5cm and 2cm of task] (rank) {Pairwise or listwise?};
+
+    % Classification branch
+    \node[decision, below left=1cm and 0.5cm of class] (mc) {Imbalanced?};
+    \node[decision, below right=1cm and 0.5cm of class] (ml) {Imbalanced?};
+
+    % Results
+    \node[result, below=0.8cm of mc, xshift=-1cm] (ce) {Cross-Entropy};
+    \node[result, below=0.8cm of mc, xshift=1cm] (focal) {Focal Loss};
+    \node[result, below=0.8cm of ml, xshift=-1cm] (bce) {BCE};
+    \node[result, below=0.8cm of ml, xshift=1cm] (asym) {Asymmetric};
+
+    % Similarity branch
+    \node[result, below left=0.8cm and 0.3cm of sim] (triplet) {Triplet};
+    \node[result, below right=0.8cm and 0.3cm of sim] (infonce) {InfoNCE};
+
+    % Ranking branch
+    \node[result, below left=0.8cm and 0.3cm of rank] (bpr) {BPR};
+    \node[result, below right=0.8cm and 0.3cm of rank] (lambda) {LambdaRank};
+
+    % Edges
+    \draw[arrow] (task) -- node[above left] {Classification} (class);
+    \draw[arrow] (task) -- node[left] {Similarity} (sim);
+    \draw[arrow] (task) -- node[above right] {Ranking} (rank);
+
+    \draw[arrow] (class) -- node[left] {Multi-class} (mc);
+    \draw[arrow] (class) -- node[right] {Multi-label} (ml);
+
+    \draw[arrow] (mc) -- node[left] {No} (ce);
+    \draw[arrow] (mc) -- node[right] {Yes} (focal);
+    \draw[arrow] (ml) -- node[left] {No} (bce);
+    \draw[arrow] (ml) -- node[right] {Yes} (asym);
+
+    \draw[arrow] (sim) -- node[left] {Pairwise} (triplet);
+    \draw[arrow] (sim) -- node[right] {Batch} (infonce);
+
+    \draw[arrow] (rank) -- node[left] {Pairwise} (bpr);
+    \draw[arrow] (rank) -- node[right] {Listwise} (lambda);
+\end{tikzpicture}
+\caption{Decision tree for loss function selection.}
+\end{figure}
+
+\subsection{Quick Reference Table}
+
+\begin{table}[H]
+\centering
+\caption{Loss function quick reference}
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+\textbf{Scenario} & \textbf{Recommended Loss} & \textbf{Alternative} \\
+\midrule
+Multi-class, balanced & Cross-Entropy & Label Smoothing + CE \\
+Multi-class, imbalanced & Focal Loss & Weighted CE \\
+Multi-label, balanced & BCE & - \\
+Multi-label, imbalanced & Asymmetric Loss & Focal + BCE \\
+Face recognition & ArcFace & CosFace \\
+General retrieval & InfoNCE & Triplet \\
+Verification (same/different) & Contrastive & Triplet \\
+Implicit feedback ranking & BPR & - \\
+Search ranking & LambdaRank & ListNet \\
+Regression, clean data & MSE & - \\
+Regression, outliers & Huber & MAE \\
+Regression, uncertainty & Quantile Loss & - \\
+Segmentation & Dice + CE & IoU Loss \\
+Sequence labeling & CTC & - \\
+Model compression & KD Loss & - \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{interviewq}
+\textbf{Q: You're building a product recommendation system with implicit feedback (clicks). What loss would you use and why?}
+
+\badgeLfive{L5} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer Implicit feedback (clicks, views, purchases) is fundamentally different from explicit feedback (ratings): \textbf{absence of a click does not mean dislike}---the user may simply not have seen the item. This asymmetry rules out pointwise losses like MSE that treat unclicked items as ``zero-rated.''
+
+\textbf{Baseline: BPR loss.} BPR models the probability that a user prefers a clicked item over an unclicked item: $\loss = -\log\sigma(s_{ui} - s_{uj})$. It only assumes clicked $>$ unclicked, making no assumption about unclicked items being negative. Negative sampling makes it efficient for large catalogs (millions of items).
+
+\textbf{Negative sampling strategy matters more than the loss formula:}
+\begin{itemize}
+    \item Uniform random: simple but becomes too easy as training progresses
+    \item Popularity-based: harder negatives (popular items the user did not click)
+    \item In-batch negatives: efficient, naturally biased toward popular items
+    \item Hard negatives from ANN index: most informative but risk false negatives
+\end{itemize}
+
+\textbf{Full system design (two-stage):}
+\begin{itemize}
+    \item \textbf{Retrieval stage}: Two-tower model with InfoNCE or BPR for candidate generation. Optimize for recall at top-$k$.
+    \item \textbf{Ranking stage}: Pointwise cross-entropy (predicting click probability) or listwise loss (LambdaRank optimizing NDCG). Include features beyond embeddings: user context, item freshness, position bias correction.
+\end{itemize}
+
+\textbf{Position bias correction:} Raw click data is biased by display position (items shown higher get more clicks regardless of relevance). Correct via inverse propensity weighting in the loss, or use a position feature that is dropped at serving time.
+
+\redflags
+\begin{itemize}
+    \item ``Use MSE to predict click counts'' --- treats unclicked items as explicit negatives, which is incorrect for implicit feedback.
+    \item ``Negative sampling doesn't matter, just sample uniformly'' --- the quality of negatives is often more important than the loss function itself.
+\end{itemize}
+
+\interviewtest{Whether you understand implicit vs.\ explicit feedback, the missing-data problem in recommendations, negative sampling strategies, and multi-stage system design.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies BPR or pairwise loss as appropriate, explains why pointwise losses are problematic for implicit feedback.
+    \item \badgeLsix{L6} Discusses negative sampling strategies in depth, describes the two-stage retrieval/ranking architecture with different losses at each stage.
+    \item \badgeLseven{L7} Addresses position bias correction, discusses how the loss interacts with the serving stack (calibrated scores for bidding vs.\ rankings for display), and mentions feedback loops (model bias reinforcing click patterns).
+\end{itemize}
+
+\followups{``How do you sample negatives effectively?'' ``What if you also have explicit ratings?'' ``How do you handle position bias in clicks?'' ``How do you evaluate offline before A/B testing?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You're building a multi-task model that does classification, regression, and ranking simultaneously. Design the loss function.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer Multi-task loss design has three fundamental challenges: \textbf{scale mismatch} (losses have different magnitudes), \textbf{gradient conflict} (tasks may compete for shared representation capacity), and \textbf{convergence rate mismatch} (tasks learn at different speeds).
+
+\textbf{Naive approach (weighted sum):}
+$$\loss_{\text{total}} = \lambda_1 \loss_{\text{CE}} + \lambda_2 \loss_{\text{MSE}} + \lambda_3 \loss_{\text{BPR}}$$
+This requires manually tuning $\lambda_1, \lambda_2, \lambda_3$. Problems: (1) CE loss is typically $O(1)$, MSE can be $O(100)$+ depending on target scale, BPR is $O(1)$---the scale mismatch means MSE dominates gradients unless carefully weighted. (2) Fixed weights cannot adapt as tasks learn at different rates.
+
+\textbf{Better: Uncertainty-based weighting} (Kendall et al., 2018). Learn task weights as homoscedastic uncertainty parameters:
+$$\loss_{\text{total}} = \frac{1}{2\sigma_1^2}\loss_{\text{CE}} + \frac{1}{2\sigma_2^2}\loss_{\text{MSE}} + \frac{1}{2\sigma_3^2}\loss_{\text{BPR}} + \log\sigma_1 + \log\sigma_2 + \log\sigma_3$$
+The $\log\sigma$ terms prevent the model from trivially setting all weights to zero. Higher uncertainty (larger $\sigma$) reduces a task's weight, allowing the model to down-weight tasks it finds harder or noisier. One nuance a pedantic interviewer may probe: Kendall et al.'s derivation yields the $\frac{1}{2\sigma^2}$ factor only for the Gaussian-likelihood \textit{regression} terms; their softmax-classification derivation gives $\frac{1}{\sigma^2}\loss_{\text{CE}}$ (no factor of 2). The uniform $\frac{1}{2\sigma^2}$ form above is a common simplification.
+
+\textbf{Alternative: GradNorm.} Dynamically adjusts task weights to balance gradient magnitudes across tasks. At each step, it computes the ratio of each task's gradient norm to the average, and adjusts weights to equalize training rates. This addresses both scale mismatch and convergence rate mismatch.
+
+\textbf{Handling gradient conflict:} When tasks have conflicting gradients on shared parameters, options include: (1) \textbf{PCGrad} (project conflicting gradients onto the normal plane of the other task's gradient), (2) \textbf{CAGrad} (find the minimum-norm point in the convex hull of task gradients), (3) \textbf{task-specific heads with a shared backbone} (limit conflict to the backbone gradients).
+
+\textbf{Practical recommendations:}
+\begin{enumerate}
+    \item Start with a shared backbone and task-specific heads
+    \item Normalize each loss to approximately the same scale (e.g., all $O(1)$) as a first pass
+    \item Use uncertainty weighting as the default adaptive method---it adds minimal overhead (3 learnable scalars)
+    \item Monitor per-task metrics separately; if one task degrades, increase its weight or check for gradient conflict
+    \item Consider whether tasks actually benefit from sharing: if classification and ranking use very different features, separate models may outperform multi-task
+\end{enumerate}
+
+\redflags
+\begin{itemize}
+    \item ``Just sum the losses with equal weights'' --- this ignores scale mismatch, which almost always exists across loss types.
+    \item ``Grid-search over $\lambda$ values'' --- this is exponential in the number of tasks and does not adapt during training.
+\end{itemize}
+
+\interviewtest{Systems-level thinking about multi-task optimization. Can you identify the three core challenges (scale, conflict, convergence rate), propose principled solutions, and reason about when multi-task learning helps vs.\ hurts?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes weighted sum, acknowledges scale mismatch, suggests normalizing losses.
+    \item \badgeLsix{L6} Describes uncertainty weighting or GradNorm, explains the mechanism, and discusses per-task monitoring.
+    \item \badgeLseven{L7} Addresses gradient conflict with PCGrad/CAGrad, questions whether multi-task is appropriate (when does sharing help vs.\ hurt?), and discusses the interaction between task weighting and model architecture (shared backbone depth, task-specific capacity).
+\end{itemize}
+
+\followups{``How do you decide which layers to share?'' ``What if one task is much more important than the others?'' ``How do you diagnose negative transfer?''}
+\end{interviewq}

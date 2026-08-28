@@ -1,0 +1,768 @@
+\chapter{Decision Frameworks: When to Use What}
+\label{chap:decision_frameworks}
+
+\begin{tldr}
+This chapter provides decision frameworks for architecture selection, loss function choice, model sizing, and common trade-offs. Staff-level interviews often test whether you can make principled decisions given constraints—not just whether you know techniques. These frameworks encode best practices and help structure your thinking during system design questions.
+\end{tldr}
+
+\section{Architecture Selection}
+\label{sec:arch_selection}
+
+\subsection{By Data Modality}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    decision/.style={diamond, draw, aspect=2, inner sep=1pt, fill=yellow!20, font=\small},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2.5cm, font=\small, align=center},
+    arrow/.style={->, thick}
+]
+    \node[decision] (modality) {Data modality?};
+    
+    % Branches
+    \node[result, below left=1.5cm and 2.5cm of modality] (tabular) {Gradient Boosting\\(XGBoost, LightGBM)};
+    \node[result, below left=1.5cm and 0cm of modality] (image) {CNN / ViT};
+    \node[result, below right=1.5cm and 0cm of modality] (text) {Transformer};
+    \node[result, below right=1.5cm and 2.5cm of modality] (graph) {GNN};
+    
+    % Edges
+    \draw[arrow] (modality) -- node[above, font=\tiny, sloped] {Tabular} (tabular);
+    \draw[arrow] (modality) -- node[above, font=\tiny, sloped] {Image} (image);
+    \draw[arrow] (modality) -- node[above, font=\tiny, sloped] {Text/Seq} (text);
+    \draw[arrow] (modality) -- node[above, font=\tiny, sloped] {Graph} (graph);
+    
+    % Sub-decisions for images
+    \node[decision, below=1cm of image] (imgdata) {Data size?};
+    \node[result, below left=0.8cm and 0cm of imgdata, minimum width=1.5cm] (cnn) {CNN};
+    \node[result, below right=0.8cm and 0cm of imgdata, minimum width=1.5cm] (vit) {ViT};
+    
+    \draw[arrow] (image) -- (imgdata);
+    \draw[arrow] (imgdata) -- node[left, font=\tiny] {Small} (cnn);
+    \draw[arrow] (imgdata) -- node[right, font=\tiny] {Large} (vit);
+\end{tikzpicture}
+\caption{Architecture selection by data modality.}
+\label{fig:arch_by_modality}
+\end{figure}
+
+\subsection{Comprehensive Architecture Decision Table}
+
+\begin{table}[H]
+\centering
+\caption{Architecture selection by task and constraints}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Task} & \textbf{First Choice} & \textbf{Alternative} & \textbf{When to Choose Alt} \\
+\midrule
+\multicolumn{4}{l}{\textbf{Tabular Data}} \\
+Classification/Regression & XGBoost/LightGBM & Neural network & Deep interactions needed \\
+Time series & LightGBM + features & Transformer, LSTM & Long-range patterns \\
+\midrule
+\multicolumn{4}{l}{\textbf{Images}} \\
+Classification (small data) & ResNet, EfficientNet & — & — \\
+Classification (large data) & ViT, Swin & ConvNeXt & Less compute \\
+Detection & YOLO, DETR & Faster R-CNN & Accuracy over speed \\
+Segmentation & U-Net, DeepLab & Mask R-CNN & Instance segmentation \\
+\midrule
+\multicolumn{4}{l}{\textbf{Text}} \\
+Classification & BERT, RoBERTa & DeBERTa & SOTA needed \\
+Generation & GPT, LLaMA & — & — \\
+Translation/Summarization & T5, BART & LLM few-shot & No training data \\
+\midrule
+\multicolumn{4}{l}{\textbf{Retrieval}} \\
+< 1K items (low thousands at most) & Cross-Encoder & — & — \\
+1K - 1M items & Two-Tower + rerank & — & — \\
+> 1M items & Two-Tower + ANN & + reranking & Quality critical \\
+\midrule
+\multicolumn{4}{l}{\textbf{Recommendation}} \\
+Collaborative filtering & Two-Tower & Matrix factorization & Simpler system \\
+Sequential & SASRec, BERT4Rec & — & — \\
+Cold start & Content-based, hybrid & — & — \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{NLP Architecture Decision Tree}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1cm,
+    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, font=\footnotesize},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=1.8cm, font=\footnotesize},
+    arrow/.style={->, thick}
+]
+    \node[decision] (task) {Task type?};
+    
+    % Understanding vs Generation
+    \node[decision, below left=1.2cm and 1cm of task] (understand) {Span extraction?};
+    \node[decision, below right=1.2cm and 1cm of task] (gen) {Conditional?};
+    
+    % Understanding branches
+    \node[result, below left=1cm and 0cm of understand] (bert) {BERT/RoBERTa};
+    \node[result, below right=1cm and 0cm of understand] (ner) {BERT + CRF};
+    
+    % Generation branches
+    \node[result, below left=1cm and 0cm of gen] (t5) {T5/BART};
+    \node[result, below right=1cm and 0cm of gen] (gpt) {GPT/LLaMA};
+    
+    % Edges
+    \draw[arrow] (task) -- node[above, font=\tiny, sloped] {Understanding} (understand);
+    \draw[arrow] (task) -- node[above, font=\tiny, sloped] {Generation} (gen);
+    \draw[arrow] (understand) -- node[left, font=\tiny] {No (cls)} (bert);
+    \draw[arrow] (understand) -- node[right, font=\tiny] {Yes (NER/QA)} (ner);
+    \draw[arrow] (gen) -- node[left, font=\tiny] {Yes (translate)} (t5);
+    \draw[arrow] (gen) -- node[right, font=\tiny] {No (open)} (gpt);
+\end{tikzpicture}
+\caption{NLP architecture selection.}
+\end{figure}
+
+%==============================================================================
+\section{Loss Function Selection}
+\label{sec:loss_selection_framework}
+%==============================================================================
+
+\subsection{Classification Losses}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=yellow!20, font=\footnotesize, align=center},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2cm, font=\footnotesize},
+    arrow/.style={->, thick}
+]
+    \node[decision] (type) {Multi-class or\\multi-label?};
+    
+    % Multi-class branch
+    \node[decision, below left=1cm and 1cm of type] (mc_imb) {Imbalanced?};
+    \node[result, below left=0.8cm and 0cm of mc_imb] (ce) {Cross-Entropy};
+    \node[result, below right=0.8cm and 0cm of mc_imb] (focal) {Focal Loss};
+    
+    % Multi-label branch
+    \node[decision, below right=1cm and 1cm of type] (ml_imb) {Imbalanced?};
+    \node[result, below left=0.8cm and 0cm of ml_imb] (bce) {BCE};
+    \node[result, below right=0.8cm and 0cm of ml_imb] (asym) {Asymmetric};
+    
+    % Edges
+    \draw[arrow] (type) -- node[above, font=\tiny, sloped] {Multi-class} (mc_imb);
+    \draw[arrow] (type) -- node[above, font=\tiny, sloped] {Multi-label} (ml_imb);
+    \draw[arrow] (mc_imb) -- node[left, font=\tiny] {No} (ce);
+    \draw[arrow] (mc_imb) -- node[right, font=\tiny] {Yes} (focal);
+    \draw[arrow] (ml_imb) -- node[left, font=\tiny] {No} (bce);
+    \draw[arrow] (ml_imb) -- node[right, font=\tiny] {Yes} (asym);
+\end{tikzpicture}
+\caption{Classification loss selection.}
+\end{figure}
+
+\subsection{Complete Loss Selection Table}
+
+\begin{table}[H]
+\centering
+\caption{Loss function quick reference}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Scenario} & \textbf{Primary Choice} & \textbf{Alternative} \\
+\midrule
+\multicolumn{3}{l}{\textbf{Classification}} \\
+Multi-class, balanced & Cross-Entropy & Label Smoothing + CE \\
+Multi-class, imbalanced & Focal Loss & Class-weighted CE \\
+Multi-label, balanced & BCE (per label) & — \\
+Multi-label, imbalanced & Asymmetric Loss & Focal + BCE \\
+Need calibration & Label Smoothing + CE & Temperature scaling \\
+\midrule
+\multicolumn{3}{l}{\textbf{Metric Learning / Retrieval}} \\
+Verification (same/different) & Contrastive Loss & — \\
+Ranking with triplets & Triplet Loss (semi-hard) & — \\
+In-batch negatives & InfoNCE / NT-Xent & — \\
+Fine-grained recognition & ArcFace & CosFace \\
+\midrule
+\multicolumn{3}{l}{\textbf{Ranking}} \\
+Implicit feedback (clicks) & BPR & — \\
+Explicit relevance labels & LambdaRank & ListNet \\
+Pairwise preferences & Margin Ranking & Hinge \\
+\midrule
+\multicolumn{3}{l}{\textbf{Regression}} \\
+Clean data & MSE & — \\
+Outliers present & Huber Loss & MAE \\
+Uncertainty estimation & Quantile Loss & Gaussian NLL \\
+\midrule
+\multicolumn{3}{l}{\textbf{Specialized}} \\
+Segmentation & Dice + CE & IoU Loss \\
+Sequence alignment & CTC & — \\
+Knowledge distillation & KL Divergence + CE & — \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Model Sizing and Compute Trade-offs}
+\label{sec:model_sizing}
+%==============================================================================
+
+\subsection{Model Size vs. Data Size}
+
+\begin{keyinsight}[Chinchilla Scaling]
+For a fixed compute budget, optimal performance is achieved when:
+\begin{equation}
+D \approx 20 \times N
+\end{equation}
+where $N$ is parameters and $D$ is tokens seen during training---roughly 20 training tokens per parameter (Chinchilla itself: 70B parameters, 1.4T tokens).
+
+Previous models (GPT-3) were undertrained: too many parameters, too little data.
+
+Caveat: compute-optimal is not deployment-optimal. Because inference cost dominates at scale, production models routinely over-train far past 20 tokens/param---Llama-3 8B trained on $\sim$15T tokens is $\sim$1{,}900 tokens per parameter.
+\end{keyinsight}
+
+\subsection{Compute Budget Guidelines}
+
+\begin{table}[H]
+\centering
+\caption{Model size recommendations by compute budget}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Compute (FLOPs)} & \textbf{Params} & \textbf{Tokens} & \textbf{Example} \\
+\midrule
+$1.9 \times 10^{17}$ & 40M & 0.8B & Small BERT \\
+$1.9 \times 10^{19}$ & 400M & 8B & BERT-Large scale \\
+$1.9 \times 10^{21}$ & 4B & 80B & T5-3B / GPT-J scale \\
+$1.9 \times 10^{23}$ & 40B & 800B & Chinchilla-optimal 40B \\
+$1.9 \times 10^{25}$ & 400B & 8T & GPT-4 scale (estimated) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+FLOPs follow $C \approx 6ND$ at the Chinchilla-optimal ratio $D = 20N$. For reference: Chinchilla itself was 70B parameters on 1.4T tokens ($C \approx 5.8 \times 10^{23}$ FLOPs), and GPT-2 XL is 1.5B parameters.
+
+\subsection{Latency vs. Accuracy Trade-off}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+    \begin{axis}[
+        xlabel={Latency (ms)},
+        ylabel={Accuracy (\%)},
+        xmin=0, xmax=100,
+        ymin=85, ymax=100,
+        legend pos=south east,
+        width=10cm,
+        height=6cm,
+        grid=major
+    ]
+    % Example Pareto frontier
+    \addplot[only marks, mark=*, blue] coordinates {
+        (5, 88) (10, 92) (20, 95) (35, 97) (50, 98) (80, 99)
+    };
+    \addplot[dashed, blue, domain=5:80] {100 - 50/x};
+    
+    % Labels
+    \node[font=\tiny] at (axis cs:5,86) {DistilBERT};
+    \node[font=\tiny] at (axis cs:12,90) {BERT-base};
+    \node[font=\tiny] at (axis cs:23,93.5) {BERT-large};
+    \node[font=\tiny] at (axis cs:38,95.5) {RoBERTa};
+    \node[font=\tiny] at (axis cs:55,96.5) {DeBERTa};
+    \node[font=\tiny] at (axis cs:85,97.5) {Ensemble};
+    \end{axis}
+\end{tikzpicture}
+\caption{Schematic accuracy-latency Pareto frontier for NLP models. Points and curve are illustrative only, not measured benchmark results---do not quote these numbers; profile your own task.}
+\end{figure}
+
+\subsection{When to Use Smaller Models}
+
+\begin{table}[H]
+\centering
+\caption{Model size decision factors}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Factor} & \textbf{Prefer Smaller} & \textbf{Prefer Larger} \\
+\midrule
+Latency requirement & < 50ms & Flexible \\
+Deployment target & Edge, mobile & Server, cloud \\
+Training data & Limited & Abundant \\
+Task complexity & Simple/well-defined & Complex/open-ended \\
+Budget & Constrained & Flexible \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Retrieval System Design}
+\label{sec:retrieval_decision}
+%==============================================================================
+
+\subsection{Architecture by Scale}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=1.2cm,
+    decision/.style={diamond, draw, aspect=2.5, inner sep=1pt, fill=lightyellow, font=\small},
+    result/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=3cm, font=\small, align=center},
+    arrow/.style={->, thick}
+]
+    \node[decision] (scale) {Corpus size?};
+    
+    \node[result, below left=1.2cm and 1.5cm of scale] (small) {Cross-Encoder\\(compare all pairs)};
+    \node[result, below=1.2cm of scale] (medium) {Two-Tower +\\Cross-Encoder rerank};
+    \node[result, below right=1.2cm and 1.5cm of scale] (large) {Two-Tower + ANN +\\Multi-stage rerank};
+    
+    \draw[arrow] (scale) -- node[above, font=\tiny, sloped] {< 1K} (small);
+    \draw[arrow] (scale) -- node[left, font=\tiny] {1K-1M} (medium);
+    \draw[arrow] (scale) -- node[above, font=\tiny, sloped] {> 1M} (large);
+\end{tikzpicture}
+\caption{Retrieval architecture by corpus scale.}
+\end{figure}
+
+The cross-encoder-only cutoff comes from latency arithmetic: a BERT-size cross-encoder scores roughly 0.2--0.5ms per query--item pair on a GPU with batching, so exhaustively scoring 1K items already costs $\sim$200--500ms per query---viable only for offline or low-QPS use---and 10K items ($\sim$2--5s) is infeasible for interactive serving. Beyond $\sim$1K items (low thousands at most), retrieve candidates with a two-tower model first and apply the cross-encoder only to the top 10--100.
+
+\subsection{Two-Stage Retrieval Design}
+
+\begin{table}[H]
+\centering
+\caption{Two-stage retrieval configuration}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Stage 1 (Retrieval)} & \textbf{Stage 2 (Reranking)} \\
+\midrule
+Model & Two-Tower (Dual Encoder) & Cross-Encoder \\
+Metric to optimize & Recall@K & NDCG, MRR \\
+Typical K & 100-1000 & 10-50 \\
+Latency target & 1-10 ms & 20-100 ms \\
+Compute per item & O(1) dot product & O(L²) attention \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{ANN Algorithm Selection}
+
+\begin{table}[H]
+\centering
+\caption{ANN algorithm selection guide}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Algorithm} & \textbf{Best For} & \textbf{Trade-off} & \textbf{Memory} \\
+\midrule
+HNSW & Best recall & Slow index build & High \\
+IVF-Flat & Balanced & Need more probes for recall & Medium \\
+IVF-PQ & Large scale & Lower recall & Low \\
+ScaNN & Production (Google) & Complex setup & Medium \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Common Trade-off Discussions}
+\label{sec:tradeoffs}
+%==============================================================================
+
+\subsection{Accuracy vs. Latency}
+
+\textbf{Techniques to improve latency while preserving accuracy}:
+\begin{enumerate}
+    \item \textbf{Quantization}: INT8 gives 2-4× speedup with < 1\% accuracy loss for compute-bound CNN/encoder inference (TensorRT-style); memory-bandwidth-bound LLM decoding sees closer to 1.5-2× from weight-only INT8
+    \item \textbf{Distillation}: Smaller student can retain 95-99\% of teacher quality
+    \item \textbf{Pruning}: Structured pruning for real speedup
+    \item \textbf{Caching}: Cache embeddings, predictions for repeated inputs
+    \item \textbf{Early exit}: Stop processing when confident
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\caption{Latency reduction techniques}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Technique} & \textbf{Speedup} & \textbf{Accuracy Impact} & \textbf{Complexity} \\
+\midrule
+INT8 quantization & 2-4× (compute-bound CNN/encoder); 1.5-2× (memory-bound LLM decode, weight-only) & < 1\% loss & Low \\
+INT4 quantization & 4-8× & 1-3\% loss & Medium \\
+Distillation & 2-10× & 1-5\% loss & Medium \\
+Structured pruning & 2-4× & 1-3\% loss & Medium \\
+Flash Attention & 2-4× & 0\% & Low \\
+Speculative decoding & 2-3× & 0\% & Medium \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Training Cost vs. Inference Cost}
+
+\textbf{When to invest in training}:
+\begin{itemize}
+    \item High inference volume amortizes training cost
+    \item One-time training, many inference calls
+    \item Training enables smaller inference model (distillation)
+\end{itemize}
+
+\textbf{When to minimize training}:
+\begin{itemize}
+    \item Rapid iteration needed
+    \item Low inference volume
+    \item Frequently changing requirements
+\end{itemize}
+
+\subsection{Model Complexity vs. Maintainability}
+
+\begin{table}[H]
+\centering
+\caption{Complexity vs. maintainability trade-offs}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Aspect} & \textbf{Simple Model} & \textbf{Complex Model} \\
+\midrule
+Debugging & Easy & Hard \\
+Iteration speed & Fast & Slow \\
+Interpretability & High & Low \\
+Peak performance & Lower & Higher \\
+Team expertise needed & Lower & Higher \\
+Production risk & Lower & Higher \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[Start Simple, Add Complexity]
+Always start with the simplest solution that could work:
+\begin{enumerate}
+    \item Baseline: Logistic regression / simple heuristics
+    \item First ML: Gradient boosting for tabular, pretrained BERT for text
+    \item Optimize: Custom architectures, ensemble, SOTA methods
+\end{enumerate}
+Add complexity only when simpler approaches fail to meet requirements.
+\end{keyinsight}
+
+\subsection{Generalization vs. Specialization}
+
+\begin{table}[H]
+\centering
+\caption{General vs. specialized models}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Factor} & \textbf{General Model} & \textbf{Specialized Models} \\
+\midrule
+Number of models & 1 & N (per task/domain) \\
+Maintenance & Easier & Harder \\
+Per-task performance & Lower & Higher \\
+Data efficiency & Can share data & Need task-specific data \\
+Deployment & Simpler & More complex \\
+When to use & Early stage, rapid iteration & Mature system, quality critical \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Debugging Decision Trees}
+\label{sec:debugging_decisions}
+%==============================================================================
+
+\subsection{Model Not Learning}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.8cm,
+    decision/.style={diamond, draw, aspect=3, inner sep=1pt, fill=lightyellow, font=\tiny},
+    action/.style={rectangle, draw, rounded corners, fill=lightgreen, minimum width=2cm, font=\tiny, align=center},
+    arrow/.style={->, thick}
+]
+    \node[decision] (start) {Loss decreasing?};
+    
+    \node[decision, below left=1cm and 1cm of start] (lr) {Tried different LR?};
+    \node[decision, below right=1cm and 1cm of start] (overfit) {Overfitting?};
+    
+    \node[action, below left=0.8cm and 0cm of lr] (try_lr) {Try LR × 0.1\\and LR × 10};
+    \node[decision, below right=0.8cm and 0cm of lr] (data) {Data correct?};
+    
+    \node[action, below left=0.8cm and 0cm of data] (check_data) {Visualize batches\\Check labels};
+    \node[action, below right=0.8cm and 0cm of data] (bug) {Check model\\architecture};
+    
+    \node[action, below left=0.8cm and 0cm of overfit] (regularize) {Add regularization\\More data/augmentation};
+    \node[action, below right=0.8cm and 0cm of overfit] (continue) {Continue training\\Monitor validation};
+    
+    \draw[arrow] (start) -- node[above, font=\tiny, sloped] {No} (lr);
+    \draw[arrow] (start) -- node[above, font=\tiny, sloped] {Yes} (overfit);
+    \draw[arrow] (lr) -- node[left, font=\tiny] {No} (try_lr);
+    \draw[arrow] (lr) -- node[right, font=\tiny] {Yes} (data);
+    \draw[arrow] (data) -- node[left, font=\tiny] {Unchecked} (check_data);
+    \draw[arrow] (data) -- node[right, font=\tiny] {Correct} (bug);
+    \draw[arrow] (overfit) -- node[left, font=\tiny] {Yes} (regularize);
+    \draw[arrow] (overfit) -- node[right, font=\tiny] {No} (continue);
+\end{tikzpicture}
+\caption{Debugging decision tree: model not learning.}
+\end{figure}
+
+\subsection{Production Performance Degradation}
+
+\begin{enumerate}
+    \item \textbf{Check data pipeline}
+    \begin{itemize}
+        \item Feature distributions changed?
+        \item Missing/null values increased?
+        \item Data source changed?
+    \end{itemize}
+    
+    \item \textbf{Check for data drift}
+    \begin{itemize}
+        \item Compare feature distributions over time
+        \item PSI (Population Stability Index) > 0.25 indicates significant drift
+    \end{itemize}
+    
+    \item \textbf{Segment analysis}
+    \begin{itemize}
+        \item Performance by user segment
+        \item Performance by feature value ranges
+        \item Identify affected subpopulations
+    \end{itemize}
+    
+    \item \textbf{Model debugging}
+    \begin{itemize}
+        \item Feature importance analysis
+        \item Error analysis on failing cases
+        \item Compare to baseline/previous model
+    \end{itemize}
+\end{enumerate}
+
+%==============================================================================
+\section{Interview Question Patterns}
+\label{sec:interview_patterns}
+%==============================================================================
+
+\subsection{System Design Questions}
+
+\textbf{Common patterns}:
+\begin{enumerate}
+    \item Clarify requirements and constraints
+    \item Propose high-level architecture
+    \item Dive into ML components
+    \item Discuss trade-offs
+    \item Address scale and production concerns
+\end{enumerate}
+
+\begin{interviewq}
+\textbf{Q: Design a content recommendation system for a news app.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer \textbf{Step 1---Clarify requirements}: Scale (users, articles/day), latency SLA ($<$200ms), cold-start handling, engagement metric to optimize (CTR, session time, retention). \textbf{Step 2---Architecture}: Two-stage system. Candidate generation: two-tower model (user tower encoding history + demographics, item tower encoding article content + metadata) with ANN retrieval over all articles. Returns top 200 candidates in $<$10ms. Ranking: a cross-encoder or feature-rich neural ranker scores the 200 candidates using user-item cross-features, session context, and real-time signals. Returns top 20 in $<$50ms. Business logic layer applies diversity constraints, freshness boost, and brand safety filters. \textbf{Step 3---Key decisions}: Two-tower for retrieval (latency) vs.\ cross-encoder for ranking (quality). Batch user embeddings with real-time session overlay. Exploration: epsilon-greedy or Thompson sampling to discover new user preferences. \textbf{Step 4---Production}: A/B test with CTR primary, retention guardrail, diversity guardrail. Feedback loop monitoring: if the model keeps showing the same content types, diversity decays. Daily model retraining. Feature store for user history (batch) and session context (streaming).
+
+\redflags
+\begin{itemize}
+    \item Jumping to model architecture without clarifying requirements
+    \item Single-stage design (no retrieval/ranking separation)
+    \item No mention of cold start, exploration, or feedback loops
+\end{itemize}
+
+\interviewtest{End-to-end ML system design. Do you start with requirements? Do you design beyond the model?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Two-stage architecture, correct metric choice, basic feature engineering
+    \item \badgeLsix{L6} Diversity constraints, exploration strategy, feedback loop awareness, A/B testing plan
+    \item \badgeLseven{L7} Multi-objective optimization (CTR + retention + diversity), position bias in training data, long-term user ecosystem health, organizational incentive alignment
+\end{itemize}
+
+\followups{``How do you handle cold-start users?'' ``How do you avoid filter bubbles?'' ``How do you balance freshness vs.\ relevance?''}
+\end{interviewq}
+
+\subsection{Architecture Choice Questions}
+
+\textbf{Pattern}: ``Would you use X or Y for this problem?''
+
+\textbf{Framework}:
+\begin{enumerate}
+    \item State your choice clearly
+    \item Explain the primary reason
+    \item Acknowledge trade-offs
+    \item Describe when you'd choose the alternative
+\end{enumerate}
+
+\begin{interviewq}
+\textbf{Q: Design the ML architecture for a content moderation system.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer Content moderation requires high recall (must catch violations) with acceptable precision (minimize false blocks) at massive scale and low latency. \textbf{Architecture---three-level cascade}: \textbf{Level 1---Rules and heuristics} (0.1ms): Keyword/regex filters, known-bad URL blocklists, exact-match against known violating content hashes (PhotoDNA-style). Catches 50--60\% of violations at near-zero cost. \textbf{Level 2---Fast classifiers} (5--10ms): Small BERT or distilled model for text. EfficientNet for images. Multi-label classification: hate speech, violence, NSFW, spam, misinformation. Catches 35\% of remaining violations. Route uncertain cases (confidence 0.3--0.7) to Level 3. \textbf{Level 3---Heavy models + human review}: Large multimodal model for complex cases (sarcasm, context-dependent content, memes). Human review queue for high-stakes decisions (legal liability). \textbf{Key design decisions}: (1) Threshold tuning per category---higher recall for child safety (accept more false positives) vs.\ lower recall for borderline political content (avoid censorship). (2) Multi-modal: text, image, video, audio all need separate or unified models. (3) Adversarial robustness: users deliberately obfuscate violating content (Unicode tricks, image perturbations). (4) Appeal system: false positives need a review path. \textbf{Metrics}: Per-category precision and recall, latency per level, human review volume, false positive appeal rate. \textbf{Production}: Continuous retraining on new violation patterns. Active learning from human review queue.
+
+\redflags
+\begin{itemize}
+    \item Single model for all moderation---ignores the latency/cost cascade
+    \item Not differentiating recall requirements by violation category
+    \item Ignoring the adversarial nature of the problem
+\end{itemize}
+
+\interviewtest{Can you design a multi-stage system with different precision/recall requirements per category? Do you think about adversarial robustness and scale?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Cascade architecture, per-category thresholds, multi-modal awareness
+    \item \badgeLsix{L6} Adversarial robustness, appeal system, active learning from human review, cost analysis
+    \item \badgeLseven{L7} Discusses policy-model alignment (translating policy guidelines into model labels), cross-cultural content differences, legal and regulatory requirements, organizational governance
+\end{itemize}
+
+\followups{``How do you handle sarcasm and context?'' ``How do you deal with adversarial attacks on the moderation system?'' ``How do you balance precision and recall for borderline content?''}
+\end{interviewq}
+
+\subsection{Trade-off Discussion Questions}
+
+\textbf{Pattern}: ``How would you handle X constraint?''
+
+\textbf{Framework}:
+\begin{enumerate}
+    \item Acknowledge the constraint explicitly
+    \item List options with trade-offs
+    \item Recommend based on typical scenarios
+    \item Ask clarifying questions if needed
+\end{enumerate}
+
+\begin{interviewq}
+\textbf{Q: Your model needs to run in $<$10ms. Current latency is 50ms. Walk through the optimization decision tree.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer This requires a 5$\times$ speedup. I approach systematically. \textbf{Step 1---Profile the bottleneck}: Break latency into components: feature computation, model forward pass, post-processing, network overhead. Fix the bottleneck, not everything. If feature computation is 30ms, no model optimization will help---you need feature precomputation or caching. \textbf{Step 2---Low-effort optimizations} (try first): INT8 quantization gives 2--4$\times$ speedup with $<$1\% quality loss. Graph optimization (TensorRT, ONNX Runtime) fuses operators for 1.5--3$\times$. Flash attention if attention is the bottleneck. These combined might get us from 50ms to 15--20ms. \textbf{Step 3---Medium-effort} (if still insufficient): Model distillation---train a smaller student to mimic the large model. A 12-layer BERT distilled to 3 layers gives $\sim$4$\times$ speedup at 95--97\% quality. Structured pruning: remove attention heads and layers that contribute least. \textbf{Step 4---Architectural changes} (if needed): Replace the model entirely with a smaller architecture (DistilBERT, TinyBERT, or a shallow model). Caching frequent predictions eliminates inference entirely for repeated inputs. Early exit: if the model is confident after 2 layers, skip the remaining 10. \textbf{Step 5---System-level}: Better hardware (GPU with tensor cores). Serving optimization (dynamic batching for throughput, not latency). Pre-computation of expensive sub-computations. \textbf{My recommendation}: Profile first (30 min). Then INT8 + TensorRT ($\sim$3--4$\times$, 1 day effort). If not enough, distillation ($\sim$1--2 week effort).
+
+\redflags
+\begin{itemize}
+    \item ``Just use a smaller model'' without profiling the actual bottleneck
+    \item Not ordering optimizations by effort-to-impact ratio
+    \item Forgetting feature computation latency (often the real bottleneck)
+\end{itemize}
+
+\interviewtest{Systematic optimization thinking. Do you profile before optimizing? Do you order by effort-to-impact?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Profiles first, knows quantization and distillation, orders by effort
+    \item \badgeLsix{L6} Includes graph optimization, caching, early exit. Gives time estimates for each approach
+    \item \badgeLseven{L7} Analyzes whether the latency SLA should be renegotiated (is 10ms truly necessary?), proposes a Pareto analysis of quality vs.\ latency, discusses the organizational process for making this tradeoff
+\end{itemize}
+
+\followups{``What if quantization causes a 3\% accuracy drop?'' ``How do you decide between distillation and pruning?'' ``What if the model is already INT8?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You have 3 months and a team of 3 ML engineers. Should you fine-tune an LLM or train a custom model?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer This is a build-vs-adapt decision. The answer depends on five factors. \textbf{1. Task specificity}: If the task is well-served by language understanding (classification, extraction, summarization, QA), fine-tune an LLM---you get strong baseline performance immediately and can iterate on data quality rather than architecture. If the task involves structured inputs (tabular data, time series, graph data), a custom model is necessary because LLMs do not handle these well. \textbf{2. Data volume and quality}: With $<$10K labeled examples, fine-tuning a pre-trained LLM via LoRA is almost always better---it leverages the model's pre-existing knowledge. With $>$100K examples and a well-defined task, a custom model (BERT-size or smaller) may be more efficient to serve and iterate on. \textbf{3. Latency and cost}: An LLM (even fine-tuned) typically requires $>$20ms for inference on GPU. A distilled BERT or lightweight custom model can serve in $<$5ms. If you need $<$10ms at 100K+ QPS, a custom smaller model is likely better. \textbf{4. Iteration speed}: Fine-tuning an LLM gives you a working prototype in days. A custom model requires architecture search, hyperparameter tuning, and more engineering time. With 3 months and 3 engineers, I would spend month 1 on LLM fine-tuning to establish a strong baseline and validate the approach with stakeholders, then months 2--3 either iterating on the LLM pipeline (data quality, prompt engineering, evaluation) or distilling to a smaller custom model if serving cost requires it. \textbf{5. Team expertise}: If the team has strong NLP experience, a custom model is feasible. If they are generalists, LLM fine-tuning has a much lower skill barrier.
+
+\redflags
+\begin{itemize}
+    \item ``Always fine-tune an LLM''---ignores serving cost, latency, and task-type constraints
+    \item ``Always build custom''---wastes months when an LLM baseline would work in days
+    \item Not considering the team's expertise as a factor
+\end{itemize}
+
+\interviewtest{Engineering judgment under resource constraints. Can you make a principled decision that accounts for team size, timeline, and technical factors?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Considers data volume, task type, and latency requirements
+    \item \badgeLsix{L6} Proposes a phased approach (LLM baseline first, then optimize), discusses the distillation path from LLM to custom model
+    \item \badgeLseven{L7} Factors in organizational context (team growth, long-term maintenance, vendor lock-in), proposes success criteria for the phase-1/phase-2 decision gate
+\end{itemize}
+
+\followups{``What if the task involves both text and tabular data?'' ``How do you evaluate whether the LLM baseline is good enough?'' ``When would you switch from LoRA to full fine-tuning?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: GPU vs TPU vs CPU for inference---give a decision framework for different workloads.}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer The choice depends on workload characteristics: model size, batch size, latency requirements, and cost. \textbf{CPU inference}: Best for small models (logistic regression, small gradient boosting, shallow networks $<$10M params), low batch sizes, or when the workload is memory-bound not compute-bound. Advantages: cheapest per instance, no GPU driver complexity, scales horizontally easily. Use for: feature-based ML models, lightweight classifiers, edge deployment. \textbf{GPU inference}: Best for large neural networks (transformers, CNNs $>$100M params) that benefit from massive parallelism. Advantages: 10--100$\times$ throughput over CPU for matrix-heavy workloads, tensor cores accelerate FP16/INT8. Use for: LLM inference, image/video models, any model where the forward pass is dominated by matrix multiplications. Trade-off: higher per-instance cost, requires batching to utilize fully. \textbf{TPU inference}: Google's custom accelerators, optimized for large batch, high throughput. Advantages: higher throughput-per-dollar than GPU for large batch inference, native BF16 support. Disadvantages: limited to Google Cloud, less flexible than GPU, poor for small batch/low latency. Use for: large-scale batch inference (daily recommendation updates), models already trained on TPU (TensorFlow/JAX ecosystem). \textbf{Decision framework}: (1) Model $<$ 10M params and no GPU-friendly operations: CPU. (2) Model $>$ 100M params, real-time serving: GPU with dynamic batching. (3) Model $>$ 100M params, batch inference at scale: TPU or GPU depending on cloud provider. (4) Edge/mobile: CPU or specialized accelerators (Apple Neural Engine, Qualcomm Hexagon).
+
+\redflags
+\begin{itemize}
+    \item ``Always use GPU for ML inference''---CPU is often better for small models
+    \item Not considering cost per inference (GPU is expensive when underutilized)
+    \item Ignoring the batch size dimension (GPUs need batching to be efficient)
+\end{itemize}
+
+\interviewtest{Hardware awareness. Do you know when GPU overhead is not justified? Can you reason about cost-performance tradeoffs?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct CPU vs.\ GPU guidance, mentions model size as the key factor
+    \item \badgeLsix{L6} Includes TPU tradeoffs, discusses dynamic batching, cost-per-inference analysis
+    \item \badgeLseven{L7} Discusses specialized accelerators (inference ASICs like AWS Inferentia, Groq), compiler optimizations (TensorRT, XLA), and the total cost of ownership including engineering time
+\end{itemize}
+
+\followups{``When would you use AWS Inferentia?'' ``How do you decide between A100 and H100?'' ``What about inference on Apple Silicon?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Build vs buy vs open-source---give a decision framework for ML infrastructure.}
+
+\badgeLseven{L7} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer This is fundamentally a strategic decision that depends on differentiation, team capability, and total cost of ownership. \textbf{Build custom} when: (1) the component is core to your competitive advantage (e.g., Google builds its own serving infrastructure because serving efficiency at their scale is a differentiator), (2) no existing solution meets your requirements (unusual scale, latency, or integration needs), (3) you have a dedicated platform team to maintain it long-term. Risk: high upfront cost, ongoing maintenance burden, opportunity cost of engineer time. \textbf{Buy (managed service)} when: (1) the component is commodity (experiment tracking, monitoring, basic serving), (2) speed to production matters more than customization, (3) you lack the team to maintain infrastructure. Examples: Weights \& Biases for tracking, Datadog for monitoring, SageMaker for managed training. Risk: vendor lock-in, cost at scale, limited customization. \textbf{Open-source} when: (1) the component is well-established with active community (MLflow, Airflow, Ray, vLLM), (2) you need customization but not from scratch, (3) you want to avoid vendor lock-in. Risk: operational burden (you own the deployment and upgrades), community priorities may not align with yours, security patches are your responsibility. \textbf{Framework}: For each ML infrastructure component (feature store, experiment tracking, model serving, training orchestration, monitoring), ask: (1) Is this a differentiator? If yes, build. (2) Does a good open-source solution exist? If yes, use it. (3) If neither, buy. \textbf{Common pattern at FAANG scale}: Build the differentiated core (serving infra, feature platform), open-source the non-differentiated components (Kubernetes, Spark), and avoid buying managed services for anything at massive scale (cost prohibitive).
+
+\redflags
+\begin{itemize}
+    \item ``Always build''---ignores opportunity cost and maintenance burden
+    \item ``Always buy''---ignores vendor lock-in and cost at scale
+    \item Not considering the team's ability to maintain what they build
+\end{itemize}
+
+\interviewtest{Strategic technical decision-making. This is a Staff+ question that tests whether you think about organizational impact, not just technical merit.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Reasonable build vs.\ buy reasoning with cost considerations
+    \item \badgeLsix{L6} Three-way framework with concrete examples, discusses vendor lock-in and total cost of ownership
+    \item \badgeLseven{L7} Connects to organizational strategy (what is the company's competitive advantage?), discusses the migration path (start with bought/OSS, migrate to custom as scale demands), proposes a decision matrix for each infrastructure component
+\end{itemize}
+
+\followups{``How do you migrate from a managed service to a custom solution?'' ``What is the true cost of maintaining open-source infrastructure?'' ``How do you make this decision at a startup vs.\ FAANG?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Would you use BERT or GPT for sentiment analysis?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer I would default to \textbf{BERT} (or a similar encoder model like RoBERTa/DeBERTa). The primary reason is that sentiment analysis is a classification task. BERT's bidirectional attention captures context from both sides of each token, which is critical for sentiment---``not bad at all'' requires understanding the negation in context. BERT also has faster inference than autoregressive models: no sequential decoding, just a single forward pass through the encoder plus a classification head. Fine-tuning BERT for sentiment is straightforward and well-studied: add a linear layer on the [CLS] token, fine-tune for 3--5 epochs. A BERT-base model ($\sim$110M params) achieves strong results on standard benchmarks with as few as 1K labeled examples. \textbf{When to use GPT/LLM instead}: (1) No labeled data available---use zero-shot or few-shot prompting with a large LLM. (2) Need multi-task capability---one LLM handles sentiment, summarization, and QA without separate fine-tuning. (3) Complex sentiment requiring reasoning (e.g., aspect-level sentiment with explanation). \textbf{The nuanced answer}: In 2024+, the line is blurring. A fine-tuned LLaMA-7B via LoRA can match BERT quality while providing more flexibility. But for a production system optimized for cost and latency, a fine-tuned encoder model remains the practical choice---10$\times$ cheaper to serve.
+
+\redflags
+\begin{itemize}
+    \item ``GPT is always better because it's larger''---bigger is not always better for classification
+    \item Not mentioning the latency/cost advantage of encoder models
+    \item Forgetting that LLMs can be useful when no labeled data exists
+\end{itemize}
+
+\interviewtest{Can you match architecture to task type? Do you understand the encoder vs.\ decoder distinction and its practical implications?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct choice with clear reasoning (bidirectional attention for classification), mentions inference efficiency
+    \item \badgeLsix{L6} Discusses the zero-shot scenario where GPT wins, proposes LLM + distillation pipeline
+    \item \badgeLseven{L7} Analyzes the cost-quality Pareto frontier across approaches, discusses when the task complexity exceeds what an encoder can handle (aspect-level sentiment, sarcasm detection)
+\end{itemize}
+
+\followups{``What if you have no labeled data?'' ``When would you use a decoder model for classification?'' ``How do you handle sarcasm?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: When should you use gradient boosting vs.\ neural networks for tabular data?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer For tabular data, gradient boosting (XGBoost, LightGBM, CatBoost) remains the default choice and consistently wins or ties neural networks on most benchmarks. \textbf{Gradient boosting wins when}: (1) Dataset is small to medium ($<$10K--1M rows)---GBMs are more sample-efficient. (2) Features are heterogeneous (mix of categorical, numerical, ordinal)---GBMs handle these natively. (3) Interpretability matters---feature importance is built-in, SHAP values are well-supported. (4) Training speed matters---GBMs train in minutes vs.\ hours for neural nets. (5) Feature engineering effort is limited---GBMs handle raw features well. \textbf{Neural networks win when}: (1) Dataset is very large ($>$10M rows) with complex feature interactions that benefit from learned representations. (2) The task involves multi-modal inputs (tabular + text + images)---neural nets can learn joint embeddings. (3) The tabular features include high-cardinality categorical variables that benefit from learned embeddings (e.g., user IDs, product IDs in recommendation). (4) You need online learning with streaming updates. (5) The downstream system is already neural (e.g., tabular features feeding into a transformer ranker). \textbf{Recent developments}: Models like TabNet, FT-Transformer, and TabPFN narrow the gap, but benchmarks (Grinsztajn et al., 2022, NeurIPS) consistently show GBMs winning on medium-sized tabular datasets. The practical default: start with LightGBM, switch to neural only if there is a specific reason.
+
+\redflags
+\begin{itemize}
+    \item ``Neural networks are always better because they're more powerful''---empirically false for tabular data
+    \item ``GBMs can't handle large datasets''---they scale well with distributed training
+    \item Not knowing about the consistent GBM advantage on tabular benchmarks
+\end{itemize}
+
+\interviewtest{Practical ML judgment. Do you know that the best model depends on the data type, not just model complexity?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows GBMs dominate tabular data, gives clear criteria for each choice
+    \item \badgeLsix{L6} Discusses multi-modal scenarios where NNs win, mentions recent benchmarks (Grinsztajn et al.), discusses embedding approaches for categorical features
+    \item \badgeLseven{L7} Proposes a hybrid architecture (GBM features as input to a neural ranker), discusses the ``two-tower with tabular features'' pattern in industry, analyzes why NNs struggle on tabular data (inductive bias mismatch)
+\end{itemize}
+
+\followups{``What about TabNet and FT-Transformer?'' ``How do you handle high-cardinality categoricals in GBMs?'' ``When would you use an ensemble of both?''}
+\end{interviewq}
