@@ -14,5 +14,6 @@ check:
 
 sync-style:
 	@for v in $(VOLS); do \
-	  cp style/essentials.sty volumes/$$v/essentials.sty 2>/dev/null && echo "synced -> $$v" || true; \
+	  cp style/essentials.sty volumes/$$v/essentials.sty 2>/dev/null && echo "synced sty -> $$v" || true; \
+	  cp style/program_map.tex volumes/$$v/program_map.tex && echo "synced map -> $$v" || true; \
 	done
