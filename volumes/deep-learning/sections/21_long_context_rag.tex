@@ -277,55 +277,15 @@ Multi-query & Broad / exploratory queries & 1 LLM call + $N$ retrievals & Redund
 \end{table}
 
 %==============================================================================
-\section{Reranking}
+\section{Reranking and Hybrid Retrieval}
 \label{sec:reranking}
 %==============================================================================
 
-The retrieval stage casts a wide net using fast but imprecise bi-encoder similarity. Reranking applies a more powerful model to score just the top-$N$ candidates.
+\textit{Pointer: the retrieval-systems depth behind this section---bi-encoder training recipes, ColBERTv2/PLAID and the late-interaction storage math, LLM rerankers and their distillation, fusion mechanics, and multi-stage latency/cost budgets---is canonical in the Search volume [SR~4]; the embedder landscape is canonical in [NLP~3]. This section keeps what a RAG designer needs to assemble the pipeline.}
 
-\subsection{Cross-Encoder Reranking}
+\textbf{The funnel in one paragraph.} Retrieval and reranking form a funnel that spends more compute per candidate on fewer candidates. The first stage casts a wide net with \textit{decomposable} scorers whose document representations are precomputed offline: BM25 and a bi-encoder run in parallel, and their candidate lists are merged with reciprocal rank fusion (rank-based fusion---raw BM25 and cosine scores live on incompatible, query-dependent scales and must not be summed). The hybrid matters because the two retrievers fail on complementary queries: embedding models blur exact identifiers (product IDs, error codes, proper nouns) that BM25 matches literally, while BM25 misses the paraphrases that embeddings catch---so hybrid consistently outperforms either alone, and in an interview you should always propose it. A \textbf{cross-encoder} then rescores the top 20--100 candidates jointly (\texttt{[CLS] query [SEP] chunk [SEP]}): full query--document attention buys back the precision that single-vector similarity loses, at $O(N)$ forward passes with nothing precomputable---affordable only over a small window, never over the corpus. \textbf{Late interaction} (ColBERT) sits between the two: per-token document embeddings stored at index time, scored by MaxSim at query time---near-cross-encoder quality with bi-encoder-style precomputation, at a storage multiple (roughly an order of magnitude over a single-vector index even with ColBERTv2's compression; the worked math is in [SR~4]).
 
-\textbf{What it is.} A cross-encoder processes the query and each candidate chunk \textit{jointly} as a single input: \texttt{[CLS] query [SEP] chunk [SEP]}. Unlike bi-encoders (which embed query and chunk independently), cross-encoders can model fine-grained token-level interactions between query and chunk.
-
-\textbf{Why it is better.} Bi-encoders compress the query into a single vector and the chunk into another single vector, then measure cosine similarity. All the nuance of how specific query terms relate to specific chunk passages is lost. Cross-encoders see both simultaneously and can attend across them.
-
-\textbf{Why it is slower.} A bi-encoder computes one embedding per query. A cross-encoder requires $N$ forward passes (one per candidate). This is why cross-encoders are used for reranking (top 20--100 candidates) rather than full-corpus retrieval.
-
-\subsection{ColBERT: Late Interaction}
-
-\textbf{What it is.} ColBERT keeps query and document \textit{encoded independently} (like a bi-encoder) but computes similarity at the \textit{token level} rather than the vector level. Each query token's embedding is compared against all document token embeddings via MaxSim---the relevance score is the sum of maximum similarities across query tokens.
-
-\begin{mathresult}{ColBERT MaxSim Scoring}
-\[
-\text{score}(q, d) = \sum_{i=1}^{|q|} \max_{j=1}^{|d|} \; \vq_i^\top \vk_j
-\]
-where $\vq_i$ and $\vk_j$ are the contextualized embeddings of the $i$-th query token and $j$-th document token.
-\end{mathresult}
-
-\textbf{Why it matters.} ColBERT achieves near-cross-encoder quality with bi-encoder-like precomputation. Document token embeddings can be stored at index time. Only the lightweight MaxSim scoring happens at query time. This makes it 10--100$\times$ faster than cross-encoder reranking while retaining most of the quality gain.
-
-\textbf{Trade-off.} Storage cost is significant: each document stores one embedding per token, not one embedding per chunk. For a 512-token chunk with 128-dim embeddings at 1 byte per dimension (a common quantized setting), ColBERT stores $512 \times 128 = 64$KB---at FP16 it would be 128KB---vs.\ 512 bytes for a single-vector bi-encoder (128-dim FP32), roughly 125$\times$ more storage.
-
-\begin{table}[H]
-\centering
-\caption{Retrieval and reranking model comparison}
-\begin{tabularx}{\textwidth}{lXXXl}
-\toprule
-\textbf{Model Type} & \textbf{Quality} & \textbf{Speed} & \textbf{Storage} & \textbf{Stage} \\
-\midrule
-Sparse (BM25) & Baseline & Very fast & Low (inverted index) & Retrieval \\
-Bi-encoder & Good & Fast (ANN) & Low (1 vec/chunk) & Retrieval \\
-ColBERT (late interaction) & Very good & Medium & High (1 vec/token) & Retrieval or rerank \\
-Cross-encoder & Best & Slow ($N$ passes) & None (no precompute) & Rerank only \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\textbf{Practical recommendation.} For most RAG systems: BM25 + bi-encoder hybrid retrieval (combine sparse and dense signals), followed by cross-encoder reranking of top 20--50 candidates. Add ColBERT when storage is not a constraint and you need faster reranking than cross-encoders.
-
-\begin{warningbox}
-\textbf{BM25 is still competitive and often complementary.} Many teams skip keyword-based retrieval entirely, assuming dense embeddings are strictly superior. In practice, BM25 catches exact-match queries (product IDs, error codes, proper nouns) that embedding models miss because they paraphrase rather than match literally. A hybrid of BM25 + dense retrieval with reciprocal rank fusion consistently outperforms either alone. In an interview, always mention this hybrid approach.
-\end{warningbox}
+\textbf{Practical default for RAG:} hybrid BM25 + bi-encoder retrieval fused with RRF, cross-encoder reranking of the top 20--50, and the top 3--10 chunks to the generator---where the reranker's output \textit{ordering}, not just its selection, affects generation quality (Section~\ref{sec:long_context_vs_rag}). When quality demands more, the modern upgrade path is distilling an LLM listwise reranker into the serving cross-encoder rather than serving anything larger online [SR~4].
 
 %==============================================================================
 \section{Beyond Top-$k$: GraphRAG, Contextual Retrieval, Agentic Retrieval}

@@ -2,24 +2,700 @@
 \label{sr:chap:evaluation_experimentation}
 
 \begin{tldr}
-Placeholder — this chapter is written in Phase C from the vector-retrieval digest and applied-search track design (see review/search-recsys/ in the DL repo).
+This chapter is the program's canonical home for ranking and retrieval evaluation. Offline, you must be able to derive and hand-compute the binary-relevance metrics (Precision@$k$, Recall@$k$, MRR, MAP) and the graded family (CG $\to$ DCG $\to$ NDCG), and to name their traps: ideal-DCG normalization artifacts, unjudged documents silently treated as irrelevant, and---for recommenders---random splits that leak the future and sampled negatives that corrupt HR@$k$/NDCG@$k$. Between offline and online sits the offline--online gap: logged data is position- and selection-biased, so a 3\% offline NDCG gain routinely produces a flat A/B test; counterfactual estimators (IPS, SNIPS, doubly robust) are the principled bridge, and they only work if you log propensities. Online, ranking systems have two instruments: interleaving (team-draft), which is one to two orders of magnitude more sample-efficient than A/B but only compares rankings, and A/B testing, whose statistical machinery (power, CUPED, sequential tests) is canonical in [CML 6]. Staff-level candidates are distinguished less by metric formulas than by evaluation-\textit{program} design: a debug $\to$ offline $\to$ online $\to$ business metric hierarchy, a judgment supply chain with a refresh cadence, and pre-registered ship criteria.
 \end{tldr}
 
-\section{Offline: NDCG Regimes and Judgment Lists}
-% TODO Phase C
+Search and recommendation are unusual among ML systems in that the \textit{measurement} problem is harder than the modeling problem. The label is not a ground truth you possess but a construct you must manufacture---from editors, crowdworkers, LLM judges, or biased behavioral logs---and the deployed system contaminates every log it writes. Most of the classic staff-level interview failures in this domain are evaluation failures: trusting a metric computed on labels the old ranker generated, comparing systems on judgment pools built for their predecessors, or shipping an offline win that an A/B test cannot even detect. This chapter builds the metrics from first principles, then the protocols, then the experiments, then the program that holds them together. Metric one-liners live in the program-wide catalog [DL 23]; derivations live here. Statistical machinery for experiments (power analysis, variance reduction, sequential testing) is canonical in [CML 6]; LLM-judge methodology is canonical in [NLP 10].
 
-\section{Relevance Judgment Programs}
-% TODO Phase C
+%==============================================================================
+\section{Offline Metrics for Binary Relevance}
+\label{sr:sec:eval_binary_metrics}
+%==============================================================================
 
-\section{Online: Search-Native Metrics}
-% TODO Phase C
+\subsection{Setup and the Question Behind Each Metric}
 
-\section{Interleaving}
-% TODO Phase C
+Fix a query $q$ with a judged set of relevant documents $R_q$ ($|R_q| = R$), and a ranked list $d_1, d_2, \ldots, d_n$ returned by the system. Let $\mathrm{rel}_i \in \{0, 1\}$ indicate whether $d_i$ is relevant. Every offline ranking metric is a scalar summary of \textit{where the relevant documents landed}---and each summary encodes a specific model of what the user came to do. Choosing a metric \textit{is} choosing a user model; the most common evaluation mistake is computing a metric whose implied user does not exist on your surface.
 
-\section{A/B for Ranking Systems}
-% TODO Phase C
+\begin{mathresult}{The Binary-Relevance Metric Family}
+\textbf{Precision@$k$} --- fraction of the top $k$ that is relevant:
+\begin{equation}
+\mathrm{P@}k = \frac{1}{k}\sum_{i=1}^{k} \mathrm{rel}_i
+\end{equation}
+\textbf{Recall@$k$} --- fraction of all relevant documents captured in the top $k$:
+\begin{equation}
+\mathrm{R@}k = \frac{1}{R}\sum_{i=1}^{k} \mathrm{rel}_i
+\end{equation}
+\textbf{Reciprocal Rank} --- inverse rank of the \textit{first} relevant document, $\mathrm{RR} = 1/\mathrm{rank}_{\text{first}}$; MRR is its mean over queries.
 
+\textbf{Average Precision} --- precision evaluated at each relevant position, averaged over the $R$ relevant documents:
+\begin{equation}
+\mathrm{AP} = \frac{1}{R}\sum_{i=1}^{n} \mathrm{rel}_i \cdot \mathrm{P@}i
+\label{sr:eq:ap}
+\end{equation}
+MAP is the mean of AP over queries. Equivalently, AP is the expected precision at the rank of a uniformly drawn relevant document, and it approximates the area under the (uninterpolated) precision--recall curve.
+\end{mathresult}
+
+\textbf{What each one actually answers.}
+\begin{itemize}
+    \item \textbf{P@$k$}: ``How good does the visible page look?'' It is flat within the top $k$ (swapping ranks 1 and $k$ changes nothing) and blind below $k$. For a query with $R < k$ relevant documents, the maximum achievable P@$k$ is $R/k < 1$, so averages across queries with different $R$ are not comparable ceilings.
+    \item \textbf{R@$k$}: ``Did the candidate set contain the answer at all?'' This is the metric of \textit{retrieval} stages: no downstream ranker can recover a document the retriever never surfaced, so R@$k$ at large $k$ (hundreds to thousands) is the gate metric for candidate generation (Section~\ref{sr:sec:eval_retrieval_judgments}).
+    \item \textbf{MRR}: ``How fast does the user reach \textit{the} answer?'' It models a user who needs exactly one document---known-item and navigational search, question answering, and fact lookup. Its discount is brutal: rank 1 scores 1.0, rank 4 scores 0.25. It ignores everything after the first hit, so it is the wrong metric wherever multiple results matter.
+    \item \textbf{MAP}: ``How well are \textit{all} the relevant documents concentrated at the top?'' It rewards both finding everything (recall) and finding it early (each relevant doc contributes the precision at its own rank). It assumes the user wants many relevant documents and reads deep---closer to a researcher or a legal-discovery user than a web searcher. It is undefined for queries with $R = 0$ (drop or ignore them, and say which you did).
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Binary-relevance metrics: the user model each one encodes}
+\label{sr:tab:binary_metrics}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Metric} & \textbf{Implied user / contract} & \textbf{Right for} & \textbf{Blind to} \\
+\midrule
+P@$k$ & Scans one screen and counts good results & SERP-page quality snapshots, precision gates & Order within top $k$; everything below $k$; ceiling $<1$ when $R<k$ \\
+R@$k$ & Not a user: a pipeline-stage contract (``is the answer in the set?'') & Candidate generation at large $k$; RAG retrieval gates & Ranking quality inside the set \\
+MRR & Needs exactly one answer, leaves on finding it & Known-item, navigational, QA, autocomplete & Every relevant document after the first \\
+MAP & Wants all relevant documents, reads until satisfied & Research, discovery, recall-oriented (legal, patent) search & Graded distinctions; undefined at $R=0$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Worked Example: One List, Four Metrics}
+
+Take a ranked list of $n = 10$ documents for a query with $R = 4$ judged-relevant documents, which land at ranks 2, 4, 5, and 9.
+
+\begin{itemize}
+    \item $\mathrm{P@}5 = 3/5 = 0.60$ (relevant at ranks 2, 4, 5); $\mathrm{P@}10 = 4/10 = 0.40$.
+    \item $\mathrm{R@}5 = 3/4 = 0.75$; $\mathrm{R@}10 = 4/4 = 1.0$.
+    \item $\mathrm{RR} = 1/2 = 0.50$ (first relevant at rank 2).
+    \item $\mathrm{AP} = \frac{1}{4}\left(\mathrm{P@}2 + \mathrm{P@}4 + \mathrm{P@}5 + \mathrm{P@}9\right) = \frac{1}{4}\left(\tfrac{1}{2} + \tfrac{2}{4} + \tfrac{3}{5} + \tfrac{4}{9}\right) = \frac{1}{4}(2.0444) \approx 0.511$.
+\end{itemize}
+
+Note what each number is sensitive to. Move the rank-9 document to rank 6: P@5, R@5, and RR are unchanged, AP rises to $\frac{1}{4}(0.5 + 0.5 + 0.6 + 0.667) \approx 0.567$. Swap ranks 2 and 4 (both relevant): every metric above is unchanged---binary metrics cannot see reorderings among equally-relevant documents, which is the opening argument for graded relevance.
+
+\begin{keyinsight}[Metrics Are User Models]
+MRR is a user who leaves after one answer; P@$k$ is a user who scans one screen and counts; MAP is a user who wants everything and reads until they have it; R@$k$ is not a user at all but a \textit{pipeline stage contract}. When an interviewer asks ``which metric would you use,'' the strong move is to answer with the user model and surface first---known-item vs.\ exploratory, one-answer vs.\ many, SERP depth---and let the metric fall out. Reciting definitions without the implied user is the weak answer.
+\end{keyinsight}
+
+\subsection{Averaging Across Queries}
+
+Every metric above is per-query; the reported number is an average, and the averaging step has its own failure modes. First, \textbf{macro-averaging} (mean of per-query scores, the default) weights every query equally, which is almost never what traffic does---a metric computed over a uniform sample of \textit{distinct} queries is dominated by the tail, while one computed over an impression-weighted sample is dominated by the head. State which sampling your evaluation set uses and report head/torso/tail slices separately, because a model change routinely moves them in opposite directions. Second, per-query metric distributions are heavily non-normal (bounded, often bimodal---many queries score 0 or 1), so compare systems with a \textbf{paired} test across queries (paired $t$-test is serviceable at scale; the paired bootstrap or a permutation test is safer at small query counts) rather than eyeballing means; the pairing matters because per-query scores of two systems on the same queries are strongly correlated, and ignoring it wastes most of your statistical power. Third, report the \textbf{win/loss/tie decomposition} alongside the mean delta: ``+1.2 NDCG, winning 180 queries and losing 140'' invites a different conversation---and a different error analysis---than ``+1.2 NDCG, winning 25 queries hugely.'' The general statistics of comparing evaluation numbers (confidence intervals, multiple comparisons across many slices) is [CML 6]; benchmark-style significance reporting for LLM evals is [DL 23].
+
+%==============================================================================
+\section{Graded Relevance: CG, DCG, and NDCG}
+\label{sr:sec:eval_ndcg}
+%==============================================================================
+
+Binary relevance cannot distinguish a perfect result from a marginally acceptable one. Production judgment programs therefore use graded scales---typically 4--5 levels such as $\{0\colon$ bad, $1\colon$ related, $2\colon$ relevant, $3\colon$ highly relevant, $4\colon$ perfect$\}$ (Section~\ref{sr:sec:eval_retrieval_judgments})---and the graded metric family is built in three moves.
+
+\subsection{The Derivation: Gain, Discount, Normalization}
+
+\textbf{Move 1: Cumulative Gain.} Assign each grade a numeric \textit{gain} $g(\mathrm{rel}_i)$ and sum over the top $k$: $\mathrm{CG@}k = \sum_{i=1}^{k} g(\mathrm{rel}_i)$. CG measures what the list \textit{contains} but is completely insensitive to \textit{order}---putting the perfect result at rank $k$ scores the same as rank 1. Useless as a ranking metric, but the right base case.
+
+\textbf{Move 2: Discounted Cumulative Gain.} Weight position $i$ by a decreasing discount $D(i)$, modeling declining user attention with rank (Järvelin \& Kekäläinen, 2002):
+
+\begin{mathresult}{DCG and NDCG}
+\begin{equation}
+\mathrm{DCG@}k = \sum_{i=1}^{k} \frac{g(\mathrm{rel}_i)}{\log_2(i+1)}
+\qquad\qquad
+\mathrm{NDCG@}k = \frac{\mathrm{DCG@}k}{\mathrm{IDCG@}k}
+\label{sr:eq:ndcg}
+\end{equation}
+where $\mathrm{IDCG@}k$ is the DCG of the \textit{ideal} ranking---the judged documents sorted by decreasing grade---so $\mathrm{NDCG@}k \in [0, 1]$ with 1 attained exactly by an ideal ordering. Two standard gain functions:
+\begin{equation}
+g(\mathrm{rel}) = \mathrm{rel} \quad \text{(linear)} \qquad \text{vs.} \qquad g(\mathrm{rel}) = 2^{\mathrm{rel}} - 1 \quad \text{(exponential)}
+\end{equation}
+The discount $1/\log_2(i+1)$ gives weights $1, 0.631, 0.5, 0.431, 0.387, \ldots$ for ranks $1\ldots 5$.
+\end{mathresult}
+
+\textbf{Why a logarithmic discount?} It sits between two extremes with clear user-model readings: $1/i$ (MRR-like, nearly all weight on rank 1) is too harsh for surfaces where users routinely scan a page, and no discount (CG) is too lenient. The log decays fast enough to be top-heavy but slowly enough that ranks 5--10 still matter---roughly matching empirically observed examination curves. It also has a post-hoc theoretical footing: Wang et al.\ (2013) showed that NDCG with a logarithmic discount can still statistically separate substantively different rankers as list length grows, while faster-decaying discounts effectively truncate the comparison and slower ones wash it out. If you want an explicit user model instead of a folklore discount, rank-biased precision (Moffat \& Zobel, 2008) derives a geometric discount from a ``continue with probability $p$'' browsing model, and ERR (Chapelle et al., 2009) derives a cascade-style discount in which strong early results \textit{absorb} attention---under ERR, a perfect result at rank 1 sharply reduces the credit available to everything below it. Concretely, ERR models a user who stops at rank $i$ with probability $R_i = (2^{g_i}-1)/2^{g_{\max}}$ and scores the expected reciprocal stopping rank:
+\begin{equation}
+\mathrm{ERR} = \sum_{r=1}^{n} \frac{1}{r}\, R_r \prod_{i=1}^{r-1} (1 - R_i)
+\label{sr:eq:err}
+\end{equation}
+which makes it the graded metric of choice when a strong result genuinely terminates the search (answer-seeking surfaces), and a poor choice when users want several good results.
+
+\textbf{Gain: the $2^{\mathrm{rel}}-1$ vs.\ linear debate.} Exponential gain maps grades $\{0,1,2,3,4\}$ to $\{0,1,3,7,15\}$: a perfect result is worth 15 relevant-grade-1 results, not 4. This encodes a product judgment---on web search, where navigational-perfect results exist and matter enormously, exponential gain (used by the LETOR/MSLR datasets and most web-search LambdaMART stacks, [SR 5]) is the norm. Linear gain (the \texttt{trec\_eval} default, and common in recsys) treats grade differences as equal increments and spreads credit more evenly down the list. Neither is ``correct''; what matters is that (a) the choice materially changes both the metric and any model trained to optimize it---LambdaRank/LambdaMART gradients scale with $|\Delta \mathrm{NDCG}|$, so exponential gain concentrates learning on getting the top grades right---and (b) your org states its convention once and never mixes them silently. A 3\% NDCG gain under one gain function can be a regression under the other when a model trades grade-4 placement against grade-2 density.
+
+\subsection{Worked Example}
+
+Query with four retrieved documents whose grades, in ranked order, are $(2, 3, 0, 1)$; the judged pool contains grades $\{3, 2, 1, 0\}$, so the ideal ordering is $(3, 2, 1, 0)$. Discounts for ranks 1--4: $1, 0.631, 0.5, 0.431$.
+
+\textbf{Linear gain.}
+\begin{align}
+\mathrm{DCG@}4 &= \frac{2}{1} + \frac{3}{\log_2 3} + \frac{0}{2} + \frac{1}{\log_2 5} = 2 + 1.893 + 0 + 0.431 = 4.323\\
+\mathrm{IDCG@}4 &= 3 + 2(0.631) + 1(0.5) + 0 = 4.762
+\qquad\Rightarrow\qquad \mathrm{NDCG@}4 = \frac{4.323}{4.762} \approx 0.908
+\end{align}
+
+\textbf{Exponential gain} ($g = 2^{\mathrm{rel}}-1$, so gains in ranked order are $3, 7, 0, 1$ and ideal gains are $7, 3, 1, 0$):
+\begin{align}
+\mathrm{DCG@}4 &= 3 + 7(0.631) + 0 + 1(0.431) = 7.847\\
+\mathrm{IDCG@}4 &= 7 + 3(0.631) + 1(0.5) + 0 = 9.393
+\qquad\Rightarrow\qquad \mathrm{NDCG@}4 = \frac{7.847}{9.393} \approx 0.835
+\end{align}
+
+\begin{table}[H]
+\centering
+\small
+\caption{The same worked example, laid out the way you should do it on a whiteboard}
+\label{sr:tab:ndcg_worked}
+\begin{tabular}{ccccccc}
+\toprule
+\textbf{Rank $i$} & \textbf{Grade} & \textbf{Discount} $1/\log_2(i{+}1)$ & \multicolumn{2}{c}{\textbf{Linear}} & \multicolumn{2}{c}{\textbf{Exponential}} \\
+ & & & gain & contrib. & gain & contrib. \\
+\midrule
+1 & 2 & 1.000 & 2 & 2.000 & 3 & 3.000 \\
+2 & 3 & 0.631 & 3 & 1.893 & 7 & 4.417 \\
+3 & 0 & 0.500 & 0 & 0.000 & 0 & 0.000 \\
+4 & 1 & 0.431 & 1 & 0.431 & 1 & 0.431 \\
+\midrule
+\multicolumn{3}{r}{DCG@4} & & 4.323 & & 7.847 \\
+\multicolumn{3}{r}{IDCG@4 (ideal order $3,2,1,0$)} & & 4.762 & & 9.393 \\
+\multicolumn{3}{r}{\textbf{NDCG@4}} & & \textbf{0.908} & & \textbf{0.835} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Same ranking, same judgments: NDCG 0.908 vs.\ 0.835. The list's one real sin is placing the grade-3 document second instead of first, and exponential gain prices that sin at more than twice what linear gain does. This is the concrete content of the gain debate---and a hand computation like this one is a standard interview screen (Section~\ref{sr:sec:eval_interview}).
+
+\subsection{NDCG@\texorpdfstring{$k$}{k} Pitfalls}
+
+\begin{warningbox}
+NDCG's normalization is per-query, and that is both its point and its trap. Every pitfall below has produced a real shipped-then-reverted ranking change.
+\begin{enumerate}
+    \item \textbf{The ideal-DCG trap.} IDCG is computed from \textit{that query's own judged documents}. A query with a single judged grade-1 document ranked first scores NDCG $= 1.0$---indistinguishable from a perfectly ordered rich query. Sparsely judged queries therefore inflate the average and dilute real differences; NDCG averages are only comparable across systems evaluated on the \textit{same} queries with the \textit{same} judgment set. Adding judgments changes IDCG, so scores are not comparable across judgment-set versions either---version your judgment sets like code.
+    \item \textbf{Unjudged $=$ irrelevant.} Standard tooling assigns gain 0 to any unjudged document. A novel system that retrieves good-but-unjudged documents is scored as if it retrieved garbage (Section~\ref{sr:sec:eval_retrieval_judgments}).
+    \item \textbf{$k$ vs.\ judgment depth.} Computing NDCG@10 against a pool judged to depth 5 silently converts half the window into pitfall 2. Match $k$ to pooling depth, or re-pool.
+    \item \textbf{Ties.} When the ranker emits tied scores, the within-tie order is whatever the sort returned, and the metric inherits that arbitrariness---enough to flip a close comparison. Tie-aware NDCG takes the expectation over random permutations of tied documents (McSherry \& Najork, 2008); at minimum, fix a deterministic tiebreak and report it.
+    \item \textbf{$k$-sensitivity.} Small $k$ (1, 3) makes the metric high-variance---one document swap moves it a lot---while large $k$ rewards deep reorderings no user sees. Pick $k$ to match the surface (5--10 for a SERP; larger for reranker-input evaluation) and report two or three cutoffs, not one.
+\end{enumerate}
+\end{warningbox}
+
+\subsection{Choosing a Regime}
+
+``NDCG'' underdetermines an evaluation: the cutoff, the gain function, the judgment depth, and sometimes the metric family itself should be chosen per surface and per pipeline stage. The table collects the defaults worth defending in an interview.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Offline metric regimes by evaluation purpose}
+\label{sr:tab:ndcg_regimes}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Purpose / surface} & \textbf{Metric and cutoff} & \textbf{Notes} \\
+\midrule
+SERP quality (web, commerce) & NDCG@5 and @10, exponential gain common & Cutoff matches the visible page; judge at least to depth $k$; report 2--3 cutoffs \\
+Reranker-input quality (L1 output) & NDCG@50 or graded recall at the handoff size & Measures whether good documents are within the reranker's reach, not what users see \\
+Candidate generation (L0) & Recall@100--1000, binary & Judgment breadth beats depth; see Section~\ref{sr:sec:eval_retrieval_judgments} for the denominator problem \\
+Navigational / known-item & MRR, success@1 & One target document; graded machinery is overkill \\
+Answer-seeking / QA surfaces & ERR@$k$ or MRR & A strong early result terminates the search; cascade-style discount fits \\
+Recsys top-$k$ & NDCG@$k$ / HR@$k$ against the full catalog, temporal split & Linear gain common; sampled-negative caveats of Section~\ref{sr:sec:eval_recsys_protocol} apply \\
+Diversification surfaces & $\alpha$-NDCG, ILS alongside accuracy & Section~\ref{sr:sec:eval_beyond_accuracy}; greedy ideal is approximate \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Rank Correlation in One Paragraph}
+
+Sometimes the object of comparison is two \textit{rankings}, not a ranking against judgments: how much did the new ranker reorder the old one (churn), how similar are two systems' outputs, or---meta-evaluation---does the ordering of \textit{systems} produced by a cheap metric agree with the ordering produced by an expensive one (offline NDCG deltas vs.\ interleaving outcomes; pooled vs.\ full judgments)? The standard tool is Kendall's $\tau$: over all $\binom{n}{2}$ item pairs, $\tau = (C - D)/\binom{n}{2}$ where $C$ and $D$ count concordant and discordant pairs; $\tau = 1$ is identity, $-1$ is reversal, $0$ is no association. TREC methodology uses $\tau$ between system orderings to argue that a cheaper evaluation (shallower pools, fewer topics, an LLM judge) is a faithful substitute for a more expensive one---the same argument you will need when proposing to replace human judgments with model-based ones. Its weakness for search is that it weights all pairs equally; top-weighted variants (e.g., $\tau_{\mathrm{AP}}$) exist and are the better default when the top of the list is what matters.
+
+%==============================================================================
+\section{Evaluating Retrieval and the Judgment Supply Chain}
+\label{sr:sec:eval_retrieval_judgments}
+%==============================================================================
+
+\subsection{Per-Stage Metrics and the End-Metric Confusion}
+
+A production stack retrieves thousands of candidates (L0), prunes to hundreds (L1), and precision-ranks tens (L2) (\ref{sr:chap:neural_retrieval_reranking}, \ref{sr:chap:learning_to_rank}). A chronic evaluation error is measuring an L0 change by the final NDCG@10: the end metric conflates every stage, has high variance relative to the candidate-set change, and---worse---is computed over judged documents that the \textit{old} candidate generator surfaced. The correct discipline is a metric per stage, each matching that stage's contract:
+
+\begin{itemize}
+    \item \textbf{L0 candidate generation: recall@$k$} at the handoff size ($k$ in the hundreds or thousands), measured against judged-relevant documents---or, for recsys, against held-out future engagements. This is the recall-ceiling argument made quantitative: NDCG@10 is upper-bounded by what L0 delivered, so a retrieval regression shows up everywhere downstream while being attributable nowhere downstream.
+    \item \textbf{L1 pruning: agreement with L2.} L1's job is to not discard what L2 would have ranked highly; measure the fraction of L2's top-$m$ (computed on the full candidate set offline) that survives L1.
+    \item \textbf{L2 ranking: NDCG@$k$ / ERR@$k$} at SERP depth, on judged lists.
+\end{itemize}
+
+When a candidate ``improves recall@1000 by 4\% but final NDCG is flat,'' both numbers can be simultaneously true and unremarkable: the reranker may not yet score the new candidates well (features missing for them), or the judgment pool may not cover them at all. Diagnose per stage before concluding anything.
+
+\textbf{The recall denominator problem.} Recall@$k$ needs a set of relevant documents to divide by, and every available denominator is incomplete in a different direction. \textit{Judged-relevant} sets undercount---they contain only what was pooled, so absolute recall numbers are optimistic (the denominator is too small) while recall \textit{deltas} between systems remain meaningful if neither system is systematically outside the pool. \textit{Behavioral} denominators (documents users clicked or converted on, for this or equivalent queries) are grounded in real utility but inherit exposure bias: they can only contain what some past system retrieved, so they are structurally kind to incumbents---useful for regression detection (``did we lose documents users demonstrably wanted?''), misleading for novel-system comparison. \textit{Known-item probes} (synthetic or curated query--document pairs where the answer is known: the exact product for a SKU query, the paper for a title query) give clean recall on a narrow slice and make good CI-level regression tests. Mature retrieval evaluation uses all three, labeled as what they are, and treats absolute recall claims with suspicion.
+
+\subsection{Pooling and the Holes It Leaves}
+
+Complete judgment of a corpus is impossible, so judgment sets are built by \textbf{pooling} (the TREC protocol): take the union of the top-$k$ results from all participating systems, judge that union, and treat everything outside the pool as irrelevant. Pooling is sound for comparing the systems that formed the pool, and quietly biased against every system that did not---a new retrieval paradigm (dense retrieval entering a lexically-pooled collection, \ref{sr:chap:vector_retrieval_theory}) surfaces documents no pooled system ever returned, and the metric scores them all at gain 0. The bias is largest exactly when the new system is most different, i.e., exactly when you most need the evaluation.
+
+Remedies, in order of practical preference: (1) \textbf{judge the delta}---send the new system's unjudged top-$k$ documents for judgment before reading the metric; this is standard practice in mature relevance teams and is cheap because the delta is small for incremental changes. (2) Report \textbf{condensed-list} metrics (remove unjudged documents, rank the rest) \textit{alongside} standard metrics as an optimistic bound---condensed lists overcorrect and inflate novel systems. (3) Judgment-robust metrics such as \textbf{bpref} (Buckley \& Voorhees, 2004), computed only over judged documents, as a sanity check. If standard and condensed-list NDCG disagree about a comparison's sign, the evaluation is telling you to buy more judgments, not to pick the bound you prefer.
+
+\subsection{Human Judgment Collection}
+
+The durable asset of a judgment program is not the labels but the \textbf{guideline document}: it operationalizes what ``relevant'' means for your product (does a compatible accessory count for a device query? is a substitute product relevant in grocery search?), fixes the graded scale, and rules on edge cases. Google's public Search Quality Rater Guidelines---with its dual needs-met $\times$ page-quality rating---is the canonical public example of how much product policy lives in this document. Mechanics that interviews probe: judges see query context (locale, device, task); qualification tests gate entry; \textbf{honeypot} tasks with known answers run continuously for quality control; each item gets $\geq 3$ independent judgments with adjudication of disagreements.
+
+Agreement is measured with chance-corrected statistics: Cohen's $\kappa$ (two raters), Fleiss' $\kappa$ (many raters), Krippendorff's $\alpha$ (handles ordinal scales and missing data---usually the right choice for graded relevance). Calibrate expectations: graded relevance typically lands at $\kappa \approx 0.4$--$0.6$. That is not a broken program; it is the task. Systematic disagreement clusters are \textit{signal about guideline ambiguity}---the correct response is a guideline revision and re-adjudication, not averaging the noise harder.
+
+\textbf{Query sampling and sizing.} The judgment set's query sample determines what the metric can see. Sample stratified by traffic decile \textit{and} by segment (intent class, category, market, zero-click share), so both the head---where most impressions live---and the tail---where most distinct queries live---are represented and reportable as slices; include the ugly strata (zero-result queries, misspellings) on purpose, because uniform sampling from \textit{successful} traffic evaluates only what already works. For sizing intuition: a few thousand queries with roughly 20--50 judged documents each is a serviceable evaluation set for a single product surface---enough for paired significance testing on realistic deltas---while per-slice reporting needs a few hundred queries \textit{per slice} you intend to gate decisions on. Depth follows the metric: judging to depth 10 supports NDCG@10 but not recall@1000, which is why retrieval-stage evaluation leans on pooling breadth rather than judgment depth.
+
+\begin{keyinsight}[The Judgment Set Is a Versioned Product]
+Treat the judgment corpus like a dataset release, not a spreadsheet: version it (metric numbers are only comparable within a version---IDCG changes when judgments are added), document its sampling frame and pooling contributors, track its age distribution, and schedule refreshes. Nearly every ``NDCG mysteriously moved'' incident traces to the ruler changing---new judgments, a re-adjudication, a guideline revision---rather than the system. The corollary for interviews: when asked how you would compare this quarter's model to last quarter's, the answer must include \textit{on which judgment-set version}.
+\end{keyinsight}
+
+\subsection{LLM-Judge Relevance Labeling}
+
+Since roughly 2023--24 the load-bearing empirical result (e.g., Microsoft's production experience reported by Thomas et al., 2024, and the TREC UMBRELA assessments) is that a well-prompted LLM judge agrees with expert assessors on \textit{topical relevance} about as well as---often better than---crowdworkers do, at one to two orders of magnitude lower cost per label. That changes the economics of everything upstream: you can afford judgment pools 10--100$\times$ denser, per-slice judgment coverage, and continuous judgment of the delta for every candidate ranker.
+
+The methodology canon for LLM judges---rubric design, position and self-preference biases, calibration protocols---is [NLP 10]; what is search-specific is the operating pattern: (1) the prompt \textit{is} the guideline---port the human guideline, not a paraphrase; (2) maintain an expert-labeled \textbf{gold calibration set} and continuously measure judge-vs-expert $\kappa$, with the human-vs-human $\kappa$ as the bar; (3) route low-confidence and disagreement cases to human adjudication; (4) pin the judge model version and re-calibrate on every upgrade---an unnoticed judge upgrade is an unnoticed metric redefinition; (5) keep independence in mind: judging a ranking stack that itself uses the same model family (as reranker or feature source, \ref{sr:chap:production_retrieval_rag}) invites correlated blind spots and self-preference. Humans do not disappear---they write policy, audit the judge on samples, and cover locales and freshness-sensitive queries where models are weakest.
+
+%==============================================================================
+\section{Beyond Accuracy: Diversity, Novelty, Coverage, Calibration}
+\label{sr:sec:eval_beyond_accuracy}
+%==============================================================================
+
+A ranker can be accurate per-item and bad as a \textit{list}: ten near-duplicate results, or a recommendation feed that collapses onto one genre. Beyond-accuracy metrics measure list- and system-level properties; they matter doubly because they are also the early-warning instruments for feedback-loop pathologies (\ref{sr:chap:recommendation_systems}).
+
+\begin{mathresult}{Beyond-Accuracy Metrics at a Glance}
+\textbf{Intra-list similarity} (Ziegler et al., 2005), diversity as its complement, over a top-$k$ list:
+\begin{equation}
+\mathrm{ILS} = \frac{2}{k(k-1)} \sum_{i<j} \mathrm{sim}(d_i, d_j)
+\end{equation}
+\textbf{$\alpha$-NDCG gain} (Clarke et al., 2008): with $J(d, s) \in \{0,1\}$ marking whether document $d$ covers subtopic $s$ and $c_{s,i-1}$ counting how many documents ranked above $i$ already covered $s$,
+\begin{equation}
+g_i = \sum_{s} J(d_i, s)\,(1-\alpha)^{c_{s,i-1}}, \qquad \text{typically } \alpha = 0.5
+\end{equation}
+plugged into the usual DCG discount and normalization. \textbf{Novelty} as self-information of popularity: $\mathrm{nov}(i) = -\log_2 p(i)$ with $p(i)$ the item's interaction (or impression) share. \textbf{Calibration} (Steck, 2018): with $p(g \given u)$ the genre/category distribution of the user's history and $q(g \given u)$ that of the recommended list,
+\begin{equation}
+C_{\mathrm{KL}}(u) = \mathrm{KL}\!\left(p(\cdot \given u) \,\middle\|\, \tilde{q}(\cdot \given u)\right), \qquad \tilde{q} = (1-\beta)\,q + \beta\, p
+\end{equation}
+where the small $\beta$-smoothing keeps the divergence finite when the list misses a genre entirely.
+\end{mathresult}
+
+\textbf{Diversity.} The classic list-level measure is \textbf{intra-list similarity}, with diversity as its complement; the similarity kernel (embedding cosine, category overlap) is a product choice that changes what ``diverse'' means. For search with explicit subtopics (ambiguous queries: ``jaguar''), \textbf{$\alpha$-NDCG} builds diversity into the gain itself: each additional document covering an already-covered subtopic earns geometrically less (the $(1-\alpha)^{c}$ factor above), so the ideal list interleaves subtopics rather than stacking the dominant one. Note that the ideal ranking is now itself NP-hard and computed greedily---which the honest evaluator mentions when reporting the metric, since the ``N'' in $\alpha$-NDCG is an approximation.
+
+\textbf{Novelty and serendipity.} Novelty is usually scored as self-information of popularity, $-\log_2 p(i)$: recommending what everyone already knows scores low. Serendipity is the harder construct---relevant \textit{and} unexpected relative to the user's profile---typically proxied as (relevance) $\times$ (distance from the user's history distribution). Both are offline proxies for a fundamentally longitudinal outcome (did the user's interest broaden?), so treat them as guardrails, not objectives.
+
+\textbf{Coverage and concentration.} Catalog coverage is the fraction of the catalog that appears in anyone's top-$k$ over a window; exposure concentration is summarized by a Gini coefficient over item impression counts $e_1 \le e_2 \le \cdots \le e_n$ (sorted ascending), $G = \sum_i (2i - n - 1)\, e_i \,/\, (n \sum_i e_i)$, with $G \to 1$ meaning a few items absorb nearly all exposure. A ranker whose accuracy metrics improve while coverage falls and Gini rises is very often riding a popularity feedback loop rather than learning relevance.
+
+\textbf{Popularity-bias measurement.} Instrument it directly: average popularity percentile of recommended items vs.\ the catalog baseline; recall stratified by item-popularity bucket (head/torso/tail)---aggregate recall gains that decompose into head-only gains are a classic false positive; and amplification over time (is the gap between exposure share and organic-interest share widening?). These slices are cheap and catch what the aggregate hides.
+
+\textbf{Calibrated recommendations.} Steck's calibration formulation (RecSys 2018) targets proportionality rather than diversity per se: if a user's history is 70\% drama / 30\% comedy, the recommended \textit{list's} genre distribution $q$ should roughly match the history distribution $p$, with miscalibration measured as $\mathrm{KL}(p \,\|\, q)$ and fixed by greedy reranking that trades score against calibration. The underlying failure it prevents is majority-interest crowd-out: an accuracy-optimal list happily serves 100\% drama, silently deleting the user's minority interests. One paragraph, but a reliable interview probe because it separates ``diversity as vibes'' from a defined, optimizable list-level objective.
+
+%==============================================================================
+\section{Offline Protocol for Recommender Evaluation}
+\label{sr:sec:eval_recsys_protocol}
+%==============================================================================
+
+Search evaluates against judgments; recommenders mostly evaluate against \textit{held-out interactions}, and the protocol---how you split, and what you rank against---changes conclusions as much as the model does.
+
+\subsection{Temporal Splits, and Why Random Splits Leak}
+
+A random interaction-level split trains on the future and tests on the past. The leakage is concrete: (1) \textbf{future popularity} leaks---an item that trends next month appears in training, so the model ``predicts'' test-period interactions it could never have anticipated, inflating exactly the popularity-following behaviors that fail online; (2) \textbf{within-user leakage}---a user's later interactions land in train while earlier ones land in test, letting the model condition on the future of the very sequence it is predicting; (3) \textbf{feature leakage}---engagement-derived features (item CTR, co-occurrence counts) computed over the full window encode the test set into the features. The honest protocol is a \textbf{global temporal split}: train on everything before time $T$, test on interactions after $T$, with features computed only from pre-$T$ data---exactly the constraint the production system operates under. Expect metrics to drop relative to random-split numbers; that drop is the leak you just removed, not a bug.
+
+\textbf{Leave-last-out} (hold out each user's final interaction; the standard protocol of the sequential recommendation literature, \ref{sr:chap:recommendation_systems}) is convenient but limited: each user's test point sits at a \textit{different} calendar time, so global temporal order is still violated across users (other users' future interactions are in train relative to your test point); a single held-out item per user makes the metric high-variance and top-1-shaped; and it silently drops cold users. Use it to compare against published baselines; use a global temporal split to make ship decisions, with dedicated cold-user and cold-item slices reported separately.
+
+\subsection{The Sampled-Metrics Trap}
+
+\begin{warningbox}
+The popular protocol ``rank the held-out positive against 100 random negatives, report HR@10 / NDCG@10'' (standardized by the NCF paper's evaluation) is \textbf{not a noisier version of the true metric---it is a different metric}. Krichene \& Rendle (KDD 2020) showed that sampled top-$k$ metrics are inconsistent with their exact full-ranking counterparts. The mechanism is elementary: if the positive's true rank in a catalog of $N$ items is $r$, each of $m$ uniformly sampled negatives outranks it independently with probability $(r-1)/(N-1)$, so the sampled rank is $1$ plus (approximately) a $\mathrm{Binomial}\!\left(m, \frac{r-1}{N-1}\right)$ draw---a statistic that depends on $r$ essentially only through the smoothed quantile $r/N$. Any top-heavy weighting applied to that sampled rank is therefore measuring a nearly linear function of the full rank: the sampled versions of HR@$k$ and NDCG@$k$ lose their top-heaviness and all degenerate toward an AUC-like statistic. Consequences: absolute numbers are wildly inflated (HR@10 against 100 negatives on a million-item catalog is nearly ``rank in the top ~10\%''), and---the damning part---\textbf{the relative ordering of algorithms can flip} between sampled and exact evaluation. Corrections exist (estimate the full-rank distribution from the sampled rank and evaluate the metric on the corrected estimate), but they are high-variance at small $m$. Practice: rank against the full catalog when feasible (a matrix multiply per user is usually affordable offline); otherwise use a large $m$ with the Krichene--Rendle correction; never compare numbers across papers or experiments that used different $m$; and never let a sampled metric be the ship gate.
+\end{warningbox}
+
+Two further protocol notes. First, \textbf{negative definitions matter}: ``random catalog item'' negatives measure something different from ``impressed but not engaged'' negatives---the former tests coarse relevance, the latter tests fine ranking but inherits the logging policy's exposure bias (Section~\ref{sr:sec:eval_offline_online_gap}). Report which you used; ideally both. Second, \textbf{popularity-stratified reporting} (Section~\ref{sr:sec:eval_beyond_accuracy}) belongs in every recsys eval readout, because interaction-based metrics structurally favor popularity-matching and the aggregate will not tell you.
+
+%==============================================================================
+\section{The Offline--Online Gap}
+\label{sr:sec:eval_offline_online_gap}
+%==============================================================================
+
+The most common staff-level war story in this domain: offline NDCG up 3\%, online CTR flat (or down). Before the estimators, the causes---because the fix differs by cause.
+
+\subsection{Why Offline Gains Vanish}
+
+\begin{enumerate}
+    \item \textbf{Position and selection bias in logged labels.} Click-derived labels inherit the old ranker's exposure: users click what they were shown, at positions the old ranker chose, with examination decaying steeply in rank (position 1 draws several times the clicks of position 5 at equal relevance). A model evaluated on such labels is rewarded for \textit{agreeing with the old ranker}; part of any offline ``gain'' is simply increased self-agreement. Only what was retrieved ever gets feedback (selection bias), so the log is silent about precisely the documents a better system would newly surface. Debiasing machinery (click models, propensity-weighted training) is covered with LTR in \ref{sr:chap:learning_to_rank}; here it appears as an evaluation confound.
+    \item \textbf{Feedback loops.} The deployed model curates its own future training and evaluation data; offline improvements measured on that data can reflect tighter closure of the loop rather than better relevance.
+    \item \textbf{Off-policy mismatch.} Offline evaluation replays logged contexts, but the new ranker would have shown \textit{different} results, for which the log has no outcomes. The metric is computed exactly where the data is least informative about the change.
+    \item \textbf{Judgment--metric mismatch.} Editorial judgments measure topical relevance under a guideline; users optimize utility (price, freshness, trust, presentation). A model can win NDCG-on-judgments while losing clicks---or vice versa---whenever the two constructs diverge. Neither is ``wrong''; they measure different things, and systematic divergence means the guideline needs revision.
+    \item \textbf{Exposure accounting.} The offline gain may live where users are not: below the fold, on low-traffic slices, or on the fraction of queries where the two systems actually differ. A 3\% NDCG gain on the 10\% of queries whose results changed is a 0.3\% expected aggregate effect---often below the A/B test's detection floor.
+\end{enumerate}
+
+\subsection{Counterfactual (Off-Policy) Evaluation}
+
+The principled bridge across the gap: estimate the \textit{online} value of a new policy $\pi$ from logs collected under the current policy $\pi_0$, by reweighting logged outcomes according to how differently the two policies would have acted.
+
+\begin{mathresult}{IPS, SNIPS, and Doubly Robust Estimators}
+Logs: $\{(x_i, a_i, r_i, p_i)\}_{i=1}^{n}$, where $x_i$ is the context (query, user), $a_i \sim \pi_0(\cdot \given x_i)$ the logged action (the shown ranking or item), $r_i$ the observed reward (click, conversion), and $p_i = \pi_0(a_i \given x_i)$ the \textbf{logged propensity}. With importance weight $w_i = \pi(a_i \given x_i)/p_i$:
+\begin{equation}
+\hat{V}_{\mathrm{IPS}}(\pi) = \frac{1}{n}\sum_{i=1}^{n} w_i\, r_i
+\qquad\qquad
+\hat{V}_{\mathrm{SNIPS}}(\pi) = \frac{\sum_i w_i\, r_i}{\sum_i w_i}
+\label{sr:eq:ips}
+\end{equation}
+IPS is unbiased for $\E_{a \sim \pi}[r]$ provided $\pi_0$ has \textbf{support}: $\pi(a \given x) > 0 \Rightarrow \pi_0(a \given x) > 0$. Its variance scales with the weight range, so weights are typically clipped at $M$ ($w_i \leftarrow \min(w_i, M)$), trading a little bias for a lot of variance. SNIPS (self-normalized IPS) is consistent rather than unbiased, has much lower variance, and is invariant to a constant multiplicative error in the propensities. The \textbf{doubly robust} estimator adds a learned reward model $\hat{r}(x, a)$:
+\begin{equation}
+\hat{V}_{\mathrm{DR}}(\pi) = \frac{1}{n}\sum_{i=1}^{n}\Big[\, \E_{a \sim \pi(\cdot \given x_i)}\big[\hat{r}(x_i, a)\big] \;+\; w_i\,\big(r_i - \hat{r}(x_i, a_i)\big) \Big]
+\label{sr:eq:dr}
+\end{equation}
+--- the model's prediction under the new policy, plus a propensity-weighted correction on the logged action. DR is unbiased if \textit{either} the propensities \textit{or} the reward model is correct, and its variance is reduced wherever $\hat{r}$ explains part of $r$.
+\end{mathresult}
+
+\textbf{A mini worked example, and what ESS tells you.} Suppose for some context the logging policy shows item $a$ with probability $0.9$ and item $b$ with probability $0.1$, and the candidate policy would always show $b$. Over $100$ logged impressions: $90$ show $a$ (importance weight $w = 0/0.9 = 0$, contributing nothing) and $10$ show $b$ (weight $w = 1/0.1 = 10$), of which $3$ were clicked. Then $\hat{V}_{\mathrm{IPS}} = \frac{1}{100}(10 \times 3) = 0.30$---exactly the empirical CTR on the $b$-impressions, as it should be: IPS has simply found the slice of logged traffic where the two policies agree and reweighted it to full mass. The effective sample size makes the cost visible: $\mathrm{ESS} = (\sum w_i)^2 / \sum w_i^2 = 100^2/1000 = 10$---your $100$ logged impressions carry the information of $10$ on-policy samples, and the estimate's confidence interval must be computed accordingly. This is the general shape of OPE practice: the further the candidate policy strays from logging, the smaller the agreeing slice, the larger the weights, and the faster ESS collapses.
+
+\textbf{The slate problem.} For ranking, the ``action'' is an entire ordering, and $\pi_0(\sigma \given x)$ for a full slate is astronomically small---whole-ranking IPS has unusable variance. The standard factorization runs through an examination model: assume (as in the position-based click model) that a click requires examination, with examination probability depending on position. Then a ranking metric that adds up over clicked documents can be estimated for a \textit{new} ranking $\sigma$ by weighting each logged click by the inverse examination propensity of the position it was logged at (Joachims et al., 2017):
+\begin{equation}
+\hat{\Delta}(\sigma \given q) = \sum_{d\,:\,\text{clicked}} \frac{\lambda\big(\mathrm{rank}(d \given \sigma)\big)}{\hat{P}\big(\text{examined at } \mathrm{rank}(d \given \sigma_0)\big)}
+\end{equation}
+where $\lambda$ is the rank weighting of your metric and $\sigma_0$ the logged ranking. The propensities $\hat{P}(\text{examined at } r)$ are identified from randomization (swap interventions) or intervention harvesting, per \ref{sr:chap:learning_to_rank}.
+
+\textbf{Logging-policy requirements---the part teams get wrong.} Counterfactual evaluation is an \textit{infrastructure} commitment made at logging time, not an analysis you can bolt on later: (1) the logging policy must be \textbf{stochastic} with support over the actions candidate policies take---a fully deterministic ranker yields propensities of 0 and 1 and no counterfactual signal; a small exploration component (epsilon slots, Plackett--Luce sampling over near-tied scores) is the price of admission; (2) \textbf{log the propensity at decision time}, from the actual sampler---reconstructing it later from a retrained model is a classic silent-bias bug; (3) snapshot the context/features as served, so the replay matches what the policy saw; (4) monitor \textbf{effective sample size}, $(\sum_i w_i)^2 / \sum_i w_i^2$: when the new policy differs a lot from logging, ESS collapses and the estimate is formally unbiased but practically meaningless---at which point the answer is an online test, not a tighter estimator.
+
+\begin{keyinsight}[The Gap Is a Property of the Pipeline, Not a Mystery]
+``Offline--online correlation'' is not a constant of nature you discover; it is an engineering outcome you buy. Teams with judgment-based metrics anchored by fresh pools, propensity-logged traffic, per-stage metrics, and counterfactual estimates validated against past A/B results can trust offline deltas within a known slice and sign; teams that evaluate on raw clicked/not-clicked logs cannot, no matter how big the dataset. In interviews, ``offline and online disagree'' should trigger a \textit{causes checklist} (bias in labels, exposure accounting, metric mismatch, power), not a shrug about offline metrics being unreliable.
+\end{keyinsight}
+
+%==============================================================================
+\section{Online Experimentation for Ranking}
+\label{sr:sec:eval_online}
+%==============================================================================
+
+\subsection{Search-Native Online Metrics}
+
+Generic engagement metrics need search-specific refinement before they mean anything:
+
+\begin{itemize}
+    \item \textbf{Click metrics with semantics}: CTR@$k$; \textbf{long click} / SAT-click (click followed by dwell above a threshold, conventionally around 30 seconds, without a quick return to the results page)---raw CTR alone rewards clickbait titles and attractive thumbnails, i.e., \textit{attractiveness}, not relevance; time-to-first-click as a speed-of-success proxy.
+    \item \textbf{Failure metrics}: zero-result rate; \textbf{reformulation rate} (immediate re-query as a dissatisfaction signal); \textbf{abandonment}, split into bad (gave up) and \textbf{good abandonment} (answer visible on the page---increasingly common as answer modules and RAG surfaces grow, \ref{sr:chap:production_retrieval_rag}, and a genuine measurement headache since satisfaction leaves no click).
+    \item \textbf{Task and business metrics}: conversion, add-to-cart, revenue per search, session success rate.
+    \item \textbf{Ecosystem guardrails}: result diversity, new-content exposure share, and latency---latency is a relevance metric in practice; added delay measurably suppresses engagement, so a ``better'' ranker that is 80\,ms slower can lose its own A/B test.
+\end{itemize}
+
+\subsection{Interleaving}
+
+Interleaving answers one narrow question---\textit{which of two rankers do users prefer, click-wise?}---with extraordinary efficiency, by giving both rankers the same query and the same user simultaneously.
+
+\textbf{Team-draft mechanics.} For each query, run both rankers A and B. Build the shown list in rounds, like schoolyard team-picking: each round, a coin flip decides who drafts first; each ranker appends its highest-ranked document not already in the merged list, and the merged list records which ``team'' contributed each document. Serve the merged list; attribute each click to the contributing team; the team with more credited clicks wins the query. Aggregate over queries (queries with equal credit are discarded) and apply a paired/sign test over per-query winners. The result is a preference direction and confidence---\textit{not} an effect size in any business metric.
+
+\textbf{Why it is $\sim$10--100$\times$ more sensitive than A/B.} Large-scale validations (Chapelle et al., 2012, on commercial search engines) found interleaving reaches significance with one to two orders of magnitude less traffic than an A/B test detecting the same ranker difference. The mechanism is paired comparison: each query is a within-user, within-query, within-moment contrast, so between-user and between-query variance---the dominant variance components in an A/B test on CTR---cancel. Every impression carries signal about the actual comparison.
+
+\textbf{Statistics and variants.} The per-query outcome is win/loss/tie; discard ties and test the win rate against $1/2$ with a binomial (sign) test, or run a paired test on per-query credit differences---peeking and sequential monitoring need the same corrections as any experiment ([CML 6]). Team-draft is the robust default. Its predecessor, balanced interleaving, has known corner cases where credit assignment favors one ranker for structural rather than quality reasons; probabilistic and optimized interleaving generalize the merge distribution to trade sensitivity against provable unbiasedness. An operational bonus worth naming: interleaved traffic is a controlled perturbation of rankings, so it doubles as exploration data for examination-propensity estimation (Section~\ref{sr:sec:eval_offline_online_gap}).
+
+\textbf{Its limits} (the half of the answer interviewers listen for): it compares \textit{rankings only}---latency, UI, snippets, and whole-page changes are invisible or confounded; its outcome is clicks, not revenue, dwell, or long-term retention; it presumes both rankers draw from the same candidate universe, so it cannot evaluate recall changes or zero-result fixes; a merged list can be incoherent when the two rankings differ radically (and blending breaks diversity constraints); credit assignment degrades with near-duplicates; personalization and learning effects, which need user-level treatment consistency over time, do not fit the within-query design; and it doubles serving cost per interleaved query. Hence the standard promotion funnel: offline judgment eval to filter candidates cheaply, interleaving to triage ranking changes on modest traffic, and a full A/B for finalists to measure business metrics and guardrails.
+
+\subsection{A/B Testing for Ranking Systems}
+
+The statistical machinery---power analysis, CUPED variance reduction, sequential testing, multiple-comparison control---is canonical in [CML 6] and is not re-derived here. One number frames why ranking experiments lean on that machinery hard: detecting a 1\% \textit{relative} lift on a 2\% base CTR ($\delta = 0.0002$ absolute) by the standard rule $n \approx 16\,p(1-p)/\delta^2$ requires roughly $7.84$ million users \textit{per group}. Small ranking improvements are real money at scale and still sit near the detection floor---which is exactly why interleaving triage, CUPED, and long-running experiments exist. The arithmetic compounds with \textbf{trigger rate}: if only a fraction $\rho$ of queries produce different results under the treatment and the per-affected-query lift is $\Delta$, the population-level effect is $\rho\Delta$---halving $\rho$ quadruples the required sample. Where the triggering condition is identifiable for both arms, run \textit{triggered analysis} (restrict the comparison to affected traffic) and recover the lost power ([CML 6]). What is ranking-specific:
+
+\textbf{Randomization unit.} User-level randomization is the default: it keeps a user's experience consistent, and it is \textit{required} whenever the treatment involves personalization or any effect that accumulates within a user. Query-level randomization yields more units and hence more power, but the same user gets different systems on repeated queries (inconsistency, contamination of session-level metrics) and it cannot measure user-level learning. Session-level is the common compromise. For marketplaces, remember the \textit{other} side: seller/supplier-side interference (treatment exposure changes what inventory is available to control) pushes toward cluster or market-level designs---covered in [CML 6], but the recognition that ranking experiments in two-sided systems interfere is expected from you here.
+
+\textbf{Guardrails and shared-infrastructure interference.} Every ranking A/B ships with guardrail metrics: latency percentiles, zero-result rate, diversity/new-content exposure, and revenue-adjacent metrics even for ``pure relevance'' changes. Two interference patterns specific to ML systems: the treatment model \textit{trains on treatment traffic}, so the system under test evolves during the test (freeze or account for it); and shared feature pipelines (e.g., engagement-count features computed over pooled traffic) let the treatment leak into control's features.
+
+\textbf{Novelty and primacy effects.} Users react to \textit{change} as well as to quality: novelty effects inflate early treatment metrics; change aversion (primacy) deflates them. Ranking changes that alter familiar orderings are especially exposed. Run experiments past the initial reaction (typically $\geq 2$ weeks), inspect treatment-effect trajectories over time, and slice by user tenure---an effect that decays monotonically toward zero over the experiment is novelty, not value.
+
+\textbf{Long-term effects.} Short A/B windows systematically miss slow consequences: feedback-loop degradation, content-ecosystem shifts (creators and sellers respond to exposure changes over months), and \textbf{learning effects}---users adapt to a surface, and the adaptation is the effect. A ranking change that initially confuses users may win once they relearn where good results live; conversely, a change that wins by exploiting attention patterns (brighter thumbnails, familiar-looking top slots) decays as users habituate. Both are invisible in a two-week window and both bias in a known direction if the experiment population's exposure time is short relative to the adaptation time. The standard instrument is the \textbf{holdback}: a small slice of traffic (commonly single-digit percent) kept on the old system---or excluded from a whole family of launches---for a quarter or more, whose long-run divergence from the launched population measures cumulative effect; the reverse form (a small slice gets the launch early and is tracked long) trades faster reads for weaker inference. Holdbacks are politically expensive (they withhold improvements from users) and scientifically irreplaceable; a staff-level answer treats the holdback budget as part of evaluation-program design, not an afterthought.
+
+%==============================================================================
+\section{Designing an Evaluation Program}
+\label{sr:sec:eval_program}
+%==============================================================================
+
+Everything above is instrumentation. The staff-level question is the \textit{program}: which measurements exist, what decision each one gates, who owns it, and on what cadence it is refreshed. A useful organizing device is the metric hierarchy---each layer catches failures the layers above are blind to, and each has its own latency and cost.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The evaluation-program hierarchy for a ranking system}
+\label{sr:tab:eval_hierarchy}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Layer} & \textbf{Instruments} & \textbf{Decision it gates} & \textbf{Cadence / latency} \\
+\midrule
+Debug & Per-stage recall@$k$, feature coverage, score distributions, judgment-set regression suites on curated hard queries & Is the pipeline healthy; did this change break a stage's contract & Every build; minutes \\
+Offline & NDCG/ERR on judged pools (per slice), counterfactual estimates on propensity-logged traffic, beyond-accuracy guardrails & Is this candidate worth online traffic & Every candidate; hours--days \\
+Online & Interleaving; A/B with guardrails & Does it win with users; ship/no-ship & Weeks \\
+Business / long-term & Revenue per search, retention, holdback divergence, ecosystem health (coverage, Gini, new-content share) & Was the strategy right; are launches compounding or cannibalizing & Quarters \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Judgment refresh cadence.} Judgments rot: the index changes under them, query intent drifts (the canonical example: what ``corona'' meant in 2019 vs.\ 2020), and pools built for yesterday's systems under-cover today's candidates. A working cadence: a \textit{frozen} regression set that never changes within a quarter (so week-over-week metric moves mean the system moved, not the ruler); a \textit{rolling} set re-sampled from live traffic, stratified by head/torso/tail and by segment; judge-the-delta on every candidate evaluation; and a scheduled re-pooling when a new retrieval source ships. LLM judging (Section~\ref{sr:sec:eval_retrieval_judgments}) makes dense refresh affordable; the expert gold set and guideline maintenance stay human.
+
+\textbf{Eval-driven development.} The mature failure mode of search teams is not bad models but unfalsifiable launches. The discipline that prevents it mirrors test-driven development: before building a feature, build the evaluation that would detect its success---the query slice it should help, the metric that should move, the guardrails that must not---and pre-register the ship criteria. This does three things: it forces the ``who is this for'' conversation to happen before the engineering; it creates the regression suite that protects the win after launch; and it makes the launch review a reading of pre-agreed numbers rather than a negotiation over post-hoc slices. Combined with the hierarchy above, it also defines escalation: a change that wins debug and offline layers but repeatedly fails online is not unlucky---it is evidence that the offline layer is miscalibrated for that change class, and the program-level action is to fix the offline instrument (new judgments, propensity logging, a new slice), not to keep rolling the A/B dice.
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C
+\label{sr:sec:eval_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: Derive NDCG from first principles, then compute NDCG@3 for a ranking with grades $(3, 0, 2)$, exponential gain, given the ideal available grades are $(3, 2, 0)$.}
+
+\badgeLfive{L5} \quad \badgetype{Metric Derivation} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Build it in three steps, naming what each step fixes. (1) \textbf{Cumulative gain}: map grades to gains and sum---but CG ignores order. (2) \textbf{Discount}: divide the gain at rank $i$ by $\log_2(i+1)$ to model decaying attention---DCG now rewards putting high grades early, but its scale depends on how many good documents the query has, so DCG is not comparable across queries. (3) \textbf{Normalize}: divide by the ideal DCG (judged documents sorted by grade) to get NDCG $\in [0,1]$, comparable and averageable across queries.
+
+\textbf{Arithmetic.} Exponential gains $2^{\mathrm{rel}}-1$: grades $(3, 0, 2) \to$ gains $(7, 0, 3)$. Discounts for ranks 1--3: $1,\ 1/\log_2 3 \approx 0.631,\ 1/\log_2 4 = 0.5$.
+\begin{equation*}
+\mathrm{DCG@}3 = 7(1) + 0(0.631) + 3(0.5) = 8.5
+\end{equation*}
+Ideal ordering $(3, 2, 0) \to$ gains $(7, 3, 0)$:
+\begin{equation*}
+\mathrm{IDCG@}3 = 7 + 3(0.631) + 0 = 8.893
+\qquad\Rightarrow\qquad
+\mathrm{NDCG@}3 = 8.5 / 8.893 \approx 0.956
+\end{equation*}
+State the conventions you used, because both are choices: gain $2^{\mathrm{rel}}-1$ vs.\ linear, discount $\log_2(i+1)$ so rank 1 is undiscounted.
+
+\redflags
+\begin{itemize}
+    \item Forgetting normalization entirely, or normalizing by the DCG of the \textit{shown} list re-sorted rather than the judged ideal.
+    \item Writing the discount as $\log_2 i$ (divides rank 1 by zero)---a sign the formula was memorized, not understood.
+    \item Being unable to say \textit{why} the log discount or the exponential gain---the arithmetic is the entry ticket; the choices are the question.
+\end{itemize}
+
+\interviewtest{Can you produce the derivation chain (gain $\to$ discount $\to$ normalize) with the reason for each step, and do error-free arithmetic under observation? This is a screen-level question at every search and recsys team.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Clean derivation and correct arithmetic; names both convention choices unprompted.
+    \item \badgeLsix{L6} Notes that with linear gain the same list scores differently and explains when exponential gain is the right product choice; mentions the IDCG trap (sparsely judged queries score 1.0 trivially).
+    \item \badgeLseven{L7} Connects the metric to training (LambdaMART's $|\Delta \mathrm{NDCG}|$ scaling means the gain convention shapes the learned model) and to the unjudged-document policy of the tooling.
+\end{itemize}
+
+\followups{``What if the grade-2 document were unjudged instead?'' ``Why $\log$ rather than $1/i$?'' ``Your judged pool has one grade-1 document---what is NDCG if you rank it first, and what does that tell you about averaging?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You have binary judgments only. When do Precision@$k$, Recall@$k$, MRR, and MAP each answer the right question---and construct a case where two of them disagree about which of two systems is better.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Answer with user models: P@$k$ scores the visible page for a scanning user (flat within $k$, blind below); R@$k$ is the candidate-generation contract---did the answer make it into the set at all---and belongs to retrieval stages at large $k$; MRR models a one-answer user (known-item, navigational, QA) and ignores everything after the first hit; MAP models a user who wants all relevant documents soon (research, discovery, legal), giving each relevant document the precision at its own rank.
+
+\textbf{Disagreement construction.} $R = 4$ relevant documents; System A places relevant docs at ranks $\{1, 50, 60, 70\}$; System B at ranks $\{3, 4, 5, 6\}$. MRR prefers A ($1.0$ vs.\ $0.333$). MAP prefers B decisively: A's AP $= \frac{1}{4}(1 + \frac{2}{50} + \frac{3}{60} + \frac{4}{70}) \approx 0.29$, while B's AP $= \frac{1}{4}(\frac{1}{3} + \frac{2}{4} + \frac{3}{5} + \frac{4}{6}) \approx 0.53$. Neither metric is wrong---they disagree because they model different users, which is precisely why the surface decides the metric: A is better for navigation, B for research.
+
+\redflags
+\begin{itemize}
+    \item Defining the four formulas correctly but having no account of when each is appropriate.
+    \item Claiming one of them is ``the standard metric'' independent of the surface.
+    \item Not knowing that MAP is undefined at $R=0$ or that P@$k$ has a ceiling below 1 when $R < k$.
+\end{itemize}
+
+\interviewtest{Do you understand metrics as encoded user models and pipeline contracts rather than as formulas---and can you reason about their disagreements instead of being surprised by them?}
+
+\followups{``Which would you monitor for the retrieval stage of a RAG system, and at what $k$?'' ``Why does graded relevance exist---what can none of these four see?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your reranker improved offline NDCG@10 by 3\% on the judgment set, but the A/B test shows flat CTR. Walk me through your investigation.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Structure the investigation as three suspects---the offline number, the exposure path, and the online measurement---and interrogate them in that order.
+
+\textbf{1. Is the offline gain real?} Where do the labels come from---if they are click-derived, the ``gain'' may be increased agreement with the old ranker's position bias (circularity), not better relevance. Check unjudged-document handling: if the new model surfaces unjudged docs scored as irrelevant---or the old one did---the comparison is biased; judge the delta. Check significance across queries (a few big-query wins can carry the mean) and slice it: head vs.\ tail, intent class, market. Confirm the gain-function convention did not change mid-comparison.
+
+\textbf{2. Does the gain reach users?} Compute the \textbf{trigger rate}: on what fraction of queries do the two systems produce visibly different top-$k$? A 3\% NDCG gain on 10\% of affected queries is a $\sim$0.3\% aggregate effect---likely below the test's detection floor; the power calculation belongs in the answer ([CML 6]). Check where in the list the gain lives (below-fold reorderings do not move CTR@visible). Check downstream stages: L3 business rules, dedup, or diversity constraints may be clobbering the reranker's changes before users see them; presentation is unchanged, and clicks respond to titles and snippets, not to internal scores.
+
+\textbf{3. Is the online measurement asking the right question?} CTR is an attractiveness metric---a relevance gain can be CTR-neutral while improving long-click rate, reformulation rate, or task success; check those. Check experiment mechanics: user- vs.\ query-level randomization, novelty/primacy dynamics in the treatment-effect trajectory, guardrail interference (did latency regress?). And check construct mismatch: judgments measure guideline topicality; users measure utility---systematic divergence is a guideline problem, not a modeling problem.
+
+Then say what you would do: run interleaving to get a high-sensitivity read on the ranking preference; if interleaving prefers the new ranker but A/B stays flat, the gain is real but small or non-click-shaped---decide on the metric hierarchy, not on CTR alone.
+
+\redflags
+\begin{itemize}
+    \item Jumping to ``offline metrics are unreliable'' without a causal checklist---or the reverse, ``ship it, offline is what matters.''
+    \item Never asking what fraction of queries actually changed (the single highest-yield question).
+    \item Not knowing that click-derived labels inherit position bias, or proposing to fix everything by collecting more of the same labels.
+\end{itemize}
+
+\interviewtest{This is the signature staff-level question in search: do you have a systematic model of the offline--online gap, and do you debug the \textit{measurement system} with the same rigor as the model?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names position bias in labels and checks whether the change reaches the visible page.
+    \item \badgeLsix{L6} Runs the full three-suspect structure with trigger-rate arithmetic and a power argument; proposes interleaving as the discriminating experiment.
+    \item \badgeLseven{L7} Treats the episode as program feedback: identifies which offline instrument was miscalibrated for this change class and what to fix (judgment refresh, propensity logging, new slice) so the \textit{next} candidate's offline number is trustworthy.
+\end{itemize}
+
+\followups{``Interleaving prefers the new ranker; A/B is still flat after 4 weeks---ship or not?'' ``How would you have caught this before spending A/B traffic?'' ``What changes if the online metric was revenue per search rather than CTR?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Interleaving vs.\ A/B testing for a ranking change---how does team-draft interleaving work, why is it more sensitive, and when would it mislead you?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Mechanics.} Per query, both rankers produce lists; the shown list is built in rounds---coin flip for draft order each round, each ranker contributes its best not-yet-included document, contributions are tagged by team. Clicks credit the contributing team; more credited clicks wins the query; discard ties; sign test over per-query winners.
+
+\textbf{Sensitivity.} One to two orders of magnitude less traffic than A/B for the same ranker comparison (validated at scale by Chapelle et al., 2012), because it is a paired, within-query design: between-user and between-query variance---which dominate A/B variance on click metrics---cancel, and every impression directly contrasts the two systems. Contrast with A/B's detection floor: a 1\% relative lift on 2\% CTR needs on the order of $7.84$ million users per group by $n \approx 16\,p(1-p)/\delta^2$ ([CML 6] for the machinery).
+
+\textbf{When it misleads.} It answers only ``which ranking do users click-prefer'': (1) latency, UI, snippet, and whole-page effects are invisible or confounding---a ranker that is better but slower will interleave as a win and A/B as a loss; (2) no business-metric effect size---you cannot make a revenue case from an interleaving win; (3) both rankers must operate on comparable candidate sets, so recall improvements and zero-result fixes cannot be interleaved; (4) radically different rankings merge into an incoherent list and break diversity constraints; (5) personalization and learning effects need user-level consistency over time, which the within-query design destroys; (6) doubled serving cost per query. Standard funnel: offline eval filters, interleaving triages many candidates cheaply, A/B decides finalists with guardrails.
+
+\redflags
+\begin{itemize}
+    \item Knowing the sensitivity claim but not its mechanism (paired comparison, variance cancellation).
+    \item Proposing interleaving for a latency-affecting or UI-affecting change.
+    \item Treating interleaving as a replacement for A/B rather than a triage stage before it.
+\end{itemize}
+
+\interviewtest{Do you know the tool beyond its headline number---mechanics, the statistical reason it works, and the boundary of its validity?}
+
+\followups{``Your interleaving result contradicts the subsequent A/B---what are the leading explanations?'' ``How would you interleave when the treatment adds a new candidate source?'' (Trick: you mostly cannot---the candidate universes differ.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You replace a lexical retriever with a dense retriever. Offline NDCG on the existing judgment set drops. Is the new system worse?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Unknown---and the default suspicion should run the other way. The judgment set was built by \textbf{pooling} the top-$k$ of previous (lexical) systems; documents outside that pool are unjudged and scored as irrelevant. A dense retriever surfaces a systematically \textit{different} slice of the corpus---vocabulary-mismatch documents no lexical system ever returned---so its novel results are disproportionately unjudged, and the metric mechanically punishes novelty. The bias is largest exactly when the paradigm shift is largest.
+
+Resolution: (1) \textbf{judge the delta}---measure the unjudged rate in the new system's top-$k$ first (if it is high, the current metric is meaningless), then send new-system-only documents for judgment (human or calibrated LLM judge) and recompute; (2) bound the truth meanwhile: standard NDCG (unjudged $= 0$) is the pessimistic bound, condensed-list NDCG (drop unjudged rows) the optimistic one---if they disagree in sign, buy judgments; (3) cross-check with behavioral evidence on a small online slice or interleaving; (4) longer term, re-pool with the dense system as a contributor and version the judgment set.
+
+\redflags
+\begin{itemize}
+    \item Taking the metric at face value in either direction---``dense is worse'' or ``judgments are wrong, ignore them.''
+    \item Not knowing that pooled judgment sets encode the incumbent systems' reach.
+    \item Proposing condensed lists as \textit{the} answer rather than as an optimistic bound.
+\end{itemize}
+
+\interviewtest{The unjudged-document trap is a canonical competence gate: do you know where judgment sets come from and therefore what they can and cannot adjudicate?}
+
+\followups{``Your LLM judge could label the delta overnight---what do you validate before trusting those labels?'' ``How would you build the judgment set differently if you had known a dense retriever was coming?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: A colleague evaluates a new sequential recommender with a random 80/20 interaction split and HR@10 against 100 sampled negatives, and reports a 12\% win. What is wrong, and what protocol do you require before believing it?}
+
+\badgeLsix{L6} \quad \badgetype{Protocol Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Two independent invalidations. \textbf{First, the split leaks the future.} A random interaction-level split trains on events that occur after the test events: future item popularity leaks in (the model ``anticipates'' trends), a user's later history sits in train while their earlier interactions are tested, and any engagement-derived features computed over the full window encode the test set. Sequential models are hurt worst---the whole premise is temporal order. Required: a \textbf{global temporal split} (train strictly before $T$, test after, features from pre-$T$ data only), with leave-last-out at most as a literature-comparison secondary.
+
+\textbf{Second, sampled metrics are a different metric.} Ranking the positive against 100 random negatives does not estimate full-catalog HR@10 noisily---Krichene \& Rendle (KDD 2020) showed sampled top-$k$ metrics are \textit{inconsistent} with exact ones: the sampled rank relates to the full rank through the sampling in a way that destroys top-heaviness, all sampled top-$k$ metrics drift toward an AUC-like quantity, and the \textit{ordering of algorithms can flip} between sampled and exact evaluation. A 12\% sampled-HR win is compatible with a full-ranking loss. Required: full-catalog ranking (usually affordable offline), or a large negative sample with the published correction---and never comparing numbers across different sample sizes.
+
+Then the protocol extras that make the readout decision-grade: popularity-stratified recall (is the win head-only?), cold-user and cold-item slices, coverage/Gini guardrails, and a statement of what the negatives are (random-catalog vs.\ impressed-not-engaged measure different things).
+
+\redflags
+\begin{itemize}
+    \item Objecting only to the sample size (``use 1000 negatives'') without knowing the inconsistency result---the problem is the estimator, not just its variance.
+    \item Accepting random splits for a \textit{sequential} model.
+    \item No mention of popularity stratification---interaction-based metrics structurally reward popularity matching.
+\end{itemize}
+
+\interviewtest{Recsys offline evaluation is where protocol errors are most rampant in practice and in the literature; this question checks whether you audit protocol before metrics.}
+
+\followups{``Full ranking over 50M items is expensive---what exactly does it cost, and where would you spend approximation?'' ``The corrected estimator disagrees with the sampled one---which do you report to leadership?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your new recommender lifts NDCG and short-term engagement, but intra-list diversity drops, catalog coverage falls, and exposure Gini rises 6 points. Do you ship it---and how should the evaluation have been set up so this is not a debate?}
+
+\badgeLsix{L6} \quad \badgetype{Judgment Call} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+First, diagnose before negotiating: an accuracy gain that arrives with falling coverage and rising exposure concentration is the signature of a model leaning harder into popularity---check popularity-stratified recall (is the ``win'' head-only?) and per-cohort effects (heavy users up, new users flat is the classic decomposition). If the gain survives that scrutiny, treat the decision as a short-term/long-term trade: the beyond-accuracy metrics are not aesthetic preferences, they are leading indicators of feedback-loop damage---starved new content, narrowing profiles, and a marketplace whose tail suppliers quietly lose exposure. Short-term engagement cannot arbitrate that; a long-term holdback can, so the strong move is to ship behind guardrail mitigations (a capped exposure-concentration budget, diversity-aware reranking or calibration on top of the new scores, an explicit exploration slice for new items) and let the holdback measure whether the engagement gain persists or decays as the loop tightens.
+
+The second half of the question is the real one: these should have been \textbf{pre-registered guardrails with thresholds}, decided when the experiment was designed---coverage and Gini bounds the launch must respect, cohort slices that must not regress---so the launch review reads numbers against agreements instead of relitigating values under deadline pressure. If the org has no such thresholds, the staff-level contribution is creating them, because every future accuracy-vs-ecosystem conflict is this same meeting again.
+
+\redflags
+\begin{itemize}
+    \item ``Ship it, engagement is up''---or the mirror image, treating any diversity drop as disqualifying without quantifying either side.
+    \item Not connecting coverage/Gini movements to the feedback-loop mechanism that makes them predictive of long-term damage.
+    \item No mention of holdbacks or of pre-registered guardrail thresholds---the process answer is half the credit.
+\end{itemize}
+
+\interviewtest{Multi-objective judgment under ambiguity: can you use beyond-accuracy metrics as leading indicators rather than vibes, and do you fix the \textit{decision process} so the trade-off is governed rather than re-argued?}
+
+\followups{``What threshold would you actually set for the Gini guardrail, and how would you defend it?'' ``The holdback shows the engagement gain decaying 40\% over a quarter---now what?'' ``How does an exploration slice interact with your offline metrics?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Without launching it, estimate what CTR a new ranking policy would achieve, using only logs from the current system. Derive the estimator, its requirements, and its failure modes.}
+
+\badgeLseven{L7} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+This is off-policy evaluation. Logs are $(x_i, a_i, r_i, p_i)$ with $a_i$ drawn from the logging policy $\pi_0$ and $p_i = \pi_0(a_i \given x_i)$ the logged propensity. The target $V(\pi) = \E_{x}\E_{a \sim \pi}[r]$ is estimated by importance weighting: $\hat{V}_{\mathrm{IPS}} = \frac{1}{n}\sum_i w_i r_i$ with $w_i = \pi(a_i \given x_i)/p_i$. Unbiasedness follows in one line---$\E_{a \sim \pi_0}\!\left[\frac{\pi(a \given x)}{\pi_0(a \given x)} r\right] = \E_{a \sim \pi}[r]$---and requires \textbf{support} ($\pi_0$ gives positive probability to every action $\pi$ takes) and \textbf{correct logged propensities}. Variance is the price: it scales with the weight range, so clip weights (small bias, large variance reduction), or self-normalize---SNIPS, $\sum w_i r_i / \sum w_i$---which is consistent, much lower-variance, and robust to constant propensity miscalibration. \textbf{Doubly robust} adds a reward model: predict $\hat{r}$ under the new policy, correct with propensity-weighted residuals on logged actions (Equation~\ref{sr:eq:dr}); unbiased if \textit{either} component is right, lower variance when $\hat{r}$ has any signal.
+
+\textbf{The ranking-specific complication:} the action is a slate, and whole-slate propensities are degenerate. Factorize through an examination model: with position-based examination propensities (identified from swap randomization or intervention harvesting), weight each logged click by the inverse examination probability of its logged position and re-score it at the new policy's position---the counterfactual LTR estimator.
+
+\textbf{Failure modes and requirements:} deterministic logging kills the method (propensities 0/1---no counterfactual information); propensities must be logged \textit{at decision time}, not reconstructed; check the effective sample size $(\sum w_i)^2/\sum w_i^2$---when the new policy is far from logging, ESS collapses and the formally-unbiased estimate is practically worthless, and the correct move is a small online test or an exploration slice, not a cleverer estimator. Validate the whole apparatus by backtesting: run the estimator on past launches and compare against their known A/B outcomes.
+
+\redflags
+\begin{itemize}
+    \item Proposing to ``replay the logs and count clicks the new ranker would have gotten''---evaluating $\pi$ on $\pi_0$'s actions without reweighting is exactly the biased thing IPS exists to fix.
+    \item No mention of support/overlap or of where propensities come from.
+    \item Deriving IPS but not knowing why it fails for slates or what ESS diagnoses.
+\end{itemize}
+
+\interviewtest{Frontier-lab and platform interviews use this to separate candidates who can \textit{derive} the counterfactual machinery and state its preconditions from those who name-drop IPS. The infrastructure implication---you must log propensities and keep the policy stochastic---is the staff-level takeaway.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States IPS with the support condition and the variance problem.
+    \item \badgeLsix{L6} Derives unbiasedness, motivates clipping and SNIPS, sketches DR, and names the propensity-logging requirement.
+    \item \badgeLseven{L7} Handles the slate factorization via examination propensities, uses ESS as the go/no-go diagnostic, and frames OPE as a logging-infrastructure investment validated against historical A/B outcomes.
+\end{itemize}
+
+\followups{``Your logging policy is deterministic today---what is the minimal change to make OPE possible, and what does it cost?'' ``When is DR worse than plain IPS?'' ``How does this connect to training (counterfactual LTR) rather than evaluation?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You want to replace most crowd relevance labeling with an LLM judge. Design the program so the labels are trustworthy---and tell me what stays human.}
+
+\badgeLsix{L6} \quad \badgetype{Program Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Anchor on the evidence and its limits: current results (Bing's production reports, TREC's UMBRELA assessments) show LLM judges matching or exceeding \textit{crowdworker} agreement with experts on topical relevance at 10--100$\times$ lower cost---which justifies replacing crowd volume, not expert judgment. Design: (1) \textbf{the guideline is the prompt}---port the human guideline document verbatim with its graded scale and edge-case rulings; structured output with rationale. (2) \textbf{Expert gold set}: a maintained, expert-labeled calibration set; measure judge-vs-expert agreement (Krippendorff's $\alpha$ for ordinal grades) continuously, with human-vs-human agreement ($\kappa \approx 0.4$--$0.6$ is realistic for relevance) as the reference bar. (3) \textbf{Routing}: low-confidence and gold-disagreement items go to human adjudication; sample-based human audit of accepted labels. (4) \textbf{Version discipline}: pin the judge model and prompt; any upgrade is a metric change---re-calibrate on gold before switching, or your quarter-over-quarter NDCG trend measures the judge, not the ranker. (5) \textbf{Independence}: if the ranking stack uses the same model family (reranker, features), watch for self-preference and correlated blind spots---prefer a different family for judging, and audit the overlap.
+
+\textbf{What stays human:} writing and evolving the guideline (product policy is not delegable), the expert gold set and adjudication, systematic-bias audits (freshness, locale, cultural nuance---known LLM weak spots), and any labels that feed back into evaluating LLM-generated content where circularity is acute. Judge-methodology canon---bias taxonomies, calibration protocols---is [NLP 10]; the search-specific deltas are the pooled-judgment supply chain and the guideline-as-prompt discipline.
+
+\redflags
+\begin{itemize}
+    \item ``The LLM agrees with humans 90\% of the time'' without chance correction or an expert-vs-crowd baseline.
+    \item No re-calibration story for judge upgrades---the most common silent metric redefinition in practice.
+    \item Eliminating humans entirely, or keeping them without a defined role (policy, gold, audit).
+\end{itemize}
+
+\interviewtest{Judgment programs are the data supply chain for both evaluation and LTR training; this checks whether you treat labeling as an owned system with QC, versioning, and a calibration loop rather than as an API call.}
+
+\followups{``Your judge's agreement with experts drops 8 points on queries issued after its training cutoff---what is happening and what do you do?'' ``How do denser, cheaper labels change your \textit{training} pipeline, not just eval?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You own relevance for a search org of several teams. Design the evaluation program: what gets measured, at what layer, on what cadence---and how does a change get to ship?}
+
+\badgeLseven{L7} \quad \badgetype{Program Design} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Present it as a hierarchy where each layer gates a decision and catches what the layers above cannot (Table~\ref{sr:tab:eval_hierarchy}): \textbf{debug} (per-stage recall@$k$, feature coverage, frozen regression suites on curated hard queries; runs on every build; gates merges), \textbf{offline} (NDCG/ERR per slice on versioned judgment pools, counterfactual estimates on propensity-logged traffic, beyond-accuracy guardrails; gates online traffic), \textbf{online} (interleaving triage, then A/B with pre-registered ship criteria and guardrails---latency, zero-result, diversity, revenue; gates launch), \textbf{long-term} (quarterly holdbacks, ecosystem health: coverage, exposure concentration, new-content share; gates strategy). The connective tissue: \textbf{judgment supply chain} with a frozen quarterly regression set plus a rolling re-sampled set, judge-the-delta on every candidate, LLM judging for volume with an expert gold calibration loop; \textbf{propensity logging and a standing exploration slice} as infrastructure, so counterfactual evaluation and unbiased training data exist at all; \textbf{eval-driven development}: the eval slice and ship criteria are written before the feature, so launch reviews read pre-agreed numbers.
+
+The staff-level moves that distinguish the answer: budget allocation (judgment spend and holdback traffic are line items someone must defend); calibration of the program itself (backtest offline deltas against realized A/B outcomes per change class, and when a class repeatedly wins offline and loses online, fix the offline instrument); explicit escalation paths for metric conflicts (engagement up, diversity down---who decides, against what pre-agreed guardrail thresholds); and slice governance (head/torso/tail, market, intent---so a launch cannot ship an aggregate win hiding a tail regression).
+
+\redflags
+\begin{itemize}
+    \item A list of metrics with no mapping from metric to decision to owner to cadence.
+    \item No judgment refresh story---a program whose ruler silently rots.
+    \item No answer for ``how do you know your offline metrics predict online''---program calibration is the point of the question.
+\end{itemize}
+
+\interviewtest{This is the purest staff signal in the chapter: can you design the \textit{measurement system} as a product---with budgets, owners, versioning, and a feedback loop on the measurements themselves?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Produces the four-layer hierarchy with sensible instruments and cadences.
+    \item \badgeLseven{L7} Adds program calibration (backtesting offline vs.\ online per change class), budget and governance reasoning, and treats the exploration slice and propensity logging as evaluation infrastructure with an ROI argument.
+\end{itemize}
+
+\followups{``Leadership wants to cut the holdback---make the case for keeping it, with what it has caught.'' ``A team's changes keep winning offline and failing online---walk through the program-level fix.'' ``Where do LLM judges change your cost structure, and what new risks do they introduce?''}
+\end{interviewq}

@@ -2,30 +2,866 @@
 \label{sr:chap:search_systems_query_understanding}
 
 \begin{tldr}
-Placeholder — this chapter is written in Phase C from the vector-retrieval digest and applied-search track design (see review/search-recsys/ in the DL repo).
+A production search engine is a funnel: a raw query passes through \textbf{query understanding} (normalize, correct, segment, link, classify, rewrite), fans out to \textbf{candidate retrieval} (lexical, dense, structured), then narrows through \textbf{L1 ranking} (cheap features, thousands $\to$ hundreds), \textbf{L2 reranking} (learned models, hundreds $\to$ tens), and \textbf{blending} (personalization, business rules, diversity) into a result page---all inside a p99 budget of a few hundred milliseconds. Two structural facts govern everything downstream: the \textbf{recall ceiling} (no ranker can recover a document retrieval missed) and the \textbf{Zipfian shape of traffic} (a few head queries dominate volume while the never-seen-before tail dominates distinct queries, so strategy must differ by segment). Query understanding is the discipline that turns keystrokes into intent: noisy-channel spell correction over query-log language models, segmentation and tagging into structured constraints, entity linking against the catalog, intent classification that gates downstream behavior, and---since 2024---LLM-based rewriting distilled and cached into the hot path. Search is a closed loop: today's result page generates tomorrow's training data, which is why measurement (Chapter~\ref{sr:chap:evaluation_experimentation}) and bias correction (Chapter~\ref{sr:chap:learning_to_rank}) are first-class citizens, not afterthoughts.
 \end{tldr}
 
-\section{The Production Search Stack}
-% TODO Phase C
+%==============================================================================
+\section{The Anatomy of a Search Engine}
+\label{sr:sec:stack_anatomy}
+%==============================================================================
 
+\subsection{The Request Lifecycle}
+
+\textbf{What actually happens when a user types a query.} Every production search engine---web, e-commerce, docs, app store---implements some version of the same request lifecycle. The user's raw string is first cleaned up and interpreted (query understanding), then dispatched in parallel to one or more candidate sources: an inverted index for lexical match (Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}), an approximate-nearest-neighbor index over embeddings for semantic match (Chapter~\ref{sr:chap:vector_retrieval_theory}), and often a structured store or knowledge graph for entity- and attribute-constrained match. Candidates are unioned, deduplicated, and filtered, then flow through a cascade of rankers of increasing cost and decreasing candidate count: a cheap L1 pass over thousands of documents, a learned L2 reranker---gradient-boosted learning-to-rank or a neural cross-encoder (Chapters~\ref{sr:chap:learning_to_rank} and~\ref{sr:chap:neural_retrieval_reranking})---over hundreds, and a final blending stage that applies personalization, business rules, and diversity constraints to the top tens before the page is assembled. Everything the user does with that page is logged, and those logs become the judgments, click signals, and training data that retrain every stage. Figure~\ref{sr:fig:search_funnel} shows the funnel.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    stage/.style={rectangle, draw, rounded corners, minimum height=0.85cm, align=center, font=\small},
+    lat/.style={font=\scriptsize, text=gray!55!black, anchor=east, align=right},
+    fb/.style={font=\scriptsize\itshape, text=deepred}
+]
+    % Funnel stages (widths shrink downward)
+    \node[stage, fill=lightgray, minimum width=11.2cm] (query)
+        {User query: \texttt{``running shoos size 10''}};
+    \node[stage, fill=lightyellow, minimum width=10.4cm, below=0.5cm of query] (qu)
+        {\textbf{Query understanding}: normalize $\to$ correct $\to$ segment $\to$ link $\to$ classify $\to$ rewrite};
+    \node[stage, fill=lightblue, minimum width=3.0cm, below=0.85cm of qu] (dense)
+        {Dense / ANN\\ (Ch.~\ref{sr:chap:vector_retrieval_theory})};
+    \node[stage, fill=lightblue, minimum width=3.0cm, left=0.4cm of dense] (lex)
+        {Lexical index\\ (Ch.~\ref{sr:chap:lexical_retrieval_inverted_indexes})};
+    \node[stage, fill=lightblue, minimum width=3.0cm, right=0.4cm of dense] (kg)
+        {Structured / KG\\ filters, facets};
+    \node[stage, fill=lightblue!50, minimum width=8.6cm, below=0.85cm of dense] (fusion)
+        {Candidate fusion, filtering, deduplication ($10^3$--$10^4$ docs)};
+    \node[stage, fill=lightgreen, minimum width=7.6cm, below=0.5cm of fusion] (l1)
+        {\textbf{L1 ranking}: cheap features, thousands $\to$ hundreds};
+    \node[stage, fill=lightgreen, minimum width=6.6cm, text width=6.2cm, below=0.5cm of l1] (l2)
+        {\textbf{L2 reranking}: LTR / cross-encoder (Ch.~\ref{sr:chap:neural_retrieval_reranking},~\ref{sr:chap:learning_to_rank}), hundreds $\to$ tens};
+    \node[stage, fill=lightgreen!60, minimum width=5.6cm, below=0.5cm of l2] (l3)
+        {\textbf{Blending}: personalization, business\\ rules, diversity (Ch.~\ref{sr:chap:recommendation_systems})};
+    \node[stage, fill=lightgray, minimum width=4.6cm, below=0.5cm of l3] (serp)
+        {Result page / answer (Ch.~\ref{sr:chap:production_retrieval_rag})};
+
+    % Arrows down the funnel
+    \draw[->, thick] (query) -- (qu);
+    \draw[->, thick] (qu.south) -- (lex.north);
+    \draw[->, thick] (qu.south) -- (dense.north);
+    \draw[->, thick] (qu.south) -- (kg.north);
+    \draw[->, thick] (lex.south) -- (fusion.north);
+    \draw[->, thick] (dense.south) -- (fusion.north);
+    \draw[->, thick] (kg.south) -- (fusion.north);
+    \draw[->, thick] (fusion) -- (l1);
+    \draw[->, thick] (l1) -- (l2);
+    \draw[->, thick] (l2) -- (l3);
+    \draw[->, thick] (l3) -- (serp);
+
+    % Latency annotations (left side)
+    \node[lat] at ($(qu.west)+(-0.35,0)$) {$\sim$5--10\,ms};
+    \node[lat] at ($(lex.west)+(-0.35,0)$) {$\sim$20--50\,ms\\ per source};
+    \node[lat] at ($(l2.west)+(-0.35,0)$) {$\sim$10--30\,ms};
+    \node[lat] at ($(serp.west)+(-0.35,0)$) {p99 total\\ 100--300\,ms};
+
+    % Feedback loop (right side)
+    \path (serp.east) ++(3.6,0) coordinate (fbA);
+    \path (query.east) ++(0.6,0) coordinate (fbB);
+    \draw[->, dashed, thick, deepred] (serp.east) -- (fbA) -- (fbA |- fbB) -- (query.east);
+    \node[fb, rotate=90, anchor=center] at ($(fbA)!0.5!(fbA |- fbB)+(0.35,0)$)
+        {logging $\to$ clicks, judgments $\to$ training data (Ch.~\ref{sr:chap:learning_to_rank},~\ref{sr:chap:evaluation_experimentation})};
+\end{tikzpicture}
+\caption{The production search funnel. Stage widths narrow as candidate counts fall and per-candidate compute rises; the dashed feedback edge is the closed loop that makes search a self-training system. Latency figures are typical for web/commerce search.}
+\label{sr:fig:search_funnel}
+\end{figure}
+
+\textbf{The latency budget is a design constraint, not an implementation detail.} A typical web or commerce SERP budget allocates roughly 5--10\,ms to query understanding, 20--50\,ms to each retrieval source (run in parallel), 10--30\,ms to L2 reranking, and the remainder to blending, snippet generation, and page assembly, for a p99 total commonly in the 100--300\,ms range. Latency is itself a relevance signal in the business sense---added delay measurably suppresses engagement---so every component in this chapter is engineered against a millisecond ceiling. This single fact explains most of the architecture: why query understanding models are distilled to tiny footprints, why expensive rankers only see tens to hundreds of candidates, and why LLMs enter the pipeline mainly offline (Section~\ref{sr:sec:query_rewriting}).
+
+\textbf{The budget is enforced, not hoped for.} Every stage runs under a deadline with a defined degradation path: if L2 times out, serve the L1 ordering; if a retrieval source or vertical misses its deadline, assemble the page without it; if a QU component fails, fall through to the raw query. Graceful degradation is why search pages are effectively never blank even during partial outages---and it is a measurement obligation too: a creeping rise in the fraction of degraded (L1-only, vertical-missing) responses is a quality regression that end-to-end relevance metrics will register only faintly and late, so degraded-response rate is monitored per stage alongside latency (Chapter~\ref{sr:chap:production_retrieval_rag}).
+
+\subsection{The Retrieval/Ranking Contract and the Recall Ceiling}
+
+\textbf{Each stage has a different job.} Retrieval is \textit{recall}-oriented: it must be cheap per document, which forces it to be decomposable---the index is built without knowing the query (postings lists keyed by term, document embeddings computed offline), so query-time work is a lookup plus a cheap score. Ranking is \textit{precision}-oriented: it can afford query--document interaction (cross-features, cross-encoders) precisely because it sees few candidates. The funnel is a cost--accuracy Pareto construction: each stage spends more per candidate on fewer candidates. The bi-encoder/cross-encoder economics behind this split are covered in [DL 7]; Chapter~\ref{sr:chap:neural_retrieval_reranking} applies them to search.
+
+\begin{keyinsight}[The Recall Ceiling]
+No downstream stage can recover a document an upstream stage dropped. If the best answer is not in the union of retrieval candidates, the finest reranker in the world will rank garbage carefully. Three practical corollaries: (1) \textbf{measure recall per stage} against judged-relevant documents, not just end-to-end NDCG (Chapter~\ref{sr:chap:evaluation_experimentation}); (2) when an offline ranking gain fails to move online metrics, the first suspect is a candidate set that never contained the good documents; (3) query understanding sits \textit{above} the funnel, so its failures---a wrong spell correction, an over-aggressive filter from a mis-tagged attribute---are recall failures that poison every stage below. This ``offline gain, online flat'' funnel diagnosis is one of the most reliable staff-level probes in search interviews.
+\end{keyinsight}
+
+\textbf{Where business logic legitimately lives.} Merchandising boosts, compliance filtering, dedup rules (one result per seller or domain), and diversity constraints belong in the final blending stage---\textit{after} the learned ranker, so they do not contaminate its training signal, but \textit{visible to evaluation}, so measured quality reflects what users actually see. Burying hand-tuned boosts inside earlier stages is the classic path to an undebuggable ranking stack.
+
+\subsection{Blending, Federation, and Universal Search}
+\label{sr:sec:federation_blending}
+
+\textbf{Real search products are federations.} The single funnel of Figure~\ref{sr:fig:search_funnel} is usually one of several: web search federates web, news, images, video, local, and shopping verticals; commerce search federates products, brands, editorial content, help articles, and sellers; enterprise search federates wikis, tickets, code, and people. Each vertical is its own engine with its own index, ranker, and freshness regime, and ``universal search'' is the meta-problem of composing them into one page. It decomposes into two decisions:
+
+\begin{itemize}
+    \item \textbf{Triggering (vertical routing)}: which verticals should even be queried? This is an output of intent classification (Section~\ref{sr:sec:query_intent}): \texttt{``earthquake''} should trigger the news vertical, \texttt{``pasta recipe''} recipe cards, and a bare SKU only the product vertical. Triggering is tuned recall-heavy (querying an extra vertical costs latency and compute; \textit{not} querying the right one is an unfixable miss downstream---the recall ceiling again), with the blender making the final call on what appears.
+    \item \textbf{Blending (whole-page composition)}: given each vertical's ranked list, what goes where on the page? The core technical obstacle is that \textbf{raw scores from different engines are not comparable}---different scoring functions, feature sets, and score distributions. The standard fix is calibration to a shared currency: predict a comparable quantity per block (typically calibrated click/engagement probability, sometimes with vertical-specific utility weights), or train a dedicated blending model on whole-page engagement with vertical identity as a feature. Slot-based layouts (a news block may appear only at positions 1, 4, or 8) constrain the problem and stabilize the UX.
+\end{itemize}
+
+The same non-comparability argument recurs one level down when fusing lexical and dense candidate lists inside a single vertical---rank-based fusion and learned fusion are covered with hybrid retrieval in Chapter~\ref{sr:chap:vector_retrieval_theory}. Whole-page evaluation (the page, not any single list, is what the user experiences) is treated in Chapter~\ref{sr:chap:evaluation_experimentation}.
+
+\subsection{Where Each Later Chapter Sits}
+
+This chapter owns the query side and the system view; the rest of the volume descends the funnel.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Chapter map for the search funnel}
+\label{sr:tab:chapter_map}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Funnel stage} & \textbf{Where covered} \\
+\midrule
+Query understanding, rewriting, sessions & This chapter \\
+Lexical retrieval: inverted indexes, BM25, analyzers & Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes} \\
+Dense retrieval: embeddings, ANN, hybrid fusion & Chapter~\ref{sr:chap:vector_retrieval_theory}; encoder training in [DL 7] \\
+Neural reranking: cross-encoders, late interaction, LLM rankers & Chapter~\ref{sr:chap:neural_retrieval_reranking} \\
+L2 ranking: LTR losses, features, click debiasing & Chapter~\ref{sr:chap:learning_to_rank}; loss families in [DL 3] \\
+Blending, personalization, recommendations & Chapter~\ref{sr:chap:recommendation_systems}; models in [DL 12] \\
+Measurement: judgments, NDCG regimes, interleaving, A/B & Chapter~\ref{sr:chap:evaluation_experimentation}; metric definitions in [DL 23] \\
+Production: indexing pipelines, serving, RAG integration & Chapter~\ref{sr:chap:production_retrieval_rag}; RAG mechanics in [DL 21], [NLP 9] \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{The closed-loop thesis.} The dashed edge in Figure~\ref{sr:fig:search_funnel} is the most important one: the ranker curates the page, the page determines what users can click, and those clicks become the next model's training data. Every bias question in this volume---position bias, feedback loops, popularity spirals, filter bubbles---is a property of this loop, not of any single model. Most staff-level interview differentiation in search happens in reasoning about the loop, not the models.
+
+%==============================================================================
+\section{The Signals Landscape}
+\label{sr:sec:signals_landscape}
+%==============================================================================
+
+\textbf{Ranking is signal fusion.} ``Relevance'' in the narrow sense---does this document match this query's topic---is only one of roughly five signal families a production ranker combines, and mature systems are distinguished less by any single model than by how deliberately they place each family in the funnel.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The five signal families and where they enter the funnel}
+\label{sr:tab:signals}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Family} & \textbf{Examples} & \textbf{Typical funnel placement} \\
+\midrule
+Relevance & BM25 per field, term coverage, embedding cosine, cross-encoder score, tagged-attribute match & Retrieval (defines the candidate set) and every ranking stage \\
+Quality / authority & PageRank-style link authority, seller rating, content quality score, spam probability, review count & Document-side, precomputed at index time; L1/L2 features; hard floors as filters \\
+Freshness & Document age, decayed engagement, query-deserves-freshness classification & Index-time field; boost or feature whose weight depends on query intent \\
+Personalization & User/category affinities, session clicks, geo/locale, past purchases & L2 features and L3 blending---late and capped (Chapter~\ref{sr:chap:recommendation_systems}) \\
+Engagement & Historical CTR and conversion per (query, doc), dwell, add-to-cart, skip patterns & Aggregated offline into priors; L1/L2 features; the primary LTR label source (Chapter~\ref{sr:chap:learning_to_rank}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{How the families combine changes down the funnel.} At retrieval, signals must be decomposable and cheap, so they appear as index-time fields and simple boosts: a freshness decay multiplier, a quality floor filter. At L1, they become features in a linear model or small GBDT. At L2, a learned ranker fuses all of them, replacing the hand-tuned ``boost soup'' that every search team builds first and later regrets (Chapter~\ref{sr:chap:learning_to_rank}). At blending, a few families get the last word as constraints rather than scores: compliance filters are absolute, diversity is a slot rule, personalization is capped so it can reorder among near-equals but never override explicit intent.
+
+\textbf{Signal weighting is query-dependent.} The correct mix is not static: a navigational query (``facebook login'') should be dominated by authority and exact match; a news-y query (``earthquake'') by freshness---the classic \textit{query deserves freshness} routing; a broad commerce query (``running shoes'') by engagement and personalization; a long tail question by pure relevance because no engagement history exists. This is the first reason query understanding earns its place as a stage: intent classification (Section~\ref{sr:sec:query_intent}) is what tells the ranker which mix applies.
+
+\textbf{Every signal family is an attack surface.} Signals are computed over inputs that outside parties control, and each family has a corresponding manipulation industry: content and authority signals attract SEO (keyword stuffing begat TF saturation; link farms begat authority discounting); engagement signals attract click farms, bot traffic, and sellers gaming their own listings---which is why signal pipelines dedupe by user, filter bots, cap per-actor contributions, and smooth low-volume aggregates before anything reaches the ranker; and in the answer-engine era the synthesizer itself is targeted by content written to manipulate generated answers (Chapter~\ref{sr:chap:production_retrieval_rag}). Adversarial robustness is a standing requirement of signal design, not an afterthought.
+
+\begin{warningbox}
+Engagement signals are the strongest and the most dangerous family. They are cheap, dense on head traffic, and directly aligned with what users do---and they are biased (position, presentation, selection), missing-not-at-random, self-reinforcing through the closed loop, and empty on the tail. A ranker naively trained on raw engagement learns to reproduce the current ranker plus popularity. The machinery for using them safely---click models, propensity weighting, exploration---is the core of Chapter~\ref{sr:chap:learning_to_rank}; the point to carry from this chapter is architectural: engagement should enter as \textit{one feature family among five}, never as the definition of relevance.
+\end{warningbox}
+
+%==============================================================================
 \section{Head, Torso, and Tail Queries}
-% TODO Phase C
+\label{sr:sec:head_torso_tail}
+%==============================================================================
 
-\section{Query Classification and Intent}
-% TODO Phase C
+\textbf{Query traffic is Zipfian.} Like word frequencies ([NLP 1] makes Zipf's law quantitative), query frequencies follow a power law: a small head of queries accounts for a huge share of impressions, while distinct queries pile up in an enormous low-frequency tail. The standard operational decomposition:
 
-\section{Spell Correction}
-% TODO Phase C
+\begin{itemize}
+    \item \textbf{Head} (roughly the top thousands of queries): each query is seen so often that you can afford per-query treatment---curated results, cached result pages, dense engagement priors, hand-audited spell corrections. Head caching is one of the largest cost levers in search serving, which is why personalizing at retrieval (making cached results non-shareable across users) is expensive by construction (Chapter~\ref{sr:chap:recommendation_systems}).
+    \item \textbf{Torso}: enough behavioral data per query for machine learning---engagement priors are estimable, learned rankers have signal---but too many queries for manual curation.
+    \item \textbf{Tail}: the majority of \textit{distinct} queries (often reported in the 50--70\% range), each seen a handful of times or exactly once. Google has said for years that about 15\% of the queries it sees each day have never been seen before. No engagement history exists here by definition.
+\end{itemize}
 
-\section{Query Segmentation and Tagging}
-% TODO Phase C
+\begin{keyinsight}[Strategy Must Differ by Segment]
+The single most common junior mistake in search system design is proposing one uniform pipeline. The head is a caching and curation problem; the torso is a supervised-learning problem; the tail is a generalization problem---and the tail is where this chapter's machinery earns its keep: spell correction (tail queries are disproportionately misspellings), segmentation and entity linking (structure substitutes for history), query relaxation and expansion (recovering from zero results), and semantic retrieval (vocabulary mismatch has no click-based fix when there are no clicks). Interviewers expect the head/torso/tail framing to appear unprompted in any ``design search'' answer, with different levers per segment---and expect evaluation to be sliced the same way, because an aggregate metric dominated by head traffic will hide a tail regression completely (Chapter~\ref{sr:chap:evaluation_experimentation}).
+\end{keyinsight}
 
-\section{Entity Resolution}
-% TODO Phase C
+\textbf{Why the tail dominates aggregate volume of pain.} Even though each tail query is rare, their union is a large fraction of traffic, and they concentrate the failure modes: zero-result pages, misspellings, rare entities, multilingual queries, and long natural-language questions. A system whose average metrics look healthy can be failing a third of its traffic in ways only segment-sliced measurement reveals. Tail quality is also disproportionately reputational: users forgive a mediocre ordering of plausible results far more readily than a ``no results found'' page for a query they know the corpus can answer.
 
-\section{Query Rewriting, Expansion, and Relaxation}
-% TODO Phase C
+\begin{table}[H]
+\centering
+\small
+\caption{Which lever works in which traffic segment}
+\label{sr:tab:segment_levers}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+ & \textbf{Head} & \textbf{Torso} & \textbf{Tail} \\
+\midrule
+Defining resource & Per-query traffic & Per-query statistics & Nothing per-query; only structure \\
+Primary levers & Result caching, curation, audited corrections, dense engagement priors & LTR over behavioral features, engagement-prior boosting, mined synonyms & Spell correction, tagging, entity linking, relaxation, semantic retrieval, LLM rewriting \\
+Dominant features & Memorized (query, doc) engagement & Blend of behavioral and content & Content and structure only (behavioral features are empty) \\
+Characteristic failure & Staleness (cached/curated results outlive events) & Bias amplification from click-trained models & Zero results, vocabulary mismatch, wrong corrections \\
+\bottomrule
+\end{tabularx}
+\end{table}
 
+%==============================================================================
+\section{The Query Understanding Pipeline}
+\label{sr:sec:qu_pipeline}
+%==============================================================================
+
+Query understanding (QU) is the stage that turns a keystroke string into a structured, corrected, disambiguated representation of intent. It runs on every query inside a single-digit-millisecond budget, which constrains every design choice below. The canonical pipeline order: normalization $\to$ spell correction $\to$ segmentation/tagging $\to$ entity linking $\to$ intent classification $\to$ expansion/rewriting (Section~\ref{sr:sec:query_rewriting}). Stages are ordered so each consumes the previous stage's cleaner output, though production systems often run some in parallel and reconcile. Table~\ref{sr:tab:qu_components} is the map for this section and a checklist for the design interview.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The query understanding pipeline at a glance}
+\label{sr:tab:qu_components}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Component} & \textbf{Input $\to$ output} & \textbf{Typical 2026 implementation} & \textbf{Primary metric} \\
+\midrule
+Normalization & Raw string $\to$ canonical string & Unicode NFKC + locale-aware folding, versioned with the index analyzer & Analyzer-parity tests \\
+Spell correction & String $\to$ corrected string + confidence & Noisy channel over query-log LM; seq2seq/edit taggers at scale & Correction precision, acceptance rate, zero-result delta \\
+Segmentation / tagging & Tokens $\to$ typed slots & Small transformer tagger, distant supervision from engagement & Tag precision, zero-result per tag type \\
+Entity linking & Mentions $\to$ canonical entities & Alias tables + context scoring + popularity prior & Linking accuracy on audited samples \\
+Intent classification & Query $\to$ intent distribution & Char n-gram LR or distilled tiny transformer, 1--5\,ms & Intent accuracy; downstream routing quality \\
+Expansion / rewriting & Query $\to$ weighted variants & Log-mined synonyms; cached/distilled LLM rewrites & Rewrite win-rate, zero-result per source \\
+Autocomplete & Prefix $\to$ ranked completions & FST/trie over log-mined completions + rank model & Acceptance rate, keystrokes saved \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Normalization}
+\label{sr:sec:query_normalization}
+
+Normalization is the unglamorous stage where the silent bugs live: Unicode normalization (NFKC folding of full-width characters, ligatures, composed vs.\ decomposed accents), case folding (with locale traps---Turkish dotless \textit{\i} famously breaks naive lowercasing of ``I''), whitespace and punctuation handling (does ``wi-fi'' equal ``wifi''? does ``C++'' survive tokenization?), and diacritic folding (``café'' vs.\ ``cafe''---fold for recall, but never for languages where diacritics are phonemic distinctions that change meaning). The governing rule is not any particular choice but \textit{consistency}: whatever transformation the query undergoes, documents must have undergone the same transformation at index time, or matches silently vanish. This index-time/query-time contract is important enough to get its own treatment in Section~\ref{sr:sec:search_product_system} and Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}.
+
+\subsection{Spell Correction}
+\label{sr:sec:spell_correction}
+
+\textbf{Why it matters.} A large share of tail traffic is misspelled, and an uncorrected misspelling usually means zero or garbage results---so spell correction is among the highest-ROI components in the pipeline. Damerau's classic finding that roughly 80\% of misspellings are a single edit (insertion, deletion, substitution, or transposition) still shapes candidate generation today.
+
+\begin{mathresult}{The Noisy-Channel Model of Spelling Correction}
+Treat the observed query $q$ as a corruption of an intended query $c$ transmitted through a noisy channel (Kernighan, Church \& Gale, 1990). The correction is the maximum-a-posteriori intended query:
+\begin{equation}
+\hat{c} \;=\; \argmax_{c \,\in\, \mathcal{C}(q)} \; P(c \given q) \;=\; \argmax_{c \,\in\, \mathcal{C}(q)} \; \underbrace{P(q \given c)}_{\text{channel (error) model}} \; \underbrace{P(c)}_{\text{source (language) model}}
+\end{equation}
+\begin{itemize}
+    \item \textbf{Candidate set} $\mathcal{C}(q)$: strings within Damerau--Levenshtein distance 1--2 of $q$, augmented with keyboard-adjacency and phonetic (Soundex/Metaphone-style) neighbors, restricted to terms that actually occur in the query logs or the corpus.
+    \item \textbf{Channel model} $P(q \given c)$: probability of the specific corruption, estimated from confusion matrices over edit operations (which letter pairs get swapped, which keys get fat-fingered), themselves mined from logged correction pairs.
+    \item \textbf{Source model} $P(c)$: a language model over \textit{queries}---estimated from query logs, not from documents. Context-sensitive correction replaces the unigram $P(c)$ with a query n-gram model so that surrounding words disambiguate.
+\end{itemize}
+Modern production correctors are often seq2seq or edit-tagging transformers that learn both terms jointly, but the decomposition still governs the engineering: the single highest-leverage design decision remains \textit{where the language model comes from}.
+\end{mathresult}
+
+\textbf{Worked example.} User types \texttt{``iphoen''}. Candidate generation within edit distance 1 yields, among others, \texttt{iphone} (transposing the final two letters) and the observed string itself. With toy but representative numbers:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Noisy-channel arithmetic for \texttt{``iphoen''}}
+\label{sr:tab:spell_example}
+\begin{tabular}{lllll}
+\toprule
+\textbf{Candidate $c$} & \textbf{Edit} & \textbf{$P(c)$ (query-log LM)} & \textbf{$P(q \given c)$ (channel)} & \textbf{Product} \\
+\midrule
+\texttt{iphone} & transpose \texttt{en}$\to$\texttt{ne} & $10^{-3}$ & $10^{-2}$ & $10^{-5}$ \\
+\texttt{iphoen} & none (keep as typed) & $10^{-9}$ (unseen, smoothed) & $\approx 0.95$ & $\approx 10^{-9}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The correction wins by four orders of magnitude---but only because the source model is built from \textit{query logs}: users search \texttt{iphone} constantly, so its prior is enormous. A language model over catalog documents would be far weaker here (product copy says ``iPhone 15 Pro,'' users type fragments and typos), and a plain dictionary has no priors at all, which is the first thing that breaks naive approaches.
+
+\textbf{Production nuances interviewers probe.}
+\begin{itemize}
+    \item \textbf{Correct vs.\ suggest thresholds.} High-confidence corrections are applied silently (searching the corrected query, with a ``showing results for\ldots'' banner and an escape hatch); medium confidence gets ``did you mean?''; low confidence leaves the query alone. The thresholds are tuned against the cost asymmetry: a wrong auto-correction on a valid query is far worse than a missed correction.
+    \item \textbf{The no-touch list.} Never correct terms that match rare-but-valid tokens: SKUs and model numbers (\texttt{RTX 4090}, \texttt{A2141}), proper names, chemical and legal terms. These are exactly the strings edit-distance candidates love to ``fix.'' A guard that checks the catalog/identifier vocabulary before correcting is mandatory in commerce.
+    \item \textbf{Context dependence.} \texttt{``dress shoos''} should become \texttt{dress shoes}; \texttt{``shoo away flies''} should not. Unigram priors cannot make this call---context LMs or sequence models can.
+    \item \textbf{Feedback contamination.} The query-log LM learns from the very misspellings it failed to correct: popular typos accumulate log frequency and start looking legitimate. Mitigate by weighting the LM toward queries with successful downstream engagement and by mining correction pairs (query $\to$ immediate reformulation with a click) as supervised signal.
+    \item \textbf{Evaluation.} Offline precision/recall on a labeled correction set including a curated no-touch list; online, correction acceptance rate plus downstream deltas in zero-result rate and reformulation rate (Chapter~\ref{sr:chap:evaluation_experimentation}).
+\end{itemize}
+
+\subsection{Query Segmentation and Tagging}
+\label{sr:sec:query_segmentation}
+
+\textbf{From token soup to structured constraints.} Segmentation groups the query's tokens into meaningful units (``new york'' is one unit, not two); tagging (slot filling) assigns those units semantic roles. In commerce this is the single highest-leverage QU component:
+\begin{center}
+\texttt{nike red running shoes size 10} \quad$\Longrightarrow$\quad
+\{\textit{brand}=nike, \textit{color}=red, \textit{product}=running shoes, \textit{size}=10\}
+\end{center}
+The payoff is that unstructured text becomes \textit{structured constraints against catalog attributes}: brand and size become filters or strongly-weighted field matches rather than loose keywords, which simultaneously improves precision (no red Nike t-shirts) and enables the faceted UI. Tagged constraints also flow to ranking as features (a query with an explicit brand slot should weight brand-field match heavily).
+
+\textbf{Models and training data.} Historically CRFs and BiLSTM-CRFs over token features; today small transformer taggers distilled to the latency budget. The interesting problem is supervision: nobody hand-labels millions of queries. The standard trick is \textit{engagement-aligned distant supervision}---align queries with the structured attributes of the products users engaged with after issuing them (if searchers of \texttt{``nike red running shoes''} overwhelmingly click products whose brand attribute is Nike, ``nike'' aligns to \textit{brand}), clean with rules, and train the tagger on the result. NER/CRF machinery in general is [NLP 11] territory; what is search-specific is the target schema (the catalog's attribute space) and the distant-supervision loop.
+
+\textbf{The risk side.} A tag that becomes a \textit{hard filter} is a recall gamble: mis-tag ``apple'' as brand on the query \texttt{``apple juice''} and the candidate set collapses to electronics accessories. Production systems therefore apply tags as filters only above a confidence threshold, prefer soft boosts below it, and monitor zero-result rate per tag type---an instance of the general rule in Section~\ref{sr:sec:search_product_system} that QU changes touching the candidate set are the high-risk ones.
+
+\subsection{Entity Linking}
+\label{sr:sec:entity_linking}
+
+Entity linking resolves surface strings to canonical entities in a catalog or knowledge graph: \texttt{``the boss album''} $\to$ \textsc{Bruce Springsteen} (alias resolution), \texttt{``apple''} $\to$ the brand or the fruit depending on context (disambiguation), \texttt{``sf''} $\to$ \textsc{San Francisco} (location resolution). The production recipe is a pipeline of \textbf{alias tables} mined from logs and anchor text (mapping surface forms to candidate entities with popularity priors), \textbf{context scoring} (embedding similarity between the query context and each candidate's description; the category signal from segmentation feeds in here), and a \textbf{popularity prior} that resolves ties toward the head entity---which is right most of the time and systematically wrong for tail intents, so confidence gating matters again. Linked entities unlock structured behavior downstream: entity-specific rankings, knowledge panels, attribute filters inherited from the KG, and disambiguation UIs (``did you mean the band or the insect?''). General entity-linking machinery is covered in [NLP 11]; the search-specific deltas are the log-mined alias tables and the tight latency budget.
+
+\subsection{Intent Classification}
+\label{sr:sec:query_intent}
+
+\textbf{The classic taxonomy.} Broder's 2002 taxonomy of web search still frames the discussion: \textbf{navigational} (the user wants a specific site: \texttt{``facebook login''}), \textbf{informational} (the user wants to learn something: \texttt{``how do transformers work''}), and \textbf{transactional} (the user wants to do or buy something: \texttt{``buy running shoes''}). Domain-specific systems refine it: commerce distinguishes product-type/category intent vs.\ brand intent vs.\ exact-item intent vs.\ browse; app stores distinguish known-item vs.\ discovery; enterprise search distinguishes known-document lookup vs.\ exploratory research.
+
+\textbf{Why intent is a gate, not just a feature.} The intent label changes downstream \textit{behavior}, not merely scores: which verticals and candidate sources to query (news? images? local?), whether to show facets, how aggressively to personalize (never on navigational; freely on browse), which signal mix the ranker should apply (Section~\ref{sr:sec:signals_landscape}), whether an answer box or a classic list is the right presentation, and---increasingly---whether the query routes to an LLM-synthesized answer at all (Chapter~\ref{sr:chap:production_retrieval_rag}).
+
+\textbf{Implementation ladder.} Rules and lexicons $\to$ logistic regression over character n-grams (runs in 1--5\,ms, still ubiquitous as the first pass) $\to$ distilled tiny transformers where budget allows. Training data comes from behavioral outcomes (a query whose clicks always land on one domain is navigational; a query whose sessions end in purchases is transactional) plus human labels for the ambiguous middle. Short queries are genuinely ambiguous---\texttt{``jaguar''} carries automotive, zoological, and sports intents simultaneously---so mature systems emit a \textit{distribution} over intents and let downstream stages hedge (diversify the SERP across intents rather than betting on one).
+
+\textbf{Head/tail split in serving.} Like most QU components, intent classification is served in two tiers: for head and torso queries, intents are computed offline at leisure (with big models, behavioral aggregates, and human audits) and served from a lookup table; the online model only handles the tail miss. This memorize-the-head/generalize-on-the-tail pattern recurs across the pipeline---corrections, tags, rewrites---and is worth naming explicitly in interviews because it reconciles quality (heavy offline computation where traffic justifies it) with the latency budget (table lookups on the hot path).
+
+\subsection{Query Autocomplete}
+\label{sr:sec:query_autocomplete}
+
+\textbf{The QU component that runs before the query exists.} Suggest-as-you-type fires on every keystroke, which makes its latency requirement the strictest in the whole stack (tens of milliseconds round-trip including network, so serving must be a lookup, not a computation). The classical architecture: completions are mined offline from query logs (filtered to queries with successful outcomes), stored in a trie or finite-state transducer keyed by prefix with the top-$k$ completions precomputed per node, and reranked lightly at serve time with recency/trending adjustments, locale, and---carefully---session context and personalization.
+
+\textbf{Why it belongs in a query understanding chapter}: autocomplete is QU's steering wheel. Every accepted suggestion converts a would-be tail query into a known head or torso query---correctly spelled, canonically phrased, cacheable---so a good suggester \textit{shrinks the tail} and raises the hit rate of everything downstream (corrections, cached rewrites, engagement priors). It is also a data product with sharp edges: suggestions are mined from other users' queries, so filtering for offensive content, defamation, and personal information is a hard requirement (suggestion leaks are the classic search privacy incident, Section~\ref{sr:sec:session_context}), and the surface is a manipulation target (coordinated searching to plant suggestions). Metrics: suggestion acceptance rate, keystrokes saved, and MRR of the accepted suggestion; the zero-state surface (what shows before any keystroke) is a recommendations problem (Chapter~\ref{sr:chap:recommendation_systems}).
+
+%==============================================================================
+\section{Query Expansion and Rewriting}
+\label{sr:sec:query_rewriting}
+%==============================================================================
+
+Expansion and rewriting attack the core failure mode of lexical search---\textbf{vocabulary mismatch}: the user says ``laptop sleeve,'' the catalog says ``notebook case,'' and no amount of BM25 tuning makes disjoint vocabularies intersect. The techniques differ in where they run (index time, query time, offline mining) and how aggressively they alter the query.
+
+\subsection{Classical Pseudo-Relevance Feedback}
+\label{sr:sec:prf_rm3}
+
+Pseudo-relevance feedback (PRF) assumes the top-$k$ results of an initial retrieval are mostly relevant and mines them for expansion terms. Rocchio (1971) is the vector-space ancestor: move the query vector toward relevant centroids. The strongest classical formulation is the relevance-model family (Lavrenko \& Croft, 2001): estimate a distribution over words from the top-$k$ documents, $P(w \given R) \approx \sum_{d \in \text{top-}k} P(w \given d)\, P(d \given q)$, and \textbf{RM3} interpolates it with the original query model, $P'(w) = \lambda\, P_q(w) + (1-\lambda)\, P(w \given R)$, to keep the original intent anchored. PRF reliably buys recall on average and remains a strong baseline in IR evaluations, but it is a double-or-nothing bet per query: when the initial top-$k$ is off-topic (precisely the ambiguous and tail queries that need help), expansion amplifies the drift. Production systems mostly use its \textit{spirit}---expand from evidence about what the query retrieves---through the log-mined and learned routes below; dense-retrieval PRF variants exist but the same drift caveat applies.
+
+\subsection{Synonym Expansion vs.\ Query Rewriting}
+\label{sr:sec:synonyms_vs_rewriting}
+
+\textbf{Two different mechanisms with different blast radii.}
+\begin{itemize}
+    \item \textbf{Analyzer-level synonym expansion} injects equivalences into the retrieval engine's analysis chain (``tv, television'' as one synonym class), either at index time or query time. It is cheap, engine-native, and applies uniformly---and it is a blunt instrument: synonym classes are context-free, so a bad entry degrades every query containing the term. The index-time vs.\ query-time placement trade-off (IDF sharing, reindex cost, phrase-query corruption, multi-word handling) is analyzer mechanics, covered with the analysis chain in Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}.
+    \item \textbf{Query-time rewriting} produces one or more alternative queries (or additional optional clauses) per incoming query, with per-rewrite weights and full context available. This is where mined synonyms, tagged-slot substitutions, and learned rewriters operate. The cardinal rule: expansions enter as \textit{lower-weighted optional clauses}, never as equal-weight required terms---the original query stays authoritative, expansions add recall at a discount.
+\end{itemize}
+
+\textbf{Mining synonyms without an ontology.} The three log-mining sources, in rising precision: (1) \textbf{session reformulations}---pairs $q_1 \to q_2$ where the user rewrote and then succeeded (clicked/converted); (2) the \textbf{click bipartite graph}---two queries whose clicks land on the same documents are candidate equivalents; (3) \textbf{embedding neighbors} as candidate generators. All three conflate synonymy with relatedness (\texttt{``iphone case''} co-clicks with \texttt{``iphone''} without being equivalent), so a precision filter---human review for the head, LLM validation at scale---sits between mining and deployment, and rollouts are measured with interleaving (Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\textbf{Query relaxation} is expansion's defensive twin: when a query returns zero or too few results, progressively drop the least essential constraints---lowest-IDF terms, unmatched optional terms, or low-confidence tags---and retry. Together with spell correction, relaxation is the standard first-quarter fix for a high zero-result rate; the retrieval-side mechanics---dialing \texttt{minimum\_should\_match} and friends---live in Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}.
+
+\textbf{The zero-result recovery ladder.} Because an empty page is the worst outcome a search system can produce, mature systems run a fixed escalation when the initial retrieval comes back empty or too thin, each rung cheap enough to attempt within the request:
+\begin{enumerate}
+    \item \textbf{Re-check the query}: apply the next-best spell correction or a suggestion the corrector held back at normal confidence---thresholds loosen when the alternative is nothing.
+    \item \textbf{Relax constraints}: drop low-confidence tags and filters first, then the lowest-IDF or unmatched terms, progressively.
+    \item \textbf{Fall back to semantic retrieval}: vocabulary mismatch is the likeliest remaining cause, and dense candidates need no lexical overlap (Chapter~\ref{sr:chap:vector_retrieval_theory}).
+    \item \textbf{Rescue rewrite}: a live LLM rewrite is affordable here---the latency argument against it evaporates when the page would otherwise fail (Section~\ref{sr:sec:llm_rewriting}).
+    \item \textbf{Degrade gracefully in the UX}: related searches, category browse, or broader-scope results clearly labeled---never a bare ``no results.''
+\end{enumerate}
+Each rung is logged with its own success metric, because the ladder is also a diagnostic: which rung rescues a query tells you which upstream component failed it.
+
+\subsection{LLM-Based Query Rewriting (2024--26 Practice)}
+\label{sr:sec:llm_rewriting}
+
+\textbf{Where LLMs genuinely win.} Two query classes were badly served by everything above and are transformed by LLM rewriting:
+\begin{itemize}
+    \item \textbf{Conversational queries}, where the current turn is incomplete without dialog state: \texttt{``how much does it cost''} needs the previous turn's entity spliced in---coreference resolution plus constraint carryover into a self-contained query (Section~\ref{sr:sec:session_context}).
+    \item \textbf{Complex and multi-hop questions}, where one query cannot retrieve all the evidence: decompose into sub-queries, retrieve per hop, combine. Decomposition, HyDE-style hypothetical-document expansion, and related RAG-flavored rewriting are canonical in [DL 21] and [NLP 9]; this section covers only the search-production side.
+\end{itemize}
+LLM rewriters also quietly dominate the \textit{offline} side: mining synonym and rewrite pairs at corpus scale, validating log-mined candidates, generating synthetic tail queries for training taggers and embedders---cheap, robust wins with no latency exposure at all.
+
+\begin{table}[H]
+\centering
+\small
+\caption{What LLM rewriting produces, by query class}
+\label{sr:tab:llm_rewrites}
+\begin{tabularx}{\textwidth}{XXl}
+\toprule
+\textbf{Incoming query (context)} & \textbf{Rewrite(s)} & \textbf{Serving path} \\
+\midrule
+\texttt{``cheaper ones from the second brand''} (conversational, after a results list) & \texttt{brand=X, price$<$\$Y, product carried over} --- structured, self-contained & Live LLM / distilled rewriter \\
+\texttt{``laptop that can train small ML models''} (complex, no lexical overlap with specs) & \texttt{laptop 32gb ram discrete gpu}; \texttt{deep learning laptop} & Cached rewrite; distilled model on miss \\
+\texttt{``why did my sourdough not rise''} (multi-hop, RAG surface) & sub-queries: \texttt{sourdough starter activity}; \texttt{proofing temperature dough rise} & Live LLM on the answer surface \\
+\texttt{``wireless earbuds for small ears''} (zero results after filters) & drop/soften \texttt{small ears}; add \texttt{compact fit ear tips} as optional clause & Zero-result rescue path \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{The latency/cost reality.} A general-purpose LLM call costs hundreds of milliseconds to seconds and orders of magnitude more compute than the rest of the query pipeline combined---against a QU budget of 5--10\,ms. Nobody puts a frontier model in the synchronous path of general search traffic. The production patterns:
+\begin{enumerate}
+    \item \textbf{Cache the rewrites.} Zipf is the friend here: head and torso queries repeat, so an offline or asynchronously-populated rewrite cache (keyed on normalized query, with TTLs and versioning) serves the bulk of traffic at lookup cost. Only cache misses---disproportionately tail---need a live model.
+    \item \textbf{Distill for the hot path.} Use the large model offline as a teacher: generate rewrites over a large query sample, then train a small seq2seq or encoder model (tens to a few hundred million parameters, quantized, often CPU-servable) to imitate it within budget. The big model stays offline as teacher and judge; the student serves.
+    \item \textbf{Route selectively.} Gate live LLM rewriting to the surfaces that need it and can afford it: conversational search (the user expects a beat of latency), zero-result recovery (the alternative is a failed page, so 300\,ms is a bargain), and high-value or explicitly agentic sessions.
+\end{enumerate}
+
+\begin{keyinsight}[The LLM Sandwich Pattern]
+The stable 2024--26 architecture keeps LLMs at the two ends of the system and out of the middle: \textbf{offline}, LLMs mine synonyms, generate and validate rewrites, label training data, and act as judges; \textbf{online}, small distilled models and caches serve the hot path within milliseconds; \textbf{selectively online}, full LLMs handle conversational turns and zero-result rescues where latency tolerance is high. Candidates who propose ``just call GPT on every query'' fail the economics test; candidates who refuse LLMs entirely miss where the field moved. The teacher--student--cache triad is the answer interviewers are listening for.
+\end{keyinsight}
+
+\begin{warningbox}
+Rewriting changes the candidate set, and every rewrite is a chance to lose the user's actual intent. Guardrails that mature systems institutionalize: (1) the original query always participates---rewrites add candidates or clauses, they do not replace the query wholesale except in conversational completion; (2) rewrite confidence gates how much weight the rewrite gets; (3) zero-result and recall metrics are monitored \textit{per rewrite source}, so a regressing miner or a drifting distilled model is attributable; (4) rewrites are logged as first-class data---when a rewritten query succeeds, credit must flow back to train the rewriter, and when it fails, someone must be able to see what the system actually searched.
+\end{warningbox}
+
+%==============================================================================
+\section{Session and Contextual Understanding}
+\label{sr:sec:session_context}
+%==============================================================================
+
+\textbf{Queries arrive in sessions, not in isolation.} A third of the interpretation problem is not in the current query string at all: it is in what the user just did.
+
+\textbf{Context carryover.} Within a session, later queries lean on earlier ones: after \texttt{``nike running shoes''}, the query \texttt{``in red''} is a refinement, not a search for the color red; after viewing a product, \texttt{``reviews''} means reviews \textit{of that product}. In conversational surfaces this becomes explicit dialog-state tracking: maintain an entity/constraint stack (product carried over, price ceiling added, brand switched), resolve references against both the conversation \textit{and the results shown} (``the second one,'' ``cheaper ones from the other brand''), and rewrite each turn into a self-contained structured query that hits the same retrieval stack as everything else. Trained rewriters distilled from LLM demonstrations are the standard implementation (Section~\ref{sr:sec:llm_rewriting}); full-history dense retrieval without explicit rewriting has repeatedly underperformed it. The RAG-era conversational stack is Chapter~\ref{sr:chap:production_retrieval_rag}'s territory.
+
+\textbf{Task detection.} Sessions have shapes: a known-item lookup (one query, one click, done), an exploratory research task (many queries, broad clicks, long dwell), a purchase mission narrowing from category to item over days. Detecting the task changes UX and ranking: exploration wants diversity and facets; missions want continuity (``resume where you left off''); repeated near-identical queries with no clicks signal a failing session that may deserve an intervention (relaxation, a ``did you mean,'' a live-help prompt). Task state also determines when carryover should \textit{reset}---the hardest practical subproblem: carrying a dead task's constraints into a new task quietly poisons the next several queries.
+
+\textbf{Personalization signals and their risks.} Session behavior, short-term history, and long-term profiles (category and brand affinities, sizes, locale) are legitimate ranking signals---applied late in the funnel and capped, per the intent-dominance rule: personalization reorders among near-equals; it never overrides what the user explicitly asked for (the iPhone owner searching \texttt{``android phone''} wants Android results). Two risks belong in every design answer as one-liners here, with depth in Chapter~\ref{sr:chap:recommendation_systems}: the \textbf{filter bubble}---profiles trained on personalized exposure narrow because exposure narrowed, a closed-loop pathology, mitigated with exploration and diversity floors; and \textbf{privacy}---query and session histories are among the most sensitive behavioral data a company holds, so retention limits, aggregation, and strict controls on surfacing one user's behavior to another (autocomplete and ``popular searches'' leaks are the classic incidents) are hard requirements, not nice-to-haves.
+
+%==============================================================================
+\section{Multilingual and Cross-Lingual Search}
+\label{sr:sec:multilingual_search}
+%==============================================================================
+
+\textbf{One page on where monolingual assumptions break.} Everything above silently assumed a language whose words are space-separated and whose morphology is mild. Production reality differs per language, and the fixes are mostly in the analysis chain (mechanics in Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}):
+
+\begin{itemize}
+    \item \textbf{Language identification} is the zeroth QU stage in multilingual systems---and it is genuinely hard on queries, which are short, name-heavy, and often code-mixed. Confidence-weighted routing (analyze under the top-2 language hypotheses and union) beats hard routing on ambiguous queries.
+    \item \textbf{CJK segmentation.} Chinese and Japanese have no whitespace; tokenization \textit{is} a model. Dictionary/statistical segmenters (MeCab/Kuromoji-class morphological analyzers for Japanese; jieba-class for Chinese; Nori for Korean's agglutinative morphology) give precise tokens but miss out-of-vocabulary terms; character-bigram indexing is the dumb-but-robust recall fallback. Production engines commonly index both and let ranking arbitrate. A segmenter mismatch between index and query time is the CJK version of the analyzer-consistency bug---and it is catastrophic, because almost nothing matches.
+    \item \textbf{Morphology and compounds.} German-style compounding (\textit{Damenlederhandschuhe} = ladies' leather gloves) needs decompounding for recall; agglutinative languages (Turkish, Finnish) need morphological analysis where English gets by with light stemming; Arabic and Hebrew add orthographic normalization of diacritics and clitics.
+    \item \textbf{Transliteration and code-mixing.} Users type Hindi in Latin script, Russian in translit, Arabic in ``Arabizi''---and mix languages mid-query. Alias tables and transliteration models map these onto canonical script; embedders handle them natively if trained for it.
+    \item \textbf{Cross-lingual retrieval}---query in one language, documents in another---has two architectures: translate-then-search (machine-translate the query, search monolingually; transparent, debuggable, compounding error) and shared-embedding-space retrieval with multilingual embedders, which since roughly 2023 has become the default for semantic candidates. Multilingual embedding models and their training are [NLP 3]'s territory; per-language evaluation is non-negotiable either way, because aggregate metrics hide per-language collapse.
+\end{itemize}
+
+%==============================================================================
+\section{Search as a Product System}
+\label{sr:sec:search_product_system}
+%==============================================================================
+
+The funnel of Figure~\ref{sr:fig:search_funnel} is half the system. The other half is offline: an indexing pipeline that ingests, analyzes, enriches, and serves documents (near-real-time indexing, segment merges, sharding---Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes} for the index internals, Chapter~\ref{sr:chap:production_retrieval_rag} for the production pipeline view), and a measurement stack that turns logged behavior into judgments, metrics, and training data (Chapter~\ref{sr:chap:evaluation_experimentation}). Three contracts tie the halves together.
+
+\textbf{Contract 1: index-time and query-time analysis must agree.} Whatever normalization, tokenization, stemming, and synonym treatment documents received at index time, queries must receive a compatible treatment at query time---the pair is a single versioned artifact, not two config files owned by two teams. The mismatch failure is \textit{silent}: no errors, no exceptions, just documents that stop matching queries they should match. Classic instances: a stemmer upgraded on the query side only; synonyms added at query time whose multi-word expansions no longer align with index-time positions; a new Unicode normalization applied to fresh documents while old segments retain the old form (the fix is a full reindex, which is why reindex capability is a production requirement, not a luxury). Interviewers use ``search quality silently degraded after a routine deploy---where do you look?'' as a probe, and analyzer skew is the expected first hypothesis.
+
+\textbf{Contract 2: query understanding owns a metrics surface.} QU is shippable only because each component has hooks into the evaluation stack. The full measurement discipline---judgment programs, NDCG regimes, interleaving, A/B---is Chapter~\ref{sr:chap:evaluation_experimentation}; the design rule that belongs here: \textit{every QU component ships with its own metric}, because aggregate search metrics are too coarse to attribute a regression to the spell corrector vs.\ the tagger vs.\ the rewriter.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Evaluation hooks per query-side concern}
+\label{sr:tab:qu_metrics}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Concern} & \textbf{Offline} & \textbf{Online} \\
+\midrule
+Correction quality & Precision/recall on labeled set + no-touch list & Acceptance rate; zero-result and reformulation deltas \\
+Tagging/linking quality & Precision on audited samples per slot type & Zero-result rate per tag type; facet engagement \\
+Rewrite/expansion quality & Judged relevance of rewritten-query results & Interleaving win-rate and zero-result per rewrite source \\
+Whole-query-side health & Judged eval set stratified by segment and language & Zero-result rate, bad-abandonment, reformulation rate, time-to-first-click---all sliced head/torso/tail \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Contract 3: retrieval-changing vs.\ ranking-changing QU.} A QU output can either alter the \textit{candidate set} (tags applied as filters, expansions, relaxation, vertical routing, spell corrections) or merely add \textit{features} for ranking (intent scores, entity confidence, tag confidences). The first class is high-risk/high-reward---it can create and destroy recall---so it ships behind confidence thresholds, zero-result monitoring, and staged rollouts. The second class is nearly free to ship: a bad feature is a small ranking regression, not an empty page. When in doubt, ship the signal as a ranking feature first, promote it to a retrieval-side action once its precision is proven. This asymmetry, plus the recall ceiling, is the deepest reason query understanding is engineered conservatively.
+
+\begin{keyinsight}[The Chapter in One Sentence]
+Search is a closed-loop funnel whose top---query understanding---is the cheapest place to win and the most dangerous place to fail: milliseconds of tiny models decide the candidate set that bounds everything below, trained on logs that the system's own output generated, so the discipline is conservative rollout, per-component measurement, and strategy that differs by traffic segment.
+\end{keyinsight}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C
+\label{sr:sec:qu_interview_questions}
+%==============================================================================
 
+%--- Q1: end-to-end walk ---
+
+\begin{interviewq}
+\textbf{Q: Walk me through what happens, end to end, when a user types a query into a large-scale search engine.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Structure the answer as the funnel, with candidate counts and latency at each stage.
+
+\textbf{(1) Query understanding} ($\sim$5--10\,ms): normalize (Unicode, case, punctuation), spell-correct (noisy channel over a query-log LM, with correct-vs-suggest thresholds), segment and tag (\texttt{``nike red running shoes''} $\to$ brand/color/product slots), link entities to the catalog/KG, classify intent (navigational/informational/transactional; category vs.\ brand in commerce), and expand/rewrite (mined synonyms as discounted optional clauses; cached or distilled LLM rewrites).
+
+\textbf{(2) Candidate retrieval} ($\sim$20--50\,ms, sources in parallel): lexical retrieval from an inverted index (BM25-family scoring, structured filters from the tags), dense retrieval via ANN over embeddings for semantic match, possibly structured/KG lookups. Union, dedupe, filter: $10^3$--$10^4$ candidates from a corpus of $10^7$--$10^9$. Retrieval is recall-oriented and decomposable; this stage bounds everything after it (the recall ceiling).
+
+\textbf{(3) Ranking cascade}: L1 scores thousands with cheap features (BM25 fields, popularity, freshness, engagement priors) down to hundreds; L2 ($\sim$10--30\,ms) applies the real learned ranker---LambdaMART-style LTR or a cross-encoder---down to tens; L3 blends: personalization (capped, intent never overridden), business rules, diversity, compliance.
+
+\textbf{(4) Presentation and logging}: snippets, facets, maybe an LLM answer; every impression and click is logged, becoming training data and judgments---search is a closed loop, and the biases of that loop (position bias, feedback loops) are why measurement is a first-class subsystem.
+
+Close with segment awareness: head queries are cached and curated, torso queries are where ML has data, tail queries (the majority of distinct queries) lean on QU and semantic retrieval.
+
+\redflags
+\begin{itemize}
+    \item Starting at ranking---skipping query understanding entirely is the most common miss and instantly reads as ``has never worked on search.''
+    \item No numbers: candidate counts and latency budgets are what make it an engineering answer rather than a diagram recitation.
+    \item Describing one uniform pipeline with no head/torso/tail differentiation.
+    \item No mention of the feedback loop from logging back to training.
+\end{itemize}
+
+\interviewtest{A breadth check: do you know the standard anatomy and the \textit{why} of each stage (decomposability, recall ceiling, cost-per-candidate gradient), and do you volunteer the closed-loop view unprompted?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names all stages in order with roughly correct candidate counts and latency.
+    \item \badgeLsix{L6} Explains the retrieval/ranking contract (recall vs.\ precision, decomposability), places business logic at L3 with the ``visible to evaluation'' caveat, and differentiates strategy by traffic segment.
+    \item \badgeLseven{L7} Frames the whole thing as a closed loop, notes that each stage needs its own recall/quality measurement, and can say where the design changes for a different product (docs search: no purchases, heavier freshness; app store: known-item heavy; RAG surface: precision@small-$k$ replaces whole-page NDCG).
+\end{itemize}
+
+\followups{``Where would this design change for an internal docs corpus of 10M documents?'' ``What breaks first when traffic grows 10$\times$?'' ``Which stages would you build first for a v1?''}
+\end{interviewq}
+
+%--- Q2: design QU for e-commerce (flagship system design) ---
+
+\begin{interviewq}
+\textbf{Q: Design the query understanding system for an e-commerce search engine.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Requirements first}: tens of thousands of QPS, a 5--10\,ms budget for the whole QU stage, a catalog with structured attributes (brand, category, size, color, price), multilingual markets, and a business north star of conversion with zero-result rate as the standing guardrail.
+
+\textbf{Pipeline} (each component with its model, data source, and metric):
+\begin{enumerate}
+    \item \textbf{Normalization}: Unicode NFKC, locale-aware case folding, punctuation policy shared---as one versioned artifact---with the index-time analyzer.
+    \item \textbf{Spell correction}: noisy channel; candidates from Damerau--Levenshtein $\le$2 + keyboard/phonetic neighbors; source LM from \textit{query logs} weighted by successful engagement; channel model from mined correction pairs (query $\to$ reformulation $\to$ click). Correct-vs-suggest thresholds tuned on the cost asymmetry; a no-touch guard over catalog identifiers (SKUs, model numbers). Metrics: correction precision on a labeled set incl.\ no-touch list, acceptance rate, zero-result delta.
+    \item \textbf{Segmentation + tagging}: small transformer tagger over the catalog attribute schema, trained by distant supervision from engagement-aligned attribute matches. High-confidence tags become filters/field constraints; low-confidence tags become soft boosts and ranking features. Metric: tag precision on audited samples, zero-result rate per tag type.
+    \item \textbf{Entity linking}: alias tables mined from logs + embedding context scoring + popularity prior; resolves brands and product lines; feeds disambiguation UI.
+    \item \textbf{Intent classification}: fast model (char n-gram LR or tiny transformer) emitting a distribution over \{exact-item, category browse, brand, informational\}; gates facet display, personalization aggressiveness, vertical routing, and the ranker's signal mix.
+    \item \textbf{Expansion/rewriting}: log-mined synonyms (co-click graph + session reformulations, LLM-validated) applied as discounted optional clauses; query relaxation on zero results; LLM rewrites cached for head/torso and served by a distilled small model for the tail; live LLM only for conversational surfaces and zero-result rescue.
+\end{enumerate}
+
+\textbf{The data flywheel}: every component is trained from logs the system itself generates---correction pairs, engagement-aligned tags, co-click synonyms---so build the logging schema (query, rewrite applied, source, downstream outcome) before building the models, and hold out randomized/clean slices for evaluation.
+
+\textbf{Rollout discipline}: anything that changes the candidate set (corrections applied silently, tags as filters, relaxation) ships behind confidence thresholds with zero-result monitoring per component; signals-only outputs (intent scores, confidences) ship freely as ranking features first and get promoted later.
+
+\redflags
+\begin{itemize}
+    \item Proposing a single end-to-end LLM for QU with no latency/cost math---the budget is single-digit milliseconds at high QPS.
+    \item No plan for where training data comes from; hand-labeling millions of queries is not a plan.
+    \item Tags applied as hard filters with no confidence gating---the \texttt{``apple juice''} $\to$ brand=Apple recall collapse.
+    \item No per-component metrics; ``we'll watch NDCG'' cannot attribute a regression to the corrector vs.\ the tagger.
+\end{itemize}
+
+\interviewtest{Can you decompose QU into owned components, each with a model \textit{and} a data supply \textit{and} a metric, under an explicit latency budget---and do you know the retrieval-changing vs.\ ranking-changing risk asymmetry?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the pipeline components and roughly what each does.
+    \item \badgeLsix{L6} Adds the latency budget, the log-mined training-data story per component, confidence-gated filters, and per-component metrics with zero-result as the guardrail.
+    \item \badgeLseven{L7} Designs the flywheel and rollout discipline explicitly, differentiates head/torso/tail treatment (cached rewrites vs.\ distilled models), covers multilingual routing, and sequences the build (normalization + correction + relaxation first: cheapest zero-result wins; tagger second; LLM layer last).
+\end{itemize}
+
+\followups{``Your tagger mislabels 3\% of queries---how much does that cost and where?'' ``How does this change for a marketplace where sellers write the titles?'' ``Add voice queries---what breaks?''}
+\end{interviewq}
+
+%--- Q3: spell correction first principles ---
+
+\begin{interviewq}
+\textbf{Q: Design spell correction for a commerce search engine. What breaks a naive dictionary approach?}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Formulation}: noisy channel---$\hat{c} = \argmax_c P(q \given c)\,P(c)$ over candidates within Damerau--Levenshtein distance 1--2 plus keyboard-adjacency and phonetic neighbors. The channel model $P(q \given c)$ comes from edit-operation confusion statistics mined from logged correction pairs; the source model $P(c)$ comes from \textit{query logs}, not documents---\texttt{``iphoen''} $\to$ \texttt{iphone} is decided by the enormous query-log prior on \texttt{iphone} (a worked example: log prior $10^{-3}$ times transposition probability $10^{-2}$ beats the unseen-string posterior by four orders of magnitude). Modern implementations are seq2seq/edit-tagging transformers, but they learn the same two factors jointly and the data question---where the LM comes from---remains the design center.
+
+\textbf{What breaks a naive dictionary}: (1) \textbf{no priors}---a dictionary says what is a word, not what users mean; (2) \textbf{valid rare tokens}: SKUs and model numbers (\texttt{RTX 4090}, \texttt{A2141}) are out-of-dictionary and must \textit{not} be corrected---you need a no-touch list built from the catalog vocabulary; (3) \textbf{context}: \texttt{``dress shoos''} vs.\ \texttt{``shoo away''} requires context LMs, not unigram lookup; (4) \textbf{the query distribution is not the document distribution}---users type fragments, brand mashups, and colloquialisms no dictionary contains; (5) \textbf{feedback contamination}: popular uncorrected typos accumulate log mass and start looking legitimate, so weight the LM by downstream engagement success.
+
+\textbf{Serving policy}: auto-correct above a high confidence threshold (with a visible ``showing results for'' escape hatch), ``did you mean'' in the middle band, leave alone below. Evaluate offline on a labeled set including the no-touch list; online via correction acceptance rate and zero-result/reformulation deltas.
+
+\redflags
+\begin{itemize}
+    \item Building the language model from documents or a dictionary without noticing the query-log requirement---this is the core of the question.
+    \item No correct-vs-suggest threshold policy; silently auto-correcting everything.
+    \item Never mentioning identifiers/SKUs---the canonical commerce failure.
+\end{itemize}
+
+\interviewtest{Do you know the noisy-channel decomposition and, more importantly, where each distribution is estimated from? The dictionary question is a trap: the answer is priors and context, not better dictionaries.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Writes the noisy-channel argmax and names edit-distance candidate generation.
+    \item \badgeLsix{L6} Query-log LM with engagement weighting, correction-pair mining for the channel model, threshold policy, no-touch list, context-sensitive correction.
+    \item \badgeLseven{L7} Adds the feedback-contamination loop and its mitigation, multilingual/transliteration handling, and the evaluation design (labeled set + online guardrails), and can discuss when to replace the pipeline with a seq2seq model and what data that requires.
+\end{itemize}
+
+\followups{``How do you get correction pairs without any existing corrector?'' ``A brand launches a product whose name looks like a typo of a common word---what happens and how do you fix it?''}
+\end{interviewq}
+
+%--- Q4: synonym mining ---
+
+\begin{interviewq}
+\textbf{Q: How do you mine synonyms for query expansion without a hand-built ontology?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Three log-mining sources, then a precision filter, then careful deployment.
+
+\textbf{Sources}: (1) \textbf{session reformulations}: pairs $q_1 \to q_2$ within a session where $q_2$ ended in success (click/conversion)---users are correcting the vocabulary mismatch for you; (2) \textbf{click-graph co-clicking}: queries whose clicks concentrate on the same documents are candidate equivalents (a bipartite graph projection); (3) \textbf{embedding neighbors} as a high-recall candidate generator, especially for the tail where log evidence is thin.
+
+\textbf{The precision problem}: all three conflate synonymy with \textit{relatedness}---\texttt{``iphone case''} co-clicks with \texttt{``iphone''}; \texttt{``flights to paris''} follows \texttt{``paris hotels''}. Deploying relatedness as equivalence quietly destroys precision. So: filter candidates with human review for high-traffic entries and LLM validation at scale (a rubric-prompted judgment ``are these interchangeable as search queries?''), and keep direction in mind---synonymy is not always symmetric (\texttt{``sneakers''} $\to$ \texttt{``running shoes''} may be safe; the reverse broader).
+
+\textbf{Deployment}: expansions enter as \textit{discounted optional clauses}---the original terms stay required/dominant, expansions add recall at reduced weight. Roll out per synonym batch, measure with interleaving (cheap, sensitive), watch zero-result rate and precision proxies; keep provenance per entry so a bad batch is revocable.
+
+\redflags
+\begin{itemize}
+    \item Treating co-click or embedding similarity as synonymy without a precision filter.
+    \item Adding expansions as equal-weight required terms.
+    \item No revocation/provenance story---synonym tables rot and need per-entry lineage.
+\end{itemize}
+
+\interviewtest{Do you know the three log sources, and---the real probe---do you flag the synonymy-vs-relatedness conflation unprompted and design the precision filter and discounted deployment around it?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names at least co-click mining and embedding neighbors as sources.
+    \item \badgeLsix{L6} All three sources, the synonymy-vs-relatedness trap, the precision filter, and discounted-clause deployment with interleaved measurement.
+    \item \badgeLseven{L7} Adds asymmetric/directional synonymy, per-entry provenance and revocation, the LLM-as-validator economics, and the cold-start plan for a new vertical with no logs (start from embeddings + LLM, migrate to log mining as traffic accrues).
+\end{itemize}
+
+\followups{``Index-time or query-time synonyms---where do these go and why?'' (Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}) ``How would you use an LLM here, and what does it replace?''}
+\end{interviewq}
+
+%--- Q5: retrieval-changing vs ranking-feature QU ---
+
+\begin{interviewq}
+\textbf{Q: When should a query understanding signal change retrieval, and when should it only be a ranking feature?}
+
+\badgeLseven{L7} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{The dividing line is whether the signal must alter the candidate set.} Changes that create or destroy candidates---segmentation tags applied as filters, query expansion, relaxation, vertical routing, applied spell corrections---\textit{must} happen at retrieval: no ranking feature can surface a document that was never retrieved (the recall ceiling). Signals that only reorder---intent scores, entity confidence, tag confidences, rewrite scores---work as L2 features, where a learned ranker can calibrate their weight per context.
+
+\textbf{The risk asymmetry drives the engineering.} Retrieval-side changes are high-risk: a mis-tag that becomes a filter empties the page (\texttt{``apple juice''} with brand=Apple); an aggressive correction searches the wrong thing entirely. Ranking-side signals fail soft: a bad feature costs a few positions, not the page. Hence the production discipline: (1) ship every new QU signal as a ranking feature first---nearly free, and the feature's learned weight tells you how much the ranker trusts it; (2) promote it to a retrieval-side action only above a proven precision threshold, with confidence gating; (3) guard every retrieval-side action with zero-result and recall monitoring attributed per component, plus staged rollout.
+
+\textbf{The exception that proves the rule}: when retrieval is already failing (zero results), the downside of a retrieval-side intervention is bounded---you cannot do worse than an empty page---so relaxation and rescue rewrites apply aggressively exactly there.
+
+\redflags
+\begin{itemize}
+    \item Not knowing the recall-ceiling argument---i.e., proposing to ``fix it in ranking'' for a signal that changes what should be retrieved.
+    \item Symmetric risk treatment; the whole point is that candidate-set changes fail hard and features fail soft.
+\end{itemize}
+
+\interviewtest{This is a judgment question about system evolution: do you have a principled promotion path for new signals and an attribution/guardrail story, rather than a static architecture?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the dividing line: candidate-set changes must happen at retrieval, reordering signals can be features.
+    \item \badgeLsix{L6} Adds the risk asymmetry (fail-hard vs.\ fail-soft) and confidence gating for retrieval-side actions.
+    \item \badgeLseven{L7} Gives the full promotion path (feature first, promote on proven precision), per-component guardrail attribution, and the zero-result exception where aggressive retrieval-side intervention is correct.
+\end{itemize}
+
+\followups{``Your intent classifier is 92\% accurate---is that good enough to route verticals with?'' ``How do you A/B a change that only affects 3\% of queries?'' (Chapter~\ref{sr:chap:evaluation_experimentation})}
+\end{interviewq}
+
+%--- Q6: inherit a BM25-only system ---
+
+\begin{interviewq}
+\textbf{Q: You inherit a search system that is a single BM25 stage with a 15\% zero-result rate. Sequence your first three quarters of investment.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Q1 --- Measurement and query hygiene (the un-skippable quarter).} Instrument logging properly (queries, impressions, clicks, reformulations, per-stage timings); build a judged evaluation set over a stratified query sample (by traffic decile, category, language); stand up dashboards for zero-result rate, abandonment, and reformulation \textit{by segment}. Then take the cheap zero-result wins, which are almost always query-side: fix analyzer inconsistencies (the silent index/query mismatch), ship noisy-channel spell correction, and add progressive query relaxation on zero results. A 15\% zero-result rate typically drops by half from hygiene alone---before any ML.
+
+\textbf{Q2 --- Behavioral signals and a first reranker.} With logging trustworthy, aggregate engagement priors per (query, doc) with decay and smoothing, and train a first LTR reranker (GBDT) over BM25 field scores, engagement priors, freshness, and popularity---position-debiased from the start (Chapter~\ref{sr:chap:learning_to_rank}). Offline-validate against the Q1 judgment set, online-validate with interleaving then A/B (Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\textbf{Q3 --- Semantic retrieval for the tail.} Add dense retrieval as an \textit{additional} candidate source (never a replacement): embeddings fine-tuned on click pairs, ANN serving, rank-based fusion with the lexical candidates, targeted at tail and zero-result traffic where vocabulary mismatch lives (Chapter~\ref{sr:chap:vector_retrieval_theory}). Online-test with the now-existing experimentation stack.
+
+\textbf{The trap being probed}: candidates who start with ``deploy embeddings'' in month one---before measurement exists to prove anything, and before the query hygiene that fixes most zero-results for a fraction of the cost. Sequencing is the answer: measurement $\to$ hygiene $\to$ behavioral ML $\to$ semantic retrieval.
+
+\redflags
+\begin{itemize}
+    \item Leading with dense retrieval or an LLM reranker before logging and evaluation exist.
+    \item No stratified judgment set---nothing later can be validated without it.
+    \item Treating zero-results as purely a recall-model problem when analyzers, spelling, and relaxation are the usual culprits.
+\end{itemize}
+
+\interviewtest{Prioritization under uncertainty: do you build the measurement foundation first, do you know that zero-result problems are usually query-side, and do you sequence ML investments by marginal value?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes sensible components (spell correction, relaxation, LTR, dense retrieval) in some order.
+    \item \badgeLsix{L6} Puts measurement first with a stratified judgment set, and attributes zero-results to analyzers/spelling/relaxation before models.
+    \item \badgeLseven{L7} Frames each quarter with an expected metric movement and a validation plan, notes organizational levers (relevance on-call, judgment program), and defends the ordering against the ``why not embeddings first?'' challenge with the cost/impact math.
+\end{itemize}
+
+\followups{``Your CEO read about vector search and wants it in Q1---what do you tell them?'' ``Which single metric do you put on the team dashboard and why?''}
+\end{interviewq}
+
+%--- Q7: offline NDCG up, online flat (funnel diagnosis) ---
+
+\begin{interviewq}
+\textbf{Q: Your new L2 reranker improves offline NDCG by 4\%, but online conversions are flat. Walk through your diagnosis.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Diagnose the funnel stage by stage, starting above the reranker.
+
+\textbf{(1) The recall ceiling first.} The reranker reorders whatever retrieval hands it; if the candidate sets lack the genuinely good documents, a better ordering of mediocre candidates moves nothing. Judged-only offline eval hides this---the judged pool was built from what past systems retrieved. Check recall per stage against judged-relevant documents; if retrieval recall is the binding constraint, the fix is upstream of the model you just shipped.
+
+\textbf{(2) Offline label contamination.} If the offline labels derive from clicks, they inherit the old ranker's position bias---``improvement'' partly measures agreement with the incumbent plus noise (Chapter~\ref{sr:chap:learning_to_rank}). Re-evaluate on the bias-resistant anchors: editorial judgments and any randomized-traffic slice.
+
+\textbf{(3) Where are the gains?} Slice the offline delta by segment and by position: gains concentrated on torso/tail queries that are a small share of traffic, or at positions below the fold, are real but commercially invisible. Traffic-weight the offline gain before expecting an online echo.
+
+\textbf{(4) What actually got served?} L3 blending---business rules, merchandising, diversity---may be clobbering the new order. Measure the override rate: how often does the served order differ from the ranker's order, and did it change?
+
+\textbf{(5) Presentation and metric distance.} A reordering with identical titles/images/prices may not change click behavior; and conversion is far downstream---check the intermediate chain (CTR@k, add-to-cart, reformulation rate) for movement. Finally, check power: the experiment may simply be underpowered for a conversion-sized effect (Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\redflags
+\begin{itemize}
+    \item ``The offline metric must be wrong'' or ``ship it anyway''---no decomposition, no diagnosis.
+    \item Not reaching for per-stage recall---the recall-ceiling check is the expected first move.
+    \item Never mentioning click-label position bias when the offline labels are behavioral.
+\end{itemize}
+
+\interviewtest{The canonical offline--online divergence probe: do you decompose the funnel in the right order (recall ceiling $\to$ label bias $\to$ traffic weighting $\to$ overrides $\to$ presentation/power) rather than guessing at a single cause?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the offline--online gap and two or three plausible causes.
+    \item \badgeLsix{L6} Runs the ordered checklist with per-stage recall and click-label bias called out explicitly.
+    \item \badgeLseven{L7} Quantifies each branch (traffic-weighted deltas, override rates, power analysis) and proposes the standing infrastructure---per-stage recall dashboards, a small randomized holdout, judged eval slices by segment---so the question never needs to be debugged from scratch again.
+\end{itemize}
+
+\followups{``How do you maintain a randomized slice cheaply and ethically?'' ``The gains were all on tail queries---what would make them show up in conversions?'' ``Offline says worse, online says better---now what?''}
+\end{interviewq}
+
+%--- Q8: head/torso/tail ---
+
+\begin{interviewq}
+\textbf{Q: Explain the head/torso/tail decomposition of query traffic. Why must strategy differ by segment?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Query frequency is Zipfian ([NLP 1]): a small head of queries carries a huge share of impressions; distinct queries pile up in a long tail, often 50--70\% of \textit{distinct} queries, each seen a handful of times---Google has long said about 15\% of daily queries are entirely new. The segments differ in the one resource that matters: \textbf{per-query data}.
+
+\textbf{Head}: enough traffic per query for per-query treatment---result caching (a major cost lever), curation, dense engagement priors, audited corrections. \textbf{Torso}: enough for statistical learning per query, too many for curation---this is where LTR and engagement features operate at full strength. \textbf{Tail}: no history per query, so everything must \textit{generalize}: spell correction, segmentation/tagging (structure substitutes for history), entity linking, expansion/relaxation, and semantic retrieval for vocabulary mismatch. Content features dominate because behavioral features are empty.
+
+Consequences beyond modeling: evaluate \textit{per segment} (aggregate metrics are head-dominated and hide tail regressions); expect engagement-feature coverage skew to bite tail queries in LTR training (Chapter~\ref{sr:chap:learning_to_rank}); and expect caching economics to shape where personalization can live (personalized retrieval breaks head caching).
+
+\redflags
+\begin{itemize}
+    \item ``Tail queries are rare so they don't matter''---their union is a large fraction of traffic and concentrates the failures.
+    \item Proposing one uniform pipeline with no segment-specific levers.
+\end{itemize}
+
+\interviewtest{A vocabulary check with a depth follow-up: the framing is table stakes; the differentiation is knowing \textit{which lever works in which segment} and that evaluation must slice the same way.}
+
+\followups{``How do you even define the segment boundaries operationally?'' ``Which segment does a brand-new product launch land in, and what happens to it?''}
+\end{interviewq}
+
+%--- Q9: LLM query rewriting productionization ---
+
+\begin{interviewq}
+\textbf{Q: Where do LLMs fit in query understanding in 2026? Your PM wants ``LLM-powered search''---what do you actually build?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Start with the economics}: QU runs in 5--10\,ms at tens of thousands of QPS; a live LLM call is hundreds of milliseconds and orders of magnitude more compute than the rest of the pipeline. So the answer is the sandwich pattern---LLMs at the ends, small models and caches in the middle:
+
+\textbf{Offline (highest ROI, lowest risk)}: mine and validate synonyms and rewrites at corpus scale; generate synthetic tail queries to train taggers and embedders; label relevance data as an LLM judge; enrich documents (attribute extraction, generated query expansions). No latency exposure, easy human audit.
+
+\textbf{Hot path}: cache LLM rewrites keyed on normalized query---Zipf means head/torso hit rates are high; distill the teacher into a small seq2seq/encoder student (tens to low hundreds of millions of parameters) that serves cache misses within budget; monitor student-vs-teacher drift on fresh traffic samples.
+
+\textbf{Selectively live}: conversational search (turn rewriting genuinely needs an LLM-class model and users tolerate latency), zero-result rescue (300\,ms beats an empty page), and multi-hop/complex questions on RAG surfaces ([DL 21], [NLP 9] for the rewriting patterns; Chapter~\ref{sr:chap:production_retrieval_rag} for the integration).
+
+\textbf{Where LLM rewriting actually wins}: conversational context carryover and complex/multi-hop decomposition---query classes the classical pipeline served badly. Where it does not: high-QPS head traffic (cache), simple keyword queries (no rewrite needed), and anything where a wrong paraphrase silently changes intent---so the original query always participates, and rewrite sources get per-source zero-result/win-rate monitoring.
+
+\redflags
+\begin{itemize}
+    \item ``Call the LLM on every query''---fails the latency/cost math immediately.
+    \item ``LLMs are too slow, so we can't use them''---misses the offline and distillation patterns where the field actually moved.
+    \item No drift story for the distilled student or the rewrite cache (stale rewrites after a catalog or events change).
+\end{itemize}
+
+\interviewtest{Economic judgment plus current practice: the teacher--student--cache triad, the offline-first ROI ordering, and knowing which query classes justify a live call.}
+
+\followups{``How do you evaluate whether a rewrite helped?'' ``The distilled model regresses on a new product category---detect and fix?'' ``Would you fine-tune the embedder instead of rewriting queries?''}
+\end{interviewq}
+
+%--- Q10: multilingual debugging ---
+
+\begin{interviewq}
+\textbf{Q: Your search engine performs well in English but users report it is nearly useless in Japanese. Diagnose.}
+
+\badgeLfive{L5} \quad \badgetype{Debugging} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Work top-down through the language-dependent stages:
+
+\textbf{(1) Language identification}: are Japanese queries even routed to the Japanese analyzer? Short queries misidentify easily; check the LID confusion on logged traffic.
+\textbf{(2) Segmentation---the prime suspect}: Japanese has no whitespace, so tokenization is a morphological analyzer (MeCab/Kuromoji-class). Failure modes: no CJK segmenter configured at all (the index holds whole-sentence tokens or per-character garbage), or---the catastrophic classic---\textit{different segmentation at index time vs.\ query time}, so almost nothing matches. Verify by running the same string through both analysis paths and diffing tokens.
+\textbf{(3) Normalization}: full-width/half-width forms (Unicode NFKC), katakana/hiragana variants, long-vowel marks---each unnormalized dimension silently partitions the vocabulary.
+\textbf{(4) Fallbacks}: if the segmenter's dictionary misses domain terms (product names, slang), recall craters on exactly the important vocabulary; character-bigram indexing alongside morphological tokens is the robust recall fallback, with ranking arbitrating.
+\textbf{(5) Everything trained}: spell correction, taggers, embedders---were they trained on Japanese data at all, or is an English-trained model silently mangling the traffic? Multilingual embedders are [NLP 3]; per-language evaluation slices are the guardrail that would have caught this before users did.
+
+\redflags
+\begin{itemize}
+    \item Jumping to ``train a better model'' before checking analyzer configuration---this is almost always an analysis-chain bug, not an ML problem.
+    \item Not knowing that CJK requires segmentation and what the index/query mismatch does.
+\end{itemize}
+
+\interviewtest{Practical multilingual literacy: do you know that tokenization is a model for CJK, that index/query analyzer consistency is the first thing to check, and that per-language metric slices are mandatory?}
+
+\followups{``How would you support Chinese and Korean next---what is shared, what is not?'' ``Users type Japanese product names in romaji---what do you add?''}
+\end{interviewq}
+
+%--- Q11: silent relevance degradation after a deploy ---
+
+\begin{interviewq}
+\textbf{Q: Search relevance metrics degraded starting last Tuesday. No model was retrained. Where do you look?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+``No model was retrained'' is the tell: the hypothesis space is configuration, data, and traffic---not learning.
+
+\textbf{(1) What shipped Tuesday?} Diff every deployed artifact touching the query or index path: analyzer/tokenizer configs, synonym and no-touch lists, QU model versions (corrector, tagger, intent), index mappings, engine version. The classic culprit is \textbf{index/query analyzer skew}: an analysis change applied to one side only, or applied to newly indexed documents while old segments retain the old form---a mixed-index state where some documents silently stop matching. Verify mechanically: run a fixed set of canary queries and documents through both analysis paths and diff the tokens (an analyzer-parity test that should have existed pre-deploy).
+
+\textbf{(2) Data-side changes that look like ranking changes.} A feed or ingestion change (fields dropped or renamed, an enrichment job failing, freshness pipeline stalled) degrades matching and features without any ranking deploy; check index field-coverage and feature-null-rate dashboards for a Tuesday step change. For dense retrieval: embedding version skew---query encoder updated while document vectors are stale, or vice versa (Chapter~\ref{sr:chap:vector_retrieval_theory}).
+
+\textbf{(3) Is it a real regression or a mix shift?} Slice the metric by segment, language, device, and traffic source: a marketing campaign, a bot wave, or a seasonal event changes the query mix and drags aggregates without any per-segment regression (Simpson's-paradox territory; Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\textbf{(4) Upstream QU behavior shifts without deploys.} Caches and mined tables refresh on schedules: a synonym batch, a refreshed rewrite cache, or a corrector LM rebuild can land mid-week; per-source zero-result/win-rate dashboards (Section~\ref{sr:sec:search_product_system}) attribute this in minutes if they exist---which is the meta-answer the interviewer wants.
+
+\redflags
+\begin{itemize}
+    \item Reaching for retraining or model architecture first when the prompt says no model changed.
+    \item Not knowing that analyzer changes require a reindex and what a mixed-index state does.
+    \item Debugging aggregates without slicing---mix shift is the false-alarm to rule out early.
+\end{itemize}
+
+\interviewtest{Operational maturity: do you treat search as a config-and-data system with versioned artifacts and parity tests, and do you have an attribution-first debugging order rather than a model-first reflex?}
+
+\followups{``How would you build the analyzer-parity test into CI?'' ``The regression is only in German---what does that tell you?'' ``How do you roll back when the bad artifact is the index itself?''}
+\end{interviewq}
+
+%--- Q12: why a funnel at all ---
+
+\begin{interviewq}
+\textbf{Q: Why is search a multi-stage funnel at all? Why not run your best model over the whole corpus for every query?}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Because the best models do not decompose.} A cross-encoder (or LLM ranker) needs the query and document \textit{together}; nothing can be precomputed per document, so scoring is $O(\text{corpus})$ model inferences per query---at $10^8$ documents and tens of ms per inference, that is years of GPU time per query. Retrieval-stage models are chosen precisely because they decompose: inverted-index postings and document embeddings are computed offline, so query-time cost is a lookup plus cheap arithmetic, sublinear or near-constant in corpus size ([DL 7] for the bi-/cross-encoder economics; Chapters~\ref{sr:chap:lexical_retrieval_inverted_indexes} and~\ref{sr:chap:vector_retrieval_theory} for the machinery).
+
+\textbf{The funnel is a cost--accuracy Pareto construction}: each stage spends more per candidate on fewer candidates---microseconds across millions (index scoring), fractions of a millisecond across thousands (L1), tens of milliseconds across hundreds (L2 cross-encoder or LTR). You buy the expensive model's quality exactly where it can matter, on candidates the cheap stages already vouched for.
+
+\textbf{Second-order reasons the funnel survives even as compute gets cheaper}: filtering and freshness are natural in an inverted index (a new document is searchable on the next segment refresh; a monolithic learned scorer must be retrained or re-embedded); structured constraints (price, availability) are trivial as index filters and awkward inside one giant model; and per-stage measurability---recall@k per stage---is how funnels get debugged (the recall ceiling), which a monolith gives up.
+
+\textbf{The honest caveat}: the funnel's boundaries move. Rerank windows widen as inference gets cheaper, late-interaction models blur the retrieval/rerank line (Chapter~\ref{sr:chap:neural_retrieval_reranking}), and for small corpora ($10^4$--$10^5$ docs) brute-force scoring with a strong model is genuinely viable---the funnel is an economic construction, not a law of nature, and a staff-level answer says at what scale it stops paying.
+
+\redflags
+\begin{itemize}
+    \item ``Latency'' as the whole answer without the decomposability argument---the point is that cross-encoder cost cannot be amortized offline.
+    \item Not knowing per-stage cost orders of magnitude.
+    \item Missing the freshness/filtering argument for keeping an index authoritative.
+\end{itemize}
+
+\interviewtest{First-principles understanding of why the architecture is shaped by what can be precomputed---the decomposability argument---rather than treating the funnel as received wisdom.}
+
+\followups{``At what corpus size would you skip retrieval and brute-force score?'' ``How do late-interaction models (ColBERT-style) change this trade-off?'' (Chapter~\ref{sr:chap:neural_retrieval_reranking})}
+\end{interviewq}

@@ -2,27 +2,716 @@
 \label{sr:chap:neural_retrieval_reranking}
 
 \begin{tldr}
-Placeholder — this chapter is written in Phase C from the vector-retrieval digest and applied-search track design (see review/search-recsys/ in the DL repo).
+This chapter is the systems treatment of neural retrieval: how bi-encoders are actually trained (in-batch negatives and why batch size matters, the logQ correction, hard-negative mining and its false-negative trap, distillation from cross-encoders), what late interaction buys and what it costs (ColBERT v1/v2, PLAID, the storage math), how reranking evolved from monoBERT to LLM rerankers and how to afford it (latency budgets, distillation into small models, score calibration), and how lexical and dense retrieval are fused (RRF, why raw score fusion fails, learned fusion). It closes with the retrieval funnel as a design object---candidate counts and latency budgets per stage---and the practical discipline of choosing and versioning embedding models. Architecture fundamentals (two-tower, cross-encoder, ANN) are canon in [DL~7]; the embedder landscape and MRL are canon in [NLP~3]; ANN index internals are Chapter~\ref{sr:chap:vector_retrieval_theory}; production operations are Chapter~\ref{sr:chap:production_retrieval_rag}.
 \end{tldr}
 
+%==============================================================================
 \section{Bi-Encoders and Training Recipes}
-% TODO Phase C
+\label{sr:sec:bi_encoder_retrieval}
+%==============================================================================
 
-\section{Late Interaction: ColBERT}
-% TODO Phase C
+\subsection{The Architecture and Its Contract}
+\label{sr:subsec:bi_encoder_contract}
 
+A \textbf{bi-encoder} (dual encoder, two-tower) maps queries and documents \textit{independently} into a shared vector space, $\vq = E_Q(q)$ and $\mathbf{d} = E_D(d)$, and scores relevance as a dot product or cosine similarity. The architecture family---siamese networks, two-tower models, weight sharing decisions---is treated in [DL~7]; the model landscape (E5/BGE/GTE encoders through 7B decoder embedders) is canon in [NLP~3]. What this chapter cares about is the \textit{contract} the architecture signs and the training recipe that determines whether it works.
+
+\begin{keyinsight}[The Decomposability Contract]
+The bi-encoder's defining property is that the score decomposes: $s(q,d) = \vq^\top \mathbf{d}$ with $\mathbf{d}$ computable \textit{offline}. That single property is what makes retrieval over $10^8$ documents feasible---embed the corpus once, build an ANN index (Chapter~\ref{sr:chap:vector_retrieval_theory}), and answer queries with one encoder forward pass plus a sublinear index probe. The price is expressiveness: every query and every document must be compressed into one vector \textit{before} they meet, so the model cannot condition its reading of the document on the query. Every architecture in this chapter---late interaction, cross-encoders, LLM rerankers---is a different point on the trade between interaction richness and decomposability, and the multi-stage funnel (Section~\ref{sr:sec:retrieval_funnel}) exists to buy back interaction quality only where it is affordable.
+\end{keyinsight}
+
+Two asymmetries matter in practice. First, \textit{query vs.\ document towers}: queries and documents differ in length, style, and vocabulary, so production systems either use task prefixes on a shared encoder (E5-style \texttt{query:}/\texttt{passage:} markers) or separate towers; a shared encoder halves the models to maintain and is the modern default. Second, \textit{train--serve symmetry}: the query-time embedding must come from exactly the model (and preprocessing) that embedded the corpus---a constraint that becomes an operational discipline in Section~\ref{sr:sec:embedder_selection}.
+
+\subsection{In-Batch Negatives and Why Batch Size Matters}
+\label{sr:subsec:in_batch_negatives}
+
+Bi-encoders are trained contrastively: pull the query toward its relevant document, push it away from irrelevant ones. The loss canon (InfoNCE, temperature, contrastive-learning theory) lives in [DL~7] and [DL~8]; here is the retrieval-specific machinery.
+
+The workhorse trick is \textbf{in-batch negatives}: for a batch of $B$ (query, positive) pairs, every other query's positive serves as a negative for this query. One forward pass over $2B$ texts yields $B \times B$ scores---$B$ positives and $B(B{-}1)$ negative pairs---nearly free negatives from computation you were doing anyway.
+
+\begin{mathresult}{InfoNCE with In-Batch Negatives and the logQ Correction}
+For a batch $\{(q_i, d_i^+)\}_{i=1}^{B}$ with similarity $s(\cdot,\cdot)$ and temperature $\tau$:
+\[
+\loss = -\frac{1}{B}\sum_{i=1}^{B} \log \frac{\exp\!\big(s(q_i, d_i^+)/\tau\big)}{\sum_{j=1}^{B} \exp\!\big(s(q_i, d_j^+)/\tau\big)}
+\]
+This is a \textit{sampled} softmax: the true objective is a softmax over the whole corpus, and the batch approximates its denominator. Because in-batch documents are drawn from the training distribution (roughly proportional to popularity $Q(d)$), popular documents appear as negatives far more often than uniform sampling would produce, and the model systematically over-penalizes them. The \textbf{logQ correction} (sampled-softmax correction; Bengio \& Sen\'ecal, 2008; applied to two-tower retrieval by Yi et al., 2019) restores an unbiased estimate by correcting each logit with the document's sampling probability:
+\[
+s'(q_i, d_j) = s(q_i, d_j) - \log Q(d_j)
+\]
+used in the loss only (serve with the raw score). $Q$ is estimated from the training stream, e.g.\ by counting item frequency.
+\end{mathresult}
+
+\textbf{Why batch size matters.} Three compounding reasons:
+\begin{itemize}
+    \item \textbf{More negatives per query.} Each query sees $B-1$ in-batch negatives; the sampled softmax approaches the true corpus-level softmax as $B$ grows. With $B = 32$ the model learns to beat 31 mostly-random documents---a trivially easy task; with $B = 4096$ the task starts to resemble retrieval.
+    \item \textbf{Higher chance of \textit{informative} negatives.} Hard negatives---documents similar enough to the positive to teach a boundary---are rare under random sampling; larger batches raise the odds that some in-batch negatives are actually close in embedding space.
+    \item \textbf{Contrastive gradient quality.} The InfoNCE gradient is dominated by the highest-scoring negatives; with few negatives, gradient variance is high and training is noisy.
+\end{itemize}
+Production recipes therefore train with batches of 512--8192 pairs, using cross-device negative gathering (all-gather embeddings across GPUs, cheap because only the $d$-dimensional vectors move, not activations) and gradient caching (GradCache-style two-pass tricks) when memory binds. This is also why the logQ correction matters more at scale: the larger the batch, the more the popularity skew of in-batch sampling distorts the loss on skewed catalogs. The correction is standard in recommendation two-towers ([DL~12] covers the recsys version) and increasingly standard in search retrievers trained on click data.
+
+\subsection{Hard-Negative Mining}
+\label{sr:subsec:hard_negatives}
+
+In-batch negatives are mostly \textit{easy}---random documents about unrelated topics. A model trained only on them learns coarse topical separation and then plateaus: it has never been forced to distinguish ``relevant to this query'' from ``about the same topic but not an answer.'' Hard-negative mining supplies that pressure, and it is the single highest-leverage lever in bi-encoder training.
+
+\begin{keyinsight}[Negatives Define the Task]
+A contrastive model learns exactly the decision boundary its negatives draw. Random negatives teach ``on-topic vs.\ off-topic.'' BM25 negatives teach ``shares words vs.\ answers the question.'' Self-mined negatives from the current model teach ``looks relevant to me now vs.\ actually relevant''---the model's own confusion, which is precisely what retrieval quality at rank 1--10 depends on. When an interviewer asks why two retrievers with identical architectures and data differ by 10 recall points, the answer is almost always the negative-sampling recipe.
+\end{keyinsight}
+
+The standard recipe stack, in order of sophistication:
+
+\begin{enumerate}
+    \item \textbf{BM25 negatives (DPR-style).} For each query, retrieve top BM25 candidates and take non-relevant ones as negatives (DPR used one per query alongside in-batch negatives; Karpukhin et al., 2020). These are lexically similar but semantically wrong---exactly the confusions a dense model must learn that a lexical system cannot. Cheap, static, and the right first step.
+    \item \textbf{Self-mined negatives, iterated (ANCE-style).} BM25 negatives are hard \textit{for BM25}, not for the current dense model. ANCE (Xiong et al., 2021) mines negatives from the model being trained: periodically re-embed the corpus with the current checkpoint, retrieve top-$k$ for each training query, and use the non-relevant retrieved documents as negatives for the next training phase. Because re-embedding the corpus each step is infeasible, the index is refreshed \textit{asynchronously} (every few thousand steps) from a recent checkpoint---slightly stale negatives are an accepted approximation. Iterating this loop (train $\to$ mine $\to$ train) is the standard recipe; two to three rounds capture most of the gain.
+    \item \textbf{Denoising false negatives (RocketQA-style).} The trap in self-mining: the top of the current model's ranking contains \textit{unlabeled positives}---most training sets label one relevant document per query, and a good retriever will surface other genuinely relevant ones, which naive mining then labels negative. Training on them actively teaches the model to push correct answers down. The fix (RocketQA; Qu et al., 2021): score every mined negative with a \textbf{cross-encoder} and discard candidates the cross-encoder rates confidently relevant. Denoised hard negatives are what make aggressive mining safe.
+\end{enumerate}
+
+\begin{warningbox}
+\textbf{False negatives are the silent killer of hard-negative mining.} The harder you mine, the higher the fraction of mined ``negatives'' that are actually relevant---the mining process is literally a relevance ranker, and its top results are relevant by design. Symptoms: training loss falls while retrieval recall \textit{drops} between mining rounds, or the model develops systematic blind spots on popular entities (which have many relevant documents, hence many false negatives). Every serious recipe pairs mining with a denoising filter, a margin threshold (only use negatives scoring well below the positive), or both. The behavioral-data version of this trap---treating not-clicked as irrelevant---is covered with unbiased LTR in Chapter~\ref{sr:chap:learning_to_rank}.
+\end{warningbox}
+
+\subsection{Distillation from Cross-Encoders}
+\label{sr:subsec:ce_distillation}
+
+The second major recipe component: use a cross-encoder (Section~\ref{sr:sec:cross_encoders}) as a \textbf{teacher}. A cross-encoder sees query--document term interactions the bi-encoder structurally cannot, so its scores encode finer relevance distinctions than binary labels do. Distillation transfers some of that into the decomposable student.
+
+\begin{mathresult}{Margin-MSE Distillation}
+Score triples $(q, d^+, d^-)$ with the teacher $T$ and student $S$, and regress the student's \textit{margin} onto the teacher's (Hofst\"atter et al., 2020):
+\[
+\loss_{\text{MarginMSE}} = \Big( \big[ S(q,d^+) - S(q,d^-) \big] - \big[ T(q,d^+) - T(q,d^-) \big] \Big)^2
+\]
+Matching margins rather than absolute scores sidesteps the fact that bi-encoder dot products and cross-encoder logits live on incomparable scales; only the \textit{ordering strength} between the pair is transferred. The teacher's soft margins also automatically discount false negatives---a mislabeled ``negative'' the teacher scores high produces a small or negative target margin instead of a full-strength push.
+\end{mathresult}
+
+The full modern recipe, then: contrastive pretraining on large weakly supervised pairs $\to$ fine-tuning with in-batch plus denoised hard negatives $\to$ margin-MSE (or listwise KL) distillation from a strong cross-encoder, often combined in one multi-task stage. Balanced topic-aware batch composition (TAS-B) and curriculum over negative difficulty are refinements on the same theme. This is also the template that scales up: today's best embedders distill from LLM rerankers and train on LLM-generated synthetic pairs ([NLP~3]).
+
+\begin{table}[H]
+\centering
+\small
+\caption{The bi-encoder training-recipe lineage---each step exists to fix the previous step's failure mode}
+\label{sr:tab:recipe_lineage}
+\begin{tabularx}{\textwidth}{llXX}
+\toprule
+\textbf{Recipe} & \textbf{Year} & \textbf{Contribution} & \textbf{Failure it fixes} \\
+\midrule
+DPR & 2020 & In-batch negatives + one BM25 hard negative per query & Random negatives too easy; lexical confusables never seen \\
+ANCE & 2021 & Self-mined negatives from an asynchronously refreshed index, iterated & BM25 negatives are hard \textit{for BM25}, not for the dense model being trained \\
+RocketQA & 2021 & Cross-encoder denoising of mined negatives; cross-batch negatives & Self-mining surfaces unlabeled positives; training on them buries correct answers \\
+TAS-B & 2021 & Topic-aware balanced batch composition + dual-teacher distillation & Batches of unrelated topics give uninformative in-batch negatives \\
+Margin-MSE & 2020 & Distill cross-encoder \textit{margins} into the bi-encoder & Binary labels waste the teacher's fine-grained relevance signal \\
+E5/BGE era & 2022--23 & Weakly supervised contrastive pretraining at scale, then supervised fine-tune with hard negatives & Supervised pairs alone too scarce for general-domain robustness \\
+LLM era & 2024-- & LLM-generated synthetic pairs and rankings; decoder-LLM backbones ([NLP~3]) & Mined-pair supply and domain coverage limits \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Late Interaction: ColBERT and PLAID}
+\label{sr:sec:late_interaction}
+%==============================================================================
+
+\subsection{MaxSim: Token-Level Scoring with Offline Document Encoding}
+
+Late interaction keeps the bi-encoder's decomposability---query and document encoded independently, documents offline---but refuses to compress the document into one vector. ColBERT (Khattab \& Zaharia, 2020) stores one small embedding \textit{per token} and scores with MaxSim:
+
+\begin{mathresult}{ColBERT MaxSim Scoring}
+\[
+\text{score}(q, d) = \sum_{i=1}^{|q|} \max_{j=1}^{|d|} \; \vq_i^\top \mathbf{d}_j
+\]
+where $\vq_i$, $\mathbf{d}_j$ are contextualized token embeddings (projected to a small dimension, typically 128). Each query token finds its best-matching document token; the score sums these best matches. Soft term matching with per-term evidence---BM25's structure with learned representations.
+\end{mathresult}
+
+Why this recovers most of the cross-encoder's quality: the single-vector bottleneck is gone. A query about ``RTX 4090 power draw'' can match ``4090'' and ``power'' against different parts of the document independently, where a pooled vector must average all aspects into one direction. What it does \textit{not} recover is joint contextualization---the document's encoding still cannot depend on the query.
+
+\subsection{The Storage Math, and ColBERTv2's Compression}
+\label{sr:subsec:colbert_storage}
+
+Late interaction's cost is storage and memory bandwidth, and you should be able to produce the arithmetic on a whiteboard. State assumptions explicitly:
+
+\begin{itemize}
+    \item \textbf{Single-vector baseline:} one 768-dim vector per chunk: 3\,KB at fp32, 1.5\,KB at fp16, 768\,B at int8.
+    \item \textbf{ColBERT v1, uncompressed:} a 512-token chunk at 128 dims per token: $512 \times 128 \times 2\,\text{B (fp16)} = 128$\,KB---roughly \textbf{85$\times$} the fp16 single vector; with 1-byte quantized dims, 64\,KB, still $\sim$40--125$\times$ depending on the baseline's precision. At $10^8$ chunks that is tens of terabytes: a different infrastructure class.
+    \item \textbf{ColBERTv2 residual compression:} cluster all token embeddings into $2^{16}$--$2^{18}$ \textbf{centroids}; store each token as its nearest centroid id plus a 1--2-bit-per-dimension quantized \textbf{residual}---roughly 20--36\,B per token, a 6--10$\times$ reduction over v1 (Santhanam et al., 2022). The same 512-token chunk drops to 10--18\,KB: still $\sim$7--12$\times$ a fp16 single vector, but within engineering reach.
+\end{itemize}
+
+The centroids do double duty: they compress, and they \textit{index}---candidate generation retrieves documents whose tokens fall near the centroids closest to each query token, so ColBERTv2 is an end-to-end retriever, not just a reranker.
+
+\subsection{PLAID Serving}
+
+PLAID (Santhanam et al., 2022) is the serving engine that made ColBERTv2 latency competitive. The idea: exploit the centroid structure to prune before touching residuals. Stages: (1) score query tokens against \textit{centroids only}; (2) build cheap centroid-level approximations of document scores and prune the candidate set aggressively; (3) decompress residuals and run exact MaxSim only for the survivors. Skipping residual decompression for most candidates yields roughly 2.5--7$\times$ (GPU) and up to 45$\times$ (CPU) latency reductions over vanilla ColBERTv2 at essentially unchanged quality---bringing late-interaction serving into the tens-of-milliseconds range on CPU for moderate corpora.
+
+\begin{keyinsight}[When Late Interaction Earns Its Cost]
+Late interaction is the right tool when (1) you need better recall/precision than a single-vector retriever \textit{at retrieval time}---not just at rerank time---because the funnel's first stage is the recall ceiling (Section~\ref{sr:sec:retrieval_funnel}); (2) queries hinge on specific terms (technical search, product attributes, code) where MaxSim's per-token evidence shines and pooled vectors blur; or (3) you want near-cross-encoder reranking quality at a fraction of its latency, with scoring cheap enough to apply to thousands of candidates. It is the wrong tool when storage is the binding constraint at $10^8$+ scale, when your queries are short and conversational (single vectors lose less), or when a well-tuned hybrid of single-vector dense + BM25 + cross-encoder rerank already meets quality targets---which, for most applications, it does. That is why late interaction remains a minority pattern in industry despite winning benchmarks: it adds an infrastructure class (token-level storage, custom kernels) for a delta the standard funnel often matches.
+\end{keyinsight}
+
+%==============================================================================
 \section{Cross-Encoders and LLM Rerankers}
-% TODO Phase C
+\label{sr:sec:cross_encoders}
+%==============================================================================
 
-\section{Hard Negative Mining}
-% TODO Phase C
+\subsection{From monoBERT to monoT5}
 
+A cross-encoder scores the concatenated pair---\texttt{[CLS] query [SEP] document [SEP]}---with full attention across query and document tokens; nothing is precomputable, so it is $O(N)$ forward passes for $N$ candidates and lives exclusively at the top of the funnel ([DL~7] covers the architecture and its economics). The lineage worth knowing:
+
+\begin{itemize}
+    \item \textbf{monoBERT} (Nogueira \& Cho, 2019): BERT fine-tuned as a binary relevance classifier over (query, passage) pairs. Its MS MARCO passage-ranking result---MRR@10 roughly \textit{doubled} over the BM25 baseline ($\sim$19 $\to$ $\sim$36 on dev)---is the event that started the neural-IR era and remains the cleanest evidence for what query--document interaction buys.
+    \item \textbf{monoT5} (Nogueira et al., 2020): reframes scoring as text generation---input \texttt{Query: \ldots\ Document: \ldots\ Relevant:}, score $=$ the softmax probability of the token \texttt{true} against \texttt{false}. Scaling the T5 backbone (base $\to$ 3B) kept improving quality, especially zero-shot on out-of-domain corpora---the first sign that reranking would become an LLM problem. \textbf{duoT5} added pairwise comparison at the very top of the ranking.
+\end{itemize}
+
+\textbf{Where reranker training data comes from} is worth a sentence, because it explains the field's trajectory: the classic generation trained on MS MARCO's shallow click-derived labels (one marked positive per query, with all the bias that implies); the current generation trains on \textit{distilled} orderings from LLM teachers plus LLM-graded relevance labels, because behavioral label supply is thin exactly where rerankers matter most (the tail) and shrinking wherever answer-style interfaces reduce clicking. The reranker and the relevance-judgment pipeline (Chapter~\ref{sr:chap:evaluation_experimentation}) increasingly share one LLM-teacher backbone.
+
+\subsection{LLM Rerankers (2024--2026)}
+\label{sr:subsec:llm_rerankers}
+
+Modern instruction-tuned LLMs rerank well with no IR-specific training, in three prompting regimes:
+
+\begin{itemize}
+    \item \textbf{Pointwise---relevance generation.} Ask the model whether the document answers the query (or to grade 0--3), and score with the \textit{token log-probabilities} of the answer (e.g., $P(\texttt{yes})$), not the sampled text---logprob scoring gives a continuous, threshold-able signal, where sampled labels are coarse and noisy. Fine-tuned variants (RankLLaMA-style) turn this into a trained pointwise reranker. Cheap ($N$ scoring calls, parallelizable, no ordering dependence) and the workhorse for LLM-based relevance \textit{labeling} pipelines (Chapter~\ref{sr:chap:evaluation_experimentation}).
+    \item \textbf{Listwise---RankGPT-style.} Put $\sim$20 numbered candidates in the prompt and ask for a ranked permutation; slide the window bottom-up with overlap (e.g., window 20, stride 10) to rank 100 candidates. Zero-shot GPT-4-class listwise reranking beat fine-tuned monoT5-3B on TREC-DL and BEIR (Sun et al., 2023)---a fully supervised baseline losing to a zero-shot prompt. Listwise sees candidates \textit{in contrast} with each other, which pointwise scoring cannot, but inherits LLM-judge pathologies: position bias within the prompt (candidates listed first get ranked higher), sensitivity to the window/stride schedule, and self-preference when ranking LLM-generated content.
+    \item \textbf{Pairwise.} Highest agreement with humans, $O(N^2)$ calls (or $O(N \log N)$ with sorting schemes); used for final top-5 polish and for building preference data, not for hot paths.
+\end{itemize}
+
+\textbf{The production pattern is distillation.} Serving a 100B-class listwise reranker per query is 10--1000$\times$ the cost of a cross-encoder for a few NDCG points, so the LLM moves \textit{offline}: it ranks large query samples as a \textbf{teacher}, and a small model---a 100--400M cross-encoder, or a 7B listwise student (RankVicuna/RankZephyr lineage)---is trained on those orderings (RankNet-style pairwise loss over teacher pairs, or listwise KL) and serves the hot path. The LLM stays in the loop as a continuous teacher and as a relevance judge on fresh traffic. Optionally, live LLM reranking is reserved for the slices where it pays: tail queries with no behavioral signal, high-value sessions, or offline enrichment. This teacher--student asymmetry---frontier quality offline, distilled speed online---is the single most reusable design pattern of the LLM-era search stack.
+
+\subsection{Latency Budgets by Candidate Count}
+\label{sr:subsec:reranker_latency}
+
+Reranking cost is linear in candidates $\times$ per-pair cost, so the budget determines how deep the reranker can look. Rough per-pair arithmetic at $\sim$256 tokens (query + passage), using $\text{FLOPs} \approx 2 \cdot \text{params} \cdot \text{tokens}$:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Reranker cost per 100 candidates at $\sim$256 tokens/pair (batched, illustrative; one modern GPU at 30--40\% utilization)}
+\label{sr:tab:reranker_latency}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Model class} & \textbf{Per-pair FLOPs} & \textbf{100 candidates} & \textbf{Where it fits} \\
+\midrule
+MiniLM-class CE (22M) & $\sim$$10^{10}$ & $\sim$3--10\,ms & L1/L2 at high QPS; distilled student \\
+BERT-base CE (110M) & $\sim$$5.6 \times 10^{10}$ & $\sim$15--60\,ms & Standard L2 rerank of top 50--200 \\
+monoT5-3B / 7B pointwise LLM & $\sim$$1.5$--$3.6 \times 10^{12}$ & seconds & Top-10--20 only, or offline teacher \\
+Listwise LLM (API, 100B-class) & --- & seconds + \$\$ & Offline teacher/judge; tail/high-value slices \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Consequences: a 50--80\,ms L2 slot fits a BERT-base cross-encoder over $\sim$100 candidates or a MiniLM-class model over $\sim$1000; anything LLM-sized cannot sit in a consumer-latency hot path at meaningful depth, which is \textit{why} distillation is not optional. Depth matters because the reranker cannot promote what the candidate set does not contain---rerank depth is a recall knob, and cutting it from 200 to 20 to save latency silently caps quality (Section~\ref{sr:sec:retrieval_funnel}).
+
+\subsection{Calibration of Reranker Scores}
+\label{sr:subsec:reranker_calibration}
+
+Rerankers are trained with pairwise or listwise objectives, which preserve \textit{order} and destroy \textit{scale}: the logit gap between 0.9 and 0.7 carries no probability meaning, and score distributions drift across query slices (long vs.\ short queries, head vs.\ tail) and across model versions.
+
+\begin{warningbox}
+\textbf{Reranker scores are not probabilities---until you make them so.} The moment a score is used for anything other than sorting one query's candidates, calibration becomes a correctness requirement: thresholding for a ``no good results'' or answerability gate, filtering context for RAG (``include chunks scoring $> \tau$''), comparing or merging results across verticals or indexes, or feeding the score as a feature to a downstream model that assumes stable semantics. Fixes: post-hoc calibration (Platt scaling / isotonic regression) against a judged set, per-slice monitoring of score distributions, and re-fitting the calibrator on every reranker retrain. Pairwise/listwise training destroying calibration---and the pointwise-vs-listwise tension that follows---is the same trade-off that ads ranking hits with pCTR, covered in Chapter~\ref{sr:chap:learning_to_rank}.
+\end{warningbox}
+
+%==============================================================================
 \section{Hybrid Retrieval and Fusion}
-% TODO Phase C
+\label{sr:sec:hybrid_fusion}
+%==============================================================================
 
+\subsection{Complementary Failure Modes}
+
+The case for hybrid is not that dense retrieval is immature---it is that lexical and dense retrieval fail on \textit{disjoint} query populations:
+
+\begin{itemize}
+    \item \textbf{Lexical fails on vocabulary mismatch:} paraphrases, conceptual queries, tail queries with no term overlap with their answers (``why does my screen flicker'' vs.\ a doc about ``display refresh artifacts''). BM25 cannot bridge synonymy; this is where dense retrieval earns its keep, and it is concentrated in the tail, where behavioral signals are also absent.
+    \item \textbf{Dense fails on exact identifiers and precision constraints:} SKUs, part numbers, error codes, names, version strings---embeddings blur near-identical strings by construction (``X100'' and ``X200'' are nearly the same vector), and struggle with negation and out-of-domain drift. Lexical match is exact by construction and degrades predictably.
+\end{itemize}
+
+Their union is better than either: the BEIR-era empirical finding is that BM25 + dense hybrid beats each alone on most benchmarks, and the effect is strongest exactly where each side's failure mode dominates. Learned sparse retrieval (SPLADE-family; Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}) is the middle path---learned term weighting served from an inverted index---but production stacks still overwhelmingly run the two-retriever hybrid.
+
+\subsection{Why Raw Score Fusion Fails}
+\label{sr:subsec:score_normalization}
+
+The naive fusion $\alpha \cdot \text{BM25} + (1-\alpha) \cdot \text{cosine}$ is the canonical interview trap, and the failure analysis matters more than the fix:
+
+\begin{itemize}
+    \item \textbf{Incompatible scales.} BM25 is unbounded above and its magnitude depends on query length and term IDFs---a rare-term query inflates BM25 scores for \textit{every} candidate; cosine lives in $[-1, 1]$ and, for real embedders, concentrates in a narrow band (anisotropy). No single $\alpha$ means the same thing across queries.
+    \item \textbf{Per-query normalization is built on order statistics of a small sample.} Min-max normalizing over each query's top-$k$ rescales by that query's observed min and max---noisy statistics of $k \approx 100$ candidates. One outlier candidate reshapes every normalized score. Z-score normalization additionally assumes a distribution shape neither system has, and both erase absolute-confidence information (a query where \textit{all} dense scores are low---retrieval found nothing---normalizes to look like a confident ranking).
+    \item \textbf{Distributions are query-dependent and drift.} Score distributions differ across query segments and shift when either model or the analyzer chain is updated, silently re-weighting the fusion.
+\end{itemize}
+
+\begin{mathresult}{Reciprocal Rank Fusion (RRF)}
+Given rankings from $m$ retrieval sources, fuse by rank position only (Cormack, Clarke \& B\"uttcher, 2009):
+\[
+\text{RRF}(d) = \sum_{i=1}^{m} \frac{1}{k + \text{rank}_i(d)}
+\]
+with $k \approx 60$ the standard constant. Rank-based fusion is \textit{scale-free}: it is invariant to any monotone transformation of either system's scores, so incompatible distributions cannot hurt it. The $k$ parameter dampens top-rank dominance: with small $k$, rank~1 vastly outweighs rank~10 ($1/1$ vs.\ $1/10$); with $k = 60$, the ratio is $61/70 \approx 0.87$---agreement across sources (a document ranked moderately by \textit{both}) can beat a single source's top hit. Documents missing from a source contribute nothing from it.
+\end{mathresult}
+
+\textbf{A two-line worked example} makes the $k$ mechanics concrete. Document $A$ is rank 1 in the dense list only: $\text{RRF}(A) = 1/61 \approx 0.0164$. Document $B$ is rank 4 lexically and rank 6 dense: $\text{RRF}(B) = 1/64 + 1/66 \approx 0.0308$. $B$ wins---two moderate votes beat one first-place vote at $k = 60$. Drop $k$ to 0 and $A$ wins ($1.0$ vs.\ $0.417$): small $k$ trusts each source's top ranks; large $k$ trusts agreement. That is the entire tuning story of RRF, and why $k$ rarely needs touching.
+
+RRF's robustness is why it is the default first ship: no tuning, no normalization, no assumptions, and it degrades gracefully when one source misfires. Its weakness is symmetric: it throws away score magnitude entirely, treats all sources as equally trustworthy, and cannot learn that dense should dominate for conceptual queries while lexical dominates for part numbers.
+
+\subsection{Learned Fusion}
+
+Two upgrades, in increasing order of capability:
+\begin{enumerate}
+    \item \textbf{Learned linear fusion:} fit source weights (over normalized scores or reciprocal ranks) on a judged set, optionally conditioned on query features (length, has-identifier flag, intent class). A few points over RRF when sources genuinely differ in reliability by segment.
+    \item \textbf{Fusion as a ranking-feature problem---the end state.} Union the candidate sets and hand \textit{both} raw scores (plus rank positions, match features, and query features) to the L1/L2 ranker as features. Fusion weights become learned, query-conditional, and jointly optimized with everything else the ranker sees. This dissolves the fusion problem into learning-to-rank (Chapter~\ref{sr:chap:learning_to_rank}); the retrieval stages' only remaining job is to get the right documents into the union.
+\end{enumerate}
+
+\textbf{When hybrid wins, and when to skip it.} Hybrid wins when traffic mixes both failure modes---commerce and enterprise search (identifiers \textit{and} paraphrase), RAG over technical corpora, anything with a heavy tail. Skip or defer it when queries are overwhelmingly structured/attribute-driven (the inverted index with filters is authoritative anyway), when the corpus is tiny (brute-force dense alone is simpler), or when the team lacks evaluation infrastructure---hybrid doubles the operational surface (two indexes, two freshness pipelines, two failure domains), and without per-slice measurement you cannot even tell whether fusion helps. That judgment---knowing hybrid is not free---is a Staff-level differentiator.
+
+%==============================================================================
+\section{The Retrieval Funnel as a Design Object}
+\label{sr:sec:retrieval_funnel}
+%==============================================================================
+
+\subsection{Stages, Candidate Counts, and the Recall Ceiling}
+
+Every serious retrieval system is a funnel: each stage spends more compute per candidate on fewer candidates. The design variables are the \textit{number of stages}, the \textit{candidate count} each passes on, and the \textit{model class} each can afford---and the discipline that makes the funnel work is measuring recall \textit{per stage}. The chapter so far has assembled the menu the funnel chooses from:
+
+\begin{table}[H]
+\centering
+\small
+\caption{The scoring-model menu, by funnel position}
+\label{sr:tab:model_menu}
+\begin{tabularx}{\textwidth}{lXXXl}
+\toprule
+\textbf{Model} & \textbf{Quality} & \textbf{Query-time cost} & \textbf{Storage} & \textbf{Stage} \\
+\midrule
+BM25 / learned sparse & Baseline / good & Very low (inverted index) & Low & L0 \\
+Bi-encoder + ANN & Good & Low (1 encode + probe) & 1 vector/chunk & L0 \\
+Late interaction (ColBERTv2) & Very good & Medium (PLAID) & $\sim$7--12$\times$ single-vector & L0 or mid-funnel \\
+Cross-encoder (distilled) & Better still & $O(N)$ passes & None precomputed & L2, top $10^2$ \\
+LLM reranker (listwise) & Best & $O(N)$ LLM calls & None & Offline teacher; tail slices \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[The Recall Ceiling]
+No downstream stage can recover a document an upstream stage dropped. L0 recall bounds L1, which bounds L2, which bounds the page. Three practical consequences: (1) \textbf{measure recall@$k$ per stage} against judged-relevant documents---end-to-end NDCG alone cannot tell you \textit{which} stage lost the answer; (2) first-stage retrieval is evaluated on \textit{recall} at its handoff depth (does the good document survive into the top 1000?), not on precision; (3) the most common funnel misdiagnosis is tuning the reranker when the candidate set never contained the right answer---the ``offline gain, online flat'' debugging pattern in Section~\ref{sr:sec:neural_retrieval_interview}. Whenever a stage's handoff count is cut for latency, the recall cost of that cut must be measured, not assumed.
+\end{keyinsight}
+
+\subsection{A Worked Budget}
+\label{sr:subsec:funnel_budget}
+
+A representative 300\,ms p95 end-to-end budget for a search API (network, serialization, and presentation excluded from the model budget):
+
+\begin{table}[H]
+\centering
+\small
+\caption{A worked 300\,ms retrieval funnel (illustrative; counts and budgets are the design variables)}
+\label{sr:tab:funnel_budget}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Stage} & \textbf{Model class} & \textbf{Budget} & \textbf{In $\to$ out} & \textbf{Owns} \\
+\midrule
+QU & classifiers, spell, tagging & 5--10\,ms & query $\to$ query plan & intent, filters, rewrites \\
+L0 retrieval & BM25 $\parallel$ ANN dense (parallel) & 40--60\,ms & corpus $\to$ $\sim$1000 & recall; hybrid union \\
+Fusion + L1 & RRF or light GBDT/linear & 20--30\,ms & 1000 $\to$ $\sim$100 & cheap features, dedup \\
+L2 rerank & cross-encoder (distilled) & 50--80\,ms & 100 $\to$ $\sim$20 & precision at the top \\
+L3 policy & rules, diversity, blending & 5--10\,ms & 20 $\to$ page & business logic \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Reading the table as a designer: the L0 sources run in \textit{parallel}, so retrieval latency is the max, not the sum; the L2 budget and Table~\ref{sr:tab:reranker_latency} jointly fix the rerank depth (an 80\,ms slot buys BERT-base over $\sim$100 candidates); and roughly 100\,ms of headroom is deliberately left for queueing, retries, and p95-vs-mean gaps. Change any requirement---10$\times$ QPS, 100\,ms budget, LLM reranking---and the candidate counts, not just the models, must be renegotiated. Caching, degradation modes, and the operational side of this funnel are Chapter~\ref{sr:chap:production_retrieval_rag}.
+
+\textbf{How the handoff counts are actually chosen.} Not by convention---by \textbf{marginal recall curves}. For each stage, plot recall of judged-relevant documents against handoff depth $k$ on your own traffic: recall@$k$ climbs steeply and then flattens, and the knee is the economically sensible handoff (past it, each extra candidate buys almost no recall but costs downstream compute linearly). The 1000/100/20 pattern above is just where the knees commonly land for web-scale corpora; a tight domain corpus may flatten by 200 at L0, a recall-critical legal or medical application may justify 5000. Rerun the curves whenever a retriever or the corpus changes materially---the knee moves, and a funnel tuned to last year's knee is silently either wasteful or lossy.
+
+\subsection{Where Business Logic and Diversity Enter}
+
+L3 is where merchandising boosts, compliance filtering, dedup (one result per seller/domain), and diversity injection legitimately live: \textit{after} the learned ranker, so they do not contaminate its training signal, but \textit{visible to evaluation}, so measured quality reflects what users actually see. Two rules keep L3 honest: every L3 override should be logged and attributable (when online metrics move, you must be able to separate ranker changes from policy changes), and L3's share of reordering should be monitored---a funnel where business rules routinely clobber the L2 order is a funnel whose expensive reranker is decorative. The L1/L2 rankers themselves---features, objectives, position-bias handling---are Chapter~\ref{sr:chap:learning_to_rank}.
+
+%==============================================================================
 \section{Embedding Lifecycle in Production}
-% TODO Phase C
+\label{sr:sec:embedder_selection}
+%==============================================================================
 
+\subsection{Choosing the Model: Dimension, Latency, Quality}
+
+The embedder landscape and selection workflow are canon in [NLP~3]---MTEB/MMTEB as a shortlist filter rather than a decision, the 100--400M encoder vs.\ 1--8B decoder-embedder trade (roughly parameter-ratio serving cost: a 7B embedder spends $\sim$60--70$\times$ the FLOPs per token of a 110M encoder), and Matryoshka representation learning, which turns output dimension into a post-training cost knob (truncate-then-renormalize, index the smallest dimension that passes your domain eval, optionally re-score a shortlist at full dimension). The retrieval-system consequences to internalize:
+
+\begin{itemize}
+    \item \textbf{Dimension is a multiplicative infrastructure cost.} Vector storage, index memory, and ANN latency all scale roughly linearly in $d$; at $10^8$ vectors the difference between 3072 and 256 dims is the difference between a sharded cluster and a RAM-resident index. MRL truncation and int8/binary quantization compose multiplicatively ([NLP~3] has the arithmetic); budget dimension like you budget latency.
+    \item \textbf{Query-side latency binds before corpus-side cost.} Corpus embedding is a one-time batch job; the query encoder runs in the hot path at L0. This is why serving stacks pair a small (or truncated) query-time model with offline-heavy document processing, and why 7B-class embedders mostly appear behind APIs or in moderate-QPS enterprise RAG rather than consumer search front doors.
+    \item \textbf{The domain fine-tuning decision.} If the best off-the-shelf candidate misses the recall bar on \textit{your} judged eval, the highest-leverage move is usually not a bigger model but contrastive fine-tuning on domain pairs with mined, denoised hard negatives (Section~\ref{sr:subsec:hard_negatives})---typically worth 5--15 recall points, more than a model-tier upgrade, at lower serving cost. Fine-tune when you have domain vocabulary off-the-shelf models miss, at least $\sim$10$^4$--$10^5$ usable pairs (clicks, co-views, curated), and an eval you trust; buy bigger or stay stock when you lack the pairs or the eval.
+\end{itemize}
+
+\subsection{Versioning Discipline}
+
+Embedding spaces from different models---or the same model retrained---are mutually incomparable: a query embedded with v2 scored against documents embedded with v1 produces garbage \textit{silently}, with no error and plausible-looking cosine values.
+
+\begin{warningbox}
+\textbf{Never let two embedding versions share an index, and never let query and document towers skew.} The discipline: (1) stamp every stored vector with an \texttt{embedding\_version}; (2) pin the query encoder to the index's version at the serving layer---the pairing is an invariant, not a config default; (3) roll out new embedders via a shadow index (dual-write new and updated documents to both, backfill in batch, compare shadow vs.\ live offline, interleave or A/B online, then cut over with the old index warm for rollback); (4) alert on version mismatch at query time. The classic incident is a partial rollout where the query tower updates before the backfill completes---relevance degrades corpus-wide, dashboards show no errors, and the root cause is invisible unless version skew is explicitly monitored. Rollout mechanics, reindex scheduling, and skew monitoring are covered with production operations in Chapter~\ref{sr:chap:production_retrieval_rag}; migration economics (re-embed, re-index, validated cutover) are quantified in [NLP~3].
+\end{warningbox}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C
+\label{sr:sec:neural_retrieval_interview}
+%==============================================================================
 
+%--- Q1: bi-encoder vs cross-encoder ---
+
+\begin{interviewq}
+\textbf{Q: Bi-encoder vs.\ cross-encoder: why not cross-encode everything, and what exactly does the cross-encoder buy?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{The economics.} A bi-encoder's score decomposes: document embeddings are computed offline, indexed with ANN, and a query costs one encoder pass plus a sublinear index probe---per-query work is $O(1)$ encoder calls regardless of corpus size. A cross-encoder scores the \textit{pair} jointly, so nothing is precomputable: scoring a corpus of $N$ documents is $N$ full forward passes per query. At $10^8$ documents and $\sim$$5 \times 10^{10}$ FLOPs per pair (BERT-base, 256 tokens), that is $\sim$$5 \times 10^{18}$ FLOPs per query---thousands of GPU-seconds. The cross-encoder is only affordable over a reranking window of $10^2$--$10^3$ candidates (Table~\ref{sr:tab:reranker_latency}).
+
+\textbf{What the joint pass buys.} The bi-encoder must compress query and document into single vectors \textit{before they meet}: matching is one dot product over pooled representations, and fine-grained term correspondence is lost. The cross-encoder attends across the pair token-by-token, so it can resolve exact identifiers, negation, and which document passage answers which query aspect. That interaction quality is why it reliably adds NDCG on top of any first stage.
+
+\textbf{The synthesis} is the funnel: recall-oriented decomposable retrieval (bi-encoder, BM25, or hybrid) feeds a precision-oriented cross-encoder over the top 100 or so---each stage spending more per candidate on fewer candidates. Late interaction (ColBERT) sits between: offline per-token document embeddings with MaxSim scoring recover most of the interaction quality while keeping precomputation, at a storage multiple. And the two stages are coupled by training, not just serving: the cross-encoder is the bi-encoder's teacher (margin-MSE distillation) and the denoiser for its mined negatives.
+
+\redflags
+\begin{itemize}
+    \item Framing it purely as ``cross-encoders are slow''---without the decomposability/precomputation argument, the answer misses \textit{why} they are slow in a way no hardware fixes.
+    \item Not knowing the reranking-window resolution---candidates who think the choice is either/or, rather than stages of one funnel, read as junior.
+    \item Proposing a cross-encoder as the first-stage retriever for a large corpus.
+\end{itemize}
+
+\interviewtest{The single most common retrieval screen. Can you produce the decomposability argument, the FLOPs-scale intuition, and the funnel synthesis unprompted?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Decomposability and $O(N)$ vs.\ $O(1)$ per query; two-stage synthesis.
+    \item \badgeLsix{L6} Quantifies the per-pair cost and the affordable window; places late interaction correctly; notes the teacher/denoiser coupling between the stages.
+    \item \badgeLseven{L7} Connects rerank depth to the recall ceiling (depth is a recall knob), and discusses when the funnel gets a third stage vs.\ when the cross-encoder is dropped entirely (tiny corpus: cross-encode everything; huge candidate sets: distilled MiniLM at L1 + full CE at L2).
+\end{itemize}
+
+\followups{``Where does ColBERT sit on this spectrum and what does it cost?'' ``How would you use the cross-encoder to make the bi-encoder better?'' ``Your reranker budget is 20\,ms---what do you serve?''}
+\end{interviewq}
+
+%--- Q2: in-batch negatives, batch size, logQ ---
+
+\begin{interviewq}
+\textbf{Q: Why do bi-encoders train with such large batches? Explain in-batch negatives and the logQ correction.}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Start from the objective.} The ideal training signal is a softmax over the \textit{entire corpus}: the positive should beat every other document. That is intractable, so InfoNCE approximates the denominator with a sample---and in-batch negatives are the cheapest possible sample: for $B$ (query, positive) pairs, each query treats the other $B-1$ positives as negatives, reusing embeddings already computed. One batch yields $B(B-1)$ negative pairs for free.
+
+\textbf{Why size matters:} (1) each query's task difficulty scales with $B$---beating 31 random documents teaches topical separation, beating 4095 starts to resemble retrieval; the sampled softmax approaches the true corpus softmax as $B$ grows; (2) informative (hard) negatives are rare under random sampling, and large batches raise the odds of catching some; (3) the InfoNCE gradient is dominated by the top-scoring negatives, so small batches give high-variance gradients. Hence 512--8192-pair batches, cross-GPU embedding all-gather (cheap---only $d$-dim vectors cross devices), and gradient-caching tricks when activation memory binds.
+
+\textbf{The logQ correction.} In-batch negatives are not sampled uniformly---they are drawn from the training distribution, roughly proportional to document/item popularity $Q(d)$. Popular documents therefore appear as negatives far too often, and the model learns to suppress them. Sampled-softmax theory says the fix is to subtract the log sampling probability from each logit during training: $s'(q,d) = s(q,d) - \log Q(d)$, with $Q$ estimated from stream frequencies; serve with the raw score. Skewed catalogs (commerce, video) see real gains; the correction is standard in two-tower recsys retrieval ([DL~12]) and applies unchanged to search retrievers trained on clicks.
+
+\textbf{The limit of the technique:} in-batch negatives, however many, remain \textit{easy} on average---the recipe still needs mined hard negatives (BM25-mined, then self-mined ANCE-style with false-negative denoising) to teach the top-of-ranking boundary.
+
+\redflags
+\begin{itemize}
+    \item ``Bigger batches are better because more data per step''---misses that the batch \textit{is} the negative distribution here; the mechanism is contrastive, not throughput.
+    \item Never having heard of the popularity bias of in-batch sampling---anyone who has trained a two-tower on real logs has hit it.
+    \item Confusing the logQ correction (train-time logit adjustment) with serving-time popularity boosting.
+\end{itemize}
+
+\interviewtest{Do you understand contrastive training as sampled softmax over the corpus---and its estimator biases---rather than as a recipe to recite?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains in-batch negatives and that more negatives help.
+    \item \badgeLsix{L6} Frames it as sampled softmax, writes the logQ-corrected logit, and knows the engineering (all-gather, GradCache, temperature).
+    \item \badgeLseven{L7} Discusses when in-batch saturates and the handoff to hard-negative mining; connects popularity bias in training negatives to popularity bias in the served ranking and to the exploration/feedback-loop story of Chapter~\ref{sr:chap:recommendation_systems}.
+\end{itemize}
+
+\followups{``Your catalog is heavily skewed---what breaks without the correction?'' ``Why not just sample negatives uniformly from the corpus?'' ``How does temperature interact with the number of negatives?''}
+\end{interviewq}
+
+%--- Q3: training recipe design ---
+
+\begin{interviewq}
+\textbf{Q: Design the training recipe for a domain bi-encoder from your search logs. Walk through negatives, denoising, and distillation.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Data first.} Positives from logs: clicked (query, document) pairs with satisfaction filtering (dwell threshold; strip abandoned clicks), deduplicated per user, stratified across head/torso/tail so the model is not just a click-popularity memorizer. Expect label noise and position bias---clicks come from the old ranker's exposure (the debiasing discipline is Chapter~\ref{sr:chap:learning_to_rank}). If pairs are scarce, generate synthetic queries per document with an LLM---the standard cold-domain move.
+
+\textbf{Stage 1: warm start with in-batch negatives.} Initialize from a strong general embedder ([NLP~3] selection workflow). Train with InfoNCE, large batches (512--4096), logQ correction if the catalog is skewed. This gets coarse domain adaptation cheaply.
+
+\textbf{Stage 2: hard negatives, iterated.} Round 1: BM25 negatives---top lexical candidates that are not the positive; teaches ``shares words $\neq$ answers the query.'' Round 2+: ANCE-style self-mining---embed the corpus with the current checkpoint, retrieve top-$k$ per training query, sample negatives from ranks $\sim$10--100. Refresh the mining index asynchronously every few thousand steps; run 2--3 mine-train rounds and expect diminishing returns after that.
+
+\textbf{Stage 3: denoise and distill.} Score all mined negatives with a cross-encoder; \textit{discard} any the teacher rates confidently relevant---these are false negatives (most datasets label one positive per query; a working retriever surfaces the others), and training on them teaches the model to bury correct answers. Then distill the cross-encoder into the bi-encoder with margin-MSE on (q, $d^+$, $d^-$) triples---soft margins transfer the teacher's fine distinctions and further neutralize residual label noise.
+
+\textbf{Evaluate per round, on your data.} Recall@100 (first-stage handoff depth) and NDCG@10 on a judged domain eval, sliced head/tail---\textit{through the real pipeline} (your chunking, your ANN settings). The characteristic failure to watch: recall \textit{drops} after a mining round $\Rightarrow$ false-negative poisoning; tighten the denoiser or add a margin threshold before mining harder.
+
+\redflags
+\begin{itemize}
+    \item Jumping straight to ``mine hard negatives'' without the false-negative discussion---the recipe's central trap.
+    \item Treating clicked-vs-not-clicked as clean binary labels with no mention of position bias or satisfaction filtering.
+    \item No per-round evaluation plan, or evaluating only end-to-end NDCG (cannot attribute regressions to a recipe stage).
+\end{itemize}
+
+\interviewtest{Have you actually trained a retriever? The tells are the false-negative trap, asynchronous index refresh, and per-round recall evaluation---details no one learns from the InfoNCE formula alone.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} In-batch plus BM25 hard negatives, with a held-out eval.
+    \item \badgeLsix{L6} Full staged recipe: iterated self-mining with async refresh, cross-encoder denoising, margin-MSE distillation, sliced per-round evaluation.
+    \item \badgeLseven{L7} Adds the data-quality layer (satisfaction filtering, stratification, synthetic queries for sparse slices), knows when to stop (diminishing returns after 2--3 rounds; fine-tuning vs.\ model-tier upgrade economics), and plans the rollout (shadow index, version discipline, Section~\ref{sr:sec:embedder_selection}).
+\end{itemize}
+
+\followups{``Recall dropped after your second mining round---diagnose.'' ``You have 5{,}000 labeled pairs, not 500{,}000---what changes?'' ``Why margins instead of matching the teacher's absolute scores?''}
+\end{interviewq}
+
+%--- Q4: late interaction economics ---
+
+\begin{interviewq}
+\textbf{Q: When does late interaction (ColBERT) earn its cost? Walk through the storage math.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{The mechanism in one line.} Documents encoded offline to \textit{per-token} 128-dim embeddings; query-time score $= \sum_i \max_j \vq_i^\top \mathbf{d}_j$ (MaxSim)---each query token finds its best document token. This removes the single-vector bottleneck (the source of most bi-encoder quality loss) while keeping document encoding offline, landing near cross-encoder quality at far lower query-time cost.
+
+\textbf{The storage math, with assumptions stated.} A 512-token chunk at 128 dims/token: fp16 $= 512 \times 128 \times 2$\,B $= 128$\,KB, vs.\ 1.5\,KB for a single 768-dim fp16 vector---$\sim$85$\times$. ColBERTv2's residual compression (centroid id + 1--2-bit quantized residual per dim, $\sim$20--36\,B/token) cuts that 6--10$\times$, to 10--18\,KB per chunk---still $\sim$7--12$\times$ single-vector. At $10^8$ chunks: $\sim$150\,GB single-vector fp16 vs.\ 1--2\,TB compressed late interaction vs.\ $>$10\,TB uncompressed. Quote the number \textit{with} the compression assumption; ``125$\times$'' and ``10$\times$'' are both right under different assumptions. Serving needs PLAID-style pruning (score centroids first, decompress residuals only for survivors; 2.5--7$\times$ GPU / up to 45$\times$ CPU speedups over vanilla ColBERTv2) to be latency-competitive.
+
+\textbf{When it earns its cost:} (1) first-stage recall is the bottleneck and single-vector + BM25 hybrid has plateaued---late interaction lifts the recall \textit{ceiling}, which no reranker can; (2) term-precision domains (technical/product/code search) where MaxSim's per-token evidence is the differentiator; (3) as a mid-funnel scorer over thousands of candidates where a cross-encoder is unaffordable. \textbf{When it does not:} storage/memory-bound deployments at $10^8$+ scale; short conversational queries (pooling loses little); and---the honest default---anywhere the standard hybrid + distilled-CE funnel already meets the bar, since late interaction adds an infrastructure class (token stores, custom kernels, its own index machinery) for a few points.
+
+\redflags
+\begin{itemize}
+    \item Quoting a single storage multiplier with no assumptions---the compression regime changes the answer by an order of magnitude.
+    \item ``ColBERT is a better bi-encoder''---misses that it needs its own serving stack (candidate generation via centroids, PLAID) rather than a drop-in ANN index.
+    \item No opinion on when \textit{not} to use it.
+\end{itemize}
+
+\interviewtest{Can you do capacity math with stated assumptions, and do you evaluate an architecture by its total system cost rather than its benchmark delta?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} MaxSim mechanism and the qualitative storage trade.
+    \item \badgeLsix{L6} Worked storage math with assumptions; ColBERTv2 centroids-plus-residuals; PLAID's role; a clear earns-its-cost list.
+    \item \badgeLseven{L7} Frames it as a recall-ceiling investment vs.\ a reranking investment, compares against the alternative spends (better hard-negative fine-tuning, deeper rerank window), and notes the operational asymmetry: benchmarks price quality, production also prices the second index's freshness pipeline and failure domain.
+\end{itemize}
+
+\followups{``Why do the centroids appear twice in ColBERTv2's design?'' ``Your corpus is 5M docs and latency-tolerant---does the calculus change?'' ``How would you A/B late interaction against your current funnel fairly?''}
+\end{interviewq}
+
+%--- Q5: LLM reranker distillation plan ---
+
+\begin{interviewq}
+\textbf{Q: A listwise LLM reranker beats your production cross-encoder by 3 NDCG points offline---at 200$\times$ the cost. What ships?}
+
+\badgeLseven{L7} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Reject the binary.} Serving a 100B-class model per query at consumer latency is not on the table (seconds per 100 candidates, Table~\ref{sr:tab:reranker_latency}); discarding 3 NDCG points is leaving real relevance on the floor. The staff answer is the teacher--student split: capture the quality offline, serve it distilled.
+
+\textbf{The distillation plan.} (1) Sample queries stratified by traffic \textit{and} segment (head/torso/tail, intent class)---tail overweighted, since that is where the LLM's zero-shot advantage concentrates. (2) Have the LLM rank each query's candidate union (rerank-depth candidates from the current funnel, not just top-10---the student must learn orderings over the distribution it will see). (3) Train the student---the existing cross-encoder, or a 7B listwise student if budget allows---on teacher orderings with pairwise (RankNet-over-teacher-pairs) or listwise KL loss. (4) Evaluate student-vs-teacher agreement \textit{and} student-vs-judgments; expect to keep 60--80\% of the teacher's gain at unchanged serving cost. (5) Keep the LLM in the loop as a \textit{continuous} teacher on fresh traffic samples---distillation is a pipeline, not a project---and as a relevance judge for evaluation (with the judge/ranker independence caveat: auditing a ranker with its own teacher model family inflates agreement; keep a human-anchored calibration set, Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\textbf{Selective live serving, if the residual gap matters:} route the LLM online only where it pays---tail/zero-signal queries, high-value sessions, or an offline-tolerant surface---behind a budget cap. Also audit the offline 3 points before spending anything: listwise LLM evals inherit prompt-position bias and self-preference; confirm the gain on human-judged data, sliced by segment, not on LLM-judged data alone.
+
+\textbf{Ship/no-ship framing:} the decision variable is not NDCG but $\Delta$quality captured per dollar per millisecond across the funnel---and the distillation path dominates both extremes on that frontier.
+
+\redflags
+\begin{itemize}
+    \item ``Cache the LLM's rankings''---cache hit rates on ranking requests are negligible outside head queries, and head queries are where the LLM helps least.
+    \item Shipping the LLM live for all traffic ``because quality wins''---no latency/cost model.
+    \item Not questioning the offline +3 (teacher-biased eval, segment concentration).
+\end{itemize}
+
+\interviewtest{The teacher--student production pattern: do you reach for it unprompted, and do you treat offline LLM-measured gains with appropriate suspicion?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes distillation into the cross-encoder.
+    \item \badgeLsix{L6} Full pipeline: stratified teacher sampling, candidate-distribution matching, listwise/pairwise student loss, agreement + judgment evaluation, continuous refresh.
+    \item \badgeLseven{L7} Adds selective routing economics, the teacher-bias audit of the offline gain, judge/teacher independence, and frames the decision as quality-per-cost across the whole funnel rather than a model bake-off.
+\end{itemize}
+
+\followups{``Your student captures only 30\% of the teacher's gain---hypotheses?'' ``Where does the LLM's advantage concentrate, and why the tail?'' ``How do you keep evaluation honest when the same LLM family is teacher and judge?''}
+\end{interviewq}
+
+%--- Q6: offline NDCG up, online CTR down (required) ---
+
+\begin{interviewq}
+\textbf{Q: Your new reranker improved offline NDCG by 4\%, but online CTR dropped. Walk through the diagnosis.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Frame it as a funnel + measurement problem}---the model is the last suspect, not the first. Offline NDCG and online CTR disagree for a small set of well-known reasons; walk them in cost order.
+
+\textbf{Hypothesis 1: latency regression.} The new reranker is slower; pages arrive later; engagement drops for reasons having nothing to do with ordering---latency is itself a relevance metric ($\sim$100\,ms delays measurably reduce engagement). \textit{Check first, it is the cheapest:} p95 end-to-end latency and timeout/degradation rates in the treatment arm. A heavier model that blows its L2 budget can also silently shrink rerank depth (100 $\to$ 20 candidates), capping quality through the recall ceiling while offline eval---run without the budget---shows a gain.
+
+\textbf{Hypothesis 2: the offline eval was rigged in your favor.} (a) \textit{Judged-only / condensed-list bias:} offline NDCG computed over judged candidates only, while online the reranker meets the full candidate distribution, including strata the judgment pool never covered. (b) \textit{Click-derived labels are circular:} labels inherited the old ranker's position bias, so ``NDCG up'' partly measures agreement-with-the-old-system + noise; a genuinely different ordering can score worse with users while scoring better on biased labels (unbiased-LTR discipline, Chapter~\ref{sr:chap:learning_to_rank}). (c) \textit{Segment mismatch:} gains concentrated on torso/tail slices that are a small traffic share, losses on head queries that dominate impressions. Re-slice both offline and online metrics by segment before concluding anything.
+
+\textbf{Hypothesis 3: the page, not the ranking.} CTR responds to \textit{presentation}: the new order surfaces documents with worse titles/snippets/images; or an answer/snippet module now satisfies the user without a click (``good abandonment'')---CTR down can mean success. Check downstream success metrics (conversion, satisfied-session rate, reformulation), not clicks alone.
+
+\textbf{Hypothesis 4: L3 interference and score-consumer breakage.} Business rules reorder the new top-20 differently (the L2 gain never reaches the page---check L3 override rates); or downstream consumers of the reranker \textit{score}---thresholds, blending, vertical merge---were calibrated to the old model's score distribution and are now misfiring (Section~\ref{sr:subsec:reranker_calibration}).
+
+\textbf{Hypothesis 5: recall ceiling misattribution.} The reranker reorders a candidate set that lacks good documents for the affected slices; offline eval used a richer candidate pool than production L0 provides. Check per-stage recall on live traffic samples.
+
+\textbf{Order of operations:} latency/timeout dashboards $\to$ segment-sliced online deltas $\to$ L3 override and score-consumer audit $\to$ candidate-set recall on live traffic $\to$ label-bias audit of the offline eval. Most real incidents resolve at steps one, two, or four.
+
+\redflags
+\begin{itemize}
+    \item Concluding ``offline metrics are useless'' or ``retrain on fresh clicks'' without a diagnosis.
+    \item Never mentioning latency---the most common real cause and the cheapest to check.
+    \item Treating CTR as ground truth (no good-abandonment or presentation reasoning), or NDCG-on-click-labels as ground truth (no circularity reasoning).
+\end{itemize}
+
+\interviewtest{Funnel thinking under a metric conflict: per-stage recall, label bias, latency, and L3 interference---not model-centric flailing. This is a standard Staff screen because it requires having operated a ranking system, not just trained one.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names offline--online gap causes: label bias, latency, segment mismatch.
+    \item \badgeLsix{L6} Runs the structured differential with discriminating checks per hypothesis, in cost order; separates ordering effects from presentation effects.
+    \item \badgeLseven{L7} Adds the score-consumer/calibration audit and judged-pool coverage analysis; proposes the lasting fix---per-stage recall monitoring, an unbiased eval slice from randomized traffic, and interleaving as the cheap online triage before A/B (Chapter~\ref{sr:chap:evaluation_experimentation}).
+\end{itemize}
+
+\followups{``Which single dashboard do you check first and why?'' ``How would you build an offline eval that would have predicted this?'' ``CTR dropped but conversions rose---what does that tell you?''}
+\end{interviewq}
+
+%--- Q7: fusion (required classic) ---
+
+\begin{interviewq}
+\textbf{Q: You run BM25 and dense retrieval in parallel. How do you combine them---and why does $0.5 \cdot \text{BM25} + 0.5 \cdot \text{cosine}$ fail?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Why the weighted sum fails.} The two scores live on incompatible, \textit{query-dependent} scales: BM25 is unbounded and its magnitude swings with query length and term rarity---a rare-term query inflates BM25 for every candidate, drowning the dense signal at any fixed $\alpha$; cosine is bounded but concentrates in a narrow band. Per-query min-max or z-score normalization does not rescue it: you are normalizing by order statistics of a small candidate sample (noisy, outlier-dominated), assuming distribution shapes neither system has, and erasing absolute-confidence information. Any fixed $\alpha$ tuned on one query mix silently breaks on another.
+
+\textbf{The robust first ship: Reciprocal Rank Fusion.} $\text{RRF}(d) = \sum_i 1/(k + \text{rank}_i(d))$, $k \approx 60$. Rank-based, hence invariant to any monotone rescaling of either score---the incompatibility problem vanishes by construction. The $k$ constant damps top-rank dominance: at $k = 60$, ranks 1 and 10 contribute comparably, so cross-source agreement can outrank a single source's top hit. No tuning, no training data, degrades gracefully.
+
+\textbf{The end state: fusion as ranking features.} RRF discards score magnitude and cannot learn that dense should dominate conceptual queries while lexical dominates identifier queries. So: union the candidates and give the L1/L2 ranker \textit{both} raw scores plus ranks and query features---fusion weights become learned and query-conditional, dissolved into learning-to-rank (Chapter~\ref{sr:chap:learning_to_rank}). The upgrade path RRF $\to$ learned fusion is itself the expected answer shape.
+
+\redflags
+\begin{itemize}
+    \item Proposing the weighted sum without flagging the scale problem---the canonical fumble; interviewers use it as a competence gate.
+    \item ``Just normalize the scores''---per-query normalization is the trap's second layer, not the fix.
+    \item Knowing the RRF formula but not the role of $k$ or why rank-based fusion is robust.
+\end{itemize}
+
+\interviewtest{The score-distribution failure analysis, not the formula. Reciting RRF without being able to say \textit{why} raw fusion fails scores as memorization.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the scale mismatch, produces RRF with $k$'s role.
+    \item \badgeLsix{L6} Full failure analysis (query-dependent distributions, order-statistic normalization noise, erased confidence), plus the fusion-as-LTR-features end state.
+    \item \badgeLseven{L7} Adds the operational judgment: when hybrid is worth its doubled surface at all, per-segment fusion evaluation (identifier vs.\ conceptual slices), and monitoring fusion weights for drift when either retriever is retrained.
+\end{itemize}
+
+\followups{``What does $k = 0$ do to RRF?'' ``When would learned fusion beat RRF materially?'' ``One retriever is down---what does your fusion degrade to?''}
+\end{interviewq}
+
+%--- Q8: THE canonical design question ---
+
+\begin{interviewq}
+\textbf{Q: Design semantic search over 100 million documents, end to end.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Step 0: pin the requirements, out loud.} Corpus: 100M documents, avg $\sim$500 tokens (assume; state it). Traffic: say 1{,}000 QPS peak, p95 $\leq$ 300\,ms. Freshness: $\sim$1\% of the corpus changes daily. Quality bar: recall-sensitive (users must find the document if it exists). These numbers drive every choice below; a design without them is unanchored.
+
+\textbf{Step 1: corpus representation and embedder, with sizing.} Chunk at $\sim$256 tokens with overlap $\Rightarrow$ $\sim$2 chunks/doc $\Rightarrow$ \textbf{200M vectors}. Embedder: shortlist from the MTEB retrieval slice across size tiers, decide on a judged \textit{domain} eval run through the real pipeline ([NLP~3] workflow); default to a 100--400M-class encoder at 768 dims for the hot path---query-side latency (2--5\,ms) binds, not corpus-side cost. Embedding cost: 200M chunks $\times$ 256 tokens $\approx$ 51B tokens $\Rightarrow$ $\sim$10--20 H100-hours self-hosted with a 110M encoder (roughly \$50--100), or low thousands of dollars via API---cheap either way; \textit{re}-embedding cost matters more (Step 5). Plan contrastive fine-tuning with denoised hard negatives once click pairs accumulate: typically worth 5--15 recall points, more than a model-tier upgrade.
+
+\textbf{Step 2: index, sized honestly.} 200M $\times$ 768\,d: 600\,GB fp32, 150\,GB int8; MRL truncation to 256\,d cuts to $\sim$50\,GB if the domain eval holds. Index family (mechanics in Chapter~\ref{sr:chap:vector_retrieval_theory}): HNSW for RAM-resident quality (add $\sim$25--100\,GB of graph; shard across nodes at this scale) vs.\ IVF-PQ / DiskANN-style for memory-bound serving (PQ codes at 64\,B/vector $\approx$ 13\,GB + SSD-resident full vectors for re-scoring). Commit to measuring \textit{index recall} (ANN vs.\ brute force) separately from retrieval quality---two different failure modes that get conflated.
+
+\textbf{Step 3: hybrid retrieval + fusion.} Run BM25 (inverted index) and dense ANN in parallel at L0; union top-$\sim$500 each; fuse with RRF for launch, migrating fusion into the ranker as features later. The inverted index stays authoritative for filters and exact identifiers---dense retrieval fails on SKUs/codes by construction, and selective metadata filters interact badly with ANN graphs (pre/post-filtering, Chapter~\ref{sr:chap:vector_retrieval_theory}).
+
+\textbf{Step 4: rerank within budget.} 300\,ms p95 decomposes as Table~\ref{sr:tab:funnel_budget}: QU 5--10\,ms $\to$ L0 parallel 40--60\,ms $\to$ 1000 candidates $\to$ L1 light ranker 20--30\,ms $\to$ 100 $\to$ L2 cross-encoder 50--80\,ms $\to$ 20 $\to$ L3 policy/diversity. The L2 slot prices a BERT-base-class cross-encoder at depth $\sim$100 (Table~\ref{sr:tab:reranker_latency}); distill it from an LLM listwise teacher offline and refresh continuously. Rerank depth is a recall knob---do not cut it to 20 to save milliseconds without measuring the recall cost.
+
+\textbf{Step 5: freshness and reindexing.} Dual write path: streaming upserts for changed documents (embed on ingest, upsert to the vector index and inverted index; 1M docs/day $\approx$ 12 docs/s---trivial); periodic compaction/rebuild for index health. Embedder migrations are the expensive event: re-embed (Step 1 cost $\times$ every migration), rebuild, and cut over via a shadow index with dual writes, offline comparison, then interleaved online test---never mix embedding versions in one index, stamp every vector with \texttt{embedding\_version}, and alert on query/index version skew (Section~\ref{sr:sec:embedder_selection}; operations detail in Chapter~\ref{sr:chap:production_retrieval_rag}).
+
+\textbf{Step 6: evaluation plan.} Offline: a judged set of a few thousand stratified queries (LLM judge with human-audited calibration), recall@1000 for L0, recall@100 at the L1 handoff, NDCG@10 end-to-end, sliced head/torso/tail and identifier-vs-conceptual; plus index recall and per-stage latency. Online: interleaving for cheap ranking triage, then A/B on satisfied-session/conversion with latency and zero-result guardrails (Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\textbf{Step 7: failure modes named up front.} Identifier queries (hybrid + exact-match features save you); selective filters collapsing ANN recall; embedding-version skew during rollout; index staleness vs.\ the freshness SLA; false-negative-poisoned fine-tuning; the recall-ceiling misdiagnosis (tuning the reranker when L0 lost the document); and popularity bias if click-trained components run without correction or exploration.
+
+\redflags
+\begin{itemize}
+    \item ``Embed everything, put it in a vector DB, add an LLM''---no sizing, no hybrid, no eval, no freshness story.
+    \item No numbers: candidate counts, latency split, index memory, embedding cost are all computable from the requirements---an unquantified design at this level is a non-answer.
+    \item Dense-only retrieval with no account of identifiers/filters, or no per-stage recall measurement.
+\end{itemize}
+
+\interviewtest{The canonical retrieval design loop: can you turn requirements into sized stages with budgets, choose components by trade-off rather than fashion, and instrument the funnel so regressions are attributable?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Two-stage retrieve-and-rerank with an ANN index and a sensible embedder.
+    \item \badgeLsix{L6} Adds hybrid + fusion with the failure-mode rationale, a worked latency/candidate budget, index sizing with quantization/MRL options, freshness/upsert design, and a sliced offline + online eval plan.
+    \item \badgeLseven{L7} Adds lifecycle economics (migration cost and shadow-index cutover as the dominant operational risk), the distillation pipeline as a continuous process, per-stage recall instrumentation as the debugging backbone, and explicit degradation modes (kill the reranker under load, serve lexical-only if the ANN tier fails).
+\end{itemize}
+
+\followups{``Now add a strict metadata filter (tenant id)---what breaks?'' ``Your p95 budget drops to 120\,ms---what goes?'' ``How does the design change at 10B documents?'' ``Where does RAG attach to this, and what changes in the eval?''}
+\end{interviewq}
+
+%--- Q9: identifiers debugging ---
+
+\begin{interviewq}
+\textbf{Q: Dense retrieval tanks on queries containing part numbers. Fix it without abandoning dense retrieval.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Why this happens---by construction, not by bug.} Embeddings are trained to map similar strings to nearby vectors; ``PX-4130'' and ``PX-4230'' are one subword apart and land nearly on top of each other, while relevance is exact-match: one is the answer, the other is a wrong product. Sub-token identifiers also fragment unpredictably in the tokenizer. No amount of generic training fixes this; the representation is doing what it was built to do.
+
+\textbf{Fix layer 1: hybrid guarantees.} Keep a lexical source in the union so exact matches \textit{cannot} be lost by the dense side---the single most robust fix, and the standard reason production stacks are hybrid (Section~\ref{sr:sec:hybrid_fusion}). Verify the fusion doesn't bury the lexical hit: an RRF union with a deep dense list can still push the exact match below the fold; check identifier-slice metrics specifically.
+
+\textbf{Fix layer 2: make the reranker exact-match-aware.} Add explicit features/signal the cross-encoder or L1 ranker can use: term-coverage and exact-match flags, and ensure identifier tokens survive analysis (Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}'s analyzer discipline). Cross-encoders naturally handle exact matches better than bi-encoders---if the reranker sees the candidate, it will usually rank it right; the risk is L0.
+
+\textbf{Fix layer 3: query understanding routing.} Detect identifier-like tokens (regex/classifier over character shape) in QU and route: boost the lexical source, apply exact-match filters, or skip dense entirely for pure-identifier queries (Chapter~\ref{sr:chap:search_systems_query_understanding}).
+
+\textbf{Fix layer 4: teach the encoder, within limits.} Hard-negative fine-tuning with \textit{identifier-swapped negatives}---pairs differing only in the model number---forces the encoder to separate them. Helps at the margin; do not expect it to replace layers 1--3: you are fighting the representation's inductive bias.
+
+\textbf{And measure the slice:} create an identifier-query eval slice (mined by pattern from logs) and track it separately forever---aggregate recall will happily hide this failure mode.
+
+\redflags
+\begin{itemize}
+    \item ``Fine-tune the embedder'' as the primary fix---the architectural fixes (hybrid, routing, features) are cheaper, robust, and are what production systems actually do.
+    \item Dropping dense retrieval entirely---throws away the tail/paraphrase wins to fix a slice lexical already handles.
+    \item No slice-level measurement plan.
+\end{itemize}
+
+\interviewtest{Do you understand \textit{why} embeddings blur near-identical strings (representation, not bug), and do you fix systems with layered architecture rather than heroic model surgery?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Hybrid union so lexical catches identifiers.
+    \item \badgeLsix{L6} Layered fix: fusion verification, exact-match reranker features, QU routing, identifier-swapped hard negatives, and a dedicated eval slice.
+    \item \badgeLseven{L7} Generalizes the lesson: inventories the other exact-precision query classes (codes, names, negation, units), designs the QU-to-retrieval routing contract for all of them, and notes the analyzer/tokenizer coupling that silently breaks identifier matching on the lexical side too.
+\end{itemize}
+
+\followups{``The part number appears in the query with a typo---now what?'' ``How do identifier-swapped negatives interact with false-negative denoising?'' ``Which of these fixes helps negation queries, and which don't?''}
+\end{interviewq}
+
+%--- Q10: calibration gate ---
+
+\begin{interviewq}
+\textbf{Q: Your reranker's score gates behavior downstream---``no results'' messaging and RAG context filtering. What breaks, and how do you make the scores trustworthy?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{What breaks.} Rerankers are trained with pairwise/listwise objectives that preserve ordering and destroy scale: the logit is not a probability, its distribution shifts across query slices (length, intent, language) and across model versions, and \textit{within-query} ordering being correct says nothing about \textit{cross-query} comparability---exactly what a fixed threshold $\tau$ assumes. Symptoms: the ``no good results'' gate fires constantly on one vertical and never on another; a reranker retrain (which changed only ordering quality) silently moves the score distribution and every downstream threshold misfires at once; RAG context filters pass junk on easy queries and starve hard ones.
+
+\textbf{The fix stack.} (1) \textbf{Calibrate post-hoc}: fit Platt scaling or isotonic regression from logits to $P(\text{relevant})$ on a judged set; threshold in probability space. (2) \textbf{Calibrate per slice} if distributions differ structurally (per language/vertical), or include slice features in the calibrator. (3) \textbf{Institutionalize}: re-fit the calibrator on every reranker retrain as a release step, and monitor score distributions per slice with drift alerts---treat the calibrated score as a versioned API contract with downstream consumers. (4) If calibration must be first-class (bidding-style decisions), train a pointwise head alongside the ranking objective---accepting the known tension that pointwise-calibrated training and listwise ordering quality pull against each other (Chapter~\ref{sr:chap:learning_to_rank}).
+
+\textbf{For the RAG case specifically}, an absolute relevance gate is the right shape (the generator's faithfulness is bounded by context precision), but calibrate it against a judged answerable/unanswerable set, and prefer ``top-$k$ with a calibrated floor'' to a raw threshold---candidate-set sizes vary too much for a bare $\tau$.
+
+\redflags
+\begin{itemize}
+    \item ``Just pick a threshold on the validation set''---ignores cross-slice and cross-version drift, the actual failure modes.
+    \item Not knowing that ranking losses destroy calibration, or proposing to fix it by switching entirely to pointwise training without acknowledging the ordering-quality cost.
+    \item Treating calibration as one-time work rather than a per-release invariant.
+\end{itemize}
+
+\interviewtest{The scores-as-contract mindset: do you know what a ranking score does and does not mean, and do you engineer the boundary where other systems consume it?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows reranker scores are uncalibrated and names Platt/isotonic.
+    \item \badgeLsix{L6} Full failure catalog (slice drift, version drift, cross-query incomparability) with the per-release calibration discipline.
+    \item \badgeLseven{L7} Designs the contract: versioned calibrated-score API, drift monitoring with alerts, per-slice calibrators, and the pointwise-head trade-off articulated with its ads-ranking precedent.
+\end{itemize}
+
+\followups{``Isotonic vs.\ Platt here---which and why?'' ``The judged set is 2{,}000 pairs---enough to calibrate per language?'' ``How does this interact with fusing scores across verticals?''}
+\end{interviewq}

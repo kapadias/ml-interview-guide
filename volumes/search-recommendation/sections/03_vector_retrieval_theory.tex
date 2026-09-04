@@ -2,33 +2,1012 @@
 \label{sr:chap:vector_retrieval_theory}
 
 \begin{tldr}
-Placeholder — this chapter is written in Phase C from the vector-retrieval digest and applied-search track design (see review/search-recsys/ in the DL repo).
+This chapter is the algorithmic core of the volume: answering top-$k$ similarity queries over $10^6$--$10^9$ embedding vectors in milliseconds. It formalizes nearest-neighbor, cosine, and maximum-inner-product search and the reductions between them; explains why high dimensions break exact indexes (distance concentration) and why real embeddings escape the curse (intrinsic dimensionality); then works through the index families---brute force with SIMD/GPUs, trees, locality-sensitive hashing, graphs (HNSW, DiskANN), and clustering (IVF)---plus the compression stack (int8, PQ, OPQ, anisotropic quantization) and Johnson--Lindenstrauss sketching. It closes with the recall--latency--memory triangle: worked sizing at $10^8$ scale and a decision framework for flat vs.\ HNSW vs.\ IVF-PQ vs.\ DiskANN. Everything downstream---neural retrieval (Chapter~\ref{sr:chap:neural_retrieval_reranking}), recsys candidate generation (Chapter~\ref{sr:chap:recommendation_systems}), production RAG (Chapter~\ref{sr:chap:production_retrieval_rag})---stands on this machinery. Encoder architectures and how the embeddings are \emph{trained} live in [DL 7]; this chapter assumes the vectors exist and asks how to search them.
 \end{tldr}
 
+%==============================================================================
 \section{Problem Statements: NN, Cosine, and MIPS}
-% TODO Phase C
+\label{sr:sec:vr_problem}
+%==============================================================================
 
+\subsection{Top-$k$ Retrieval, Formally}
+
+Every dense retrieval system---semantic search, two-tower recommendation, RAG, ad matching---reduces at serving time to the same primitive: given a query vector, return the $k$ corpus vectors with the best scores. Stated as a data-structure problem:
+
+\begin{mathresult}{Top-$k$ Vector Retrieval}
+Given a corpus $\mathcal{X} \subset \R^d$ with $|\mathcal{X}| = m$ and a distance (or negated similarity) function $\delta$, preprocess $\mathcal{X}$ in time and space polynomial in $m$ and $d$ into an index such that, for any query $\vq \in \R^d$,
+\begin{equation}
+\operatorname*{arg\,min}^{(k)}_{\vu \in \mathcal{X}} \; \delta(\vq, \vu)
+\end{equation}
+is answered in time $o(md)$---\emph{sublinear} in the cost of exhaustive search. The three standard flavors differ only in $\delta$:
+\begin{itemize}
+    \item \textbf{$k$-NN} (nearest neighbors): $\delta(\vq,\vu) = \norm{\vq - \vu}_2$;
+    \item \textbf{$k$-MCS} (maximum cosine similarity): $\delta(\vq,\vu) = -\inner{\vq}{\vu} / (\norm{\vq}\norm{\vu})$;
+    \item \textbf{$k$-MIPS} (maximum inner-product search): $\delta(\vq,\vu) = -\inner{\vq}{\vu}$.
+\end{itemize}
+Exhaustive (``flat'') search costs $O(md)$ score computations plus $O(m \log k)$ for a bounded heap. Everything in this chapter is about beating $O(md)$ without giving up too much accuracy.
+\end{mathresult}
+
+\textbf{Exact vs.\ approximate.} The exact problem asks for the true top-$k$. The \emph{$c$-approximate} relaxation (equivalently $(1+\epsilon)$-approximate, $c = 1+\epsilon$) accepts any $\vu$ with $\delta(\vq,\vu) \le c \cdot \delta(\vq,\vu^*)$, where $\vu^*$ is the true nearest neighbor. Approximation is what makes sublinear indexes possible at all in high dimension---but note the mismatch with practice: theory states guarantees in the $(1+\epsilon)$ form, while production systems measure
+\begin{equation}
+\text{recall@}k = \frac{|S \cap \tilde{S}|}{k},
+\end{equation}
+the overlap between the true top-$k$ set $S$ and the returned set $\tilde{S}$, computed against brute-force ground truth on a held-out query sample. When an interviewer says ``95\% recall,'' this set-overlap definition is what they mean.
+
+\textbf{Why top-$k$ retrieval is the serving core.} Both search and recommendation funnels begin with candidate generation: a two-tower model [DL 7] emits a query/user embedding, and the first stage must pull a few hundred candidates from millions to billions of precomputed item embeddings in a $\sim$5--20\,ms budget. Every later stage---cross-encoder reranking (Chapter~\ref{sr:chap:neural_retrieval_reranking}), learning-to-rank (Chapter~\ref{sr:chap:learning_to_rank}), business logic---can only reorder what this stage returns. ANN recall@$k$ is therefore a \emph{ceiling} on end-to-end quality: a relevant item the index misses is unrecoverable. This is why retrieval infrastructure gets its own chapter, and why interviewers probe it so hard.
+
+\begin{table}[H]
+\centering
+\caption{Typical ANN operating points in production funnels (orders of magnitude, 2026)}
+\label{sr:tab:operating_points}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Workload} & \textbf{Corpus} & \textbf{Budget for ANN stage} & \textbf{Typical recall target} \\
+\midrule
+Web-scale search candidate gen & $10^9$--$10^{10}$ docs & 5--20\,ms, $10^4$--$10^5$ QPS & recall@1000 $\ge$ 0.95 \\
+Recsys retrieval (two-tower) & $10^7$--$10^9$ items & 5--20\,ms, very high QPS & recall@500 $\ge$ 0.9 \\
+RAG over enterprise corpus & $10^5$--$10^8$ chunks & 20--100\,ms, low QPS & recall@50 $\ge$ 0.95 \\
+Dedup / abuse matching & $10^8$--$10^{10}$ & offline/batch & near-exact \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Inner Product, Cosine, and L2: One Family, Three Problems}
+
+The three score functions are algebraically entangled through one identity:
+\begin{equation}
+\norm{\vq - \vu}_2^2 \;=\; \norm{\vq}^2 - 2\inner{\vq}{\vu} + \norm{\vu}^2.
+\label{sr:eq:l2_expansion}
+\end{equation}
+Two consequences follow immediately.
+
+\textbf{On the unit sphere, all three coincide.} If every corpus vector is L2-normalized ($\norm{\vu} = 1$) then $\norm{\vq-\vu}^2 = \norm{\vq}^2 + 1 - 2\inner{\vq}{\vu}$: minimizing L2 distance, maximizing inner product, and maximizing cosine all produce the \emph{same ranking}. The choice becomes purely computational (dot product is cheapest). This is the single most-tested fact in this territory.
+
+\textbf{Off the sphere, MIPS is a genuinely different---and harder---problem.} The inner product is not a metric: it violates non-negativity and the triangle inequality, and it even lacks the ``coincidence'' property---a point need not be its own best match. If $\vv' = \alpha\vv$ with $\alpha > 1$, then $\inner{\vv}{\vv'} > \inner{\vv}{\vv}$: the scaled-up copy beats the query itself. Some corpus points can \emph{never} be a MIPS answer for any query (their inner-product Voronoi cone is empty), which no metric-space intuition predicts. Norms matter because they carry signal: dot-product-trained two-tower models routinely encode popularity or quality in the item-embedding norm, so the ``weird'' geometry is a feature, not a bug.
+
+\begin{warningbox}
+\textbf{Never silently L2-normalize dot-product-trained embeddings.} Normalizing the corpus converts MIPS into cosine search---and \emph{changes the ranking} whenever norms vary. In recommendation models, that erases the learned popularity/quality prior and measurably degrades results. If the model was trained with dot-product scores, the index must answer MIPS: either use an inner-product-native index, or apply the rank-preserving augmentation below. The metric baked into the index must match the metric the encoder was trained with---a top-three root cause in ``my retrieval quality dropped'' postmortems.
+\end{warningbox}
+
+\subsection{The Reduction Zoo}
+
+The three problems reduce to one another at the cost of at most one extra dimension. These formulas are worth being able to produce on a whiteboard.
+
+\begin{mathresult}{NN $\leftrightarrow$ MIPS $\leftrightarrow$ Cosine Reductions}
+\textbf{Cosine $\to$ MIPS.} L2-normalize the corpus only:
+$\argmax_{\vu} \frac{\inner{\vq}{\vu}}{\norm{\vq}\norm{\vu}} = \argmax_{\vu} \inner{\vq}{\,\vu/\norm{\vu}}$.
+The query norm is a constant per query and never affects the ranking.
+
+\textbf{NN $\to$ MIPS.} Expand \eqref{sr:eq:l2_expansion}, drop the constant $\norm{\vq}^2$, and fold $\norm{\vu}^2$ into one appended coordinate:
+\begin{equation}
+\vq' = [\vq;\; -\tfrac{1}{2}] \in \R^{d+1}, \qquad
+\vu' = [\vu;\; \norm{\vu}^2] \in \R^{d+1}
+\;\;\Rightarrow\;\;
+\argmin_{\vu}\norm{\vq-\vu}_2 = \argmax_{\vu'} \inner{\vq'}{\vu'}.
+\end{equation}
+
+\textbf{MIPS $\to$ Cosine/NN} (the direction you need to reuse a cosine or L2 index for a dot-product model). Rescale the corpus so $\max_{\vu}\norm{\vu} \le 1$, then augment asymmetrically:
+\begin{equation}
+\varphi(\vu) = \big[\vu;\; \sqrt{1 - \norm{\vu}^2}\big], \qquad
+\psi(\vq) = [\vq;\; 0].
+\end{equation}
+Every $\varphi(\vu)$ has unit norm and $\inner{\psi(\vq)}{\varphi(\vu)} = \inner{\vq}{\vu}$, so cosine ranking against $\psi(\vq)$ reproduces the MIPS ranking exactly; likewise $\norm{\psi(\vq)-\varphi(\vu)}^2 = \norm{\vq}^2 + 1 - 2\inner{\vq}{\vu}$, so L2-NN on the augmented space also solves MIPS (Bachrach et al., 2014; Neyshabur and Srebro, 2015, showed this simple asymmetric transform suffices---no exotic ``asymmetric LSH'' machinery needed).
+\end{mathresult}
+
+\textbf{The staff-level caveat.} The MIPS$\to$NN transform is \emph{query-to-data} only: it preserves the ranking of corpus points relative to a \emph{query}, but $\inner{\varphi(\vu)}{\varphi(\vv)}$ between two \emph{corpus} points is not rank-equivalent to $\inner{\vu}{\vv}$. Index structures that compare corpus points to each other during construction---proximity graphs above all (Section~\ref{sr:sec:vr_graphs})---therefore build a distorted graph on the transformed points. This is why inner-product-native graph construction is its own research problem and why libraries expose an explicit inner-product mode rather than just transforming under the hood.
+
+%==============================================================================
 \section{Why High Dimensions Are Hard}
-% TODO Phase C
+\label{sr:sec:vr_highdim}
+%==============================================================================
 
+\subsection{Distance Concentration}
+
+The curse of dimensionality for retrieval has a precise form: as dimension grows, distances from a query to \emph{all} points concentrate around the same value, and ``nearest'' stops being meaningful.
+
+\begin{mathresult}{Instability of Nearest Neighbors (Beyer et al., 1999)}
+Let the query--point distances $\delta(\vq, X)$ be generated by any process such that
+\begin{equation}
+\lim_{d\to\infty} \frac{\Var[\delta(\vq,X)]}{\E[\delta(\vq,X)]^2} = 0 .
+\end{equation}
+Then for every $\epsilon > 0$, the probability that \emph{all} $m$ corpus points lie within $(1+\epsilon)$ of the nearest-neighbor distance tends to 1: $\delta_{\max}/\delta_{\min} \to 1$, and every point becomes an acceptable $(1+\epsilon)$-approximate nearest neighbor.
+\end{mathresult}
+
+\textbf{Intuition, not proof.} For i.i.d.\ coordinates, an $L_p^p$ distance (or an inner product) is a sum of $d$ independent per-coordinate contributions: its mean grows like $d$ while its standard deviation grows like $\sqrt{d}$, so the \emph{relative} spread $\sqrt{d}/d \to 0$. All distances land in a thin shell; the gap between the closest and the median point vanishes. To feel the scale: for uniform points in $[0,1]^d$, per-coordinate squared differences have mean $1/6$ and variance $7/180$, so squared distances concentrate as $d/6 \pm O(\sqrt{d})$---at $d = 2$ the spread is comparable to the mean, at $d = 768$ it is a $\sim$4\% ripple on top of it. Two corollaries sharpen the picture: (i) for $m$ uniform points in a $d$-dimensional hypercube, the NN distance concentrates at $\Theta(\sqrt{d}/m^{1/d})$---and since $m^{1/d} \approx 1$ for any realistic $m$ once $d \gtrsim 100$ ($10^{9\,/\,768} \approx 1.03$), your nearest neighbor sits nearly as far away as a random point; (ii) the identity of the true NN becomes unstable---a tiny perturbation of $\vq$ reshuffles it---so even \emph{exact} search answers a fragile question on such data.
+
+\begin{warningbox}
+\textbf{Never benchmark ANN on i.i.d.\ synthetic vectors.} On uniform or Gaussian random data in high $d$, the NN problem itself is ill-posed by the theorem above: recall--latency curves measured there are meaningless and wildly pessimistic, and papers or vendor demos that win on random vectors tell you nothing. Benchmark on your real embeddings (or a public corpus with similar structure); recall at fixed parameters is a \emph{dataset} property, not an index property.
+\end{warningbox}
+
+\subsection{What Concentration Does to Exact Indexes}
+
+Every classical exact index---$k$-d trees, R-trees, metric trees---works by partitioning space and \emph{certifying} that pruned regions cannot contain the answer: prune a cell only if the ball $B(\vq, r_{\text{best}})$ around the query does not intersect it. When distances concentrate, $r_{\text{best}}$ is nearly as large as the diameter of the data, the query ball crosses essentially every partition boundary, and certification visits $2^{\Omega(d)}$ cells. Beyond $d \approx 20$--$30$, every exact index degenerates into an exhaustive scan with extra bookkeeping (Section~\ref{sr:sec:vr_trees} quantifies this for trees). That is the honest justification for the ``A'' in ANN: at embedding dimensions, \emph{approximation is not an optimization but the price of sublinearity}.
+
+\subsection{The Intrinsic-Dimensionality Escape Hatch}
+
+Why, then, does ANN work superbly on 768-dimensional embeddings? Because real embeddings are not i.i.d.\ in $\R^{768}$: they concentrate near low-dimensional, clustered structures, and what governs difficulty is \emph{intrinsic}, not ambient, dimension. The standard formalization is the \textbf{doubling dimension} $d_\circ$: the smallest number such that every ball of radius $2r$, intersected with the data, can be covered by $2^{d_\circ}$ balls of radius $r$. A $k$-dimensional flat has $d_\circ = O(k)$ regardless of the ambient $d$; subsets inherit $d_\circ$; a union of $n$ well-behaved pieces adds only $\log n$. Every honest ANN guarantee---randomized trees, cover trees, DiskANN's graph bounds---is stated in terms of $d_\circ$, with factors like $2^{d_\circ}$ or $(4\alpha)^{d_\circ}$ that are only meaningful because $d_\circ \ll d$ on real data.
+
+\begin{keyinsight}
+The curse of dimensionality is real for worst-case data and irrelevant for typical embedding corpora---and \emph{intrinsic dimensionality} is the vocabulary that reconciles the two. This also explains an everyday production mystery: the same index with the same parameters gets 0.98 recall on one corpus and 0.85 on another of identical size and dimension. The second corpus has higher intrinsic dimension (or the queries land in unstructured regions), so the recall--latency curve---a dataset property---is worse. Retune per corpus; never copy parameters across datasets and assume recall transfers.
+\end{keyinsight}
+
+%==============================================================================
+\section{The Brute-Force Baseline: When You Do Not Need an Index}
+\label{sr:sec:vr_flat}
+%==============================================================================
+
+Before any index discussion, a staff-level answer establishes the baseline: exact search is a dense matrix--vector (batched: matrix--matrix) product, the single most hardware-friendly workload that exists. Modern SIMD and GPU kernels make ``flat'' search viable far beyond naive intuition, with recall exactly 1.0, zero build time, and trivial inserts and deletes.
+
+\textbf{Worked estimate: 1M $\times$ 768 flat search.} The corpus is $10^6 \times 768 \times 4\,\mathrm{B} \approx 3.1$\,GB in fp32 (1.5\,GB fp16). Exact search reads every byte once per query batch, so the machine's memory bandwidth is the budget [DL 26]:
+\begin{itemize}
+    \item \textbf{CPU.} A server sustaining $\sim$100--300\,GB/s of effective bandwidth scans 3.1\,GB in $\sim$10--30\,ms using all cores (AVX-512 dot products are not the bottleneck; DRAM is). A single query therefore lands in the 10--30\,ms range, and the \emph{throughput ceiling} is bandwidth divided by corpus size: $\sim$300\,GB/s $/$ 3\,GB $\approx$ 100 full scans/s---shared across all concurrent queries unless you batch them into one scan.
+    \item \textbf{GPU.} At $\sim$2\,TB/s of HBM bandwidth, one pass over 3\,GB takes $\sim$1.5\,ms. Batch $B$ queries and the scan becomes a $(B \times 768) \times (768 \times 10^6)$ GEMM whose cost is amortized across the batch: a single modern GPU sustains on the order of tens of thousands of \emph{exact} queries per second at 1M scale. At this size, brute force on GPU is not a fallback; it is often the best engineering answer.
+\end{itemize}
+
+\textbf{The decision boundary.} Flat search is the right default when \emph{any} of these hold: the corpus is $\lesssim$ 1--5M vectors (CPU) or $\lesssim$ 50--100M with a GPU and batched traffic; the corpus churns so fast that index rebuild cost dominates; recall must be exactly 1.0 (legal/dedup audits); or you are prototyping and want to eliminate index tuning as a variable. The index earns its complexity only when corpus size $\times$ QPS pushes past the bandwidth ceiling within the latency budget. A useful interview one-liner: \emph{``At 1M vectors I would not build an ANN index at all---flat GPU search is exact, simpler, and fast enough; the interesting engineering starts at $10^7$--$10^8$.''}
+
+%==============================================================================
 \section{Trees and Branch-and-Bound}
-% TODO Phase C
+\label{sr:sec:vr_trees}
+%==============================================================================
 
+\textbf{$k$-d trees} recursively split on a coordinate at the median: depth $O(\log m)$, build $O(m \log m)$, space $O(m)$. Search routes the query to its leaf, then \emph{backtracks}: a sibling subtree may be pruned only if the ball $B(\vq, r_{\text{best}})$ does not cross the splitting hyperplane. In low dimension this certification is cheap and expected query time is $O(\log m)$ (Friedman et al., 1977). In high dimension it collapses: the NN radius is comparable to $\sqrt{d}$ while cell sides shrink only by halving one coordinate at a time, so the query ball crosses the splitting planes in $\Omega(d)$ dimensions and certified search must visit $2^{\Omega(d)}$ leaves---empirically, for $d \gtrsim 30$ a $k$-d tree spends $\sim$95\% of its time backtracking and does exhaustive search with extra steps. \textbf{Ball trees} replace axis-aligned boxes with metric balls and \textbf{cover trees} add nesting/covering/separation invariants that yield guarantees in doubling metrics ($2^{d_\circ}$-type constants, $O(m)$ space); they extend the usable range somewhat but die of the same disease in truly high ambient---and intrinsic---dimension.
+
+\textbf{The rescue that survives:} drop certification entirely (\emph{defeatist} search: descend to one leaf, return the best there, accept mistakes near boundaries), randomize the splits (random directions and split fractiles---RP trees), and grow a \emph{forest}, unioning candidates across trees. Failure probability decays with the number of trees and is governed by the \emph{intrinsic} dimension of the data, not the ambient one. This is exactly Spotify's \textbf{Annoy}: an RP-tree forest with defeatist search---a design that remained competitive for years and survives today in systems that value cheap, memory-mapped, immutable indexes. The classic interview probe ``why not a $k$-d tree for 768-d embeddings?'' wants the certification-cost argument plus this pivot: randomization + forests + no certification is how tree methods buy back practicality.
+
+%==============================================================================
 \section{Locality-Sensitive Hashing}
-% TODO Phase C
+\label{sr:sec:vr_lsh}
+%==============================================================================
 
+LSH is the canonical ``do you know the theory'' topic: the first family of methods with worst-case sublinear query guarantees in high dimension, and the vocabulary ($\rho$, amplification, hash families) still frames how people reason about randomized indexing.
+
+\subsection{Sensitive Families and Amplification}
+
+\begin{mathresult}{LSH Guarantees}
+A hash family $\mathcal{H}$ is \emph{$(r, (1{+}\epsilon)r, p_1, p_2)$-sensitive} for $\delta$ if for $h \sim \mathcal{H}$:
+\begin{equation}
+\delta(\vu,\vv) \le r \Rightarrow \prob{h(\vu) = h(\vv)} \ge p_1,
+\qquad
+\delta(\vu,\vv) > (1{+}\epsilon) r \Rightarrow \prob{h(\vu) = h(\vv)} \le p_2,
+\end{equation}
+with $p_1 > p_2$. Amplify the gap by \textbf{AND}-ing $\ell$ hashes into one bucket key $g = (h_1, \ldots, h_\ell)$ (drives down false positives) and \textbf{OR}-ing over $L$ independent tables (recovers recall). With the quality exponent
+\begin{equation}
+\rho = \frac{\ln p_1}{\ln p_2} \in (0,1),
+\end{equation}
+choosing $\ell = \log_{1/p_2} m$ and $L = m^{\rho}$ solves the $(1{+}\epsilon)$-approximate near-neighbor decision problem with constant success probability, scanning $O(L)$ candidates: \textbf{query time $O(d \, m^{\rho})$, space $O(m^{1+\rho})$}---sublinear query, \emph{superlinear} space. Better families have smaller $\rho$; $\rho$ is the single quality dial.
+\end{mathresult}
+
+\subsection{The Families to Know Cold}
+
+\begin{table}[H]
+\centering
+\caption{Standard LSH families}
+\label{sr:tab:lsh_families}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Distance} & \textbf{Family} & \textbf{Hash and collision probability} \\
+\midrule
+Hamming & Bit sampling & $h(\vu) = u_i$ for random $i$; collision prob.\ $1 - \delta_H(\vu,\vv)/d$ \\
+Angular & Hyperplane (SimHash) & $h(\vu) = \operatorname{sign}\inner{\bm{r}}{\vu}$, $\bm{r}$ random on the sphere; collision prob.\ $1 - \theta(\vu,\vv)/\pi$ (a random hyperplane separates the pair with prob.\ $\theta/\pi$) \\
+Angular & Cross-polytope & Randomly rotate, snap to the nearest $\pm \bm{e}_i$; strictly better $\rho$ than hyperplane; practical via fast pseudo-rotations (FALCONN) \\
+Euclidean & E2LSH ($p$-stable) & $h(\vu) = \lfloor (\inner{\bm{a}}{\vu} + b)/w \rfloor$ with Gaussian $\bm{a}$ (2-stable: $\inner{\bm{a}}{\vu-\vv} \sim \norm{\vu-\vv}_2 \cdot Z$), $b \sim U[0,w]$; adjacent buckets enable multi-probe \\
+Jaccard & MinHash & Min of a random permutation over the element set; collision prob.\ $=$ Jaccard similarity---the workhorse of near-duplicate detection [NLP 1] \\
+Inner product & (via reduction) & No symmetric LSH family exists for unbounded MIPS; apply the asymmetric $\varphi/\psi$ augmentation of Section~\ref{sr:sec:vr_problem} and reuse any angular family \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Multi-probe LSH} exploits the structure of E2LSH buckets: instead of only the query's own bucket, probe the neighboring buckets most likely to hold near points. This cuts the number of tables needed for a target recall by roughly an order of magnitude---the difference between an absurd and a merely large memory footprint.
+
+\subsection{Theory vs.\ Practice, 2026 Status}
+
+Run the numbers once and the production verdict follows. For $m = 10^8$ with a decent family ($p_1 = 0.8$, $p_2 = 0.5$, so $\rho \approx 0.32$): $\ell \approx \log_2 10^8 \approx 27$ hashes per table and $L = m^{\rho} \approx 375$ tables---roughly 375 stored copies of the ID set plus hash machinery, i.e.\ hundreds of GB of index for a corpus whose raw vectors are 300\,GB. (Completing the theory picture: the guarantee above solves the \emph{decision} problem at one radius---``is there a point within $r$ of $\vq$?'', known as PLEB---and full $(1{+}\epsilon)$-approximate retrieval binary-searches over a geometric grid of radii, multiplying space by another $O(\log_{1+\epsilon}\Delta)$ for aspect ratio $\Delta$. Interviewers rarely push here, but knowing the guarantee is radius-wise explains why LSH parameters are tuned to a target radius while graphs and IVF are not.) Empirically, graph and IVF-PQ indexes dominate LSH throughout the recall--QPS plane on realistic embedding workloads, which is why no major 2026 vector store uses vanilla LSH as its primary dense index. LSH remains the right tool where its distinctive properties matter: \textbf{near-duplicate detection at extreme scale} (MinHash/SimHash over document shingles---the standard pretraining-dedup pipeline [NLP 1]), insert-heavy or streaming workloads (hashing needs no index maintenance), sharding and routing (a hash is a cheap, stateless partitioner), and settings that demand \emph{provable} guarantees or have no exploitable cluster structure. In an interview, present LSH as ``the theory anchor and the dedup workhorse, displaced by graphs and IVF-PQ for in-RAM dense retrieval''---and be ready to derive $\ell$, $L$, and the space blow-up.
+
+%==============================================================================
 \section{Graph Indexes: HNSW and DiskANN}
-% TODO Phase C
+\label{sr:sec:vr_graphs}
+%==============================================================================
 
+Proximity-graph indexes are the production workhorse of 2026: best recall--QPS trade-off in RAM, the default in essentially every vector database. The mental model has three layers: an ideal graph with an exactness guarantee, the heuristics that approximate it at scale, and the systems engineering (memory, updates, disk) around them.
+
+\subsection{Why Greedy Graph Search Works at All}
+
+Index $=$ a directed graph over the corpus vectors. Query $=$ greedy traversal: from an entry point, repeatedly move to the neighbor closest to $\vq$; when no neighbor improves, stop. The gold standard is the \textbf{Delaunay graph} (dual of the Voronoi diagram): on it---or any supergraph of it---every local minimum of greedy search is global, so traversal returns the \emph{exact} nearest neighbor; it is also the minimal graph with this property. Two things kill it in high dimension: construction cost is exponential in $d$, and distance concentration makes almost every pair of Voronoi cells adjacent, so the graph tends toward complete. Practical graphs therefore approximate the Delaunay ideal from two directions:
+\begin{enumerate}
+    \item \textbf{Long-range edges for speed.} Kleinberg's small-world result: on a lattice, adding long links with $\prob{\text{link } u \to v} \propto \operatorname{dist}(u,v)^{-\alpha}$ yields polylogarithmic greedy routing \emph{only} when $\alpha$ equals the lattice dimension ($O(\log^2 m)$ hops); any other exponent gives polynomially many hops. Translation: a navigable graph needs a scale-free mix of short and long edges tuned to the data's dimension---which is exactly what NSW/HNSW approximate heuristically.
+    \item \textbf{Edge pruning for bounded degree.} Keeping all near neighbors wastes degree on redundant directions. The relative-neighborhood-graph (RNG) rule keeps edge $(\vu,\vv)$ only if no third point is simultaneously closer to both; DiskANN's $\alpha$-pruning relaxes this (below) to keep a few ``redundant'' edges that act as highways.
+\end{enumerate}
+
+\subsection{NSW $\to$ HNSW Mechanics}
+
+\textbf{NSW} (Malkov et al., 2014) builds the graph by inserting points in random order and connecting each to its $M$ nearest \emph{already-inserted} points: early-inserted nodes acquire long-range edges (their ``nearest'' neighbors at insertion time were far away), giving small-world navigability for free. \textbf{HNSW} (Malkov and Yashunin, 2016) makes the long-range structure explicit as a layer hierarchy:
+
+\begin{itemize}
+    \item \textbf{Layers.} Each node draws a top level $l = \lfloor -\ln(\mathrm{Unif}(0,1)) \cdot m_L \rfloor$ with $m_L = 1/\ln M$: layer populations decay geometrically, so upper layers are sparse coarse ``express'' networks and layer 0 contains everything.
+    \item \textbf{Search.} From the top layer's entry point, greedy-descend with beam width 1 until layer 1; at layer 0, switch to a \textbf{best-first beam search} with a priority queue of size \texttt{efSearch}: repeatedly pop the closest unexplored candidate, score its neighbors, keep the best \texttt{efSearch} seen so far, and stop when the beam stabilizes (the closest unexplored candidate is worse than the worst kept result). The beam is bounded backtracking: it is what recovers from greedy dead ends, and \texttt{efSearch} ($\ge k$) is \emph{the} recall knob at query time.
+    \item \textbf{Construction.} Insertion runs the same search with beam \texttt{efConstruction} to find candidate neighbors, then selects $M$ of them with an RNG-style diversity heuristic (prefer neighbors not already covered by other selected neighbors). Layer 0 allows $2M$ links; upper layers $M$.
+\end{itemize}
+
+\begin{algorithm}[H]
+\caption{HNSW layer-0 beam search (the \texttt{efSearch} loop)}
+\begin{algorithmic}[1]
+\REQUIRE query $\vq$, entry point $e$ (from upper-layer descent), beam width $ef$
+\STATE $C \gets \{e\}$ \COMMENT{candidates, min-heap by $\delta(\vq,\cdot)$}
+\STATE $W \gets \{e\}$ \COMMENT{best results so far, max-heap, $|W| \le ef$}
+\STATE mark $e$ visited
+\WHILE{$C \neq \emptyset$}
+    \STATE $c \gets$ pop closest from $C$
+    \IF{$\delta(\vq, c) > \delta(\vq, \text{farthest in } W)$ \AND $|W| = ef$}
+        \STATE \textbf{break} \COMMENT{beam has stabilized}
+    \ENDIF
+    \FOR{each unvisited neighbor $v$ of $c$ in layer 0}
+        \STATE mark $v$ visited; compute $\delta(\vq, v)$
+        \IF{$|W| < ef$ \OR $\delta(\vq, v) < \delta(\vq, \text{farthest in } W)$}
+            \STATE insert $v$ into $C$ and $W$; if $|W| > ef$, evict farthest from $W$
+        \ENDIF
+    \ENDFOR
+\ENDWHILE
+\RETURN top-$k$ of $W$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=0.9,
+    every node/.style={font=\small}]
+    % Layer 2
+    \node[anchor=east] at (-0.7, 4.4) {\textbf{Layer 2}};
+    \fill[deepblue] (0.5, 4.4) circle (2.5pt);
+    \fill[deepblue] (4.5, 4.4) circle (2.5pt);
+    \draw[gray] (0.5, 4.4) -- (4.5, 4.4);
+    % Layer 1
+    \node[anchor=east] at (-0.7, 2.4) {\textbf{Layer 1}};
+    \foreach \x in {0.5, 1.8, 3.1, 4.5, 5.6} \fill[deepblue] (\x, 2.4) circle (2.5pt);
+    \draw[gray] (0.5,2.4) -- (1.8,2.4) -- (3.1,2.4) -- (4.5,2.4) -- (5.6,2.4);
+    \draw[gray] (0.5,2.4) to[bend left=25] (3.1,2.4);
+    \draw[gray] (1.8,2.4) to[bend right=25] (4.5,2.4);
+    % Layer 0
+    \node[anchor=east] at (-0.7, 0.4) {\textbf{Layer 0}};
+    \foreach \x in {0.2, 0.9, 1.6, 2.3, 3.0, 3.7, 4.4, 5.1, 5.8} \fill[deepblue] (\x, 0.4) circle (2.5pt);
+    \draw[gray] (0.2,0.4) -- (0.9,0.4) -- (1.6,0.4) -- (2.3,0.4) -- (3.0,0.4) -- (3.7,0.4) -- (4.4,0.4) -- (5.1,0.4) -- (5.8,0.4);
+    \draw[gray] (0.9,0.4) to[bend left=20] (2.3,0.4);
+    \draw[gray] (3.0,0.4) to[bend left=20] (4.4,0.4);
+    % vertical dashed connections
+    \draw[dashed, gray] (0.5,4.4) -- (0.5,2.4) -- (0.2,0.4);
+    \draw[dashed, gray] (4.5,4.4) -- (4.5,2.4) -- (4.4,0.4);
+    \draw[dashed, gray] (3.1,2.4) -- (3.0,0.4);
+    % query + path
+    \fill[deepred] (3.55, -0.4) circle (3pt) node[below] {\textcolor{deepred}{query $\vq$}};
+    \draw[->, thick, deepred] (0.5,4.35) -- (4.4,4.35);
+    \draw[->, thick, deepred] (4.5,4.3) -- (4.5,2.5);
+    \draw[->, thick, deepred] (4.45,2.35) -- (3.2,2.45);
+    \draw[->, thick, deepred] (3.1,2.3) -- (3.05,0.55);
+    \draw[->, thick, deepred] (3.05,0.35) -- (3.6,0.35);
+    \node[anchor=west, text width=4.6cm, font=\footnotesize] at (6.6, 2.4)
+        {Greedy descent through sparse upper layers reaches the right region in few hops; the \texttt{efSearch} beam at layer 0 does the fine-grained search with bounded backtracking.};
+\end{tikzpicture}
+\caption{HNSW: geometrically decimated layers give logarithmic-style routing; layer 0 holds the full graph.}
+\label{sr:fig:hnsw_layers}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{HNSW parameters and their effects}
+\label{sr:tab:hnsw_params}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Parameter} & \textbf{Typical} & \textbf{What it controls} \\
+\midrule
+$M$ (degree) & 16--64 & Graph connectivity. Higher $M$: better recall ceiling and robustness on hard data, linearly more memory ($\approx 4$\,B per link) and slower builds. Layer 0 stores up to $2M$ links per node. \\
+\texttt{efConstruction} & 100--500 & Build-time beam. Higher: better graph quality (recall at fixed \texttt{efSearch}), roughly linear build slowdown. Cheap insurance; skimping produces an index whose recall plateaus below target no matter how you tune search. \\
+\texttt{efSearch} & $k$--512 & Query-time beam. \emph{The} recall--latency dial: latency grows near-linearly with it, recall rises with diminishing returns. Tuned per deployment to hit the recall SLO. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Costs and caveats.} Memory $=$ vectors $+$ graph: with 32-bit neighbor IDs, layer-0 links cost $\approx 2M \times 4$\,B per node ($\approx$128\,B at $M{=}16$; upper layers add a few percent). Search complexity is \emph{empirically} $O(\log m)$ distance evaluations---there is no worst-case guarantee, and adversarial instances exist that force near-linear scans (Indyk and Xu, 2023). Builds are expensive (hours at $10^8$ scale on a large multicore box) and traversal is random access over the whole vector array, which is why HNSW wants everything in RAM.
+
+\textbf{MIPS on graphs.} Inner-product geometry complicates graph construction specifically: inner-product ``Voronoi regions'' are cones through the origin, some of them empty (points that can never win any query---prunable at build time), and the IP-analogue of the Delaunay guarantee covers top-1 only. The query-to-data augmentation of Section~\ref{sr:sec:vr_problem} does not preserve corpus-to-corpus rankings, so building an L2 graph on transformed points distorts the neighborhood structure. Production libraries therefore implement IP-native edge selection; when reusing a cosine/L2 graph stack for a dot-product model, validate recall against exact MIPS ground truth rather than assuming the reduction composes with the index.
+
+\textbf{Deletes and updates are the sore spot.} HNSW supports cheap inserts, but true deletion is unsupported in most implementations: deleted nodes are tombstoned (filtered from results while still traversed), and mass deletion erodes connectivity---the express routes decay and recall drifts down. Ask about the update path \emph{before} choosing HNSW; ``how do you handle deletes?'' is a favorite follow-up.
+
+\begin{table}[H]
+\centering
+\caption{Handling churn in graph indexes}
+\label{sr:tab:graph_updates}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Strategy} & \textbf{Mechanism} & \textbf{Cost / caveat} \\
+\midrule
+Tombstones & Mark deleted; filter at query time & Recall and latency decay as tombstone fraction grows; needs a rebuild trigger ($\sim$10--20\% is a common budget) \\
+Blue/green rebuild & Rebuild offline, atomically swap & 2$\times$ peak memory; hours of build at $10^8$; simplest to reason about \\
+Segmented indexes & Immutable per-segment graphs $+$ background merges (Lucene-style) & Query fans out across segments; merge amplification; bounded staleness \\
+Delta $+$ merge (FreshDiskANN) & Small in-RAM index absorbs writes; periodic merge into the disk graph with in-place patching & Engineering-heavy; the published design for streaming updates at billion scale \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{DiskANN/Vamana: Billion Scale on SSD}
+
+When vectors no longer fit in RAM, the DiskANN design (Subramanya et al., 2019) is the standard answer, and its graph---\textbf{Vamana}---is interesting in its own right. Vamana builds a \emph{flat} (single-layer) graph by iterated search-and-prune with the \textbf{$\alpha$-pruning rule}: scanning candidate neighbors of $\vu$ in increasing distance, discard candidate $\vw$ if an already-kept neighbor $\vv$ satisfies $\alpha \cdot \delta(\vv, \vw) \le \delta(\vu, \vw)$ for $\alpha > 1$ (typically 1.2). Setting $\alpha = 1$ recovers the RNG rule; $\alpha > 1$ deliberately keeps extra ``redundant'' edges that guarantee geometric progress toward any target. This is the one practical graph with worst-case guarantees: greedy search reaches an $\big(\frac{\alpha+1}{\alpha-1} + \epsilon\big)$-approximate neighbor in $O(\log_{\alpha} \Delta)$ hops (with degree $O((4\alpha)^{d_\circ} \log \Delta)$, $\Delta$ the aspect ratio), while HNSW- and NSG-style heuristics admit adversarial instances with no such bound (Indyk and Xu, 2023). The bound itself is weak ($\alpha = 1.2$ gives factor 11); its value is explaining \emph{why} the graph stays navigable---practice is far better than the bound.
+
+\textbf{The systems layout is the actual innovation.} Full-precision vectors and adjacency lists live \emph{on NVMe SSD}, laid out so one node's vector $+$ neighbor list fits in a single 4\,KB read. In RAM: only PQ-compressed codes (Section~\ref{sr:sec:vr_quant}) of all vectors, a few GB per billion. Search runs a beam of width $W$: pop candidates by \emph{PQ-approximate} distance (RAM, free), fetch the popped nodes' pages from SSD (a handful of parallel 4\,KB reads per hop), score their neighbors with PQ, and use the \emph{exact} vectors that arrived from disk to rerank the final results. Latency $\approx$ hops $\times$ one parallel SSD round-trip ($\sim$100\,$\mu$s each): the original paper served $\sim$10$^9$ points from a 64\,GB machine at $\sim$5\,ms with $>$95\% recall@1. Extensions cover the operational gaps: \textbf{FreshDiskANN} (streaming inserts/deletes via an in-memory delta index $+$ background merge) and \textbf{Filtered-DiskANN} (filter-aware graph construction and traversal for metadata predicates).
+
+\begin{warningbox}
+\textbf{Metadata filters break graph traversal.} Applying a selective filter (say, 2\% of the corpus) to a graph index fails in both naive modes: \emph{post-filtering} the top-$k$ leaves fewer than $k$ survivors, and \emph{pre-filtering} induces a subgraph that is disconnected and unnavigable---greedy search strands in local optima and recall craters. Production answers: oversample ($k / \text{selectivity}$) then post-filter (works for mild filters); filter-aware traversal that walks the full graph but only scores matching nodes; dedicated per-tenant/per-partition indexes for hot filters; and a brute-force fallback below a selectivity threshold, where scanning the 2\% exactly is cheaper than fighting a broken graph walk. Vector databases differ mainly in how gracefully they handle exactly this.
+\end{warningbox}
+
+%==============================================================================
 \section{Clustering and IVF}
-% TODO Phase C
+\label{sr:sec:vr_ivf}
+%==============================================================================
 
+\subsection{Mechanics and the $\sqrt{m}$ Rule}
+
+The inverted-file (IVF) index is $k$-means recycled as a retrieval structure, and the other production workhorse. \textbf{Build:} cluster the corpus into $C$ cells (the \emph{coarse quantizer}); store per centroid an inverted list of its members---the same skeleton as a lexical inverted index (Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}), with centroids playing the role of terms. \textbf{Query:} score all $C$ centroids, take the closest \texttt{nprobe} cells, scan their lists exhaustively. Per-query cost:
+\begin{equation}
+\underbrace{C \cdot d}_{\text{routing}} \; + \; \underbrace{\texttt{nprobe} \cdot \frac{m}{C} \cdot d}_{\text{list scans (balanced clusters)}},
+\end{equation}
+minimized at $C = \sqrt{m \cdot \texttt{nprobe}}$---hence the folklore $C \approx \sqrt{m}$ (e.g., $m = 10^8$, \texttt{nprobe} $= 64$ $\Rightarrow$ $C \approx 8 \times 10^4$; Faiss practice runs $C$ somewhat larger, $2^{16}$--$2^{18}$ at billion scale). Once $C$ reaches tens of thousands, exhaustive centroid scoring itself becomes the bottleneck---so route with an index \emph{over the centroids}: IVF with an HNSW coarse quantizer is the standard composition (HNSW over $10^5$ centroids is tiny and fast, and the lists provide the memory-efficient bulk storage). IVF composes with everything: compress the lists with PQ (IVF-PQ, Section~\ref{sr:sec:vr_quant}), spill boundary points into multiple cells, run it on GPUs.
+
+\textbf{GPU retrieval in one paragraph.} GPUs change the calculus on both build and serve. Builds: $k$-means and PQ encoding are embarrassingly parallel, and GPU graph construction (cuVS's CAGRA) turns multi-hour CPU builds into minutes---often the decisive argument when the corpus re-embeds frequently. Serving: HBM bandwidth ($\sim$2--8\,TB/s) makes scanning compressed IVF lists extremely fast, and batched traffic amortizes kernel launches, so GPU IVF-PQ or CAGRA wins decisively at high QPS on corpora whose compressed form fits in device memory (tens of GB---i.e., $10^8$--$10^9$ vectors under PQ). The caveats: device memory caps corpus size per GPU, low-QPS workloads waste the hardware, and PCIe transfer of results erodes small-batch latency. The standard 2026 stack: NVIDIA cuVS (successor to RAFT) inside Faiss, Milvus, and the managed vector databases.
+
+\subsection{The \texttt{nprobe} Curve and Its Pathologies}
+
+\texttt{nprobe} is IVF's recall--latency dial, and its recall curve has a characteristic shape: steep at first (the true neighbors' cells are usually among the closest few), then a long flattening tail. Latency, by contrast, grows essentially linearly in \texttt{nprobe} (each probe scans another list), so the operating point is chosen by walking up the curve until the recall SLO is met and checking the latency is still affordable.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+    width=0.72\textwidth, height=5.2cm,
+    xlabel={\texttt{nprobe} (log scale)}, ylabel={recall@10},
+    xmode=log, log basis x=2,
+    xmin=1, xmax=256, ymin=0.3, ymax=1.02,
+    ytick={0.4,0.6,0.8,1.0},
+    legend pos=south east, legend style={font=\footnotesize},
+    grid=major, grid style={gray!20}]
+\addplot[deepblue, thick, mark=*, mark size=1.5pt] coordinates
+    {(1,0.52) (2,0.66) (4,0.78) (8,0.87) (16,0.93) (32,0.96) (64,0.98) (128,0.99) (256,0.995)};
+\addlegendentry{well-clustered corpus}
+\addplot[deepred, thick, dashed, mark=square*, mark size=1.5pt] coordinates
+    {(1,0.35) (2,0.45) (4,0.55) (8,0.64) (16,0.71) (32,0.76) (64,0.80) (128,0.83) (256,0.85)};
+\addlegendentry{hard corpus / misrouted queries}
+\end{axis}
+\end{tikzpicture}
+\caption{Stylized \texttt{nprobe}--recall curves. The blue curve is healthy: steep rise, plateau near 1. The red curve plateaus well below the target---the signature of a routing problem (imbalanced cells, stale centroids, boundary-heavy queries), which more probing cannot fix.}
+\label{sr:fig:nprobe_recall}
+\end{figure}
+
+Two structural problems govern the tail:
+
+\textbf{The cell-edge problem.} A query near a Voronoi boundary has true neighbors scattered across \emph{several} cells whose centroids may not rank among the top \texttt{nprobe}---the neighbor sits close to the query but its \emph{centroid} is far. This is IVF's intrinsic failure mode (graphs do not share it: traversal crosses cell boundaries freely). Mitigations: raise \texttt{nprobe}, soft-assign/spill boundary points to multiple lists at build time, or train more, smaller cells and probe more of them.
+
+\textbf{Routing is a ranking problem.} The centroid is a first-order summary of its cell; ranking cells by centroid distance is a crude proxy for ``probability the cell contains a true neighbor.'' On MIPS workloads with variable norms, plain $k$-means produces pathological clusterings (huge cells of small-norm points, singleton cells of large-norm points)---use spherical $k$-means (cluster on the unit sphere) for cosine/MIPS data. Beyond that, the router can be \emph{learned} (train a model to predict which cells hold answers for the query distribution)---an active research edge and a good L7 talking point: IVF, unique among the four families, has no formal recall analysis; its justification is the empirical cluster structure of real data---precisely the structure that distance concentration says i.i.d.\ data lacks (Section~\ref{sr:sec:vr_highdim}).
+
+\begin{keyinsight}
+A recall plateau in \texttt{nprobe} means the \emph{router} is the bottleneck, not the scan: if the right cells were being ranked into the probe set, more probes would keep helping. Suspect, in order: cluster imbalance from norm variance (fix: spherical $k$-means or normalization), stale centroids after distribution drift (fix: re-train the coarse quantizer), boundary-heavy queries (fix: spillage), and metric mismatch between router and scorer. This diagnosis pattern---``which stage stopped improving?''---is the IVF version of funnel debugging.
+\end{keyinsight}
+
+%==============================================================================
 \section{Quantization: PQ, OPQ, and Anisotropic}
-% TODO Phase C
+\label{sr:sec:vr_quant}
+%==============================================================================
 
+Indexes locate candidates; quantization is how the candidates' vectors fit in memory. At $10^8$--$10^9$ scale, compression is not an optimization---it decides whether the system fits on one machine or twenty.
+
+\subsection{Scalar Quantization}
+
+The zeroth-order tools: fp16 (2$\times$ smaller, ranking-neutral in practice) and int8 scalar quantization (4$\times$; per-dimension scale/offset learned from a sample). SQ8 typically costs $\lesssim$1 point of recall on embedding workloads---and even that is usually recovered by exact reranking of a slightly larger candidate set. SIMD dot products on int8 are also \emph{faster} than fp32 (more elements per vector register, better cache economics), so SQ8 is close to a free lunch and the default first move when memory pressure appears.
+
+\subsection{Product Quantization and ADC}
+
+\textbf{Codebook mechanics.} Product quantization (J\'egou et al., 2011) splits $\R^d$ into $L$ subspaces of $d/L$ dimensions, runs $k$-means with $C$ codewords (almost always $C = 256$, one byte) independently in each, and stores per vector only the $L$ codeword indices: $L$ bytes per vector, e.g.\ $768 \times 4\,\mathrm{B} = 3{,}072\,\mathrm{B} \to 96\,\mathrm{B}$ at $L = 96$ (32$\times$). Codebooks are negligible ($L \cdot C \cdot d/L = C \cdot d$ floats $\approx$ 786K floats $\approx$ 3\,MB at $d = 768$).
+
+\textbf{ADC is the actual point of PQ}---distances are computed \emph{without decompressing}. Per query, precompute $L$ lookup tables, where table $i$ holds the partial squared distance from the query's $i$-th subvector to each of the $C$ codewords ($O(Cd)$ total, once per query). A candidate's distance is then just $L$ table lookups and adds:
+\begin{equation}
+\widehat{\delta}(\vq, \vu)^2 \;=\; \sum_{i=1}^{L} T_i\big[\,c_i(\vu)\,\big],
+\qquad
+\text{total cost } O(Cd + mL) \text{ vs.\ } O(md) \text{ exact},
+\end{equation}
+i.e., 96 lookup-adds instead of 768 multiply-adds per candidate. Keeping the query side \emph{unquantized} (``asymmetric'' distance computation) means only the data-side quantization error enters. Production implementations push further with 4-bit codes and register-resident tables (Faiss \texttt{fast\_scan}, ScaNN): table lookups become SIMD shuffles, several candidates per cycle. Inside IVF, encode the \emph{residual} $\vu - \bm{\mu}_{\text{cell}}$ rather than the raw vector---residual energy is smaller, so the same code budget buys less error (IVF-PQ).
+
+\textbf{OPQ.} PQ's error depends on how energy and correlations spread across the arbitrary subspace chopping. Optimized PQ (Ge et al., 2013) learns an orthogonal rotation $\mR$ applied before splitting, alternating between fitting codebooks given $\mR$ and solving for $\mR$ given codebooks (a closed-form Procrustes step). Standard practice: ``OPQ$+$PQ'' as a drop-in that recovers several recall points over raw PQ for free at query time (the rotation folds into the query transform).
+
+\subsection{Anisotropic (Score-Aware) Quantization: ScaNN}
+
+Classical PQ minimizes reconstruction MSE $\norm{\vu - \tilde{\vu}}^2$---the right objective only if queries are isotropic. For \emph{MIPS}, what matters is the score error $\E_{\vq}\big[\inner{\vq}{\vu - \tilde{\vu}}^2\big]$, and only for the queries a point could actually win. Guo et al.\ (2020) weight the loss by the score ($\omega(s) = \mathds{1}\{s \ge \theta\}$: care only about high-scoring pairs) and prove the weighted loss decomposes over the residual $\bm{r} = \vu - \tilde{\vu}$ split into components parallel and orthogonal to $\vu$:
+\begin{equation}
+\loss(\vu, \tilde{\vu}) \;=\; h_{\parallel} \, \norm{\bm{r}_{\parallel}}^2 + h_{\perp} \, \norm{\bm{r}_{\perp}}^2,
+\qquad h_{\parallel} \ge h_{\perp} \text{ always}.
+\end{equation}
+\textbf{Why MIPS wants error pushed orthogonal to the data point:} the parallel component of the residual is a \emph{norm} distortion, and in inner-product retrieval a high-norm point can win even at a large angle from the query---so misrepresenting norms flips winners near the decision threshold, while orthogonal error mostly perturbs scores of pairs that were not contenders anyway. Training codebooks with this anisotropic loss (a modified Lloyd iteration) is the core of ScaNN and the main reason it led MIPS benchmarks. Know the boundary: with constant norms (cosine on normalized vectors) the loss collapses back to ordinary MSE---anisotropic quantization buys nothing, so do not cargo-cult it onto normalized corpora.
+
+\textbf{Residual quantization, in one paragraph.} Instead of splitting dimensions, stack \emph{stages}: quantize the vector, then quantize the residual of stage one with a second full-dimensional codebook, and so on---$\tilde{\vu} = \sum_i \bm{\mu}_{i, c_i}$. Same bit budget as PQ, strictly more expressive (PQ is the special case of subspace-sparse codewords), at the price of a combinatorial encoding step (beam search over stages). Coarse-to-fine RQ is exactly the IVF-residual idea iterated---and its byproduct is a \emph{hierarchical discrete code} per item: the sequence of codeword IDs. Trained with neural encoders (RQ-VAE), those code sequences are the ``semantic IDs'' used by generative recommenders (TIGER-style)---the bridge from retrieval compression to generative recsys picked up in Chapter~\ref{sr:chap:recommendation_systems}.
+
+\subsection{Method Comparison and Memory Math}
+
+\begin{table}[H]
+\centering
+\caption{The quantization ladder}
+\label{sr:tab:quant_ladder}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Method} & \textbf{What it learns} & \textbf{Error profile / when} \\
+\midrule
+fp16 / int8 SQ & Per-dimension scale (SQ) & Negligible-to-small, uniform; always the first move \\
+PQ & $L$ independent subspace codebooks & Error set by bits/vector and subspace correlations; the 10--100$\times$ workhorse \\
+OPQ & $+$ orthogonal rotation before PQ & Recovers several recall points by balancing subspace energy; near-free at query time \\
+Additive/residual (AQ/RQ) & Full-dimensional codebooks, summed across stages & Lower error at equal bits than PQ; costly combinatorial encoding; codes double as ``semantic IDs'' \\
+Anisotropic (ScaNN) & Codebooks under a score-aware loss & Same bits, better \emph{MIPS} recall by preserving norms; no-op on normalized corpora \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Bytes per 768-d vector and totals at $10^8$ vectors (vectors only; IDs $+$ index structures add $\sim$1--10\,GB)}
+\label{sr:tab:memory_math}
+\begin{tabularx}{\textwidth}{lXcc}
+\toprule
+\textbf{Encoding} & \textbf{Notes} & \textbf{B/vector} & \textbf{$10^8$ vectors} \\
+\midrule
+fp32 & exact & 3{,}072 & 307\,GB \\
+fp16 & ranking-neutral & 1{,}536 & 154\,GB \\
+int8 SQ & $\lesssim$1 recall pt; faster SIMD & 768 & 77\,GB \\
+PQ, $L{=}96$ & 32$\times$; ADC lookups & 96 & 9.6\,GB \\
+PQ, $L{=}64$ & 48$\times$; standard IVF-PQ64 & 64 & 6.4\,GB \\
+PQ, $L{=}32$ & 96$\times$; rerank mandatory & 32 & 3.2\,GB \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}
+The standard recipe at scale is \textbf{compressed search $+$ exact rerank}: retrieve a few hundred candidates with PQ scores, then rescore them with full-precision vectors (RAM if they fit, SSD if not---DiskANN's layout). Reranking converts PQ's score error from a ranking error into a candidate-set inefficiency, which oversampling absorbs; it is why aggressive compression (PQ32--96) is usable at all at high recall targets.
+\end{keyinsight}
+
+%==============================================================================
 \section{Sketching and Random Projections}
-% TODO Phase C
+\label{sr:sec:vr_sketch}
+%==============================================================================
 
+\begin{mathresult}{Johnson--Lindenstrauss Lemma}
+For any $m$ points in $\R^d$ and $\epsilon \in (0,1)$, a random linear map $\Phi: \R^d \to \R^{d'}$ with
+\begin{equation}
+d' = O\!\left(\epsilon^{-2} \log m\right)
+\end{equation}
+preserves all pairwise distances to within $(1 \pm \epsilon)$ with high probability. $d'$ is \emph{independent of $d$}. Gaussian $N(0, 1/d')$ or Rademacher $\pm 1/\sqrt{d'}$ entries work; fast variants use Hadamard mixing. Inner products are preserved in expectation---$\inner{\Phi\vu}{\Phi\vv}$ is unbiased for $\inner{\vu}{\vv}$---with error on the scale of $\epsilon \norm{\vu} \norm{\vv}$: \emph{relative to the norm product, not the inner product}, which is brutal for near-orthogonal pairs.
+\end{mathresult}
+
+\textbf{Run the numbers before reaching for JL.} Rule of thumb $d' \approx \epsilon^{-2} \ln m$ (formal statements carry a small constant):
+
+\begin{table}[H]
+\centering
+\caption{JL target dimension $d' \approx \epsilon^{-2} \ln m$---note the independence from $d$ and the punishing $\epsilon^{-2}$}
+\label{sr:tab:jl_sizing}
+\begin{tabular}{lccc}
+\toprule
+ & $\epsilon = 0.05$ & $\epsilon = 0.1$ & $\epsilon = 0.2$ \\
+\midrule
+$m = 10^6$ & 5{,}500 & 1{,}380 & 350 \\
+$m = 10^8$ & 7{,}400 & 1{,}840 & 460 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At $\epsilon = 0.1$ and $m = 10^7$, $d' \approx 1{,}600$---\emph{larger} than 768; even $\epsilon = 0.2$ gives only a modest 2$\times$ reduction at 20\% distortion. This is why learned compression (PQ/OPQ at equal bit budget, or Matryoshka-truncatable embeddings [NLP 3]) beats random projection on any stable real corpus: learned methods exploit the data's structure; JL by design uses none.
+
+\textbf{When sketching is the right tool:} it is \emph{data-oblivious}, hence immune to distribution shift, retrain-free, and analyzable---the properties learned codebooks lack. Use it when the data is adversarial, streaming, or drifting faster than codebooks can be retrained; as a cheap pre-transform before indexing (rotate-and-reduce); for one-pass similarity estimation in dedup pipelines (SimHash \emph{is} a 1-bit-per-projection JL cousin [NLP 1]); and in privacy or communication-constrained settings where the projection must be shareable and data-free. The oblivious-vs-learned choice under drift is the L7 framing worth volunteering.
+
+\textbf{Aside: sampling algorithms for MIPS.} A niche but distinctive family exploits the \emph{linearity} of the inner product to estimate rankings without computing full scores: sample coordinates with probability proportional to their contribution and count which items keep getting hit (alias-table sampling, $O(d + \text{samples})$ per query), or run a bandit-style elimination that maintains partial dot products and halves the candidate set each round---linear in $m$ but \emph{sublinear in $d$}, the opposite regime of every index above. Their practical virtues: essentially no index build, and an \emph{anytime} knob---the sample budget is a live per-query latency--accuracy dial. Worth one sentence in an interview when asked about strict per-query budgets or huge-$d$/modest-$m$ corners; not a production default.
+
+%==============================================================================
+\section{The Recall--Latency--Memory Triangle}
+\label{sr:sec:vr_triangle}
+%==============================================================================
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[scale=1.0, every node/.style={font=\small}]
+    % Triangle
+    \coordinate (R) at (0, 4.2);
+    \coordinate (L) at (-3.4, -0.6);
+    \coordinate (M) at (3.4, -0.6);
+    \draw[thick, deepblue] (R) -- (L) -- (M) -- cycle;
+    \node[above] at (R) {\textbf{Recall}};
+    \node[below left] at (L) {\textbf{Latency (QPS)}};
+    \node[below right] at (M) {\textbf{Memory (cost)}};
+    % placements
+    \node[deepgreen] at (0, 2.2) {Flat (exact)};
+    \node[font=\footnotesize, deepgreen] at (0, 1.85) {recall $= 1$, pay latency or memory};
+    \node[deepred] at (-1.5, 0.4) {HNSW};
+    \node[font=\footnotesize, deepred] at (-1.5, 0.05) {recall $+$ speed, pay RAM};
+    \node[orange!80!black] at (1.6, 0.4) {IVF-PQ};
+    \node[font=\footnotesize, orange!80!black] at (1.6, 0.05) {memory $+$ speed, pay recall};
+    \node[deepblue] at (0, -1.35) {DiskANN: buy back memory with NVMe latency \quad $\cdot$ \quad rerank: buy back recall with oversampling};
+\end{tikzpicture}
+\caption{The retrieval trade triangle. No index wins all three corners; the standard compositions (compressed search $+$ exact rerank, SSD-resident graphs) are ways of purchasing a missing corner at a controlled price.}
+\label{sr:fig:vr_triangle}
+\end{figure}
+
+\subsection{Worked Sizing: 100M $\times$ 768}
+
+Every index choice is a point in the (recall, latency, memory) trade space; the sizing arithmetic below is the kind interviewers expect unprompted.
+
+\begin{itemize}
+    \item \textbf{Flat fp32:} $10^8 \times 3{,}072\,\mathrm{B} = 307\,\mathrm{GB}$. No single commodity box; exact but a full scan per query batch.
+    \item \textbf{HNSW over fp16:} $154\,\mathrm{GB}$ vectors $+$ graph ($\approx 2M \times 4\,\mathrm{B} \approx 128\,\mathrm{B}$/node at $M{=}16$) $\approx 13\,\mathrm{GB}$ $\Rightarrow$ $\sim$165--170\,GB. Fits a 256\,GB-RAM machine; best recall--QPS; sub-ms to low-ms per query.
+    \item \textbf{IVF-PQ64:} codes 6.4\,GB $+$ IDs ($8\,\mathrm{B}$) 0.8\,GB $+$ centroids/list overheads $<$1\,GB $\Rightarrow$ $\sim$7--8\,GB. Fits anywhere, including one GPU; recall ceiling lower, so pair with exact rerank from fp16 vectors on SSD.
+    \item \textbf{DiskANN:} $\sim$10--30\,GB RAM (PQ codes $+$ metadata), vectors $+$ graph on NVMe ($\sim$350\,GB); $\sim$5\,ms-class latency at high recall. The answer when RAM, not recall, is the binding constraint.
+\end{itemize}
+
+\subsection{Index Selection Decision Framework}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Index selection by operating constraints (768-d embeddings; boundaries are order-of-magnitude)}
+\label{sr:tab:index_selection}
+\begin{tabularx}{\textwidth}{lXXXX}
+\toprule
+\textbf{Regime} & \textbf{Flat (SIMD/GPU)} & \textbf{HNSW} & \textbf{IVF-PQ ($+$rerank)} & \textbf{DiskANN} \\
+\midrule
+Corpus size & $\lesssim$1--5M CPU; $\lesssim$10$^8$ GPU batched & 10$^6$--10$^9$ (RAM permitting; shard above) & 10$^7$--10$^{10}$ & 10$^8$--10$^{10}$ per node \\
+Latency & ms--10s of ms (bandwidth-bound) & sub-ms--ms & ms & $\sim$5--15\,ms (SSD hops) \\
+Memory & full vectors & vectors $+$ graph in RAM (highest) & 30--100$\times$ compressed; smallest & small RAM $+$ big NVMe \\
+Recall & exactly 1.0 & highest ANN recall--QPS & capped by PQ error unless reranked & high (exact rerank built in) \\
+Updates & trivial & inserts cheap; deletes tombstoned, rebuilds needed & retrain centroids on drift; list appends cheap & FreshDiskANN merge pipeline \\
+Build cost & none & hours at 10$^8$ (CPU) & minutes--hour ($k$-means $+$ encode; GPU-fast) & heaviest (search-based build) \\
+Choose when & small corpus, exactness, churn, prototyping & QPS/recall king, RAM affordable & memory or cost is binding; GPU serving & corpus $\gg$ RAM on one node \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Scaling beyond one node.} The table assumes a single node; the two scaling axes are orthogonal. \emph{Sharding} (partition the corpus, fan out the query, merge top-$k$) buys corpus size: each shard runs its own index, and the merge is a trivial $k$-way heap---but tail latency is now the \emph{max} over shards, so p99 degrades with shard count unless per-shard variance is controlled. \emph{Replication} buys QPS: clone the whole index behind a load balancer. Rules of thumb: shard by random hash (keeps per-shard score distributions comparable for merging) unless a partition key gives you filter locality; keep shards big enough that per-shard fixed costs (routing, merge, RPC) stay small against scan work; and monitor per-shard recall separately---one degraded shard hides inside a global average.
+
+\textbf{Embedding dimension is a multiplier on everything.} Every byte-per-vector figure above scales linearly with $d$, and flat-scan latency does too---so the cheapest ``index optimization'' is often a smaller embedding. Matryoshka representation learning trains embeddings whose prefixes are usable at any truncation [NLP 3], enabling coarse-search-at-256-d/rerank-at-768-d schemes that cut memory and bandwidth 2--3$\times$ at near-zero quality cost. Decide $d$ jointly with the index, not before it.
+
+\textbf{Operational closing note.} Whatever the index: maintain a golden query set with brute-force ground truth, recompute recall@$k$ on every reindex and parameter change, and alert on drift---ANN recall failures are silent (results look plausible) and surface only as unexplained downstream metric decay. The debugging question in the next section exists because this monitoring is so often missing.
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C
+\label{sr:sec:vr_interview}
+%==============================================================================
 
+%--- Q1 ---
+
+\begin{interviewq}
+\textbf{Q: How does HNSW work, and why is it fast?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+HNSW is a proximity graph over the corpus vectors with a small-world hierarchy on top, searched greedily with a bounded beam.
+
+\textbf{Structure.} Every vector is a node in a layered graph. Each node draws a random top level from a geometric distribution, so layer populations shrink by a constant factor going up: layer 0 contains all $m$ points, the top layers only a handful. Within each layer, a node keeps at most $M$ links (layer 0: $2M$) to nearby nodes, selected at insert time with a diversity heuristic that mimics the relative-neighborhood-graph rule---keep neighbors that cover \emph{different directions} rather than the $M$ literal nearest. Upper layers act as an express network of long-range hops; layer 0 carries the fine-grained structure.
+
+\textbf{Search.} Enter at the top layer and greedily hop to whichever neighbor is closest to the query, descending a layer each time no neighbor improves. At layer 0, widen to a best-first beam of size \texttt{efSearch}: pop the closest unexplored candidate, score its neighbors, keep the best \texttt{efSearch} found so far, stop when the closest unexplored candidate is worse than the worst kept result. Return the top $k$ from the beam.
+
+\textbf{Why it is fast.} Three compounding reasons. (1) The hierarchy solves the entry problem: greedy descent through geometrically decimated layers reaches the query's neighborhood in roughly $O(\log m)$ hops instead of walking there through layer 0. (2) Each hop is $O(M)$ distance computations against a constant-degree adjacency list, so total work is proportional to path length times beam width---empirically $O(\log m)$ scored candidates, i.e.\ hundreds of distance evaluations for $m = 10^8$ rather than $10^8$. (3) The beam makes the greedy walk robust: distance concentration in high dimension creates local optima, and \texttt{efSearch}-bounded backtracking escapes them at bounded cost, which is why \texttt{efSearch} is the recall--latency dial.
+
+\textbf{The honest asterisk.} $O(\log m)$ is an empirical observation on real (low intrinsic dimension) data, not a theorem---adversarial instances force HNSW into near-linear scans. And the speed is bought with memory: full-precision vectors plus $\approx 2M \times 4$ bytes of edges per node, all in RAM, with random-access traversal patterns that make it a poor fit for disk.
+
+\redflags
+\begin{itemize}
+    \item ``It's a tree/binary search''---HNSW is a graph; there is no partitioning and no certification, and the search is best-first, not branch-and-bound.
+    \item Stating $O(\log m)$ as a proven worst-case bound.
+    \item Not knowing what \texttt{efSearch} does---the parameter every production tuning session revolves around.
+\end{itemize}
+
+\interviewtest{Whether you can explain the mechanism (layers, greedy descent, beam) rather than recite ``it's fast and accurate,'' and whether you know which knobs map to which trade-offs.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Layers $+$ greedy descent $+$ \texttt{efSearch} beam, and the memory cost.
+    \item \badgeLsix{L6} Explains the RNG-style neighbor selection and why degree diversity beats raw nearest links; gives the memory formula and the deletes/tombstone weakness; positions \texttt{efConstruction} vs \texttt{efSearch}.
+    \item \badgeLseven{L7} Connects to the theory: Delaunay exactness ideal, Kleinberg's exponent-equals-dimension condition for navigability, why the hierarchy matters mostly at low intrinsic dimension, and that only $\alpha$-pruned graphs (Vamana) carry worst-case guarantees.
+\end{itemize}
+
+\followups{``What happens if \texttt{efSearch} $<$ $k$?'' ``Why is deletion hard?'' ``When would you pick IVF-PQ over HNSW?''}
+\end{interviewq}
+
+%--- Q2 ---
+
+\begin{interviewq}
+\textbf{Q: Index 500M $\times$ 768-d embeddings and serve top-100 under 15\,ms p99 on a machine with 64\,GB RAM---walk me through the design.}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Frame the constraint first.} Raw vectors: $5 \times 10^8 \times 3{,}072\,\mathrm{B} \approx 1.5\,\mathrm{TB}$ fp32, 768\,GB fp16---an order of magnitude over the RAM budget, so any in-RAM full-precision design (HNSW included) is dead on arrival. The two viable families are (a) aggressive compression in RAM with exact rerank from SSD, or (b) a DiskANN-style SSD-resident index. Both keep a compressed representation in RAM and touch NVMe for full precision.
+
+\textbf{Design A: IVF-PQ in RAM $+$ SSD rerank.} PQ64 codes: $5 \times 10^8 \times 64\,\mathrm{B} = 32$\,GB; 8-byte IDs add 4\,GB; coarse quantizer with $C \approx 2^{17}$ centroids ($\approx$400\,MB, routed via a small HNSW over the centroids) and list structures $\sim$1\,GB. Total $\approx$ 37--40\,GB---fits with headroom for the OS page cache. Query path: route to \texttt{nprobe} $\approx$ 32--128 cells, ADC-scan a few million codes ($\sim$1--3\,ms), take the top $\sim$300--500 by PQ score, fetch their fp16 vectors from NVMe ($\sim$1.5\,KB each; a few hundred parallel random reads $\approx$ 1--3\,ms at high queue depth), exact-rescore, return top-100. Budget: $\sim$5--8\,ms typical, p99 well under 15\,ms if SSD queue depth is managed.
+
+\textbf{Design B: DiskANN.} Vamana graph and fp16 vectors on NVMe (vector $+$ adjacency per node packed into aligned reads; $\sim$0.9--1\,TB SSD), PQ32--64 codes in RAM (16--32\,GB) to steer the beam. Search: beam of width $\sim$4--8, PQ distances rank candidates for free in RAM, each hop issues a handful of parallel 4\,KB reads, exact vectors fetched along the way rerank the final set. The original DiskANN served $10^9$ points from 64\,GB at $\sim$5\,ms and $>$95\% recall@1, so 500M under 15\,ms p99 is comfortably in-envelope. Better recall--latency than Design A at this scale, at the cost of a much heavier build (graph construction over 500M points, typically sharded then merged) and more complex operations.
+
+\textbf{What I would actually do:} Design A if the team values operational simplicity and the corpus re-embeds often (IVF-PQ rebuilds are $k$-means $+$ encoding---GPU-fast); Design B if recall at tight latency is the binding constraint and the corpus is comparatively stable. In both: consider Matryoshka truncation to 384-d [NLP 3] to halve every number above; int8 instead of fp16 on SSD to halve read sizes; and non-negotiably, a golden query set with brute-force ground truth to measure recall@100 per build, plus p99 tracking that accounts for SSD tail behavior (mixed read/write, background compaction).
+
+\redflags
+\begin{itemize}
+    \item Proposing in-RAM HNSW without doing the memory arithmetic that rules it out.
+    \item No exact-rerank stage---PQ-only scores cap recall and the design has no way to hit a high-recall SLO.
+    \item Quoting recall numbers with no ground-truth measurement plan, or ignoring the p99-vs-mean distinction on SSD.
+    \item Jumping to ``shard it across 20 machines'' when the question fixes a single 64\,GB node---sharding is the fallback, not the answer to the constraint as posed.
+\end{itemize}
+
+\interviewtest{Memory arithmetic under a hard constraint, knowledge of the two standard billion-scale patterns (compressed-RAM$+$rerank and DiskANN), and whether latency claims are grounded in SSD and ADC cost models rather than vibes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly eliminates in-RAM full precision and sketches IVF-PQ with rerank.
+    \item \badgeLsix{L6} Produces the byte math for both designs, budgets latency per stage, names the build-cost and ops trade-off between them, and includes recall monitoring.
+    \item \badgeLseven{L7} Adds dimension reduction as a design variable, discusses update paths (FreshDiskANN vs.\ cheap IVF rebuilds), filter handling, and degradation strategy (oversampling knobs, brute-force fallback tiers) under traffic spikes.
+\end{itemize}
+
+\followups{``Now add per-user metadata filters at 1\% selectivity.'' ``What breaks first if QPS grows 10$\times$?'' ``How do you re-embed the corpus with a new model without downtime?''}
+\end{interviewq}
+
+%--- Q3 ---
+
+\begin{interviewq}
+\textbf{Q: Your ANN recall dropped after a reindex---same code, same corpus size. Debug it.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+First make the number trustworthy, then bisect the pipeline: a ``recall drop'' is only meaningful against brute-force ground truth on a fixed golden query set, with the same $k$ and the same metric. Half of these incidents are measurement artifacts; the other half have a short list of causes.
+
+\textbf{Step 1: validate the measurement.} Recompute exact top-$k$ on the golden set against the \emph{new} corpus snapshot. If ground truth was cached from before the reindex while documents changed, ``recall'' is being scored against stale answers. Confirm the query encoder version used for evaluation matches production.
+
+\textbf{Step 2: check for encoder/index skew.} The classic silent killer: the corpus was re-encoded with a new embedding model version but queries still use the old encoder (or vice versa). Old and new embedding spaces are incompatible even across minor retrains---mixed-space retrieval degrades smoothly and plausibly rather than failing loudly. Diff embedding checksums, or score a sample of (query, known-relevant-doc) pairs under both encoders.
+
+\textbf{Step 3: check metric and normalization parity.} Was the index built with L2 while the embeddings expect inner product? Did a normalization step get added or dropped in the pipeline? A dot-product model served from a cosine index reranks everything with norms erased (see the normalization question below). Also check dtype: an fp16 cast that clips outlier dimensions, or zero-padded/truncated vectors from a schema change.
+
+\textbf{Step 4: diff the build configuration and training samples.} Learned index components---IVF centroids, PQ/OPQ codebooks---are trained on a sample: if the new build trained on an unrepresentative or stale sample (or reused old codebooks against re-encoded vectors), recall drops corpus-wide. For graphs, check \texttt{efConstruction}/$M$ silently reverting to defaults, and build parallelism settings that change graph quality. For IVF, verify cluster-size histograms look like the previous build's (a few giant cells $\Rightarrow$ norm pathology or a bad training sample).
+
+\textbf{Step 5: check the deletion/tombstone path.} If the ``reindex'' was an in-place compaction: tombstoned nodes, ID remapping bugs, or dropped segments mean vectors are missing---compare item counts and spot-check that known IDs are retrievable at all.
+
+\textbf{Prevention:} recall@$k$ against brute force as a release gate on every build; blue/green index swaps with side-by-side recall on shadow traffic; version-locking the encoder with the index artifact; storing build config in the index metadata and diffing it automatically.
+
+\redflags
+\begin{itemize}
+    \item Immediately turning up \texttt{efSearch}/\texttt{nprobe}---that masks the regression and its cost, without diagnosing it.
+    \item Not asking how recall is measured, against what ground truth, with which encoder.
+    \item Never mentioning encoder/index version skew---the most common real-world cause.
+\end{itemize}
+
+\interviewtest{Systematic debugging of a serving pipeline with learned components: measurement hygiene first, then version skew, then config drift---rather than parameter-twiddling.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Checks parameters and proposes measuring against exact ground truth.
+    \item \badgeLsix{L6} Runs the full bisection: measurement validity, encoder skew, metric/normalization parity, quantizer training samples, tombstones; proposes the release-gate fix.
+    \item \badgeLseven{L7} Designs the prevention system (golden sets, shadow eval, artifact versioning) and discusses how recall regressions surface downstream as slow metric decay---arguing for per-stage recall monitoring as a standing dashboard, not an incident tool.
+\end{itemize}
+
+\followups{``Recall is fine on the golden set but production CTR still fell---now what?'' ``How large should the golden set be to detect a 1-point recall drop?'' ``How would you catch this before deploy?''}
+\end{interviewq}
+
+%--- Q4 ---
+
+\begin{interviewq}
+\textbf{Q: Why doesn't a $k$-d tree work for 768-dimensional embeddings, and what minimal changes rescue tree-based indexes?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Why it fails.} Exact $k$-d tree search is branch-and-bound: descend to the query's leaf, then backtrack, pruning a subtree only when the ball $B(\vq, r_{\text{best}})$ around the query provably misses it. In high dimension, distance concentration makes $r_{\text{best}}$ nearly as large as the data diameter while each split only halves one of 768 coordinates---so the query ball crosses the splitting hyperplanes in $\Omega(d)$ dimensions, certification cannot prune, and the search visits $2^{\Omega(d)}$ leaves. Past $d \approx 20$--$30$ the tree is an exhaustive scan with pointer-chasing overhead: roughly 95\% of query time is backtracking. Ball trees and cover trees change the cell shape and buy guarantees in terms of doubling dimension, but on genuinely high-intrinsic-dimension data they die the same way.
+
+\textbf{The rescue.} Give up exactness and make three changes: (1) \emph{defeatist search}---descend to one leaf and return its best candidates, no backtracking; (2) \emph{randomize} the splits (random projection directions, random split fractiles) so each tree fails on different queries; (3) build a \emph{forest} and union candidates across trees, then exact-rerank. Failure probability decays with the number of trees and scales with the data's \emph{intrinsic} dimension, not the ambient 768. This is precisely Annoy: an RP-tree forest with defeatist search, memory-mappable and immutable---a reasonable choice even today when you want dead-simple, read-only index files, though graphs and IVF-PQ dominate the recall--QPS frontier.
+
+\redflags
+\begin{itemize}
+    \item ``Trees don't work because the data is sparse/dense''---the failure is certification cost under distance concentration, not sparsity.
+    \item Claiming $O(\log m)$ holds for $k$-d trees at any dimension.
+    \item Not knowing any rescue---the defeatist/forest idea is the whole reason tree methods survived into production (Annoy).
+\end{itemize}
+
+\interviewtest{Whether you understand \emph{why} exact indexing fails in high dimension---the ball-crosses-every-hyperplane argument---and can pivot to the randomization-plus-no-certification recovery rather than just declaring trees dead.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} The certification-cost argument and the Annoy-style rescue.
+    \item \badgeLsix{L6} Quantifies ($2^{\Omega(d)}$ leaves, $d \approx 20$--$30$ threshold), names spill trees (duplicate boundary points into both children) and the space cost of overlap.
+    \item \badgeLseven{L7} States that forest failure probability is governed by intrinsic/doubling dimension, connecting to why the same forest behaves differently across corpora---and uses that to argue for per-dataset benchmarking.
+\end{itemize}
+
+\followups{``What is a spill tree?'' ``Why does randomization help---what exactly is decorrelated across trees?'' ``When would you still pick Annoy over HNSW?''}
+\end{interviewq}
+
+%--- Q5 ---
+
+\begin{interviewq}
+\textbf{Q: A recsys team L2-normalizes item embeddings from a dot-product-trained two-tower model so they can reuse a cosine HNSW index. Ranking quality drops. Diagnose and fix.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Diagnosis.} Normalization erased the embedding norms, and in dot-product-trained models the norms carry learned signal---typically popularity, quality, or confidence priors. MIPS and cosine search return different rankings whenever norms vary: maximizing $\inner{\vq}{\vu}$ and maximizing $\inner{\vq}{\vu}/\norm{\vu}$ agree only when all $\norm{\vu}$ are equal. The index is now answering a different question than the model was trained to score. Confirm cheaply: for a sample of queries, compare exact dot-product top-$k$ (brute force over raw embeddings) against exact cosine top-$k$ over normalized ones---the rank-correlation gap quantifies the damage, and the items that fell out will skew toward high-norm (popular/high-quality) items.
+
+\textbf{Fix 1: use an inner-product-native index.} HNSW implementations support an IP metric directly; this is the lowest-friction correct answer.
+
+\textbf{Fix 2: the augmentation reduction.} If the serving stack only does cosine/L2: rescale the corpus so $\max_u \norm{\vu} \le 1$, index $\varphi(\vu) = [\vu; \sqrt{1 - \norm{\vu}^2}]$, and query with $\psi(\vq) = [\vq; 0]$. Then $\inner{\psi(\vq)}{\varphi(\vu)} = \inner{\vq}{\vu}$ with all indexed vectors unit-norm---cosine/L2 search on the augmented space answers MIPS \emph{exactly}, at the cost of one extra dimension.
+
+\textbf{The L7-depth caveat to volunteer:} the transform preserves query-to-data rankings only. Corpus-to-corpus inner products on the augmented vectors are \emph{not} rank-equivalent to the originals, so a graph \emph{built} on transformed points is built on distorted geometry---one reason IP-native graph construction exists as its own feature and research line. In practice the augmented-graph distortion is usually tolerable, but it belongs in the risk list, and it is the reason to prefer Fix 1 when available.
+
+\redflags
+\begin{itemize}
+    \item ``Normalization never changes anything''---only true when norms are (near-)constant.
+    \item Retraining the model with cosine loss as the \emph{first} resort---it may be a fine long-term alignment of training and serving, but it is a model change with its own risks; the serving-side fixes are immediate and exact.
+    \item Not proposing any quantitative confirmation of the hypothesis before shipping a fix.
+\end{itemize}
+
+\interviewtest{The MIPS-vs-cosine distinction under variable norms, awareness that norms encode learned priors in dot-product two-tower models, and command of the reduction that makes any cosine index MIPS-capable.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies that normalization changed the ranking and that norms carry popularity signal.
+    \item \badgeLsix{L6} Produces the augmentation formulas and the confirm-first diagnosis; knows IP-native index modes exist.
+    \item \badgeLseven{L7} Raises the query-to-data-only limitation of the transform for graph construction, and discusses when norm signal is actually \emph{unwanted} (popularity debiasing) so normalization becomes a deliberate product choice rather than a bug.
+\end{itemize}
+
+\followups{``When would you deliberately serve cosine on a dot-product model?'' ``How does this interact with PQ---should you quantize before or after the augmentation?'' ``What if norms span three orders of magnitude?''}
+\end{interviewq}
+
+%--- Q6 ---
+
+\begin{interviewq}
+\textbf{Q: Your HNSW recall@10 drops from 0.95 to 0.6 when users apply a metadata filter matching 2\% of the corpus. Why, and what are the fixes?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Why both naive strategies fail.} \emph{Post-filtering} runs vanilla top-$k$ then discards non-matching results: with 2\% selectivity, the unfiltered top-10 contains on average 0.2 matching items---you return near-empty or deeply suboptimal results unless you oversample enormously. \emph{Pre-filtering} restricts traversal to matching nodes: the induced subgraph over 2\% of nodes is sparse, likely disconnected, and no longer navigable---greedy search strands in local optima immediately, which is exactly the recall crater observed. Graph navigability is a property of the \emph{whole} graph; filters break it.
+
+\textbf{Fixes, in the order I would try them:}
+\begin{enumerate}
+    \item \textbf{Oversample $+$ post-filter} with $k' \approx k/\text{selectivity}$ (here $k' \approx 500$, i.e.\ \texttt{efSearch} in the several-hundreds): works and is one config change, but latency scales with $1/\text{selectivity}$ and collapses for sub-percent filters.
+    \item \textbf{Filter-aware traversal}: walk the \emph{full} graph (every node usable as a routing waypoint) but only admit filter-matching nodes into the result beam. This preserves navigability and is what mature engines implement (Filtered-DiskANN-style designs go further and wire filter labels into graph construction).
+    \item \textbf{Partitioned indexes for hot filters}: if a filter dimension is low-cardinality and common (tenant, language, product category), build per-partition indexes---exact and fast, at index-management cost.
+    \item \textbf{Brute-force fallback below a selectivity threshold}: 2\% of 100M is 2M vectors; an exact SIMD/GPU scan over the matching set can be a few ms and recall 1.0---often strictly better than any graph gymnastics. Every serious system has this fallback with a selectivity-based router.
+\end{enumerate}
+
+\textbf{And measure it:} recall must be evaluated against \emph{filtered} exact ground truth per selectivity bucket; a single unfiltered recall number hides all of this.
+
+\redflags
+\begin{itemize}
+    \item Not distinguishing pre- from post-filtering---they fail for opposite reasons.
+    \item ``Just raise \texttt{efSearch}'' with no selectivity analysis or cost model.
+    \item Missing the brute-force fallback---the strongest tool at low selectivity.
+\end{itemize}
+
+\interviewtest{Understanding that graph search depends on connectivity, filter-selectivity arithmetic, and knowledge of the production playbook (oversample / filter-aware traversal / partitioning / brute-force router).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains why post-filtering starves and proposes oversampling.
+    \item \badgeLsix{L6} Explains subgraph disconnection for pre-filtering, proposes filter-aware traversal and the selectivity-routed brute-force fallback with the 2M-vector arithmetic.
+    \item \badgeLseven{L7} Discusses filter-aware index construction, correlated-filter pathologies (filters aligned with embedding clusters behave differently than random ones), and per-selectivity-bucket SLO monitoring.
+\end{itemize}
+
+\followups{``What if the filter matches 0.01\%?'' ``How do IVF indexes handle the same problem?'' ``How would you design the selectivity estimator that routes between strategies?''}
+\end{interviewq}
+
+%--- Q7 ---
+
+\begin{interviewq}
+\textbf{Q: Walk me through how a PQ index computes distances without decompressing anything, and where the time goes.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Setup.} Each database vector is stored as $L$ bytes: the vector was split into $L$ subvectors (say $L = 96$ subspaces of 8 dims each from $d = 768$), and each subvector replaced by the index of its nearest codeword among $C = 256$ per-subspace centroids learned by $k$-means.
+
+\textbf{Query time---asymmetric distance computation (ADC).} The query stays \emph{uncompressed}. For each subspace $i$, compute the squared distance from the query's $i$-th subvector to all 256 codewords of that subspace: $L$ lookup tables of 256 floats, built once per query in $O(Cd)$ ($\approx 256 \times 768$ multiply-adds---trivial). Then any candidate's approximate distance is the sum of $L$ table entries selected by its code bytes: \textbf{96 lookup-adds instead of 768 multiply-adds}, over 96 bytes instead of 3\,KB. Total per-query cost: $O(Cd + nL)$ for $n$ scanned candidates, and the memory traffic drops 32$\times$, which matters as much as the arithmetic.
+
+\textbf{Where the time actually goes:} table construction is negligible; the scan is bound by cache behavior of the lookups. Production implementations (Faiss fast-scan, ScaNN) shrink codes to 4 bits so each table has 16 entries and fits in SIMD registers---lookups become vector shuffle instructions processing many candidates per cycle. ``Asymmetric'' matters: only the database side carries quantization error; quantizing the query too (symmetric) would roughly double the error for no speed gain in this layout.
+
+\textbf{The error story:} PQ distances are approximations, so a PQ index is almost always paired with exact reranking of the top few hundred candidates using full-precision vectors---converting quantization error into an oversampling cost. Inside IVF, vectors are encoded as residuals from their cell centroid, shrinking the energy the codebooks must cover.
+
+\redflags
+\begin{itemize}
+    \item Believing vectors are decompressed and compared---missing ADC means missing the entire point of PQ.
+    \item Confusing PQ (vector compression) with dimensionality reduction---codes are not vectors in a lower-dimensional space.
+    \item No mention of the rerank pattern that makes lossy codes production-safe.
+\end{itemize}
+
+\interviewtest{Mechanism-level understanding of the workhorse compression scheme: the table trick, the asymmetric design choice, the cost model, and how the error is neutralized in a full system.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct table mechanics and the 96-vs-768 arithmetic.
+    \item \badgeLsix{L6} Adds symmetric-vs-asymmetric error, residual encoding in IVF-PQ, 4-bit SIMD fast-scan, and the rerank pattern.
+    \item \badgeLseven{L7} Discusses OPQ rotation (why subspace independence assumptions fail and how a learned rotation fixes energy balance) and score-aware/anisotropic objectives as the next refinement for MIPS.
+\end{itemize}
+
+\followups{``Why 256 codewords per subspace?'' ``What does OPQ add?'' ``How would you pick $L$ for a 10\,GB memory budget at 100M vectors?''}
+\end{interviewq}
+
+%--- Q8 ---
+
+\begin{interviewq}
+\textbf{Q: When and why does ScaNN's anisotropic quantization beat plain PQ?}
+
+\badgeLseven{L7} \quad \badgetype{Trade-off} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{The objection to plain PQ.} PQ codebooks minimize reconstruction MSE $\norm{\vu - \tilde{\vu}}^2$. But retrieval does not pay for reconstruction error---it pays for \emph{score} error $\inner{\vq}{\vu - \tilde{\vu}}$ on the queries where the point is a contender. MSE is the right proxy only if query directions are isotropic and all pairs matter equally; neither holds for MIPS.
+
+\textbf{The ScaNN result.} Weight the quantization loss by whether the pair scores above a threshold ($\omega(s) = \mathds{1}\{s \ge \theta\}$: only potential winners count). The expected weighted score error then decomposes over the residual $\bm{r} = \vu - \tilde{\vu}$ into components parallel and orthogonal to the data point: $h_{\parallel}\norm{\bm{r}_{\parallel}}^2 + h_{\perp}\norm{\bm{r}_{\perp}}^2$ with $h_{\parallel} \ge h_{\perp}$ \emph{always}. Intuition: the parallel component distorts the point's \emph{norm}, and in inner-product search a high-norm point can win even at a substantial angle from the query---so norm distortion flips outcomes among contenders, while orthogonal error mostly perturbs scores of pairs that were never close to winning. Training codebooks with this anisotropic loss (a modified Lloyd iteration) preferentially preserves norms and buys a better recall--speed frontier on MIPS benchmarks---this, plus SIMD engineering, is ScaNN's core.
+
+\textbf{When it matters---and when it does not.} It wins when (a) the task is genuinely MIPS (dot-product-trained two-tower recsys, DPR-style retrieval on unnormalized embeddings) and (b) norms vary meaningfully across the corpus. If embeddings are L2-normalized, $\bm{r}_{\parallel}$ vs.\ $\bm{r}_{\perp}$ lose their special roles and the loss collapses to ordinary MSE---anisotropic training buys nothing on cosine-normalized corpora, so benchmark before adopting. It is also orthogonal (pun intended) to the rest of the stack: you can drop anisotropic codebooks into an IVF or graph pipeline unchanged.
+
+\redflags
+\begin{itemize}
+    \item ``ScaNN is faster because it's better engineered''---true but not the question; the algorithmic content is the score-aware loss.
+    \item Claiming it helps on normalized embeddings.
+    \item Unable to say \emph{which} residual direction is penalized more, or why.
+\end{itemize}
+
+\interviewtest{Whether you can connect a quantizer's training objective to the retrieval metric it serves---the general lesson (optimize the loss you serve, not reconstruction) generalizes well beyond ScaNN.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows ScaNN quantizes with a retrieval-aware objective.
+    \item \badgeLsix{L6} States the parallel/orthogonal decomposition and the norm-preservation intuition; identifies the normalized-corpus boundary condition.
+    \item \badgeLseven{L7} Sketches why $h_{\parallel} \ge h_{\perp}$ follows from thresholding scores, relates it to the isotropy assumption hidden in MSE, and generalizes: the same score-aware idea reappears in query-distribution-aware quantization and in training rerankers on retrieval-sliced data.
+\end{itemize}
+
+\followups{``What happens to the loss as the threshold $\theta \to 0$?'' ``Could you make the weights query-distribution-aware instead of threshold-based?'' ``Why does plain PQ implicitly assume isotropic queries?''}
+\end{interviewq}
+
+%--- Q9 ---
+
+\begin{interviewq}
+\textbf{Q: You are offered an LSH family with $p_1 = 0.8$, $p_2 = 0.5$ at your target radius. Size an index for 100M vectors and decide whether to use it.}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{Size it.} Quality exponent: $\rho = \ln p_1 / \ln p_2 = \ln 0.8 / \ln 0.5 \approx 0.223/0.693 \approx 0.32$. Per-table hash length: $\ell = \log_{1/p_2} m = \log_2 10^8 \approx 27$ concatenated hashes. Number of tables: $L = m^{\rho} = 10^{8 \times 0.32} \approx 10^{2.6} \approx 375$. Query cost $O(d \cdot m^{\rho})$: $\sim$375 table probes and a few thousand candidate verifications---fine. Space is the problem: each table stores all $10^8$ IDs, so $375 \times 10^8 \times 8\,\mathrm{B} \approx 300$\,GB of \emph{index structure} before storing a single vector (the vectors are another 300\,GB fp32). The $O(m^{1+\rho})$ blow-up is not a constant-factor nuisance; it is the reason vanilla LSH lost to graphs and IVF-PQ.
+
+\textbf{Mitigations before verdict:} multi-probe LSH (probe neighboring buckets) cuts tables by roughly 10$\times$ ($\sim$40 tables, $\sim$30\,GB---now plausible); a better family (cross-polytope vs.\ hyperplane) lowers $\rho$ itself; and quantized fingerprints shrink per-entry cost.
+
+\textbf{The verdict I would give:} for a static, in-RAM, dense-embedding corpus at this scale, no---HNSW or IVF-PQ dominates the recall--QPS--memory frontier empirically, and the LSH guarantees are for the $(1+\epsilon)$-approximate problem, not the recall@$k$ you actually report. I would choose LSH-style hashing when its distinctive properties bind: streaming/insert-heavy workloads (no index maintenance), dedup at extreme scale (MinHash/SimHash [NLP 1]), stateless sharding/routing, adversarial or fast-drifting data where learned structures (centroids, codebooks, graphs) go stale, or a hard requirement for provable bounds.
+
+\redflags
+\begin{itemize}
+    \item Sizing only query time and never computing the space blow-up---the decisive term.
+    \item Not knowing $\rho = \ln p_1/\ln p_2$ or what amplification (AND on $\ell$, OR on $L$) is for.
+    \item A blanket ``LSH is obsolete''---it lost the dense in-RAM race but owns dedup and streaming niches.
+\end{itemize}
+
+\interviewtest{Whether you can turn LSH theory into concrete numbers ($\rho$, $\ell$, $L$, bytes) and then make an engineering call informed by where the theory's guarantees do and do not match production metrics.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Computes $\rho$, $\ell$, $L$ correctly and flags the space cost.
+    \item \badgeLsix{L6} Adds multi-probe and family-choice mitigations, and articulates the guarantee-vs-recall mismatch.
+    \item \badgeLseven{L7} Frames the decision as structure-vs-obliviousness: LSH is data-oblivious and drift-immune, graphs/IVF exploit structure and can go stale---then names the workloads where each property wins.
+\end{itemize}
+
+\followups{``Where does the $m^{\rho}$ come from?'' ``Why does multi-probe work on E2LSH buckets specifically?'' ``Your data distribution shifts weekly---does that change the answer?''}
+\end{interviewq}
+
+%--- Q10 ---
+
+\begin{interviewq}
+\textbf{Q: Why does greedy search on a proximity graph find the nearest neighbor at all? What breaks in high dimensions, and which practical graph has worst-case guarantees?}
+
+\badgeLseven{L7} \quad \badgetype{Conceptual} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{The exactness anchor.} On the Delaunay graph---the dual of the Voronoi diagram---greedy search cannot get stuck: if the current node $\vu$ is not the nearest neighbor of $\vq$, then $\vq$ lies in some other Voronoi cell, and $\vu$ has a Delaunay edge toward a strictly closer cell; so every local minimum is global, and this holds for any supergraph of Delaunay. Delaunay is also the \emph{minimal} graph with this property. That is the entire reason ``walk to the closest neighbor'' is a sane search primitive.
+
+\textbf{What breaks in high dimension.} Two things. First, the Delaunay graph itself becomes unusable: construction is exponential in $d$, and distance concentration makes nearly all Voronoi cells adjacent, driving the graph toward complete---degree explodes. Second, even given a sparse navigable graph, you need \emph{few hops}: Kleinberg's small-world analysis shows greedy routing is polylogarithmic only when long-range links are distributed with exponent exactly equal to the data dimension---a delicate condition no heuristic guarantees. Practical graphs (NSW, HNSW, NSG) approximate both sides---$k$-NN edges plus incidental or hierarchical long links, pruned RNG-style for degree---and their $O(\log m)$ behavior is empirical, with known adversarial instances forcing near-linear scans.
+
+\textbf{The exception with proofs.} Vamana/DiskANN's $\alpha$-pruned sparse neighborhood graphs: keeping edge candidates unless an existing neighbor is $\alpha$-times closer to them guarantees every greedy hop shrinks the distance geometrically. Indyk and Xu (2023) proved degree $O((4\alpha)^{d_\circ}\log\Delta)$, $O(\log_{\alpha}\Delta)$ hops, and an $\big(\frac{\alpha+1}{\alpha-1}+\epsilon\big)$-approximation for greedy search on them---the only such worst-case result among deployed graph indexes---while exhibiting bad instances for HNSW- and NSG-style constructions. The bound is numerically weak ($\alpha = 1.2 \Rightarrow$ factor 11) and states approximation in distance, not recall; its value is structural: it isolates \emph{which} pruning rule preserves navigability, and its constants depend on doubling dimension $d_\circ$---formalizing why graphs work on 768-d embeddings (low $d_\circ$) despite worst-case impossibility at ambient $d$.
+
+\redflags
+\begin{itemize}
+    \item Treating HNSW's $O(\log m)$ as proven.
+    \item No mention of the Delaunay/Voronoi argument---the answer to ``why does greedy work at all.''
+    \item Confusing degree pruning (RNG/$\alpha$) with the hierarchy---they solve different problems (memory/hop cost vs.\ entry distance).
+\end{itemize}
+
+\interviewtest{Depth beyond mechanics: whether you know the theoretical skeleton under the production default and can separate what is proven from what is empirical---a distinctly senior skill.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Greedy on a good graph descends to the neighborhood; more edges $=$ fewer dead ends.
+    \item \badgeLsix{L6} Delaunay optimality/minimality, RNG pruning, and the empirical status of HNSW complexity.
+    \item \badgeLseven{L7} Kleinberg's exponent condition, the $\alpha$-pruning guarantee with its $d_\circ$ dependence, the MIPS wrinkle (inner-product Voronoi cones can be empty; IP-Delaunay guarantees top-1 only), and honest limits of all these bounds.
+\end{itemize}
+
+\followups{``Why does HNSW's hierarchy matter less at high intrinsic dimension?'' ``What does $\alpha$ trade off in Vamana?'' ``How would you \emph{measure} navigability of a built graph?''}
+\end{interviewq}
+
+%--- Q11 ---
+
+\begin{interviewq}
+\textbf{Q: Tune an IVF index for 100M vectors: how many clusters? And what do you do when latency headroom remains but recall plateaus as you raise \texttt{nprobe}?}
+
+\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Choosing $C$.} Per-query cost is routing plus scanning: $C d + \texttt{nprobe} \cdot (m/C) \cdot d$ under balanced clusters, minimized at $C = \sqrt{m \cdot \texttt{nprobe}}$. For $m = 10^8$ and \texttt{nprobe} in the tens: $C \approx 3$--$10 \times 10^4$; practice rounds up (Faiss-style $2^{16}$--$2^{17}$) and routes with a small HNSW over the centroids so routing cost stays sublinear in $C$. Train $k$-means on a representative sample (a few hundred training vectors per centroid is the usual floor), spherical $k$-means if the metric is cosine/IP.
+
+\textbf{Diagnosing the recall plateau.} More probes always widen the scanned set, so a plateau means the \emph{router} is failing---the cells containing the missing true neighbors are not entering the probe ranking at any reasonable \texttt{nprobe}. Work the causes in order:
+\begin{enumerate}
+    \item \textbf{Cluster imbalance / norm pathology.} Check the cluster-size histogram. Variable-norm (dot-product) embeddings under plain $k$-means produce giant low-norm cells and singleton high-norm cells; centroid ranking then misroutes systematically. Fix: spherical $k$-means or the MIPS augmentation, and re-train.
+    \item \textbf{Stale centroids.} Corpus drifted since the coarse quantizer was trained (new content domains, re-encoded embeddings). Fix: re-train centroids on a fresh sample; monitor the assignment-distance distribution over time as a drift signal.
+    \item \textbf{Cell-edge queries.} Queries near Voronoi boundaries have neighbors whose centroids rank poorly. Fix: soft assignment/spillage of boundary points into multiple lists at build time (memory for recall), or more, smaller cells with higher \texttt{nprobe}.
+    \item \textbf{Measurement and PQ error.} Verify recall is against exact ground truth in the \emph{same} metric, and that the plateau is not the PQ score-error ceiling---if IVF-\emph{Flat} recall keeps rising where IVF-PQ plateaus, the fix is more code bytes or exact reranking, not routing.
+\end{enumerate}
+
+\textbf{The L7 extension:} routing is a ranking problem---the centroid is a first-order sketch of its cell, and a learned router (trained on the live query distribution to predict answer-bearing cells) is the principled fix; IVF notably lacks any formal recall theory, so empirical routing diagnostics are the only tool you get.
+
+\redflags
+\begin{itemize}
+    \item ``Recall plateaus, so raise \texttt{nprobe} further''---the premise says that stopped working; the router is the bottleneck.
+    \item Choosing $C$ by folklore ($\sqrt{m}$) without being able to derive it from the cost model.
+    \item Never checking the cluster-size histogram---the one-minute diagnostic that catches the most common pathology.
+\end{itemize}
+
+\interviewtest{Whether you can derive index parameters from a cost model and debug a learned-component pipeline by isolating stages (router vs.\ scanner vs.\ quantizer vs.\ measurement).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} The three-step IVF recipe, \texttt{nprobe} as the dial, $C \approx \sqrt{m}$.
+    \item \badgeLsix{L6} Derives $C = \sqrt{m \cdot \texttt{nprobe}}$, runs the plateau diagnosis (imbalance, drift, edges, PQ ceiling) with concrete checks.
+    \item \badgeLseven{L7} Learned routing as ranking, spillage trade-offs, the IVF-has-no-theory honesty, and connecting cell stability to the clustered-data escape from distance concentration.
+\end{itemize}
+
+\followups{``Why does variable norm break $k$-means specifically?'' ``How would you detect centroid staleness automatically?'' ``When do you rebuild vs.\ re-train vs.\ just add spillage?''}
+\end{interviewq}
+
+%--- Q12 ---
+
+\begin{interviewq}
+\textbf{Q: Your ANN benchmark on synthetic Gaussian vectors shows terrible recall at any latency, but the same index on real embeddings is fine. Explain.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{The index is fine; the synthetic problem is ill-posed.} For i.i.d.\ high-dimensional data, distance concentration (Beyer et al.) applies: the variance-to-squared-mean ratio of query--point distances vanishes as $d$ grows, so $\delta_{\max}/\delta_{\min} \to 1$ and every point is nearly as close as the true nearest neighbor. Two consequences hit the benchmark. First, the true top-$k$ set is essentially a set of coin flips---separated from the rest by margins smaller than any structure an index can exploit---so any sublinear method that prunes \emph{anything} misses them; recall is low \emph{by construction}, at every latency short of a full scan. Second, i.i.d.\ data has intrinsic dimension equal to ambient dimension: there are no clusters for IVF to route by, no navigable manifold for graphs, no energy concentration for quantizers. Every exploitable assumption is violated simultaneously.
+
+\textbf{Why real embeddings behave oppositely.} Trained encoders map data onto low-intrinsic-dimension, clustered structures ($d_\circ \ll d$); query--neighbor margins are real, cluster-retrieval is stable even where exact-NN identity is fuzzy, and the geometry that indexes exploit exists. Same index, same parameters, different \emph{dataset difficulty}---recall--latency curves are properties of the (index, data) pair.
+
+\textbf{What to change:} benchmark on your production embeddings or a public corpus with similar structure (and with your \emph{real query distribution}---uniform random queries over the corpus are also unrepresentative); if synthetic data is unavoidable, generate it with planted cluster structure at realistic intrinsic dimension. And treat this as a standing evaluation-hygiene rule: distrust any vendor or paper number produced on uniform random vectors, in either direction.
+
+\redflags
+\begin{itemize}
+    \item Concluding the index is misconfigured and re-tuning against the synthetic set.
+    \item ``Gaussian data is too easy''---it is too \emph{hard}, for a precise, stateable reason.
+    \item No mention of distance concentration or intrinsic dimensionality---the two concepts this question exists to probe.
+\end{itemize}
+
+\interviewtest{Whether the curse of dimensionality is real understanding or a slogan: the candidate should connect concentration $\to$ meaningless NN $\to$ inevitable recall collapse, and intrinsic dimension $\to$ why production data escapes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} ``Distances concentrate on random high-d data; real embeddings have structure''---qualitatively right.
+    \item \badgeLsix{L6} States the variance/mean$^2$ criterion, the instability consequence, and the benchmarking prescription.
+    \item \badgeLseven{L7} Ties it to evaluation methodology at large (dataset-dependent recall curves, per-corpus retuning), and notes the flip side: an ANN paper that wins only on synthetic uniform data is exploiting an ill-posed benchmark.
+\end{itemize}
+
+\followups{``What happens to this experiment at $d = 8$?'' ``How would you \emph{measure} the intrinsic dimension of your embedding corpus?'' ``Your recall dropped after switching embedding models---related?''}
+\end{interviewq}

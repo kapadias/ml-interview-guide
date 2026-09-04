@@ -2,24 +2,754 @@
 \label{sr:chap:learning_to_rank}
 
 \begin{tldr}
-Placeholder — this chapter is written in Phase C from the vector-retrieval digest and applied-search track design (see review/search-recsys/ in the DL repo).
+Learning to rank (LTR) is the supervised-learning discipline of ordering a candidate list, and it lives almost entirely in the L2 stage of the retrieval funnel (Chapter~\ref{sr:chap:neural_retrieval_reranking}). The core taxonomy---pointwise, pairwise, listwise---is really a statement about what the loss can see: a single document, a preference between two, or the ordered list the user actually experiences. The canonical lineage to master is RankNet $\rightarrow$ LambdaRank $\rightarrow$ LambdaMART: RankNet defines a pairwise logistic loss whose gradient factors into per-document ``forces'' ($\lambda$s); LambdaRank multiplies each force by the $|\Delta \text{NDCG}|$ of swapping the pair, which optimizes a non-smooth metric without ever differentiating it; LambdaMART feeds those $\lambda$s to gradient-boosted trees and dominated production ranking for a decade. Around the models sits the pipeline that interviews actually probe: feature taxonomies and their coverage skew, labels from graded judgments versus click-derived engagement, negatives mined from impressions, temporal splits, and---above all---position bias. Clicks are missing-not-at-random; training on them raw teaches the model to imitate the ranker that produced the log. Counterfactual LTR fixes this with inverse-propensity-scored objectives, with propensities estimated from randomization, intervention harvesting, or EM over logs. The pragmatic 2026 answer to ``GBDT or neural?'': tuned LambdaMART is still at or near parity on tabular ranking features; neural rankers win when the features become embeddings, sequences, and multi-task labels---and most production stacks are hybrids.
 \end{tldr}
 
+%==============================================================================
+\section{The Learning-to-Rank Problem}
+\label{sr:sec:ltr_problem}
+%==============================================================================
+
+\subsection{What Makes Ranking Its Own Learning Problem}
+
+Learning to rank is supervised learning where the unit of prediction is not a label but an \textit{ordering}. The training data is grouped: for each query $q$ we have a candidate set $\{d_1, \ldots, d_n\}$, a feature vector $\vx_{q,d_i}$ per query-document pair, and relevance information---graded labels, preferences, or clicks. The model learns a scoring function $s = f(\vx_{q,d})$, and at serving time the candidates are sorted by score. Three consequences follow immediately, and each shapes the rest of the chapter:
+
+\begin{enumerate}
+    \item \textbf{Only within-query order matters.} Scores are never compared across queries, so any per-query monotone transformation of the scores is a free parameter. Objectives that spend capacity on absolute score levels (pointwise regression) are solving a harder problem than the one being evaluated (Section~\ref{sr:sec:ltr_taxonomy}).
+    \item \textbf{The metrics are non-smooth.} NDCG, MRR, and MAP depend on scores only through the induced permutation: they are piecewise-constant functions of the scores, with zero gradient almost everywhere and undefined gradient at ties. The central technical trick of the field---the lambda gradient---exists to route around this (Section~\ref{sr:sec:lambda_family}).
+    \item \textbf{The labels come from a biased instrument.} The cheapest and largest label source is user behavior on results \textit{the previous ranker chose to show, in the order it chose}. Ranking is the canonical setting where the training distribution is manufactured by the model being replaced (Section~\ref{sr:sec:unbiased_ltr}).
+\end{enumerate}
+
+\subsection{Where LTR Sits in the Funnel}
+
+In the multi-stage architecture of Chapter~\ref{sr:chap:neural_retrieval_reranking}, LTR is the workhorse of the \textbf{L2 (full ranking) stage}: it consumes the few hundred to few thousand candidates surviving retrieval and L1, evaluates a rich feature vector per candidate, and produces the ordering that L3 (business rules, diversity, blending) lightly perturbs. The placement dictates the engineering envelope:
+
+\begin{itemize}
+    \item \textbf{L1 rankers} score thousands to tens of thousands of candidates in a few milliseconds: linear models, very small GBDTs, or a two-tower dot product. Features must be precomputable or trivially cheap; the objective is recall preservation---do not drop the documents L2 would have ranked highly.
+    \item \textbf{L2 rankers} score hundreds of candidates with a budget of roughly 10--30\,ms: a full LambdaMART ensemble, a deep feature-interaction network, or a cross-encoder (Chapter~\ref{sr:chap:neural_retrieval_reranking}) whose score often enters L2 as one feature among many rather than replacing it.
+    \item \textbf{The recall ceiling} applies with full force: L2 cannot recover a document retrieval missed. Offline LTR gains measured on judged candidate sets routinely fail to materialize online because the live candidate set lacks the good documents---diagnose the funnel stage by stage before blaming the ranker.
+\end{itemize}
+
+\subsection{Serving: Budgets and the Scoring Contract}
+
+Because LTR is a stage in a latency-budgeted funnel, the model's serving cost is a design input, not an afterthought:
+
+\begin{itemize}
+    \item \textbf{Per-document budgets.} An L1 scorer runs at hundreds of nanoseconds to a few microseconds per document (linear model, tiny GBDT, or a precomputed-embedding dot product); a full LambdaMART ensemble or mid-size neural ranker at L2 spends tens to hundreds of microseconds per document---acceptable over hundreds of candidates, ruinous over hundreds of thousands. The funnel shape \textit{is} this arithmetic.
+    \item \textbf{Feature cost dominates model cost.} For most L2 rankers the expensive part is assembling the feature vector---feature-store lookups, on-the-fly aggregations, a cross-encoder call---not evaluating the trees. Feature budgets get allocated the way model budgets do, and the most expensive features are often computed only for a top slice of candidates (a mini-funnel inside L2).
+    \item \textbf{Log what you serve.} Serving-time feature values should be logged with the impression, both to make training data leak-free (Section~\ref{sr:sec:ltr_data}) and to make online/offline parity auditable rather than assumed.
+    \item \textbf{Caching interacts with feature design.} Head-query result caching is one of the largest cost levers in search; features that vary per user or per hour break cacheability, which is one structural reason personalization enters late and as a light reordering (Chapter~\ref{sr:chap:recommendation_systems}).
+\end{itemize}
+
+\subsection{The Feature View}
+
+LTR features are the most heterogeneous feature space in production ML---BM25 scores next to embedding cosines next to seven-day click rates next to price. The standard taxonomy, which interviewers expect you to produce unprompted:
+
+\begin{table}[H]
+\centering
+\small
+\caption{The LTR feature taxonomy}
+\label{sr:tab:ltr_features}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Group} & \textbf{Examples} & \textbf{Properties} \\
+\midrule
+Query-only & Query length, IDF statistics of query terms, intent-classifier scores, historical query CTR, query frequency decile & Constant within a query group, so useless to a purely pairwise objective on their own---they matter only through interactions (e.g., ``BM25 matters more for rare queries'') \\
+Document-only & Popularity, freshness/age, quality and spam scores, PageRank-style authority, price, rating, seller reliability, content length & Precomputable and cacheable; also usable at L1; independent of the query, so they encode priors, not relevance \\
+Query-document & BM25 per field (Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}), phrase and proximity matches, term-coverage ratios, field-match flags, embedding cosine from a two-tower model, cross-encoder score, historical engagement of this (query, document) pair & The heart of the model; the expensive ones (cross-encoder) are why L2 sees only hundreds of candidates \\
+Context & Device, locale, time of day, surface (grid vs.\ list), session features & Enable per-context behavior but multiply data requirements; personalization features usually enter here (Chapter~\ref{sr:chap:recommendation_systems}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Behavioral features and coverage skew.} Aggregated engagement---clicks, add-to-carts, purchases per (query, document) pair, impression-normalized and time-decayed---is consistently the strongest single feature family in commerce and web search. It is also the most dangerous: it exists only where traffic exists. Head queries have dense, reliable engagement priors; tail queries have none. A model trained on head-dominated data learns to lean on the engagement features and quietly degrades the tail, where only content features (BM25, embeddings) generalize. Standard defenses: back-off hierarchies (query $\rightarrow$ query category $\rightarrow$ global document prior), Bayesian smoothing of rates with impression-count floors, explicit coverage-indicator features (``this feature is present''), and per-segment evaluation slices (Chapter~\ref{sr:chap:evaluation_experimentation}). Behavioral features are also the feedback-loop vector: they encode the old ranker's exposure decisions (Section~\ref{sr:sec:unbiased_ltr}).
+
+\subsection{Labels: Judgments and Clicks}
+
+Two label supply chains feed LTR, with complementary failure modes:
+
+\begin{itemize}
+    \item \textbf{Graded human judgments.} Editors or crowd workers rate (query, document) pairs on a 4--5 point scale (e.g., 0 bad / 1 related / 2 relevant / 3 highly relevant / 4 perfect). Unbiased with respect to position (judges see the pair, not the SERP), stable, and auditable---but expensive (thousands of queries $\times$ tens of documents is a serious program), slow to refresh, and they measure \textit{topical relevance}, not utility: judges do not know that users at this price point never buy that brand. Judgment program design---guidelines, agreement statistics, pooling, LLM-assisted judging---is covered in Chapter~\ref{sr:chap:evaluation_experimentation}.
+    \item \textbf{Click-derived labels.} Effectively free and enormous, and they measure revealed preference. Raw clicks are noisy (attractive titles get clicked regardless of relevance), so practice refines them: a \textbf{long click} or SAT click requires dwell above a threshold (a common convention is around 30 seconds) before counting as positive; a \textbf{short click} followed by a quick return to the results page is a negative signal despite being a click; the \textbf{last click of a session} is often treated as the satisfying one; and stronger engagement events are mapped onto a graded scale---a typical marketplace mapping is purchase $= 4$, add-to-cart $= 3$, long click $= 2$, click $= 1$, impression without click $= 0$. All of these inherit position and presentation bias from the logging ranker, which is the subject of Section~\ref{sr:sec:unbiased_ltr}.
+\end{itemize}
+
+\begin{keyinsight}[Not-Clicked $\neq$ Irrelevant]
+An unclicked result is usually an \textit{unexamined} result. Click data is missing-not-at-random: the probability of observing a relevance signal depends on the position the old ranker assigned. The one distinction that partially survives the bias is Joachims' pairwise heuristic: a document that was \textit{skipped above a click} was plausibly examined and rejected, so ``clicked $\succ$ skipped-above'' pairs are far more trustworthy than ``clicked $\succ$ any unclicked.'' Every label-construction and negative-sampling decision in this chapter should be checked against this asymmetry.
+\end{keyinsight}
+
+In mature systems the two supplies are blended: judgments anchor offline evaluation and provide clean labels for the tail; debiased engagement provides volume and utility signal for the head and torso. When they systematically disagree, that disagreement is information---about presentation, guideline gaps, or freshness---not an inconvenience to average away (see the interview question on this in Section~\ref{sr:sec:ltr_interview}).
+
+%==============================================================================
 \section{Pointwise, Pairwise, Listwise}
-% TODO Phase C
+\label{sr:sec:ltr_taxonomy}
+%==============================================================================
 
+\subsection{The Three Families}
+
+The taxonomy classifies objectives by how much of the ranking problem the loss function can see. It is a statement about \textit{loss structure}, not model architecture: a GBDT or a neural network can be trained under any of the three.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The LTR objective taxonomy}
+\label{sr:tab:ltr_taxonomy}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Family} & \textbf{Loss unit and objective} & \textbf{Canonical instances} & \textbf{Structural weakness} \\
+\midrule
+Pointwise & One (query, doc): regress the grade or classify relevant/not; $\loss = \sum_i \ell(f(\vx_i), y_i)$ & MSE on grades, logistic regression on clicks, ordinal regression, McRank & Optimizes absolute scores nobody evaluates; dominated by cross-query calibration and label imbalance; ignores which query a document competes in \\
+Pairwise & One preference $d_i \succ d_j$ within a query: minimize mis-ordered pairs & RankNet, RankSVM, RankBoost, GBRank; BPR is the implicit-feedback sibling ([DL 3], Chapter~\ref{sr:chap:recommendation_systems}) & All inversions weigh equally---fixing a swap at ranks 49--50 pays the same as at ranks 1--2, but NDCG does not care about the former \\
+Listwise & The whole ranked list for a query: optimize (a surrogate or reweighting for) the list metric & LambdaRank and LambdaMART via $|\Delta\text{NDCG}|$; ListNet, ListMLE; softmax cross-entropy; smooth surrogates (ApproxNDCG, SoftRank) & Surrogates approximate; permutation likelihoods (ListMLE) optimize order likelihood, not the metric's position discounts, unless reweighted \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Why Pointwise Regression Misses the Ranking Structure: A Worked Example}
+
+The standard interview probe is ``why not just regress the relevance grades with MSE?'' The complete answer has three parts; the first deserves numbers.
+
+\textbf{(1) MSE can prefer the model with the worse ranking.} One query, two documents, graded labels $l_A = 3$ (perfect) and $l_B = 1$ (marginal):
+
+\begin{itemize}
+    \item \textbf{Model 1} predicts $s_A = 1.8$, $s_B = 2.0$. MSE $= \tfrac{1}{2}\left[(3-1.8)^2 + (1-2.0)^2\right] = \tfrac{1}{2}(1.44 + 1.00) = 1.22$. Ranking: $B$ above $A$ --- \textit{inverted}.
+    \item \textbf{Model 2} predicts $s_A = 0.8$, $s_B = -1.2$. MSE $= \tfrac{1}{2}\left[(3-0.8)^2 + (1+1.2)^2\right] = \tfrac{1}{2}(4.84 + 4.84) = 4.84$. Ranking: $A$ above $B$ --- \textit{perfect}.
+\end{itemize}
+
+Pointwise MSE prefers Model 1 by a factor of four; every ranking metric prefers Model 2. With exponential gains ($2^{l}-1$) the inverted list scores $\text{NDCG} = \frac{1/1 + 7/\log_2 3}{7/1 + 1/\log_2 3} = \frac{5.42}{7.63} \approx 0.71$ versus $1.0$ for Model 2. The regression loss rewarded being \textit{uniformly close} to the labels; the product only ever asked which document goes first.
+
+\textbf{(2) Cross-query calibration is wasted capacity.} For a navigational query every candidate might deserve grade 2--4; for a garbage tail query nothing beats grade 1. A pointwise objective forces one global scale onto both, spending model capacity aligning score levels across queries---a constraint the evaluation never checks, since NDCG is computed per query and averaged. Pairwise and listwise objectives are invariant to per-query score shifts by construction.
+
+\textbf{(3) Label imbalance concentrates effort in the wrong place.} Most candidates for most queries are irrelevant, so a pointwise regressor earns most of its loss reduction by predicting ``irrelevant'' accurately---while the metric is decided entirely by the ordering among the few plausible candidates at the top.
+
+\begin{keyinsight}[When Pointwise Is Nevertheless Correct]
+Pointwise objectives are not a beginner's mistake; they are what you use when you need \textit{calibrated absolute scores}. Ads auctions bid expected value and require a calibrated pCTR ([DL 12]); quality gates threshold a score (``show the answer box only if $p > 0.7$''); multi-surface blending compares scores across sources. Pairwise and listwise training destroys calibration---only score \textit{differences} within a query are constrained. The production pattern is a calibrated pointwise model where money or thresholds touch the score, with a listwise reranker on top, or post-hoc recalibration (Platt/isotonic) of a ranking model's outputs where that suffices.
+\end{keyinsight}
+
+\subsection{Listwise Objectives Beyond the Lambda Trick}
+
+Two listwise lineages predate and parallel the LambdaRank line of Section~\ref{sr:sec:lambda_family}. \textbf{Permutation-likelihood losses} put a probability model on orderings: ListNet (Cao et al., 2007) matches top-one choice probabilities under a Plackett--Luce model; ListMLE (Xia et al., 2008) maximizes the likelihood of the observed permutation. The listwise softmax cross-entropy---treat the clicked/relevant document's score as the logit of the correct class among its group---is the quiet workhorse of neural rankers and two-tower training. \textbf{Smooth surrogates} replace the rank function with a differentiable approximation (soft ranks via pairwise sigmoids, ApproxNDCG, SoftRank) so NDCG-like objectives admit gradients directly. In practice, the lambda reweighting of the next section won on both benchmarks and production adoption because it targets the exact metric, needs no surrogate tuning, and drops into gradient boosting unchanged.
+
+%==============================================================================
 \section{RankNet, LambdaRank, LambdaMART}
-% TODO Phase C
+\label{sr:sec:lambda_family}
+%==============================================================================
 
+This is the lineage every ranking interview eventually reaches (Burges' 2010 overview, ``From RankNet to LambdaRank to LambdaMART,'' remains the canonical reference). Each step keeps the previous step's machinery and fixes its blind spot.
+
+\subsection{RankNet: Pairwise Logistic Loss and the Lambda View of Its Gradient}
+
+RankNet (Burges et al., 2005) trains a scoring function $s = f(\vx)$ so that within a query, the more relevant document of a pair gets the higher score. It is logistic regression on score differences.
+
+\begin{mathresult}{RankNet: Loss and the Lambda Factorization of Its Gradient}
+For documents $i, j$ in the same query group with scores $s_i = f(\vx_i)$, $s_j = f(\vx_j)$, model the preference probability as
+\begin{equation}
+P_{ij} \;=\; \prob{i \succ j} \;=\; \frac{1}{1 + e^{-\sigma_0 (s_i - s_j)}},
+\end{equation}
+with $\sigma_0$ a shape constant. For a training pair whose label says $i \succ j$, the cross-entropy loss is
+\begin{equation}
+C_{ij} \;=\; -\log P_{ij} \;=\; \log\!\left(1 + e^{-\sigma_0 (s_i - s_j)}\right).
+\end{equation}
+Its gradient with respect to the scores factors through a single scalar per pair:
+\begin{equation}
+\lambda_{ij} \;\equiv\; \frac{\partial C_{ij}}{\partial s_i} \;=\; \frac{-\sigma_0}{1 + e^{\sigma_0 (s_i - s_j)}}, \qquad \frac{\partial C_{ij}}{\partial s_j} = -\lambda_{ij}.
+\end{equation}
+Summing over all labeled pairs gives one signed \textbf{force per document},
+\begin{equation}
+\lambda_i \;=\; \sum_{j:\, i \succ j} \lambda_{ij} \;-\; \sum_{j:\, j \succ i} \lambda_{ji},
+\end{equation}
+and the parameter update is $\Delta \vw \propto -\sum_i \lambda_i\, \partial s_i / \partial \vw$. Properties worth stating in an interview: $\lambda_{ij} \in (-\sigma_0, 0)$; its magnitude approaches $\sigma_0$ when the pair is badly mis-ordered ($s_i \ll s_j$) and approaches $0$ when the pair is confidently correct---a margin-aware push. The per-document aggregation is also the computational trick: gradients accumulate per document rather than per pair, so one forward pass per document serves all its pairs.
+\end{mathresult}
+
+The physical picture---which is also the correct way to explain this to a non-ML engineer---is a system of forces on the current ranked list: every mis-ordered pair pushes its more-relevant member up and its less-relevant member down, with force proportional to how wrong the model currently is about the pair. Training equilibrates the forces.
+
+\textbf{RankNet's blind spot.} The loss counts inversions, all inversions equally. A model that fixes a mis-ordering at ranks 49--50 reduces the loss exactly as much as one that fixes ranks 1--2. But NDCG's position discount means the user-visible metric moves roughly thirty times more in the second case (worked below). Optimizing pairwise cross-entropy therefore spends gradient budget deep in the list where the metric---and the user---cannot see it.
+
+\subsection{LambdaRank: Weight Each Gradient by the Metric It Would Move}
+
+LambdaRank (Burges, Ragno, and Le, 2006) makes one modification, and it is the single most important idea in this chapter.
+
+\begin{mathresult}{LambdaRank: Metric-Weighted Lambda Gradients}
+Keep RankNet's pairwise force, but scale it by the change in NDCG that swapping the two documents' positions would cause:
+\begin{equation}
+\lambda_{ij} \;=\; \frac{-\sigma_0}{1 + e^{\sigma_0 (s_i - s_j)}}\;\cdot\;\bigl|\Delta \text{NDCG}_{ij}\bigr|,
+\end{equation}
+where, for documents with grades $l_i, l_j$ currently at ranks $r_i, r_j$ (exponential gain, log discount),
+\begin{equation}
+\bigl|\Delta \text{NDCG}_{ij}\bigr| \;=\; \frac{\bigl|2^{l_i} - 2^{l_j}\bigr| \cdot \bigl|\tfrac{1}{\log_2(1+r_i)} - \tfrac{1}{\log_2(1+r_j)}\bigr|}{\text{IDCG}}.
+\end{equation}
+Note what changed conceptually: LambdaRank \textbf{defines the gradients directly} rather than deriving them from a loss function. NDCG is piecewise-constant in the scores---its true gradient is zero almost everywhere---so instead of differentiating the metric, LambdaRank writes down the force field a differentiable version of the metric \textit{would} induce and follows it. Computing $|\Delta\text{NDCG}_{ij}|$ requires sorting by current scores each iteration (ranks $r_i$ enter the formula); the pair swap is a purely local, $O(1)$ metric delta. Substituting $|\Delta\text{MRR}|$, $|\Delta\text{MAP}|$, or $|\Delta\text{ERR}|$ retargets training at those metrics with no other change.
+\end{mathresult}
+
+\textbf{Why the weighting has the right shape.} The factor $|2^{l_i} - 2^{l_j}|$ makes forces large when the grade gap is large (a perfect result under a bad one is urgent; two mediocre results in either order are not). The discount-difference factor makes forces large near the top: for a grade-3 vs.\ grade-0 pair, the discount difference at ranks 1--2 is $1 - 1/\log_2 3 \approx 0.369$, while at ranks 9--10 it is $1/\log_2 10 - 1/\log_2 11 \approx 0.012$---the same mis-ordered pair generates roughly $31\times$ the gradient when it sits at the top of the list. Learning concentrates exactly where the metric lives. Empirically---and later verified as local optimality by Donmez, Svore, and Burges (2009)---gradient ascent on these forces climbs NDCG despite no NDCG-valued loss ever being written down.
+
+\textbf{A worked micro-example: where the forces go.} Three documents for one query, graded $l_A = 0$, $l_B = 3$, $l_C = 1$, currently ranked $A$ (rank 1), $B$ (rank 2), $C$ (rank 3) by the model. Gains $2^l - 1$ give $\text{IDCG} = 7/\log_2 2 + 1/\log_2 3 = 7.631$; the current $\text{NDCG} = (0 + 7/\log_2 3 + 1/\log_2 4)/7.631 \approx 0.644$. The three labeled pairs and their swap deltas:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Pairwise $|\Delta\text{NDCG}|$ for the worked three-document example}
+\label{sr:tab:lambda_example}
+\begin{tabularx}{\textwidth}{llllX}
+\toprule
+\textbf{Pair (better $\succ$ worse)} & \textbf{Ranks} & \textbf{Gain gap $|2^{l_i} - 2^{l_j}|$} & \textbf{$|\Delta\text{NDCG}|$} & \textbf{Reading} \\
+\midrule
+$B \succ A$ & 2 vs.\ 1 & $7$ & $7 \times 0.369 / 7.631 = 0.339$ & Mis-ordered, huge grade gap, at the very top: this pair dominates \\
+$B \succ C$ & 2 vs.\ 3 & $6$ & $6 \times 0.131 / 7.631 = 0.103$ & Correctly ordered and lower down; small corrective pressure \\
+$C \succ A$ & 3 vs.\ 1 & $1$ & $1 \times 0.500 / 7.631 = 0.066$ & Mis-ordered but a minor grade gap; modest push \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Aggregating forces: $B$ is pushed up by both of its pairs (dominated by the $0.339$ term), $A$ is pushed down by two pairs, and $C$ receives a small net nudge. The gradient budget concentrates almost entirely on the one swap that matters---promoting the perfect document over the bad one at the top---which is exactly the ordering NDCG cares about: performing that single swap alone would raise NDCG from $0.644$ to $0.983$. Being able to run this arithmetic on a whiteboard (grade gaps times discount differences, normalized by IDCG) is a fair proxy for actually understanding the method.
+
+\textbf{The LambdaLoss postscript.} The obvious theoretical discomfort---``you defined gradients without a loss; of what are they the gradient?''---was answered by the LambdaLoss framework (Wang et al., 2018): lambda gradients are the gradients of a well-defined family of metric-driven losses derived from a probabilistic model over ranked lists, optimized EM-style; the framework both legitimizes LambdaRank and yields tighter NDCG bounds. The one-liner to know: \textit{LambdaRank turned out to be minimizing a proper listwise loss all along, and LambdaLoss tells you which one}.
+
+\subsection{LambdaMART: Lambdas Drive Gradient-Boosted Trees}
+
+LambdaMART is gradient boosting (MART) with the lambda gradients as the thing being fit. Recall the GBDT template ([CML 2] for full internals): each boosting round fits a regression tree to the negative gradient of the loss at the current predictions (the pseudo-residuals), then adds a damped version of that tree to the ensemble. LambdaMART's entire specialization is the choice of pseudo-residual:
+
+\begin{enumerate}
+    \item Score every training document with the current ensemble; sort each query group by score to obtain current ranks.
+    \item Compute each document's $\lambda_i$---the sum of its metric-weighted pairwise forces from the LambdaRank formula---using those ranks.
+    \item Fit the next regression tree to the targets $\{\lambda_i\}$; set leaf values with a Newton step using the second derivatives $\partial \lambda_i / \partial s_i$ (standard boosting refinement, not ranking-specific).
+    \item Shrink by the learning rate, add to the ensemble, repeat; early-stop on validation NDCG@$k$.
+\end{enumerate}
+
+Everything the trees do---splits on raw features, handling of mixed scales and missing values, interaction discovery---is inherited unchanged from GBDT. The ranking problem enters only through the targets.
+
+\textbf{Why it dominated a decade.} LambdaMART-family models won the Yahoo!\ Learning to Rank Challenge (2010, on a corpus of tens of thousands of judged queries with hundreds of features), set the reference numbers on the MSLR-WEB30K benchmark (30k queries, 136 features, 0--4 grades), and became the default production L2 ranker across web search, e-commerce, and app stores---as well as the standard winning recipe for ranking-shaped Kaggle competitions via LightGBM's \texttt{lambdarank} objective and XGBoost's \texttt{rank:ndcg}. The reasons are the generic GBDT-on-tabular advantages, which LTR feature vectors exhibit in extreme form: dozens-to-hundreds of heterogeneous features on wildly different scales, missing values with meaning (no click history $\neq$ zero clicks), non-linear monotone-ish relationships, and small-to-medium labeled data. Add ranking-specific virtues: training in minutes on CPUs (fast iteration on features, the actual bottleneck of ranking work), microsecond-scale inference per document, and robustness to the feature-hygiene accidents that silently degrade neural rankers.
+
+\subsection{Practical Configuration}
+
+What a working LambdaMART setup looks like (LightGBM vocabulary; XGBoost equivalents exist):
+
+\begin{itemize}
+    \item \textbf{Capacity:} \texttt{num\_leaves} 31--255 (larger datasets and feature counts justify deeper trees), \texttt{min\_data\_in\_leaf} $\sim$50--200 to stop leaves memorizing single tail queries.
+    \item \textbf{Schedule:} learning rate 0.02--0.1 with 300--3000 trees, governed by \textbf{early stopping on validation NDCG@$k$} (patience 50--100 rounds)---the validation set must be split by query (never by row) and preferably by time, with the same $k$ you report.
+    \item \textbf{Ranking-specific knobs:} \texttt{label\_gain} defaults to $2^{l}-1$ (know that, because it means grade 4 carries $15\times$ the gain of grade 1); \texttt{lambdarank\_truncation\_level} restricts pair generation to pairs involving the current top-$k$, concentrating compute where NDCG@$k$ lives; per-query pair sampling caps the quadratic blowup on queries with many labeled documents.
+    \item \textbf{Regularization and robustness:} feature and row subsampling ($\sim$0.7--0.9), and \textbf{monotonic constraints} on guardrail features (score non-decreasing in rating, non-increasing in price where policy demands it)---cheap insurance against a model that occasionally punishes better-rated items because of a confounded training slice.
+\end{itemize}
+
+\begin{warningbox}
+The two silent evaluation bugs specific to grouped data: (1) random row-level train/validation splits leak query groups across the boundary---the same query's documents appear on both sides and validation NDCG is optimistically inflated; split by query ID, and by time if behavioral features are present. (2) Reporting NDCG improvements while early-stopping on a different $k$ or a different gain function than the reported metric quietly tunes for the wrong target; NDCG regimes (choice of $k$, gain base, unjudged handling) are a real decision, covered in Chapter~\ref{sr:chap:evaluation_experimentation}.
+\end{warningbox}
+
+%==============================================================================
 \section{Features and Training Data Construction}
-% TODO Phase C
+\label{sr:sec:ltr_data}
+%==============================================================================
 
+Models are interchangeable; the dataset is the system. This section is the craft layer interviews probe with ``walk me through building the training set.''
+
+\subsection{Assembling Query Groups}
+
+\textbf{Query sampling.} Sample training queries stratified by traffic \textit{and} by segment (head/torso/tail, category, locale)---pure traffic-weighted sampling produces a head-dominated model (the tail-degradation interview question in Section~\ref{sr:sec:ltr_interview}); pure uniform sampling over distinct queries underweights the queries users actually issue. Deduplicate near-identical queries (normalization variants) before splitting, or they leak across the boundary.
+
+\textbf{Candidates and negatives.} Each query group needs positives and a realistic candidate context:
+
+\begin{itemize}
+    \item \textbf{Impressed negatives} (shown, not engaged) are the workhorse: they match the serving distribution---these are exactly the documents the ranker must learn to demote. Weight skipped-above-click impressions as stronger negatives (cascade logic, Section~\ref{sr:sec:unbiased_ltr}); treat below-the-last-click impressions as weak or unknown, not negative.
+    \item \textbf{Random or retrieved-but-not-shown negatives} prevent the model from only learning distinctions among plausible candidates, but pure random negatives make training trivially easy---the model learns ``match any query term'' and stalls. Mix them in as a minority.
+    \item \textbf{Judged non-relevant documents} are the cleanest negatives where a judgment program exists.
+    \item The standard blend is impressed negatives as the base, a slice of harder negatives (high-BM25 or high-embedding-similarity non-engaged documents---the ranking cousin of the hard-negative mining used to train retrieval encoders, Chapter~\ref{sr:chap:neural_retrieval_reranking}), plus a small random slice.
+\end{itemize}
+
+\textbf{Splits.} Temporal splits are mandatory once any behavioral feature exists: train on weeks $1$--$N$, validate on week $N{+}1$. Random-in-time splits let the model peek at future engagement regimes and overstate every behavioral feature's value.
+
+\subsection{Feature Leakage in Ranking}
+
+Ranking has its own leakage bestiary beyond the generic ML list, because so many features are aggregates of the very behavior being predicted:
+
+\begin{warningbox}
+\textbf{The point-in-time rule.} Every behavioral feature must be computed \textit{as of the impression timestamp}, from data strictly preceding it. The classic violations: (1) engagement aggregates computed over a window that overlaps or includes the labeled impression---the label is inside its own feature, and offline metrics soar while the online model, which cannot see the future, disappoints; (2) same-session signals (the dwell of the very click being predicted, ``user later purchased from this seller'') leaking into features; (3) features rebuilt at training time from \textit{current} tables while serving reads \textit{then-current} values---an online/offline skew that is leakage's operational twin, solved by logging feature values at serving time and training on the logged values; (4) judgment-derived features (a ``quality'' score that judges assigned after seeing relevance) predicting judgments. The tell in all cases: a feature whose offline importance is enormous and whose online contribution is absent.
+\end{warningbox}
+
+\subsection{Sample Weighting}
+
+Instance weights are the quiet control surface of LTR training, used for at least four distinct purposes---know which one you are doing:
+
+\begin{itemize}
+    \item \textbf{Segment rebalancing:} up-weight tail or strategic segments so the loss does not simply mirror the traffic distribution (the alternative to stratified sampling; equivalent in expectation, different in variance).
+    \item \textbf{Label confidence:} weight a purchase-derived label above a click-derived one; down-weight single-click evidence versus repeated engagement; weight judgments by judge agreement.
+    \item \textbf{Bias correction:} inverse-propensity weights that turn biased click data into an unbiased objective (Section~\ref{sr:sec:unbiased_ltr})---these are principled, not heuristic, and come with variance consequences.
+    \item \textbf{Recency:} exponential decay on example age so the model tracks the current catalog and query mix without discarding history outright.
+\end{itemize}
+
+\subsection{Retraining Cadence and the Loop}
+
+Production LTR retrains on a cadence (often daily to weekly) set by feature freshness rather than model drift: behavioral aggregates move fast, and the model must track catalog churn. The strategic fact about the cadence is that \textbf{each generation trains on data its predecessor curated}: the previous model chose what got impressed, which determines which (query, document) pairs ever receive labels, which shapes the next model. Left alone, this loop entrenches incumbents, starves new documents of feedback, and narrows the system's view of the corpus. The mitigations---exploration traffic, logging discipline, propensity-aware training, long-term holdouts---are the operational subject of Chapter~\ref{sr:chap:production_retrieval_rag}; the statistical core, position bias, is next.
+
+%==============================================================================
 \section{Position Bias and Unbiased LTR}
-% TODO Phase C
+\label{sr:sec:unbiased_ltr}
+%==============================================================================
 
+This is the section of the chapter interviewers weight most heavily at the staff level. Raising position bias \textit{unprompted} in any discussion of click-trained rankers is close to a pass/fail gate.
+
+\subsection{The Examination Hypothesis and Click Models}
+
+The founding observation (eye-tracking and randomization studies from Joachims and colleagues in the mid-2000s): users examine results top-down and sparsely, so click probability confounds \textit{where the result was shown} with \textit{how relevant it was}. At equal relevance, position 1 draws on the order of $3$--$10\times$ the clicks of position 5. The \textbf{examination hypothesis} factorizes the confound:
+\begin{equation}
+\prob{\text{click} \given d, \text{position } p} \;=\; \underbrace{\prob{\text{examined} \given p}}_{\text{propensity } \theta_p} \;\cdot\; \underbrace{\prob{\text{click} \given d, \text{examined}}}_{\text{attractiveness/relevance}}
+\end{equation}
+Click models are structured instantiations of this factorization; the three to know:
+
+\begin{table}[H]
+\centering
+\small
+\caption{The three click models to know cold}
+\label{sr:tab:click_models}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Model} & \textbf{Examination assumption} & \textbf{What it buys you} & \textbf{Where it breaks} \\
+\midrule
+Position-Based Model (PBM) & Examination depends on position only: $\theta_p$ per rank & Clean propensity/relevance factorization---$\theta_p$ is exactly the IPS weight counterfactual LTR needs; handles multiple clicks per page & Ignores sequential dependence: examination actually depends on what was seen above (a perfect result at rank 1 suppresses examination below) \\
+Cascade (Craswell et al., 2008) & Strict top-down scan; stop at the first click & Explains why skips-above-a-click are informative negatives (examined and rejected)---the justification for Joachims' ``clicked $\succ$ skipped-above'' pairs & Models exactly one click per session; multi-click and no-click sessions need extensions (DCM, UBM) \\
+Dynamic Bayesian Network (DBN) & Cascade plus a latent \textit{satisfaction} variable: after a click, the user continues only if unsatisfied & Separates attractiveness (click) from satisfaction (no return to the results page)---the principled basis for dwell/last-click graded pseudo-labels & More parameters to estimate; satisfaction is inferred, not observed; still assumes linear scan \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+In practice: PBM propensities feed the counterfactual training below; cascade logic justifies the negative-mining rules of Section~\ref{sr:sec:ltr_data}; DBN-style satisfaction converts click streams into graded engagement labels. Beyond position and examination, remember \textbf{trust bias} (users click top results partly \textit{because} they are top---examination alone does not capture it) and \textbf{presentation bias} (snippets, images, price display), which no position-indexed propensity absorbs.
+
+\begin{warningbox}
+\textbf{The circularity trap, stated once and bluntly.} Train on raw clicks and your model's labels are a function of the old ranker's ordering; the easiest way to score well is to reproduce that ordering. Offline metrics computed on the same logs then \textit{reward} the mimicry---you can ship a model whose main skill is agreeing with its predecessor, observe beautiful offline numbers, and change nothing online. Every fix in this section is an attack on one link of that circle.
+\end{warningbox}
+
+\subsection{Counterfactual LTR: Inverse Propensity Scoring}
+
+Counterfactual (unbiased) LTR, formalized by Joachims, Swaminathan, and Schnabel (2017), treats the click log as the output of a biased measurement instrument and reweights it into an unbiased objective.
+
+\begin{mathresult}{The IPS Estimator for Ranking}
+Consider additive rank metrics of the form $\Delta(f \given q) = \sum_{d \,\in\, \text{rel}(q)} \mu\!\left(\operatorname{rank}(d \given f, q)\right)$---a sum over relevant documents of a rank weight $\mu$ (for DCG, $\mu(r) = 1/\log_2(1+r)$). Full-information evaluation needs all relevance labels; the log provides only clicks $c_d$ observed at logged positions $p_d$. Under the examination hypothesis with propensities $\theta_p$, the inverse-propensity-scored estimator
+\begin{equation}
+\widehat{\Delta}_{\text{IPS}}(f \given q) \;=\; \sum_{d:\, c_d = 1} \frac{\mu\!\left(\operatorname{rank}(d \given f, q)\right)}{\theta_{p_d}}
+\end{equation}
+is unbiased: a relevant document examined with probability $\theta_{p_d}$ contributes in expectation $\theta_{p_d} \cdot \mu(\cdot)/\theta_{p_d} = \mu(\cdot)$, exactly its full-information contribution. (Click noise given examination adds variance, not bias, and the same argument extends to it.) Requirements: \textbf{correct propensities} and \textbf{positivity} ($\theta_p > 0$ for every position that can show a relevant document---documents never exposed contribute nothing, and no reweighting recovers them). Training replaces the metric with a per-positive surrogate loss weighted the same way, e.g.\ propensity-weighted pairwise hinge (Joachims' Propensity SVM-Rank), propensity-weighted lambda losses, or propensity-weighted listwise softmax: rare-examination clicks (deep positions) count more, because each one speaks for the many relevant documents examined there and missed.
+\end{mathresult}
+
+\textbf{The variance tax and its management.} $1/\theta_p$ explodes for deep positions, so a handful of deep-position clicks can dominate the gradient; the estimator is unbiased but high-variance. Standard toolkit:
+
+\begin{itemize}
+    \item \textbf{Propensity clipping:} cap weights at $1/\tau$ (equivalently floor propensities at $\tau$). Reduces variance at the cost of reintroducing bias \textit{toward the logging policy's ordering}---clipping shrinks exactly the corrections IPS was built to make. Sweep $\tau$; monitor both.
+    \item \textbf{Self-normalized IPS (SNIPS):} divide by the sum of weights instead of the raw count; trades a small bias for a large variance reduction and immunizes against globally mis-scaled propensities.
+    \item \textbf{Doubly robust estimators:} combine an imputed-relevance model (which fills in unclicked documents) with IPS applied to its residuals---unbiased if \textit{either} the propensities or the imputation model is correct, and lower variance than pure IPS; increasingly the default recommendation in the unbiased-LTR literature (Oosterhuis and collaborators, early 2020s).
+    \item \textbf{Diagnostics:} track the effective sample size $(\sum_i w_i)^2 / \sum_i w_i^2$ of the weighted data; when it collapses to a small fraction of the nominal count, the estimator is being carried by a few heavy clicks and no offline number from it should be trusted.
+\end{itemize}
+
+\subsection{Estimating the Propensities}
+
+IPS moves the problem to: where do the $\theta_p$ come from? Four answers, in decreasing order of cleanliness and increasing order of practicality:
+
+\begin{enumerate}
+    \item \textbf{Uniform randomization.} Shuffle the top-$k$ for a small traffic slice; relative click rates by position estimate $\theta_p$ directly. Gold standard, brutal UX cost---rarely acceptable beyond tiny slices, but even a tiny always-on randomized slice is priceless as an \textit{unbiased evaluation set}.
+    \item \textbf{Pair randomization (RandPair / FairPairs).} Swap only adjacent pairs (or a designated pair) at random. Each swap is nearly invisible to users yet yields the propensity \textit{ratio} between the two positions; chaining adjacent ratios recovers the full curve. The usual production choice when intervention is allowed.
+    \item \textbf{Intervention harvesting.} No new intervention: exploit variation you already have. Different ranker versions, A/B arms, and natural reorderings place the same (query, document) at different positions over time; treating these as quasi-experiments recovers propensities from logs alone (Agarwal et al., 2019). Requires enough natural variation and care that the variation is not itself relevance-correlated.
+    \item \textbf{Joint estimation from plain logs (regression EM).} Treat examination and relevance as latent, alternate between estimating $\theta_p$ given current relevance estimates and vice versa (Wang et al., 2018, developed for personal search where randomization was impossible). Identifiability leans on the same documents appearing at multiple positions; the model-based assumptions (PBM structure) do real work. The production shortcut in the same spirit: \textbf{position as a training feature}---feed the logged position into the model (often via a separate shallow tower so it cannot interact deeply with content features), then at serving fix the position input to a constant; the model's content pathway has been de-confounded from rank. Cheap, widely used (the YouTube shallow-tower pattern), approximately correct exactly when the PBM factorization is approximately true.
+\end{enumerate}
+
+\textbf{Practice notes.} Propensities are \textit{surface} properties: estimate them per device, layout, and module (grid versus list, above versus below the fold), and re-estimate after any UI change---a redesign silently invalidates the propensity curve and, with it, every IPS-trained model downstream. Log everything needed to reconstruct the counterfactual: position, surface, ranker version, and ideally the full impressed list with scores; the cheapest unbiased-LTR program is mostly a logging discipline. And keep the editorial judgment set (Chapter~\ref{sr:chap:evaluation_experimentation}) as the anchor: debiased-click metrics and judgment metrics disagreeing is your early warning that the propensity model has drifted.
+
+\subsection{Online LTR, Briefly}
+
+The counterfactual approach learns offline from logged bias-corrected data; \textit{online} LTR instead learns from live interaction. Dueling Bandit Gradient Descent (Yue and Joachims, 2009) perturbs the ranker's parameters and uses interleaved comparisons to decide whether the perturbation won; Pairwise Differentiable Gradient Descent (Oosterhuis and de Rijke, 2018) makes the update differentiable via a Plackett--Luce ranker and inference from observed clicks. Online LTR is elegant and handles nonstationarity naturally, but industry has largely settled on the counterfactual pattern---offline training on debiased logs, online \textit{evaluation} via interleaving and A/B---because it keeps model iteration off the live traffic and auditable. Interleaving mechanics and the offline-to-online promotion funnel are covered in Chapter~\ref{sr:chap:evaluation_experimentation}.
+
+%==============================================================================
 \section{Neural LTR and the GBDT Question}
-% TODO Phase C
+\label{sr:sec:neural_ltr}
+%==============================================================================
 
+``Should the L2 ranker be a GBDT or a neural network?'' is a genuine engineering decision with a defensible 2026 answer, not a fashion question. The honest starting fact: on the classic tabular LTR benchmarks (MSLR-WEB30K, Yahoo, Istella), carefully tuned LambdaMART remained ahead of most published neural rankers for years, and the systematic head-to-head study by Qin et al.\ (ICLR 2021) found neural models reached parity only with substantial effort---a result that should discipline any ``neural is obviously better'' instinct.
+
+\subsection{When Neural Rankers Win}
+
+The decision is a \textbf{feature-space question}. GBDTs are unbeatable consumers of a few hundred well-engineered scalar features; they cannot natively consume the inputs that increasingly carry ranking signal:
+
+\begin{itemize}
+    \item \textbf{Embeddings as first-class features.} Query, document, and user embeddings---hundreds of dense correlated dimensions---are awkward for axis-aligned tree splits but native to a neural ranker, which can also \textit{fine-tune} them jointly with the ranking objective (and share encoders with retrieval, Chapter~\ref{sr:chap:neural_retrieval_reranking}).
+    \item \textbf{Large sparse ID spaces.} Item IDs, seller IDs, query tokens with learned embedding tables---the core of modern recommendation ranking---simply do not fit the GBDT input model; this is why recsys ranking went neural first (Chapter~\ref{sr:chap:recommendation_systems}).
+    \item \textbf{Behavior sequences.} Encoding a user's recent interaction history with attention, in the style of DIN or SASRec, has no tree-model equivalent.
+    \item \textbf{Multi-task heads.} Jointly predicting click, add-to-cart, purchase, and dwell with shared representations (MMoE-style) both regularizes and produces the multiple calibrated outputs that L3 blending wants; GBDTs train one objective at a time.
+    \item \textbf{Very large data.} GBDT returns diminish past tens of millions of examples; neural capacity keeps scaling, and online/continual updates of embedding tables have no tree analogue.
+\end{itemize}
+
+The feature-interaction architectures that dominate neural ranking---Wide\,\&\,Deep, DeepFM, DCN, DLRM lineage---are recommendation canon and are treated properly in Chapter~\ref{sr:chap:recommendation_systems}; from this chapter's viewpoint they are ``pointwise/listwise scorers over embedding-rich features,'' trainable with every objective in Section~\ref{sr:sec:ltr_taxonomy}.
+
+\subsection{Listwise Context: Transformers over the Candidate Set}
+
+A structurally distinct neural idea---not available to per-document scorers of any kind---is to score candidates \textit{jointly}: run self-attention over the top-$k$ candidate list so each document's score depends on what it is competing against (SetRank, the Personalized Re-ranking Model, Seq2Slate). This ``context-aware reranking'' captures effects a univariate scoring function cannot express: relative price within the displayed set, redundancy (the third near-duplicate is worth less than the first), complementarity and list-level diversity. It typically runs as a final thin reranker over the L2 top 20--50, where $O(k^2)$ attention is trivial. Distinguish this from cross-encoder reranking (Chapter~\ref{sr:chap:neural_retrieval_reranking}), which is attention \textit{within} a query-document text pair; transformer-over-candidates is attention \textit{across} the list, and the two compose.
+
+\subsection{The Pragmatic 2026 Answer}
+
+\begin{keyinsight}[GBDT vs.\ Neural Is a Feature-Space Question, Not a Loyalty Question]
+If your ranking signal lives in a few hundred engineered scalars---text-match scores, engagement aggregates, quality priors---a tuned LambdaMART remains the best accuracy-per-engineer-hour and accuracy-per-serving-dollar in the business, and it is what you should reach for first at a search company with tabular features. If your signal lives in embeddings, ID spaces, behavior sequences, or multiple engagement objectives, the neural stack is not optional. Production systems therefore run hybrids, most commonly: \textbf{neural models produce features, GBDT ranks}---two-tower cosines, cross-encoder scores, and user-affinity dot products enter LambdaMART as columns (fusion-as-a-feature); or the mirror image in embedding-heavy shops, a neural ranker consuming a handful of GBDT-era engineered scalars alongside its embeddings. The interview failure mode is arguing either technology ``won''; the staff answer names the feature-space criterion, the hybrid patterns, and the benchmark humility (tabular parity was hard-won for neural rankers).
+\end{keyinsight}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C
+\label{sr:sec:ltr_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: Compare pointwise, pairwise, and listwise learning to rank. When is each the right choice?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The taxonomy is about what the loss function can see. \textbf{Pointwise} treats each (query, document) independently---regress the grade or classify engagement; it optimizes absolute scores. \textbf{Pairwise} sees preferences within a query---RankNet's $\prob{i \succ j} = \sigma(s_i - s_j)$---and minimizes mis-ordered pairs, which makes it invariant to per-query score shifts. \textbf{Listwise} sees the whole ranked list and targets the list metric, either through surrogates (ListNet/ListMLE, smooth NDCG approximations) or through LambdaRank's metric-weighted gradients.
+
+Pointwise is wrong for pure ranking for three reasons: MSE can prefer a model with an inverted order (being uniformly close to labels $\neq$ ordering correctly---a two-document example shows MSE preferring the swapped ranking by $4\times$); it wastes capacity calibrating scores \textit{across} queries, which no ranking metric checks; and label imbalance concentrates loss on confidently predicting ``irrelevant.'' Pairwise fixes all three but weighs an inversion at ranks 49--50 the same as ranks 1--2, while NDCG's discount makes the top inversion enormously more important. Listwise---in practice the $|\Delta\text{NDCG}|$ lambda weighting---fixes that.
+
+When each is right: pointwise whenever you need \textbf{calibrated absolute scores}---ads bidding on expected value, quality-gate thresholds, cross-surface blending---because pairwise/listwise training destroys calibration. Pairwise when labels arrive naturally as preferences (clicked vs.\ skipped-above) or for implicit-feedback recsys (BPR). Listwise for the final ranker whose output is judged by NDCG-like metrics---the production default.
+
+\redflags
+\begin{itemize}
+    \item Defining the three families but unable to say \textit{why} pointwise underperforms---the cross-query calibration and inversion-weighting arguments are the actual content.
+    \item ``Listwise is always best''---misses the calibration requirement that makes pointwise mandatory in ads and thresholded decisions.
+    \item Conflating the taxonomy with model architecture (``pairwise means neural network'')---any scorer can train under any family.
+\end{itemize}
+
+\interviewtest{Whether you understand ranking as a distinct learning problem---order within groups, non-smooth metrics, calibration trade-offs---or just memorized three labels.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the three families with an example loss each and the pointwise weaknesses.
+    \item \badgeLsix{L6} Gives the numeric MSE-prefers-the-wrong-model construction, names the calibration destruction of pair/listwise training, and knows where each family runs in a real stack.
+    \item \badgeLseven{L7} Connects the taxonomy to label supply (preferences from cascade-model click logic), notes ListMLE vs.\ metric-driven losses optimize different things, and describes the pointwise-plus-listwise layered pattern in ads.
+\end{itemize}
+
+\followups{``Why does pairwise training destroy calibration?'' ``Write the RankNet loss.'' ``Which family does a two-tower retrieval model with in-batch softmax belong to?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Explain LambdaRank to a strong engineer who knows GBDT but has never done ranking.}
+
+\badgeLsix{L6} \quad \badgetype{Communication} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+An answer that builds in four steps, each on ground the listener already owns:
+
+\textbf{Step 1 --- the problem.} ``You know boosting fits each tree to the gradient of the loss. Our loss should be NDCG, which only cares about the \textit{order} of the scores, weighted heavily toward the top of the list. But NDCG is a step function of the scores: nudge a score slightly and either nothing changes or two documents swap and the metric jumps. Zero gradient almost everywhere, undefined at the jumps. Nothing to hand your gradient step.''
+
+\textbf{Step 2 --- pairwise forces.} ``So start from something differentiable: for every pair in the same query where A is labeled better than B, put a logistic loss on the score difference, $\log(1+e^{-(s_A - s_B)})$. Its gradient has a nice physical reading: each mis-ordered pair exerts a \textit{force}---push A up, push B down---strong when the model is badly wrong about the pair, fading as it gets it right. Sum the forces on each document into one number $\lambda_i$ per document. That is RankNet.''
+
+\textbf{Step 3 --- the lambda trick.} ``RankNet's flaw: all pairs push equally hard, but fixing a swap at positions 1--2 moves NDCG about thirty times more than the same swap at 9--10. LambdaRank's entire idea: \textbf{multiply each pair's force by $|\Delta\text{NDCG}|$---how much the metric would change if the two documents swapped places}. That factor is cheap to compute (sort by current scores, evaluate a local delta). We never differentiate NDCG; we define the gradient field directly, so the non-smooth metric's priorities---big grade gaps, top positions---are stamped onto a smooth optimization. Empirically, and later theoretically (LambdaLoss showed these are gradients of a proper listwise loss), this climbs NDCG.''
+
+\textbf{Step 4 --- landing on GBDT.} ``Now the punchline for you: LambdaMART is your ordinary MART loop where \textit{the pseudo-residual each tree fits is $\lambda_i$}. Score everything with the current ensemble, sort, compute forces, fit a tree to the forces, Newton step on the leaves, shrink, repeat, early-stop on validation NDCG. Nothing about the trees changes---only the targets. Swap $|\Delta\text{NDCG}|$ for $|\Delta\text{MRR}|$ and the same machinery optimizes a different metric.''
+
+\redflags
+\begin{itemize}
+    \item Jumping to formulas without the ``NDCG has no usable gradient'' motivation---the listener never learns why any of it exists.
+    \item Saying LambdaRank ``approximates'' or ``smooths'' NDCG---it defines gradients directly; no differentiable surrogate of the metric is constructed.
+    \item Unable to state what the trees fit in LambdaMART (the per-document lambdas as pseudo-residuals).
+\end{itemize}
+
+\interviewtest{This is a communication question wearing a math question's clothes: can you sequence ideas for a specific audience, anchoring each step in what a GBDT engineer already knows? Interviewers also listen for whether \textit{you} understand the mechanism well enough to compress it honestly.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} The four-step build above, with the forces metaphor and the pseudo-residual landing.
+    \item \badgeLseven{L7} Adds the $\sim$31$\times$ top-vs-deep discount arithmetic, the LambdaLoss theoretical resolution, and practical texture (truncation levels, label gains, why this concentrates learning on top-of-list errors)---while keeping the explanation compact.
+\end{itemize}
+
+\followups{``Why not use a smooth approximation of NDCG instead?'' ``What is the computational cost per boosting round?'' ``How would you retarget it at MRR?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your click-trained ranker keeps favoring the items that have historically sat at position 1---better new items never rise. Diagnose and fix.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+This is the position-bias feedback loop, and it enters through three doors at once; a complete answer names all three, then fixes each.
+
+\textbf{Diagnosis.} (1) \textit{Labels}: clicks are examination-gated---position 1 gets several times the examination of position 5---so click-derived labels systematically overrate whatever the old ranker showed first. The model learns ``predict what was ranked high.'' (2) \textit{Features}: historical CTR and engagement aggregates are accumulated \textit{exposure}, not merit; incumbents arrive with a fat prior, new items with an empty one, and the model leans on exactly these features. (3) \textit{The loop}: this model's output decides future exposure, which decides future labels and features---each retrain entrenches the incumbents further. Confirm empirically: check label agreement against a judgment set or a randomized slice; check feature importance of engagement priors; measure new-item time-to-first-impression and exposure concentration trending worse.
+
+\textbf{Fixes, in order of leverage.} \textit{Labels}: train counterfactually---weight clicks by inverse examination propensity $1/\theta_p$ (with clipping or self-normalization for variance), propensities from adjacent-pair randomization, intervention harvesting across ranker versions, or regression EM; the cheap alternative is position-as-a-feature during training, fixed to a constant at serving. \textit{Features}: impression-normalize engagement (rates, not counts), Bayesian-smooth toward category priors so empty history reads as ``prior,'' not ``bad,'' add time decay, and add coverage indicators so the model can learn to discount absent history. \textit{The loop}: dedicate exploration traffic---epsilon slots or Thompson sampling over smoothed engagement priors---so new items acquire data; keep a small always-on randomized slice as the unbiased eval set; and add guardrail metrics (new-item exposure share, impression concentration) to the launch criteria so the regression is caught next time.
+
+\redflags
+\begin{itemize}
+    \item Proposing only a hand-tuned freshness boost---treats the symptom, leaves labels, features, and the loop broken.
+    \item No mention of propensities or randomization---the debiasing toolkit is the expected content at this level.
+    \item Fixing labels but not the engagement \textit{features}, which reintroduce the same bias through a second door.
+    \item No evaluation story: without a randomized slice or judgment set, you cannot even measure whether the fix worked.
+\end{itemize}
+
+\interviewtest{The single most common staff-level search failure gate: recognizing click-log circularity unprompted and knowing the counterfactual toolkit. The three-door structure (labels, features, loop) separates candidates who have operated such a system from those who have read about IPS.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies position bias in the labels and proposes randomization or IPS.
+    \item \badgeLsix{L6} Covers all three doors with concrete mechanisms (propensity estimation options, smoothing/back-off feature design, exploration slots) and an unbiased evaluation plan.
+    \item \badgeLseven{L7} Adds the variance economics of IPS (clipping bias vs.\ variance, effective sample size), the doubly robust upgrade, the UI-change-invalidates-propensities operational trap, and frames exploration as an investment in future label supply rather than a tax.
+\end{itemize}
+
+\followups{``How exactly would you estimate the propensities here?'' ``Your IPS-trained model's offline NDCG dropped versus the biased baseline---is that bad?'' ``How much exploration traffic is enough?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Walk me through constructing an LTR training set from a marketplace's search logs: labels, negatives, and splits.}
+
+\badgeLfive{L5} \quad \badgetype{Applied} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Grouping and sampling.} The unit is the query group: query, impressed candidates, engagement outcomes, and logged context (position, surface, timestamp, ranker version). Sample queries stratified jointly by traffic decile and segment (category, head/torso/tail) so the set neither mirrors head traffic exclusively nor overweights noise-tail queries; deduplicate normalization variants of the same query before splitting.
+
+\textbf{Labels.} Map engagement to grades---purchase $=4$, add-to-cart $=3$, long click (dwell above threshold) $=2$, click $=1$, impression $=0$---with short clicks (quick return to results) demoted despite being clicks. Flag that all of this inherits position bias and state the debiasing plan (propensity weighting or position-as-feature); blend in editorial judgments where they exist, especially for tail coverage.
+
+\textbf{Negatives.} Base: impressed-but-not-engaged items, because they match the serving distribution; strengthen skipped-above-a-click impressions (examined and rejected under cascade logic); treat impressions below the last click as unknown rather than negative. Add a minority of harder negatives (high-BM25 or high-similarity non-engaged items) and a small random slice so the model also learns coarse distinctions---pure random negatives make training trivially easy, pure impressed negatives inherit maximal bias.
+
+\textbf{Splits and hygiene.} Temporal split (train weeks $1$--$N$, validate week $N{+}1$), grouped by query ID---never random-by-row, which leaks query groups across the boundary. Every behavioral feature computed point-in-time as of the impression, ideally by training on \textit{logged} serving-time feature values, which also kills online/offline skew. Validate on NDCG@$k$ at the $k$ you will report, sliced by segment.
+
+\redflags
+\begin{itemize}
+    \item Random row-level splits, or no mention of grouping---the classic leakage that inflates offline metrics.
+    \item Using all unclicked items as equal negatives---misses examination logic entirely.
+    \item Labels described with no acknowledgment of position bias.
+    \item Features aggregated over windows overlapping the label period.
+\end{itemize}
+
+\interviewtest{Pipeline craft: whether you have actually built one of these. The negative-mining reasoning and the point-in-time discipline are where experience shows.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Grouped data, graded engagement labels, impressed negatives, temporal query-grouped splits.
+    \item \badgeLsix{L6} Skipped-above logic, negative mixing rationale, stratified sampling defense, logged-feature training, per-segment validation slices.
+    \item \badgeLseven{L7} Sample-weighting strategy (confidence, recency, segment rebalancing, IPS), judgment/click blending policy, and how the dataset design anticipates the feedback loop.
+\end{itemize}
+
+\followups{``Why not use documents that were never retrieved as negatives?'' ``How many queries and documents per query do you need?'' ``How does this dataset differ for training a retrieval encoder versus the L2 ranker?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: When would you insist on a pointwise objective even though the product is a ranked list?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Whenever a downstream consumer reads the score as a \textit{number} rather than a sort key---because pairwise and listwise training only constrain score differences within a query, leaving absolute levels uncalibrated and drifting.
+
+Three canonical cases. \textbf{Ads and auctions}: the bid is expected value, $\text{bid} \propto \text{pCTR} \times \text{value}$, so pCTR must be a calibrated probability; a miscalibrated ranker that orders perfectly still misprices every auction ([DL 12]). \textbf{Thresholded decisions}: show/hide gates, minimum-quality cutoffs, ``display the answer box only above $p = 0.7$''---a threshold on an uncalibrated score is a threshold on noise that shifts with every retrain. \textbf{Cross-stream comparability}: blending candidates from multiple sources or surfaces requires scores on a shared scale, which within-query objectives never establish.
+
+The production patterns: (a) calibrated pointwise model where money or thresholds touch the score, with a listwise reranker for pure-order surfaces; (b) train listwise, then post-hoc calibrate (Platt scaling or isotonic regression on a held-out set) when the consumer's needs are mild; (c) multi-head models emitting both a calibrated probability and a ranking score. Also worth saying: pointwise \textit{evaluation} still uses ranking metrics---the objective choice is about the score's contract, not the product's shape.
+
+\redflags
+\begin{itemize}
+    \item ``Never---listwise is strictly better for ranking products.''
+    \item Not knowing \textit{why} pairwise/listwise training breaks calibration (only differences are constrained).
+    \item Proposing to threshold a LambdaMART score directly.
+\end{itemize}
+
+\interviewtest{Whether you understand what different objectives promise about the score, and can map consumers (auction, gate, blender, sorter) to contracts.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names ads calibration and thresholds.
+    \item \badgeLsix{L6} All three cases plus the layered and post-hoc-calibration patterns, with the ``score contract'' framing.
+    \item \badgeLseven{L7} Discusses calibration drift under retraining, monitoring calibration in production, and where in the funnel each contract binds.
+\end{itemize}
+
+\followups{``How do you check whether a model is calibrated?'' ``Does Platt scaling change the ranking?'' ``Which objective for a two-sided marketplace's fee-sensitive ranking?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: GBDT or neural network for your L2 ranker? Decide for (a) a commerce search engine with rich engineered features, (b) a feed ranker over user history and item IDs.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The decision criterion is the \textbf{feature space}, not the model family's prestige.
+
+\textbf{(a) Commerce search, tabular features:} LambdaMART. A few hundred heterogeneous scalars---per-field BM25, engagement rates, price, quality priors---is GBDT's home turf: mixed scales and missing-with-meaning handled natively, minutes-scale CPU training so feature iteration (the real bottleneck) is fast, microsecond inference, monotonic constraints for guardrails. The benchmark record backs this: neural rankers took years to reach parity with tuned LambdaMART on the tabular LTR benchmarks (the systematic Qin et al.\ ICLR 2021 comparison), so the burden of proof sits on the neural proposal. Modern embeddings still participate---as \textit{features}: two-tower cosine and cross-encoder scores enter the GBDT as columns, which is also the cleanest hybrid-retrieval fusion mechanism.
+
+\textbf{(b) Feed ranker, IDs and sequences:} neural, without much debate. Sparse ID embedding tables, user-history sequence encoders, and multi-task heads (click/like/dwell with shared representations) have no GBDT equivalent; data volume is past the point where GBDT capacity saturates; and continual/online updates of embeddings matter. This is the recommendation-ranking canon (Chapter~\ref{sr:chap:recommendation_systems}).
+
+\textbf{The general rule}: engineered scalars $\rightarrow$ GBDT first; embeddings/IDs/sequences/multi-task $\rightarrow$ neural; most mature stacks are hybrids, most commonly neural-models-as-feature-factories feeding a GBDT in search, and occasionally the reverse in embedding-heavy shops. Also weigh the org: a GBDT stack is operable by a small team; a neural ranking platform is an infrastructure commitment (feature logging, GPU serving or distillation, embedding lifecycle).
+
+\redflags
+\begin{itemize}
+    \item Arguing from fashion in either direction (``trees are legacy'' / ``deep learning is overkill'') without the feature-space criterion.
+    \item Not knowing the tabular-benchmark history---claiming neural rankers straightforwardly dominate tabular LTR.
+    \item Missing the hybrid patterns, which is what production actually does.
+\end{itemize}
+
+\interviewtest{Judgment under real constraints: can you connect data characteristics, benchmark evidence, serving economics, and team capacity to a defensible architecture call---and avoid tribal answers.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct calls on (a) and (b) with the basic tabular-vs-embeddings reasoning.
+    \item \badgeLsix{L6} Cites the benchmark evidence, details both hybrid directions, and covers serving cost and iteration speed.
+    \item \badgeLseven{L7} Adds transformer-over-candidates as a distinct listwise capability neither plain option provides, the distillation path (neural teacher $\rightarrow$ cheap student), and a migration plan with parity gates for moving (a) toward neural if embeddings begin to dominate.
+\end{itemize}
+
+\followups{``How would you feed an embedding into a GBDT?'' ``When does the answer for (a) flip?'' ``What breaks operationally when you move from LambdaMART to a neural ranker?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: How would you estimate position-bias propensities without degrading the user experience?}
+
+\badgeLsix{L6} \quad \badgetype{Applied} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Ordered from cleanest to least intrusive:
+
+\textbf{(1) Uniform top-$k$ randomization} on a small slice directly measures examination by position, but the UX cost is real (users see shuffled results), so it is at most a tiny always-on slice---which is worth keeping anyway as the unbiased \textit{evaluation} set even if propensities come from elsewhere.
+
+\textbf{(2) Adjacent-pair randomization (RandPair/FairPairs)}: randomly swap a neighboring pair per impression. Nearly invisible---the two results were of comparable estimated quality---yet each position pair's relative click rates yield the propensity ratio $\theta_{p+1}/\theta_p$; chaining ratios recovers the whole curve. This is the standard deliberate-intervention choice.
+
+\textbf{(3) Intervention harvesting}: zero new intervention. A/B arms, successive ranker versions, and natural variation already place the same (query, document) at different positions; treat those as quasi-experiments (Agarwal et al., 2019). Free of UX cost; requires enough overlap and care that the variation is not relevance-driven (a document promoted \textit{because} it got more relevant corrupts the estimate).
+
+\textbf{(4) Joint estimation from plain logs}: regression EM (Wang et al., 2018) treats examination and relevance as latent and alternates estimates---the choice when no intervention is possible (e.g., personal search); it leans hardest on the PBM assumptions. The production shortcut in the same family: position as a training feature (isolated in a shallow tower), fixed to a constant at serving.
+
+Cross-cutting craft: estimate propensities \textit{per surface} (device, layout, module---examination curves differ drastically between a phone grid and a desktop list); re-estimate after any UI change, which silently invalidates the curve; and validate the estimated $\theta_p$ against a small randomized slice before trusting them in IPS training.
+
+\redflags
+\begin{itemize}
+    \item Only knowing full randomization---missing the pair-swap idea that makes intervention affordable.
+    \item Treating propensities as global constants across devices and layouts.
+    \item No validation story for the estimated propensities.
+\end{itemize}
+
+\interviewtest{Depth in the unbiased-LTR toolkit beyond the IPS formula: the estimation side is where practical competence lives.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Randomization and the idea that swaps estimate examination.
+    \item \badgeLsix{L6} All four methods with their intrusiveness/assumption trade-offs, plus per-surface estimation and re-estimation after UI changes.
+    \item \badgeLseven{L7} Identifiability caveats of EM, relevance-confounded variation in harvesting, connecting propensity quality to downstream IPS variance, and the shallow-tower equivalence argument.
+\end{itemize}
+
+\followups{``Derive why adjacent swaps identify the propensity ratio.'' ``What breaks if trust bias is strong?'' ``How would you detect that your propensities have gone stale?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your new LTR model improves overall NDCG but tail-query relevance regresses. Why, and what do you change?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Mechanism.} Both the training distribution and the feature supply are head-dominated. Traffic-weighted sampling means most gradient comes from head queries; behavioral features (engagement priors, historical CTR) are dense and predictive there, so the model learns to lean on them. On tail queries those features are empty, and a model that over-relies on them defaults to weak priors---while the aggregate metric, dominated by head traffic, still improves. Coverage skew plus averaged evaluation is the whole story; a variant: the tail's effective labels are noisier (single-click evidence), so the model rationally ignores tail-discriminative content features.
+
+\textbf{Confirm.} Slice offline NDCG by traffic decile and by feature-coverage bucket; inspect per-slice feature attributions (engagement features should dominate head slices and---pathologically---still be consulted on tail slices where they are imputed); compare against a content-only ablation model on tail queries.
+
+\textbf{Fixes.} Data: stratified query sampling or segment reweighting so tail gradient survives. Features: back-off hierarchies (query $\rightarrow$ category $\rightarrow$ global), Bayesian smoothing with impression floors, explicit coverage indicators so the model can branch on ``history absent,'' and strong content features (per-field BM25, embedding similarity) that generalize to zero-history queries. Modeling: a segment feature or separate tail model if the regimes are truly different. Process: make per-segment slices launch-blocking guardrails so aggregate NDCG can never again purchase a tail regression silently (Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\redflags
+\begin{itemize}
+    \item Proposing more model capacity or more training data without diagnosing the coverage skew.
+    \item No per-slice evaluation instinct---accepting a single aggregate metric.
+    \item Missing that feature design (back-off, smoothing, indicators), not just data reweighting, is the durable fix.
+\end{itemize}
+
+\interviewtest{Whether you reason about metric aggregation hiding distributional regressions, and whether your fixes span data, features, modeling, and process rather than one hammer.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies head-dominated training data and proposes stratified sampling with sliced eval.
+    \item \badgeLsix{L6} Adds the feature-coverage mechanism, back-off/smoothing design, and launch-guardrail process change.
+    \item \badgeLseven{L7} Quantifies the trade (how much head loss buys how much tail gain and whether traffic weights justify it), considers a router or tail-specialized model, and ties the tail story to semantic retrieval's role upstream (Chapter~\ref{sr:chap:vector_retrieval_theory}).
+\end{itemize}
+
+\followups{``How would you weight head vs.\ tail in the objective, concretely?'' ``Could this be a label-noise problem instead---how would you tell?'' ``What would make you ship it anyway?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Editorial judgments say document A beats B for this query; click data says B massively outperforms A. Which do you trust, and what do you do?}
+
+\badgeLsix{L6} \quad \badgetype{Judgment} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Neither, until the disagreement is explained---the two instruments measure different constructs, and the gap is diagnostic signal.
+
+\textbf{Hypotheses to check, in order.} (1) \textit{Presentation}: B has a better image, price display, or title; clicks measure the \textit{snippet}, judges saw the \textit{document}. (2) \textit{Position and examination}: is B's click advantage just exposure? Compare propensity-adjusted CTR, not raw CTR, before believing any behavioral claim. (3) \textit{Construct gap}: judges score topical relevance; users act on utility---price, shipping, brand trust. A judged-perfect item nobody can afford will lose clicks forever, and it \textit{should}. (4) \textit{Staleness}: judgments age; B may have improved (reviews, price) since judging. (5) \textit{Guideline gap}: if a systematic class of pairs disagrees, the judgment guideline is missing a criterion users care about---fix the guideline, which is the highest-leverage act available (judgment program design: Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\textbf{Resolution policy.} Use each instrument where it is strong: editorial judgments anchor topical relevance and gate retrieval quality (they are position-unbiased and cover the tail); debiased behavior drives final ordering among topically-acceptable items (it captures utility judges cannot see). Systematic disagreements route to guideline revision or presentation fixes, not to silently overriding one source. A model-level implementation: train with both label sources, with behavioral labels debiased first and judgments up-weighted where behavioral coverage is thin.
+
+\redflags
+\begin{itemize}
+    \item Picking a side immediately (``clicks are ground truth'' / ``judges are ground truth'').
+    \item Comparing raw CTR without position adjustment.
+    \item Not recognizing the topicality-vs-utility construct difference.
+\end{itemize}
+
+\interviewtest{Measurement maturity: understanding that label sources are instruments with error models, and that reconciling them is a system-design act. This is a staff-level differentiator.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names presentation bias and position bias as explanations.
+    \item \badgeLsix{L6} Full hypothesis list, propensity-adjusted comparison, and the use-each-where-strong resolution policy.
+    \item \badgeLseven{L7} Elevates to process: systematic-disagreement mining as a guideline-improvement pipeline, and the organizational point that the guideline document encodes product policy.
+\end{itemize}
+
+\followups{``Design the query that distinguishes hypothesis (1) from (3).'' ``How do you debias the click side of this comparison?'' ``Should the ranker ever show the judged-better item anyway?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design the end-to-end unbiased-LTR loop for a search product---logging through training through evaluation---and tell me where it silently breaks.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{The loop.} (1) \textit{Logging}: for every impression record query, full impressed list with positions, surface/layout/device, ranker version, serving-time feature values, and engagement with timestamps and dwell---the counterfactual must be reconstructable from the log alone. (2) \textit{Interventions}: a small always-on randomized slice (unbiased eval) plus adjacent-pair swaps (propensity estimation) plus exploration slots (label supply for cold items). (3) \textit{Propensities}: per-surface PBM propensities from the pair swaps, cross-checked by intervention harvesting across ranker versions; refreshed on a schedule and forcibly on UI change. (4) \textit{Labels and training}: graded engagement labels, IPS-weighted listwise objective with clipping (sweep the clip), sample weights composing bias correction with confidence and recency; temporal, query-grouped splits. (5) \textit{Evaluation}: three-legged---debiased offline metrics on held-out logs, judgment-list NDCG as the position-free anchor, and the randomized slice as ground truth; per-segment slices as guardrails; then interleaving and A/B for promotion (Chapter~\ref{sr:chap:evaluation_experimentation}). (6) \textit{Feedback governance}: exposure-concentration and new-content metrics watched over time (Chapter~\ref{sr:chap:production_retrieval_rag}).
+
+\textbf{Where it silently breaks.} The failure modes are quiet by construction: a \textit{UI redesign} shifts examination curves and every downstream IPS quantity is wrong until propensities are re-estimated---nothing errors, metrics just drift; \textit{surface pooling} (one propensity curve across phone grid and desktop list) biases corrections while looking principled; \textit{positivity violations}---documents the logger never showed contribute nothing, and IPS cannot speak about them at all, which is why exploration is part of the statistical design, not an add-on; \textit{variance collapse}---a few deep-position clicks with huge weights dominate training; the effective-sample-size diagnostic catches what loss curves hide; \textit{trust and presentation bias}---PBM absorbs neither, so propensity-corrected data still overrates trusted top slots and pretty snippets; \textit{log-join decay}---impressions without engagement quietly dropped by a pipeline join turns the dataset into positives-plus-nothing; and \textit{model-version confounding} in harvested interventions, where position changes caused by relevance changes masquerade as randomization.
+
+\redflags
+\begin{itemize}
+    \item A loop with no interventions at all---pure log-based EM presented as consequence-free.
+    \item No re-estimation trigger tied to UI changes.
+    \item Evaluation with a single leg (only debiased offline metrics, no judgment anchor or randomized slice).
+    \item Treating exploration as a product tax rather than part of the estimator's positivity requirement.
+\end{itemize}
+
+\interviewtest{Whether you can operate counterfactual ML as a \textit{system}---logging contracts, estimator health monitoring, invalidation triggers---rather than recite the IPS formula. The silent-failure list is where operating experience is unmistakable.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} A coherent loop with propensity estimation, IPS training, and multi-legged evaluation.
+    \item \badgeLseven{L7} The governance layer: invalidation triggers, estimator diagnostics as first-class monitors, exploration-as-positivity framing, and honest limits of PBM corrections (trust/presentation bias).
+\end{itemize}
+
+\followups{``Which piece would you build first with two engineers?'' ``How do you validate the propensity model itself?'' ``What changes when the surface becomes an LLM answer page with few clicks?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your IPS-weighted training runs are unstable---a few examples dominate the gradient and validation NDCG oscillates. What is happening and what are your options?}
+
+\badgeLseven{L7} \quad \badgetype{Depth} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{Mechanism.} IPS weights are $1/\theta_p$, and $\theta_p$ decays steeply with position---examination at deep ranks is rare. A click logged at a deep position therefore carries an enormous weight: it is statistically standing in for the many relevant-but-unexamined documents at that position. The estimator stays unbiased, but its variance is governed by $\E[w^2]$, which the propensity tail inflates; concretely, the effective sample size $(\sum w_i)^2 / \sum w_i^2$ collapses to a small fraction of the nominal dataset, and each minibatch's gradient is essentially a few heavy examples plus noise---hence the oscillation.
+
+\textbf{Options, with their prices.} (1) \textbf{Clip} weights at $1/\tau$: the standard first move; directly bounds variance but reintroduces bias \textit{toward the logging ranker's ordering}---clipping shrinks precisely the large corrections IPS exists to make. Sweep $\tau$ against the randomized-slice eval. (2) \textbf{Self-normalized IPS}: normalize by the weight sum; a consistent, slightly biased estimator with much lower variance, and robust to global propensity mis-scaling. (3) \textbf{Doubly robust}: fit an imputation model for relevance and apply IPS only to its residuals; unbiased if either component is right, and the variance reduction is often decisive---the current literature default. (4) \textbf{Truncate the position range}: train only on positions where $\theta_p$ is estimated reliably (say, top 10--20), accepting silence about deeper slots. (5) \textbf{Buy variance down at the source}: more pair-randomization traffic raises deep-position propensities and shrinks the weights---an intervention-budget-for-variance trade. (6) Plumbing checks: propensity floors against $\theta \to 0$ estimates, weight-aware batching so heavy examples spread across batches, gradient clipping as a symptom-level stabilizer.
+
+The meta-point: this is the bias-variance dial of counterfactual learning---every stabilizer moves you back toward the biased raw-click objective, so tune against unbiased ground truth (randomized slice, judgments), never against the biased offline metric that the untreated instability is corrupting.
+
+\redflags
+\begin{itemize}
+    \item Reaching only for generic optimizer fixes (lower LR, gradient clipping) without the variance diagnosis.
+    \item Recommending clipping with no acknowledgment of the bias it reintroduces or how to choose $\tau$.
+    \item Not knowing SNIPS or doubly robust exist.
+\end{itemize}
+
+\interviewtest{Depth past the IPS formula: variance mechanics, the estimator-repair toolkit, and the discipline of tuning bias-variance trades against unbiased ground truth.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Correct variance diagnosis with clipping and SNIPS, aware of the bias trade.
+    \item \badgeLseven{L7} Adds doubly robust, effective-sample-size monitoring as a standing diagnostic, the buy-randomization-to-reduce-variance option, and the tune-against-ground-truth discipline.
+\end{itemize}
+
+\followups{``Write the SNIPS estimator.'' ``Why is doubly robust unbiased if either component is correct?'' ``How would you set the clipping threshold in practice?''}
+\end{interviewq}

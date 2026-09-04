@@ -2,27 +2,816 @@
 \label{sr:chap:lexical_retrieval_inverted_indexes}
 
 \begin{tldr}
-Placeholder — this chapter is written in Phase C from the vector-retrieval digest and applied-search track design (see review/search-recsys/ in the DL repo).
+Lexical retrieval---BM25 over an inverted index---still carries the majority of production search traffic in 2026, and staff-level interviews probe it as a \emph{system}, not a formula. This chapter covers BM25 as a tunable ranking function ($k_1$ saturation, $b$ length normalization, per-corpus tuning regimes); field weighting done right (BM25F's joint saturation vs.\ the per-field-sum double-dip, with a worked example); how the index is actually built (analyzer chains, in-memory segments, spill-and-merge, FST dictionaries); why postings compression (delta, varbyte, PForDelta) is a throughput feature rather than a storage optimization; query evaluation from TAAT/DAAT through MaxScore, WAND, and block-max WAND with a worked pruning example; scaling by document-partitioned sharding, index tiering, and caching; and learned sparse retrieval (docT5query, uniCOIL, SPLADE), which closes lexical retrieval's vocabulary-mismatch gap while riding the same inverted-index machinery. The probabilistic derivation of BM25 is canonical in [NLP 1]; this chapter is the systems home. If you interview for search infrastructure or ranking at any serious scale, you must be able to explain how a three-word query returns top-10 from a billion documents in tens of milliseconds---mechanically, stage by stage.
 \end{tldr}
 
-\section{Inverted Index Mechanics}
-% TODO Phase C
-
+%==============================================================================
 \section{BM25 as a System: Parameters and Tuning}
-% TODO Phase C
+\label{sr:sec:bm25_system}
+%==============================================================================
 
+The probabilistic relevance framework that produces BM25---the binary independence model, the eliteness argument, the derivation of saturating term frequency---is canonical in [NLP 1], along with a worked numeric example of saturation and length normalization. Here we take the formula as given and treat it the way a search team does: as a parameterized scoring system whose two knobs encode explicit assumptions about your corpus, and whose defaults are wrong for many production fields.
+
+\begin{mathresult}{BM25 (production form)}
+\begin{equation}
+\text{BM25}(q, d) = \sum_{t \in q} \operatorname{idf}(t) \cdot \frac{f(t,d)\,(k_1 + 1)}{f(t,d) + k_1\left(1 - b + b\,\frac{|d|}{\text{avgdl}}\right)}
+\label{sr:eq:bm25}
+\end{equation}
+with $f(t,d)$ the term frequency, $|d|$ the document length, avgdl the corpus average, and the Lucene-smoothed IDF
+$\operatorname{idf}(t) = \ln\!\left(1 + \frac{N - \operatorname{df}(t) + 0.5}{\operatorname{df}(t) + 0.5}\right)$,
+which stays positive even when $\operatorname{df}(t) > N/2$ (the classic probabilistic IDF goes negative there---see [NLP 1] for the gotcha).
+\end{mathresult}
+
+\subsection{What the Parameters Actually Control}
+
+\textbf{$k_1$: term-frequency saturation.} The TF component is concave in $f(t,d)$ and asymptotes at $(k_1+1)$, so a single term's total contribution is capped at $\operatorname{idf}(t)\cdot(k_1+1)$. At the default $k_1 = 1.2$, the first occurrence buys you $1.0$ of the possible $2.2$; the fifth occurrence has already collected about $87\%$ of the asymptote. This is the structural defense against keyword stuffing that raw TF--IDF lacks. Interpret $k_1$ as ``how much do repeated mentions matter'': $k_1 = 0$ makes term frequency binary (presence/absence); large $k_1$ approaches linear TF.
+
+\textbf{$b$: length normalization.} The factor $1 - b + b\,|d|/\text{avgdl}$ scales the effective $k_1$ by relative document length. At $b = 1$, a document twice the average length needs twice the term frequency for the same score; at $b = 0$, length is ignored. Interpret $b$ as ``how much is length evidence of verbosity rather than scope'': high $b$ assumes long documents are padded; low $b$ assumes long documents are legitimately more comprehensive.
+
+\subsection{Tuning by Corpus Type}
+
+The defaults ($k_1 \approx 1.2$, $b \approx 0.75$) were tuned on TREC-era news prose. Production corpora differ, and the tuning intuition is a reliable interview probe:
+
+\begin{table}[H]
+\centering
+\caption{BM25 parameter regimes by field/corpus type}
+\label{sr:tab:bm25_tuning}
+\begin{tabularx}{\textwidth}{p{3.1cm}p{2.1cm}p{2.0cm}X}
+\toprule
+\textbf{Corpus / field} & \textbf{$k_1$} & \textbf{$b$} & \textbf{Reasoning} \\
+\midrule
+Titles, product names, tags & low ($0.1$--$0.9$) & low ($0$--$0.4$) & Short structured fields: presence is nearly binary evidence; length variation is noise, not verbosity \\
+News, long-form prose & default ($1.2$--$2$) & default ($\approx 0.75$) & The regime BM25 was tuned for \\
+Boilerplate-heavy pages (templates, footers) & default & high ($0.8$--$1$) & Length correlates with padding; normalize hard so template bloat does not dilute or inflate scores \\
+Technical docs, legal & higher ($1.5$--$2$) & moderate & Repetition of a term genuinely tracks aboutness in long focused documents \\
+Short posts, chat, queries-as-docs & low & low & Term repetition is rare and uninformative; length is nearly constant \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Tuning is empirical: grid-search $k_1 \in [0.5, 2]$, $b \in [0.3, 1]$ against a judgment list (Chapter~\ref{sr:chap:evaluation_experimentation}) and validate per query segment---head and tail queries often prefer different settings, and per-field settings (next section) matter more than a single global pair.
+
+\begin{keyinsight}[BM25 Is a Family, Not a Constant]
+``BM25'' in production is really a family of scoring functions indexed by $(k_1, b)$ per field, an IDF variant, field weights, and the analysis chain that defines what a ``term'' even is. Two engines both ``running BM25'' can produce wildly different rankings. When an interviewer asks why relevance differs between your staging and production clusters, parameter and analyzer drift should be on your hypothesis list before anything exotic.
+\end{keyinsight}
+
+\subsection{Boolean Structure Around the Scoring}
+
+BM25 scores documents that match; the boolean query structure decides \emph{what matches}, and it is the recall/precision dial you turn first:
+
+\begin{itemize}
+    \item \textbf{AND vs.\ OR semantics.} Pure OR maximizes recall but floods results with one-term matches; pure AND is precise but brittle (one typo or vocabulary mismatch yields zero results). The common commerce pattern is AND-first with relaxation on zero results (Chapter~\ref{sr:chap:search_systems_query_understanding} covers query relaxation).
+    \item \textbf{minimum\_should\_match.} The middle path: require a fraction of query terms, with idioms like \texttt{2<75\%} (``all terms required for queries up to 2 terms; 75\% of them for longer queries''). This single setting is one of the highest-leverage relevance knobs in Elasticsearch/Solr deployments.
+    \item \textbf{Phrase and proximity boosts.} A separate clause that adds score when query terms appear adjacent or near each other (in Solr's dismax family: \texttt{pf}/\texttt{pf2}/\texttt{pf3}). This is how ``red dress'' as a phrase outranks documents containing ``red'' and ``dress'' in unrelated sentences; the positional machinery it requires is covered in Section~\ref{sr:sec:query_eval}.
+\end{itemize}
+
+%==============================================================================
 \section{Field Weighting and BM25F}
-% TODO Phase C
+\label{sr:sec:bm25f}
+%==============================================================================
 
-\section{The Analysis Chain}
-% TODO Phase C
+Real documents are structured---title, body, brand, anchor text, reviews---and a match in the title is worth more than a match in the body. The naive implementation, and what stock Lucene/dismax scoring does, is to compute BM25 \emph{per field} and combine the per-field scores with boosts:
+\begin{equation}
+\text{score}_{\text{naive}}(q,d) = \sum_{\text{field } F} w_F \cdot \text{BM25}(q, d_F).
+\label{sr:eq:perfield_sum}
+\end{equation}
 
-\section{Top-k Evaluation: WAND and Block-Max}
-% TODO Phase C
+\subsection{The Double-Dipping Problem}
 
+Equation~\eqref{sr:eq:perfield_sum} has a structural flaw: each field gets its own \emph{fresh saturation curve}. A term occurring once in the title and once in the body collects the steep initial region of two separate curves; the per-term score cap becomes $\sum_F w_F (k_1+1)\operatorname{idf}(t)$ instead of $(k_1+1)\operatorname{idf}(t)$. Occurrences \emph{spread across fields} are systematically overpaid relative to the same occurrences concentrated in one field.
+
+\textbf{BM25F} (Robertson, Zaragoza, and Taylor, 2004) fixes this by moving the field weighting \emph{inside} the saturation: combine weighted term frequencies across fields first, then saturate once.
+
+\begin{mathresult}{BM25F: weight, then saturate}
+\begin{equation}
+\tilde{f}(t,d) = \sum_{\text{field } F} w_F \cdot \frac{f(t, d_F)}{1 - b_F + b_F\,\frac{|d_F|}{\text{avgdl}_F}},
+\qquad
+\text{BM25F}(q,d) = \sum_{t \in q} \operatorname{idf}(t) \cdot \frac{\tilde{f}(t,d)\,(k_1+1)}{\tilde{f}(t,d) + k_1}.
+\label{sr:eq:bm25f}
+\end{equation}
+Each field gets its own length normalization $b_F$ (low for titles, higher for bodies), but there is a \emph{single} saturation with a single asymptote $(k_1+1)\operatorname{idf}(t)$ per term, no matter how many fields the term appears in.
+\end{mathresult}
+
+\subsection{Worked Example: Per-Field Sum vs.\ BM25F}
+
+Single query term \emph{dress}; two fields with weights $w_{\text{title}} = 5$, $w_{\text{body}} = 1$; $k_1 = 1.2$; set $b_F = 0$ everywhere so length drops out; write the saturation as $S(x) = x(k_1+1)/(x+k_1) = 2.2x/(x+1.2)$, and drop the common IDF factor.
+
+\begin{itemize}
+    \item \textbf{Document A} --- clean title match: \emph{dress} once in the title, absent from the body.
+    \item \textbf{Document B} --- title match plus a keyword-stuffed description: once in the title, 15 times in the body.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Field-weighting worked example: the double-dip, quantified}
+\label{sr:tab:bm25f_worked}
+\small
+\begin{tabular}{lccc}
+\toprule
+\textbf{Scheme} & \textbf{Doc A} & \textbf{Doc B} & \textbf{B's premium} \\
+\midrule
+Per-field sum \eqref{sr:eq:perfield_sum} & $5 \cdot S(1) = 5.00$ & $5 \cdot S(1) + 1 \cdot S(15) = 7.04$ & $+41\%$ \\
+BM25F \eqref{sr:eq:bm25f} & $S(5 \cdot 1) = 1.77$ & $S(5 \cdot 1 + 1 \cdot 15) = S(20) = 2.08$ & $+17\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Under the per-field sum, stuffing the description bought Document B a $41\%$ premium because the body occurrences start a brand-new unsaturated curve; under BM25F they enter a curve already deep in its saturated tail. The per-term score cap tells the structural story: per-field sum caps at $(5+1)\times 2.2 = 13.2$, BM25F at $2.2$.
+
+The spreading version of the same pathology: with two equal-weight fields, one occurrence in \emph{each} field scores $S(1) + S(1) = 2.0$ under the per-field sum, while two occurrences in \emph{one} field score $S(2) = 1.375$---a $45\%$ bonus for identical evidence merely spread across fields. BM25F scores both as $S(2)$. This is not hypothetical: e-commerce catalogs routinely duplicate the product title as the first line of the description, so every such document double-dips---and unevenly, since sellers control their own descriptions.
+
+\begin{warningbox}
+Per-field-sum scoring is an \emph{incentive structure}: any party that controls document text (sellers, SEO authors, spammers) is paid to replicate query-likely terms across as many fields as possible. If you cannot deploy true BM25F, the practical mitigations are the dismax \texttt{tie} parameter---score $= \max_F(\text{score}_F) + \text{tie} \cdot \sum_{\text{other } F}(\text{score}_F)$, where $\text{tie}=0$ takes only the best field and $\text{tie}\approx 0.1$--$0.3$ grants partial corroboration credit---plus low $k_1$ on short fields so their curves saturate almost immediately.
+\end{warningbox}
+
+A typical production lexical stack for commerce looks like: BM25F-style weighting around \texttt{title\^{}3}--\texttt{5}, \texttt{brand\^{}2}, \texttt{body\^{}1}, anchor/query-log-derived fields where available; phrase boosts on the title; \texttt{minimum\_should\_match} tuned per query length; and hand-set freshness/popularity boosts---which is exactly the ``boost soup'' that learning to rank (Chapter~\ref{sr:chap:learning_to_rank}) eventually replaces with learned weights over the same signals. Web search adds anchor text as a heavily weighted field, historically one of the strongest lexical signals: anchors are third-party descriptions of the target page, so they resist self-promotion in a way on-page fields cannot.
+
+%==============================================================================
+\section{Building the Inverted Index}
+\label{sr:sec:index_construction}
+%==============================================================================
+
+Everything in Sections~\ref{sr:sec:bm25_system}--\ref{sr:sec:bm25f} presumes a data structure that can, given a term, produce the documents containing it with their term frequencies---without touching the rest of the corpus. [NLP 1] introduces the inverted index at concept level; this section and the next two are the deep treatment.
+
+\subsection{The Analyzer Chain}
+
+Before anything is indexed, text passes through the \textbf{analysis chain}: character filters (Unicode normalization, HTML stripping) $\rightarrow$ tokenizer $\rightarrow$ token filters (lowercasing, stopword handling, stemming, synonym injection, n-gram generation). The output token stream---not the raw text---is what the index stores, so the analyzer \emph{defines} what a ``term'' is, and every relevance property downstream inherits its decisions:
+
+\begin{itemize}
+    \item \textbf{Stemming vs.\ lemmatization.} Porter-style aggressive stemming (\emph{running}, \emph{runs}, \emph{ran} $\not\rightarrow$ but \emph{running} $\rightarrow$ \emph{run}) boosts recall and shrinks the vocabulary at the cost of precision collisions (\emph{university}/\emph{universe} in careless configurations); light stemmers (kstem, light language-specific rules) are the modern default for English. Lemmatization is more precise but slower and dictionary-dependent.
+    \item \textbf{Stopwords.} Mostly \emph{kept} in modern indexes: IDF already discounts them to near zero, disk is cheap, and removing them breaks phrase queries (``to be or not to be,'' ``The Who''). The old rationale---postings lists for ``the'' are enormous---is handled by the pruning algorithms of Section~\ref{sr:sec:query_eval} instead.
+    \item \textbf{Synonyms.} Injected at index time (expand each document's stream) or query time (expand the query). Index-time synonyms make queries fast and give the merged class a shared IDF, but changing the synonym set requires reindexing, and multi-word synonyms corrupt token positions unless a graph-aware filter is used. Query-time synonyms update instantly and preserve phrase semantics but add per-query cost and inherit asymmetric IDFs. The common production split: high-confidence, stable synonyms at index time; experimental and tail synonyms at query time with discounted weights.
+    \item \textbf{N-grams and shingles.} Edge n-grams power prefix matching and autocomplete; word shingles (``new york'' as one term) buy cheap phrase matching at the cost of index size; character n-grams give typo robustness for languages or fields where stemming fails (identifiers, agglutinative languages, CJK segmentation fallback).
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Analysis-chain placement decisions}
+\label{sr:tab:analyzer_placement}
+\begin{tabularx}{\textwidth}{p{3.4cm}XX}
+\toprule
+\textbf{Transformation} & \textbf{Typical placement} & \textbf{Failure mode to watch} \\
+\midrule
+Lowercasing, Unicode normalization & Both sides, byte-identical config & Composed vs.\ decomposed accents indexed one way, queried the other: silent recall loss \\
+Stemming / lemmatization & Both sides, same stemmer \emph{and version} & Version drift after an engine upgrade; over-stemming collisions harming precision \\
+Stopword removal & Mostly avoided; keep terms, let IDF discount & Removal breaks phrase queries (``The Who'') \\
+Synonyms: stable, single-word & Index time & Any change requires a full reindex \\
+Synonyms: multi-word or experimental & Query time, as discounted optional clauses & Position corruption if injected at index time without a graph filter; IDF asymmetry between original and expansion \\
+Edge n-grams (prefix, autocomplete) & Index time, dedicated subfield & Accidentally n-gramming the query side too; index bloat \\
+Shingles (phrase terms) & Index time subfield for high-value collocations & Index growth; subfield query analyzer must mirror \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}
+Index-time and query-time analysis must agree, and mismatches fail \emph{silently}: a stemmed index queried through an unstemmed analyzer simply loses recall---no error, no log line, just missing results. The same applies to Unicode normalization mismatches (composed vs.\ decomposed accents) and tokenizer version drift after an upgrade. ``Show me your analyzer config for this field, index-side and query-side'' is the first question an experienced search engineer asks when someone reports ``the document is in the index but doesn't match.'' It is also a standard interview debugging scenario.
+\end{warningbox}
+
+\subsection{Anatomy of the Index}
+
+Per indexed field, the engine maintains:
+
+\begin{itemize}
+    \item \textbf{Term dictionary.} Maps each distinct term to its document frequency and the location of its postings list. Two implementations dominate: hash tables (O(1) exact lookup, but no ordered iteration) and sorted structures. Lucene uses a \textbf{finite-state transducer (FST)} as an in-memory prefix index over on-disk term blocks: shared prefixes and suffixes compress millions of terms into a few bytes per term, and because the FST is an automaton, prefix, wildcard, and fuzzy queries become automaton intersections---a Levenshtein automaton intersected with the term FST enumerates all terms within edit distance 1--2 without scanning the vocabulary, which is what makes fuzzy matching and spell-candidate generation cheap.
+    \item \textbf{Postings lists.} For each term, the sorted-by-docID list of documents containing it, each entry carrying the term frequency and optionally token positions (Section~\ref{sr:sec:query_eval}) and payloads. Sorted docID order is the load-bearing choice: it enables delta compression (Section~\ref{sr:sec:compression}) and the merge-join style evaluation of every algorithm in Section~\ref{sr:sec:query_eval}.
+    \item \textbf{Per-document statistics.} Field lengths (for the $|d|/\text{avgdl}$ factor---precomputed, often quantized to a byte), plus any static document priors.
+    \item \textbf{Document store (forward index).} The original field values, compressed in blocks (LZ4/zstd), used to render results---never touched during matching.
+    \item \textbf{Doc values (columnar store).} Per-field column arrays for sorting, filtering, faceting, and feature extraction for rankers. Ranking reads postings; aggregations and filters read columns. Keeping these separate is why an inverted index gets structured filtering essentially for free---a real architectural advantage over pure vector stores (Chapter~\ref{sr:chap:vector_retrieval_theory}).
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    font=\small,
+    term/.style={rectangle, draw=deepblue, fill=lightblue, rounded corners=2pt, minimum width=3.0cm, minimum height=0.8cm, align=center, font=\scriptsize},
+    block/.style={rectangle, draw, fill=lightgray, minimum width=2.55cm, minimum height=0.95cm, align=center, font=\tiny},
+    side/.style={rectangle, draw=deepgreen, fill=lightgreen, rounded corners=2pt, minimum width=3.55cm, minimum height=0.7cm, align=center, font=\tiny},
+    arrow/.style={->, thick, >=stealth},
+    skiparrow/.style={->, thick, >=stealth, deepred, dashed}
+]
+    % Dictionary
+    \node[term] (dict) {Term dictionary (FST)\\prefix-compressed, in memory};
+    \node[term, below=1.15cm of dict] (t1) {\textbf{ceramic}\\ df $=$ 41{,}208 \quad $U = 3.1$};
+    \node[term, below=0.75cm of t1] (t2) {\textbf{vase}\\ df $=$ 9{,}114 \quad $U = 4.2$};
+    \draw[arrow] (dict) -- (t1);
+    \draw[arrow] (dict.south) to[out=-90, in=170] (t2.west);
+
+    % Postings blocks for ceramic (skip/block-max metadata inside each block)
+    \node[block, right=0.75cm of t1] (b11) {\textbf{block 1:} 128 $\Delta$-ids\\ $+$ tf, packed 5 bits\\ last 3{,}998 $\cdot$ max 2.9};
+    \node[block, right=0.3cm of b11] (b12) {\textbf{block 2:} 128 $\Delta$-ids\\ $+$ tf, packed 7 bits\\ last 4{,}630 $\cdot$ max 2.4};
+    \node[block, right=0.3cm of b12] (b13) {\textbf{block 3:} 128 $\Delta$-ids\\ $+$ tf, packed 4 bits\\ last 5{,}512 $\cdot$ max 3.1};
+    \draw[arrow] (t1) -- (b11);
+
+    % Postings blocks for vase
+    \node[block, right=0.75cm of t2] (b21) {\textbf{block 1:} 128 $\Delta$-ids\\ $+$ tf, packed 9 bits\\ last 4{,}301 $\cdot$ max 1.1};
+    \node[block, right=0.3cm of b21] (b22) {\textbf{block 2:} 128 $\Delta$-ids\\ $+$ tf, packed 8 bits\\ last 7{,}944 $\cdot$ max 4.2};
+    \node[block, right=0.3cm of b22] (b23) {\textbf{block 3:} 128 $\Delta$-ids\\ $+$ tf, packed 9 bits\\ last 11{,}016 $\cdot$ max 2.0};
+    \draw[arrow] (t2) -- (b21);
+
+    % Skip arrow over ceramic's blocks
+    \draw[skiparrow] (b11.north) to[out=35, in=145] node[font=\tiny, above, deepred]{skip: advance(4{,}700) jumps block 2} (b13.north);
+
+    % Side stores: bottom row
+    \node[side, below=0.75cm of t2.south west, anchor=north west, xshift=0.4cm] (lens) {field lengths $|d_F|$ (quantized)};
+    \node[side, right=0.35cm of lens] (dv) {doc values (columnar):\\filters, facets, ranking features};
+    \node[side, right=0.35cm of dv] (store) {document store (forward index):\\render-only, block-compressed};
+\end{tikzpicture}
+\caption{Anatomy of one shard's index for two terms. Postings are delta-encoded in fixed-size blocks; each block carries skip metadata (last docID, offset) and a block-local score maximum---the attachment points for the \texttt{advance()} primitive and block-max pruning of Section~\ref{sr:sec:query_eval}. Field lengths, doc values, and the document store live beside the postings, not inside them.}
+\label{sr:fig:index_anatomy}
+\end{figure}
+
+\subsection{Construction: In-Memory Build, Spill, Merge}
+
+Indexing follows an LSM-tree-like discipline, because postings lists cannot be efficiently updated in place:
+
+\begin{enumerate}
+    \item \textbf{In-memory segment build.} Incoming documents are analyzed and accumulated into an in-memory inverted index (hash map from term to a growing postings buffer).
+    \item \textbf{Spill/flush.} When the buffer hits a size threshold, it is sorted and written out as an immutable on-disk \textbf{segment}---a complete miniature index (dictionary, postings, doc values).
+    \item \textbf{Merge.} Background merges combine small segments into larger ones (a k-way merge of sorted term streams and sorted postings), amortizing the cost and bounding the segment count a query must consult. Deletes and updates never touch old segments: a delete marks a tombstone bit; an update is delete-plus-reinsert; merges physically drop tombstoned documents.
+\end{enumerate}
+
+Consequences worth stating in interviews: (1) a query runs over \emph{several} segments and merges their top-k, so segment count affects latency; (2) ``near-real-time'' search means newly indexed documents become visible when the next in-memory buffer is flushed/reopened (sub-second to seconds), not instantly; (3) corpus-level statistics like IDF are computed per shard and drift as segments merge---usually harmless, occasionally the answer to a relevance mystery. The freshness/update pipeline at production depth---indexing SLAs, reindex strategies, schema migration---is covered in Chapter~\ref{sr:chap:production_retrieval_rag}.
+
+%==============================================================================
+\section{Postings Compression and Skip Lists}
+\label{sr:sec:compression}
+%==============================================================================
+
+A web-scale postings file holds on the order of $10^{11}$--$10^{12}$ (docID, tf) entries. Raw 32-bit integers would need terabytes; compression brings this to roughly a byte per posting---but the reason every serious engine compresses aggressively is \emph{speed}, not disk.
+
+\subsection{The Compression Stack}
+
+\textbf{Delta (gap) encoding.} Because postings are sorted by docID, store gaps instead of absolute IDs: docIDs $\langle 1000, 1008, 1012, 1027 \rangle$ become gaps $\langle 1000, 8, 4, 15 \rangle$. Gaps are small---and crucially, \emph{frequent terms have smaller gaps}, so the terms with the longest lists compress best. Term frequencies are small integers already.
+
+\textbf{Variable-byte (varbyte).} Encode each integer in as few bytes as needed, using 7 bits of payload per byte plus a continuation bit. The gap $8$ becomes the single byte \texttt{0}\,\texttt{0001000} (continuation bit clear); the gap $1000 = 512 + 488$ splits into two 7-bit groups, \texttt{1}\,\texttt{0000111} \texttt{0}\,\texttt{1101000} (first byte's continuation bit set). The gap sequence above takes $2+1+1+1 = 5$ bytes instead of 16. Simple, byte-aligned, decode-friendly---the workhorse in many systems---but it wastes bits on very small gaps (minimum one byte) and its per-integer branching limits decode speed.
+
+\textbf{Bit-packing / Frame of Reference (FOR).} Encode a block (e.g., 128 gaps) using the same fixed bit width $= \lceil \log_2(\max \text{gap in block}) \rceil$. Fixed width means branchless, SIMD-friendly decoding of whole blocks at a time.
+
+\textbf{PForDelta (``patched'' FOR).} FOR's weakness is that one outlier forces a wide bit width on the whole block. PForDelta picks a width that covers, say, 90\% of values and stores the outliers separately as \emph{exceptions}, patched back in after the bulk decode. In our example, one block containing the outlier gap 1000 among gaps $\le 15$ packs 127 values at 4 bits each and patches the single outlier, instead of forcing 10 bits on everyone. Modern engines use vectorized descendants of these ideas (SIMD-BP128-family bit-packing; Lucene packs blocks of 128 docIDs with FOR and falls back to varbyte for the tail; Elias--Fano encodings are the elegant alternative offering random access within a compressed list).
+
+\subsection{Skip Lists}
+
+Compressed lists cannot be binary-searched directly, but query evaluation constantly needs ``advance this cursor to the first posting with docID $\ge d$'' (the \texttt{seek}/\texttt{advance} primitive that intersections and WAND depend on). The answer is \textbf{skip data}: alongside the block-compressed postings, store an index of (last docID, file offset) per block---conceptually a skip list over the blocks. A cursor advancing to docID $d$ scans the skip entries (or a multi-level skip list for very long lists), jumps directly to the right block, and decompresses only that block. Skip granularity trades metadata size against skip precision; block boundaries also carry the per-block metadata that block-max WAND exploits (Section~\ref{sr:sec:query_eval}).
+
+\begin{keyinsight}[Compression Is a Throughput Feature]
+The honest hierarchy of reasons to compress postings: (1) \textbf{cache and memory residency}---a 4$\times$ smaller index means the hot postings fit in RAM (and more of them in L2/L3), turning disk seeks into memory reads; (2) \textbf{memory bandwidth}---query evaluation is a sequential scan-and-decode workload, so bytes moved per posting is the bottleneck resource; decoding 128-value blocks at hundreds of millions of integers per second costs less than the cache misses the uncompressed data would incur; (3) \textbf{skip synergy}---block structure gives skip lists and block-max metadata natural attachment points; and only then (4) storage cost. State it this way in interviews: compression makes queries \emph{faster}, and an engine that decompresses at memory-bandwidth speed is the physical substrate that makes the ``millions of candidates in milliseconds'' claim true.
+\end{keyinsight}
+
+%==============================================================================
+\section{Query Evaluation: TAAT, DAAT, and Top-$k$ Pruning}
+\label{sr:sec:query_eval}
+%==============================================================================
+
+Given postings for each query term, the engine must produce the top-$k$ documents by score. How it traverses the lists determines whether a billion-document index answers in milliseconds or seconds.
+
+\subsection{TAAT vs.\ DAAT}
+
+\textbf{Term-at-a-time (TAAT)} processes one term's entire postings list before the next, accumulating partial scores in a per-document accumulator table. It is simple and has good locality per list, but the accumulator table can approach corpus size for common terms, and no document's final score is known until the last term finishes---so nothing can be safely pruned mid-stream without approximation (accumulator-limiting heuristics exist, but they surrender exactness).
+
+\textbf{Document-at-a-time (DAAT)} advances one cursor per query term over the docID-sorted lists in parallel, like a k-way merge: at each step it identifies the smallest current docID, sums the score contributions of every term present, and pushes the completed score into a size-$k$ heap. Memory is $O(\text{\#terms} + k)$, and---the decisive property---each document's \emph{final} score is known the moment it is visited, which enables safe skipping. Production engines are DAAT; TAAT survives in some analytical and impact-ordered settings.
+
+\subsection{Top-$k$ Pruning: MaxScore, WAND, Block-Max WAND}
+
+Exhaustive DAAT still scores every document containing \emph{any} query term. The pruning family avoids most of that work while returning \emph{exactly} the same top-$k$ (``rank-safe up to $k$''). All three algorithms share two ingredients: a per-term \textbf{score upper bound} $U(t) \ge$ the largest contribution $t$ makes to any document (precomputed at index time), and the running \textbf{threshold} $\theta$ = score of the current $k$-th best document. As evaluation proceeds, $\theta$ rises and skipping gets more aggressive---which is why the first few thousand scored documents are the expensive ones.
+
+\textbf{MaxScore} (Turtle and Flood, 1995). Sort terms by $U(t)$; call a maximal-prefix set of low-bound terms \emph{non-essential} if $\sum U < \theta$. No document containing \emph{only} non-essential terms can enter the top-$k$, so the engine drives iteration from the essential terms' postings only, probing non-essential lists just to complete scores of candidates. As $\theta$ rises, more terms become non-essential---frequent, low-IDF terms effectively stop generating candidates.
+
+\textbf{WAND} (Broder et al., 2003) skips at a finer granularity via pivoting. A worked example, which is exactly the level of mechanical detail interviews reward:
+
+Query \{\emph{blue}, \emph{ceramic}, \emph{vase}\} with upper bounds $U(\text{blue}) = 1.8$, $U(\text{ceramic}) = 3.1$, $U(\text{vase}) = 4.2$; current threshold $\theta = 6.0$. Cursor positions (next unscored posting): \emph{blue} at doc 4180, \emph{ceramic} at doc 4205, \emph{vase} at doc 4477.
+
+\begin{enumerate}
+    \item Sort cursors by current docID and accumulate upper bounds until they reach $\theta$: $1.8$ (\emph{blue}) $\rightarrow$ $1.8+3.1 = 4.9$ (\emph{ceramic}) $\rightarrow$ $4.9 + 4.2 = 9.1 \ge \theta$ at \emph{vase}. The \textbf{pivot} is doc 4477, \emph{vase}'s current document.
+    \item Every document before the pivot is provably dead: a doc in $[4180, 4477)$ can contain at most \emph{blue} and \emph{ceramic} (the \emph{vase} cursor has passed it), bounding its score by $4.9 < 6.0$. So docs 4180 and 4205 are \emph{never scored}; the \emph{blue} and \emph{ceramic} cursors jump to $\ge 4477$ via skip lists.
+    \item If enough cursors land on the pivot document that the bounds still clear $\theta$, doc 4477 is fully scored (say \emph{blue} and \emph{vase} occur in it: actual score $5.1 < 6.0$---bounded promise, no entry into the heap); cursors advance and the loop repeats. Actual scores are usually far below the sum of upper bounds, which is the slack that block-max attacks.
+\end{enumerate}
+
+\textbf{Block-Max WAND (BMW)} (Ding and Suel, 2011). Global bounds are loose: $U(\text{vase}) = 4.2$ might come from one short document somewhere, while around doc 4477 \emph{vase}'s local contributions are tiny. BMW stores, per compressed block of each postings list (Section~\ref{sr:sec:compression}), the \emph{block-local} maximum contribution. After WAND selects a pivot with global bounds, BMW rechecks with the block maxima of the blocks containing the pivot: in the example, if block maxima are $1.2$ (\emph{blue}), $2.4$ (\emph{ceramic}), $1.1$ (\emph{vase}), the true local ceiling is $4.7 < 6.0$, and BMW skips past doc 4477 to the nearest block boundary without decompressing or scoring anything. In practice BMW evaluates a small fraction of the documents exhaustive DAAT would score---often 10--100$\times$ fewer scoring operations on realistic query loads---while returning the identical top-$k$. This, plus compression, is the honest mechanism behind interactive-latency lexical search; variants (variable-sized blocks/BMW-V, live-block filtering, and MaxScore/BMW hybrids chosen per query length) are the current engineering frontier, and Lucene itself implements block-max pruning since version 8.
+
+\begin{table}[H]
+\centering
+\caption{Query evaluation strategies}
+\label{sr:tab:query_eval}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Strategy} & \textbf{Core idea} & \textbf{Skips} & \textbf{Notes} \\
+\midrule
+TAAT & One list at a time into accumulators & None (safe) & Accumulator memory; no early exact top-$k$ \\
+DAAT exhaustive & Parallel cursors, merge-style & None & $O(\text{terms}+k)$ memory; baseline \\
+MaxScore & Essential vs.\ non-essential terms by $U(t)$ vs.\ $\theta$ & Docs lacking essential terms & Wins on many-term queries \\
+WAND & Pivot via sorted cumulative $U(t)$ & All docs before pivot & Fine-grained; more cursor sorting overhead \\
+Block-max WAND & WAND + per-block maxima & Whole blocks around weak pivots & Production default; rank-safe top-$k$ \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Pruning power is a function of $k$ and $\theta$---a funnel-design consequence.} Everything above skips relative to the threshold $\theta$, the current $k$-th best score. Small $k$ (a user-facing top-10) drives $\theta$ up fast and prunes hard; large $k$ prunes weakly, because the 1000th-best score is a low bar. This matters for architecture: when lexical retrieval feeds a reranker (Chapter~\ref{sr:chap:learning_to_rank}) and must return $k = 500$--$2000$ candidates, the pruning machinery loses much of its leverage and retrieval cost rises accordingly---one of the quiet line items in the multi-stage funnel's budget (Chapter~\ref{sr:chap:production_retrieval_rag}). Engines claw some of it back by seeding $\theta$ above zero: from a results cache, from the score distribution of previous executions of the same query, or---in distributed settings---by having the coordinator share the best $\theta$ seen so far with straggler shards.
+
+\subsection{Impact Ordering and Unsafe Early Termination}
+
+An alternative family reorders postings by \emph{impact} (quantized score contribution) instead of docID: process the highest-impact postings first and stop when the top-$k$ is unlikely to change. This gives excellent early-termination behavior but surrenders rank-safety guarantees (and docID-order tricks like cheap intersection), so it historically lived in specialized engines. It matters again for two reasons: static-priority orderings (sorting docIDs by a quality/popularity prior so good documents appear early in every list, letting the engine stop after a prefix--- the classic web-search trick) and learned sparse retrieval (Section~\ref{sr:sec:learned_sparse}), whose quantized learned impacts fit impact-ordered and block-max machinery naturally.
+
+\begin{keyinsight}[Safe vs.\ Unsafe: Know Which Guarantee You Are Trading]
+Keep the taxonomy straight, because interviewers conflate-test it. \emph{Rank-safe up to $k$} (MaxScore, WAND, BMW): provably identical top-$k$ to exhaustive evaluation---the only thing sacrificed is wasted work. \emph{Approximate/unsafe} (impact-ordered early termination, accumulator limiting, static-rank prefix stopping): faster still, but the top-$k$ can differ, so quality must be \emph{measured}, not assumed---the same recall-vs-latency contract as ANN search (Chapter~\ref{sr:chap:vector_retrieval_theory}). Production stacks use both: safe pruning within a tier, unsafe tricks across tiers (a tiered index \emph{is} an unsafe early-termination scheme at the architecture level---the tail tier is simply not consulted for most queries).
+\end{keyinsight}
+
+\subsection{Positional Postings and Phrase Queries}
+
+Phrase queries (``\emph{new york}'') and proximity boosts need to know not just \emph{that} a term occurs but \emph{where}. Positional postings store the token offsets of each occurrence; a phrase match is a docID intersection followed by a position intersection (occurrences of \emph{york} at position $p+1$ for some occurrence of \emph{new} at $p$; proximity generalizes to $|p_1 - p_2| \le$ window). Costs are real: positions multiply index size by roughly 2--4$\times$ and phrase evaluation adds a second intersection level, which is why engines store positions in a separately-skippable stream, why phrase \emph{boosts} (rescoring the top candidates for adjacency) are often preferred over phrase \emph{matching} (requiring adjacency during retrieval), and why shingle fields sometimes buy the common phrases outright. Term-position machinery is also what index-time multi-word synonyms corrupt (Section~\ref{sr:sec:index_construction})---the details connect.
+
+%==============================================================================
+\section{Scaling the Index: Sharding, Tiering, Caching}
+\label{sr:sec:scaling}
+%==============================================================================
+
+One machine indexes and serves millions to a few hundred million documents comfortably. Beyond that, the index must be partitioned---and the industry converged decisively on one of the two options.
+
+\subsection{Document vs.\ Term Partitioning}
+
+\textbf{Document partitioning}: each shard holds a complete miniature index over a subset of documents. A query is broadcast to all shards; each returns its local top-$k$; a coordinator merges (``scatter-gather'').
+
+\textbf{Term partitioning}: each shard holds the complete postings lists for a subset of \emph{terms}. A query touches only the shards owning its terms.
+
+Term partitioning looks attractive on paper (fewer shards touched per query) and lost anyway, for reasons interviewers like to hear articulated:
+
+\begin{itemize}
+    \item \textbf{Scoring is local under doc partitioning.} All of a document's postings, lengths, and doc values live on one shard, so BM25 (and any feature extraction) completes locally. Under term partitioning, conjunctions and scoring require shipping postings lists between shards---network cost proportional to \emph{list length}, the largest objects in the system---and multi-term coordination for every query.
+    \item \textbf{Load balance.} Query term popularity is Zipfian; the shard owning hot terms melts. Documents hash-distribute evenly.
+    \item \textbf{Fault and latency isolation.} Losing a doc-partitioned shard degrades results proportionally (you miss that slice of the corpus); losing a term shard deletes those terms from every query.
+    \item \textbf{Indexing simplicity.} A new document touches exactly one shard under doc partitioning; under term partitioning it scatters postings across many.
+\end{itemize}
+
+The cost of doc partitioning is that every query pays fan-out to all shards, and tail latency becomes $\max$ over shards---the p99 of the slowest shard is the p99 of the query. Mitigations: replicas with hedged/duplicate requests, per-shard deadlines with partial-results semantics, and keeping shard count as low as capacity allows. Two smaller doc-partitioning consequences worth naming: IDF is computed per shard (fine at scale since shards are statistically similar; small clusters sometimes exchange global stats), and deep pagination is pathological (page 100 requires every shard to return $100k$ candidates for the coordinator to merge---hence \texttt{search\_after} cursors and hard page caps in every production API).
+
+\subsection{Two-Phase Execution: Query, Then Fetch}
+
+Distributed execution is itself split to keep bytes off the wire. In the \textbf{query phase}, each shard runs matching and scoring and returns only lightweight (docID, score) pairs---plus sort keys if sorting by fields---for its local top-$k$. The coordinator merges these into the global top-$k$. Only then does the \textbf{fetch phase} ask the handful of winning shards to materialize the actual documents (titles, snippets, prices) from their document stores. The reasoning: scoring touches postings (cheap, sequential, RAM-resident), while rendering touches stored fields (larger, random-access, decompression)---so the system defers the expensive reads until it knows the at-most-$k$ documents that need them. Elasticsearch's \texttt{query\_then\_fetch} is the canonical implementation, and its \texttt{dfs\_query\_then\_fetch} variant adds a round trip to gather global term statistics first---worth enabling only on small or skewed clusters where per-shard IDF visibly distorts ranking. The same shape reappears one level up in the retrieval funnel: retrieval returns IDs and scores; feature hydration for the reranker happens only for the surviving candidates (Chapter~\ref{sr:chap:production_retrieval_rag}).
+
+\subsection{Tiering}
+
+Corpora and traffic are both skewed, and serving everything from one tier wastes money. \textbf{Index tiering} splits the corpus by expected usefulness: a small \emph{head} tier of high-quality, high-traffic documents (by static rank, popularity, or click history) served from RAM on many replicas, and one or more \emph{tail} tiers of the long tail on cheaper storage. Queries hit the head tier first; only if it fails to produce enough confident results (a results-quality or count threshold) do they \emph{fall through} to the tail tier. Web engines have run this way for two decades (the head tier answers the overwhelming majority of queries), and the same pattern reappears in commerce as ``active catalog'' vs.\ ``archive.'' Tiering interacts with freshness (new documents typically enter an NRT tier before promotion) and with the funnel economics of Chapter~\ref{sr:chap:production_retrieval_rag}.
+
+\subsection{Caching}
+
+Search caching is layered, and each layer exploits a different skew:
+
+\begin{itemize}
+    \item \textbf{Results cache}: full result pages for exact repeated queries. Head queries are Zipfian, so hit rates of 30--50\% are common in web/commerce; invalidation on index refresh (or short TTLs) is the price. Personalization poisons this cache---one of the strongest arguments for keeping retrieval intent-driven and injecting personalization late (Chapter~\ref{sr:chap:search_systems_query_understanding}).
+    \item \textbf{Postings/block cache}: decoded or raw postings blocks for hot terms, exploiting term-level skew; often just the OS page cache doing its job, deliberately sized so the hot index is memory-resident.
+    \item \textbf{Filter/doc-set caches}: cached bitsets for frequently reused structured filters (category, in-stock, language).
+\end{itemize}
+
+The production treatment---cache hierarchies, invalidation vs.\ freshness SLAs, cache-aware capacity planning---is in Chapter~\ref{sr:chap:production_retrieval_rag}; here the takeaway is architectural: caching is a first-class reason the lexical stack is cheap, and cacheability constrains where dynamic per-user logic may live.
+
+\subsection{The Arithmetic of a Billion-Document Query}
+
+Putting the chapter together with defensible round numbers (the L5 systems question at the end of this chapter walks the same path): 1B documents, doc-partitioned across $\sim$128 shards $\approx$ 8M docs/shard. A three-term query's postings on one shard total perhaps $10^4$--$10^5$ entries (df-dependent); block-max WAND fully scores a few thousand of them; at memory-bandwidth decode rates that is single-digit milliseconds of shard CPU. Add FST dictionary lookups (microseconds), fan-out and merge of $128 \times 10$ doc-score pairs (microseconds of coordinator work, one network round trip), and the end-to-end budget is dominated by the slowest shard plus the network---which is why p99 engineering is replica hedging and deadline design, not scoring micro-optimization. Compressed, the shard's postings ($\sim$$10^9$--$10^{10}$ postings at $\sim$1 byte each, positions extra) fit in tens of GB of RAM: the whole hot index lives in memory. None of this required scoring a billion documents; the index touched perhaps $10^{-5}$ of the corpus.
+
+%==============================================================================
 \section{Learned Sparse Retrieval}
-% TODO Phase C
+\label{sr:sec:learned_sparse}
+%==============================================================================
 
+Lexical retrieval's fundamental failure is \textbf{vocabulary mismatch}: ``notebook'' does not match ``laptop,'' and no amount of BM25 tuning fixes a term that is not in the document. Dense retrieval (Chapter~\ref{sr:chap:vector_retrieval_theory}, [DL 7]) attacks this by abandoning terms entirely---at the cost of new ANN infrastructure, opaque scores, and weak exact matching. \textbf{Learned sparse retrieval} is the third way: keep the inverted index, but let a neural model decide \emph{which terms} represent a document and \emph{how much each weighs}. [NLP 9] introduces this family in the RAG context; this is the deep treatment.
+
+\subsection{The Lineage}
+
+\begin{itemize}
+    \item \textbf{docT5query / doc2query} (Nogueira et al., 2019): train a seq2seq model to generate plausible queries for a document and \emph{append them to the document text} before ordinary BM25 indexing. Expansion happens purely at index time; the serving stack is untouched BM25. Crude but effective---and the conceptual ancestor: it showed that closing vocabulary mismatch is a \emph{document representation} problem, not a scoring problem.
+    \item \textbf{DeepCT / DeepImpact / uniCOIL} (2019--2021): stop generating text; directly \emph{learn the term weights}. uniCOIL caps the lineage: a BERT encoder emits one scalar weight per document token (optionally over a docT5query-expanded document), quantized into the term-frequency slot of an ordinary postings entry. Scoring becomes a learned-impact dot product over exact term matches---BM25's machinery with learned numbers in it.
+    \item \textbf{SPLADE} (Formal et al., 2021; SPLADE v2 same year): the current reference point. Instead of weighting only the tokens present, SPLADE projects every token's contextual embedding through the masked-language-model head onto the \emph{entire vocabulary}, so a document about ``laptops'' can activate the term \emph{notebook} it never contains---expansion and weighting in one model, on both documents and queries.
+\end{itemize}
+
+\begin{mathresult}{SPLADE: log-saturated expansion + FLOPS regularization}
+Given MLM logits $w_{ij}$ (token position $i$, vocabulary term $j$), the document's weight on vocabulary term $j$ is
+\begin{equation}
+w_j = \max_{i} \; \log\bigl(1 + \operatorname{ReLU}(w_{ij})\bigr)
+\label{sr:eq:splade}
+\end{equation}
+(max pooling over positions in SPLADE v2; the original summed). Training combines a contrastive ranking loss (in-batch + hard negatives) with the \textbf{FLOPS regularizer}
+\begin{equation}
+\ell_{\text{FLOPS}} = \sum_{j \in V} \bar{a}_j^{\,2}, \qquad \bar{a}_j = \tfrac{1}{N}\sum_{d} w_j^{(d)},
+\label{sr:eq:flops}
+\end{equation}
+a smooth proxy for the expected number of multiplications in a sparse dot product. Separate regularization weights $\lambda_q \gg \lambda_d$ keep \emph{queries} extremely sparse, since query-side density multiplies retrieval cost.
+\end{mathresult}
+
+Two design choices carry the intuition. The $\log(1+\operatorname{ReLU}(\cdot))$ is BM25's lesson re-learned: saturate term weights so no single term dominates---the model is architecturally biased toward BM25-like concave scoring. And the FLOPS regularizer penalizes the \emph{squared mean activation per vocabulary term}: because the penalty is quadratic in each term's average activation, frequently activated terms are punished superlinearly, pushing the model away from lighting up the same common terms in every document (which would recreate stopword-like postings lists that pruning cannot skip) and toward a balanced index whose retrieval cost is actually low---a regularizer designed for the \emph{serving data structure}, not just for sparsity.
+
+\subsection{Efficiency and Serving Characteristics}
+
+\begin{table}[H]
+\centering
+\caption{BM25 vs.\ learned sparse vs.\ dense retrieval}
+\label{sr:tab:sparse_dense}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Dimension} & \textbf{BM25} & \textbf{Learned sparse (SPLADE-class)} & \textbf{Dense bi-encoder} \\
+\midrule
+Vocabulary mismatch & Fails & Largely closed (learned expansion) & Closed \\
+Exact match / identifiers & Exact & Strong (term-level scoring retained) & Weak---embeddings blur near-identical strings \\
+Index infrastructure & Inverted index & Same inverted index (quantized impacts) & ANN index (HNSW/IVF-PQ), new stack \\
+Indexing cost & Trivial (analysis only) & GPU forward pass per document & GPU forward pass per document \\
+Query latency & Lowest & Higher: expansion adds query terms; flatter impacts weaken pruning (see below) & Low with ANN (recall/latency dial) \\
+Training data & None & Required (like dense) & Required \\
+Out-of-domain (BEIR-style) & Strong baseline & Strong---inherits term grounding & Degrades most without adaptation \\
+Interpretability & Full (terms + weights) & Good (inspect expansion terms) & Low \\
+Structured filtering & Free (same engine) & Free (same engine) & Filtered-ANN complexity (Chapter~\ref{sr:chap:vector_retrieval_theory}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The latency row deserves expansion, because it is where naive deployments get surprised. A SPLADE-class query is slower than its BM25 twin for two structural reasons: query expansion turns a 3-term query into a 20--40-term disjunction, and learned impact distributions are \emph{flatter} than IDF-skewed BM25 scores, which weakens exactly the upper-bound leverage that MaxScore/WAND/BMW pruning depends on (Section~\ref{sr:sec:query_eval}). The efficiency playbook: drop query-side expansion entirely (SPLADE-doc-style models push all expansion to the document side, leaving the query as a cheap bag of original terms), regularize and train with serving in mind (the FLOPS term, pruning-aware objectives), quantize impacts into the tf slot so the standard machinery applies, and serve from impact-ordered or block-max-aware engines built for this workload (the academic reference stack is PISA). With those measures, learned sparse serves within small multiples of BM25 latency---still on CPUs, still without an ANN cluster.
+
+The strategic point interviewers reward: learned sparse retrieval \emph{rides the existing inverted-index estate}. The postings format, compression, skip lists, block-max pruning, sharding, tiering, caching, and filtering of this entire chapter apply unchanged---the neural model only changes what gets written into the index at document-processing time (plus a small query encoder or even a pre-expanded query table at query time). For an organization with a mature Lucene/Elasticsearch/Vespa deployment, that is a fundamentally cheaper adoption path than standing up a parallel ANN serving stack---while for greenfield systems the comparison with dense retrieval is genuinely open, and hybrid setups (Chapter~\ref{sr:chap:neural_retrieval_reranking}) frequently take both.
+
+%==============================================================================
+\section{When Lexical Wins}
+\label{sr:sec:when_lexical_wins}
+%==============================================================================
+
+After three chapters of neural retrieval enthusiasm elsewhere in this volume, it is worth being precise about where plain lexical retrieval remains the \emph{best} tool, not merely the incumbent:
+
+\begin{itemize}
+    \item \textbf{Exact identifiers.} SKUs, part numbers, error codes, flight numbers, legal citations, usernames: \texttt{RTX 4090} vs.\ \texttt{RTX 4080} differ by one character and mean different products. Embeddings blur near-identical strings \emph{by construction}---their geometry is trained for semantic similarity, and the two GPUs are semantically almost identical. Term matching is binary and correct.
+    \item \textbf{Tail and zero-history queries.} Dense retrieval quality depends on training distribution; the tail is precisely where training data is thin. BM25 needs no training data and degrades gracefully---an unseen rare term with high IDF is its \emph{best} case, not its worst.
+    \item \textbf{Rare entities and neologisms.} New product names, people, and jargon enter the index the moment they are indexed; a frozen encoder embeds them poorly or not at all until retrained (the embedding lifecycle problem, Chapter~\ref{sr:chap:neural_retrieval_reranking}).
+    \item \textbf{Compounding and morphology-rich languages.} German compounds (\emph{Winterjacke}), agglutinative morphology (Finnish, Turkish), and CJK segmentation are handled by decades of analyzer engineering---decompounders, morphological analyzers, character n-gram fallbacks---with predictable, debuggable behavior per language.
+    \item \textbf{Quoted phrases and operators.} Users who type quotes, minus-operators, or \texttt{site:} filters are expressing constraints, not similarity; positional and boolean machinery honors them exactly.
+    \item \textbf{Operational profile.} No training pipeline, no drift, no embedding version skew, millisecond CPU-only serving, and explainable scores (``it matched these terms with these weights'')---which matters for debugging, for merchandising disputes, and for regulated domains.
+\end{itemize}
+
+None of this argues against dense retrieval; it argues for the \emph{split}. Production systems run lexical and dense (and increasingly learned-sparse) retrieval as parallel candidate sources whose complementary error sets are fused downstream---the hybrid architecture, fusion mechanics (RRF and friends), and when-not-to-hybridize judgment are Chapter~\ref{sr:chap:neural_retrieval_reranking}'s subject.
+
+\begin{keyinsight}[The Lexical Stack Is the Benchmark to Beat]
+The correct mental model for 2026: BM25 over a block-max-pruned, doc-partitioned, tiered, cached inverted index is a decades-refined system that serves most of the world's search traffic at single-digit-millisecond shard latencies, for free, with no training data, with structured filtering built in. Every neural retrieval proposal must beat it \emph{net of these properties}---which is why the winning architectures either ride it (learned sparse), sit beside it (hybrid), or sit after it (rerankers), and almost never replace it.
+\end{keyinsight}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C
+\label{sr:sec:lexical_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: Walk me through, mechanically, how BM25 over an inverted index returns the top-10 results from a billion documents in under 50\,ms.}
+
+\badgeLfive{L5} \quad \badgetype{Systems Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Structure the answer as ``why almost no work happens per query,'' stage by stage:
+
+\textbf{1. Precomputation moved the work to index time.} Every quantity BM25 needs---term frequencies, document lengths, document frequencies---is precomputed into the index. The analyzer chain has already normalized documents and will normalize the query identically. Scoring is arithmetic over lookups, not text processing.
+
+\textbf{2. The index touches only the query's terms.} The term dictionary (an FST/hash, microseconds per lookup) maps each of the $\sim$3 query terms to its postings list. Work is proportional to the length of three postings lists---perhaps $10^4$--$10^5$ entries per shard---not to $10^9$ documents. The other 99.99\% of the corpus is never touched.
+
+\textbf{3. Sharding divides, replicas protect the tail.} The corpus is document-partitioned across $\sim$100+ shards ($\sim$8M docs each), each a complete mini-index scoring locally. The query fans out, each shard returns its top-10, and the coordinator merges $\sim$1{,}280 (docID, score) pairs---microseconds. End-to-end latency is $\max$ over shards plus one network round trip, so p99 is managed with replicas, hedged requests, and per-shard deadlines.
+
+\textbf{4. Compression keeps postings in RAM.} Delta-encoded, block-packed postings run about a byte per posting, so a shard's postings fit in tens of GB---memory-resident. Decoding is block-wise and SIMD-friendly at memory-bandwidth speed; skip lists let cursors jump blocks without decompressing.
+
+\textbf{5. Top-$k$ pruning scores a tiny fraction of matches.} DAAT evaluation with block-max WAND: per-term and per-block score upper bounds let the engine prove that most candidate documents cannot beat the current 10th-best score, skipping them (often whole blocks) unscored---while returning provably the same top-10. Typically only a few thousand documents per shard are fully scored: single-digit milliseconds of CPU.
+
+Close the loop: 3 dictionary lookups + tens of thousands of postings decoded + a few thousand scored + a scatter-gather merge $\approx$ 5--15\,ms per shard in parallel, comfortably inside 50\,ms with network and merge overhead. If asked where added latency hides: a slow shard (tail latency), cold postings (page faults), very-common-term queries (long lists, low $\theta$ leverage), and deep pagination.
+
+\redflags
+\begin{itemize}
+    \item ``It scores all documents quickly''---missing the entire point: the design goal is scoring almost nothing.
+    \item No mention of pruning (WAND/block-max)---exhaustive DAAT over common terms does not hit these latencies at this scale.
+    \item Proposing term partitioning, or being unable to say how shard results are combined.
+    \item Hand-waving compression as a disk-cost concern rather than a memory-residency/throughput feature.
+\end{itemize}
+
+\interviewtest{Whether ``BM25 is fast'' is a memorized phrase or a mechanism you can decompose. This question is a Staff-screen for search-infrastructure literacy: each stage (dictionary, postings, pruning, sharding) is a follow-up hook.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly narrates dictionary $\rightarrow$ postings $\rightarrow$ DAAT top-$k$ $\rightarrow$ scatter-gather, with the ``work proportional to postings, not corpus'' insight.
+    \item \badgeLsix{L6} Adds WAND/block-max mechanics with the threshold/upper-bound argument, the compression-for-throughput argument, and p99 tail management (hedging, deadlines).
+    \item \badgeLseven{L7} Gives the capacity arithmetic unprompted (postings volume, bytes/posting, shard RAM), names the failure regimes (hot terms, deep pagination, cold cache), and connects to tiering and caching as the levers that make the fleet affordable.
+\end{itemize}
+
+\followups{``Where does p99 latency come from and how do you fix it?'' ``What changes if I need page 100 of results?'' ``How does a just-indexed document become searchable?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What do BM25's $k_1$ and $b$ actually control, and when would you change them from the defaults?}
+
+\badgeLfive{L5} \quad \badgetype{Core Concept} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+$k_1$ controls \textbf{term-frequency saturation}. BM25's TF component is concave and asymptotes at $k_1 + 1$, so a term's contribution is capped at $\operatorname{idf}(t)(k_1+1)$: the fifth occurrence adds far less than the first, and the fiftieth adds almost nothing. This is the anti-keyword-stuffing property raw TF--IDF lacks. $k_1 = 0$ collapses TF to binary presence; large $k_1$ approaches linear TF. Default $\approx 1.2$.
+
+$b$ controls \textbf{document-length normalization}: it interpolates between ignoring length ($b=0$) and fully normalizing ($b=1$, where a doc twice the average length needs twice the TF for the same score). Default $\approx 0.75$ encodes ``long documents are partly padded, partly legitimately richer.''
+
+When to move them---answer per field/corpus, not globally:
+\begin{itemize}
+    \item \textbf{Short structured fields} (titles, product names, brands): low $b$ (length variation is noise, not verbosity) and low $k_1$ (a second occurrence of a term in a title adds nothing---presence is the evidence). This is the most common production deviation.
+    \item \textbf{Boilerplate-heavy corpora} (templated pages): raise $b$ toward 1 so template bloat is normalized away.
+    \item \textbf{Long focused technical documents}: raise $k_1$---repeated mentions genuinely track aboutness.
+\end{itemize}
+Finish with process: these are empirical parameters---grid-search $k_1 \in [0.5,2]$, $b \in [0.3,1]$ against a judgment list, evaluate per query segment, and set them per field (which is most of the way to BM25F).
+
+\redflags
+\begin{itemize}
+    \item Reciting the formula without the saturation intuition---this is the canonical lexical-search fumble test, and formula-recitation is explicitly what it screens out.
+    \item Swapping the parameters (attributing length normalization to $k_1$).
+    \item ``The defaults are optimal''---they were tuned on TREC news prose, not on titles or product catalogs.
+\end{itemize}
+
+\interviewtest{The single most common lexical-search competence gate. Interviewers listen for the words ``saturation,'' ``asymptote/cap,'' and ``length normalization,'' plus at least one concrete case for moving each parameter.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct intuition for both parameters with the saturation cap.
+    \item \badgeLsix{L6} Per-field regimes (title vs.\ body), the tuning-by-judgment-list process, and the connection to BM25F.
+    \item \badgeLseven{L7} Connects $k_1$'s concavity to spam economics, notes IDF-variant differences (Lucene's $\ln(1+\cdot)$ smoothing and why classic IDF can go negative), and observes that SPLADE re-learns the same concave shape (\,$\log(1+\operatorname{ReLU})$\,)---the design principle outlived the formula.
+\end{itemize}
+
+\followups{``Your corpus is tweets---what do you set?'' ``Why can classic IDF go negative and what does Lucene do about it?'' ``How would you validate a parameter change before shipping?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: A search for ``red dress'' ranks a product titled ``Red'' with ``dress'' scattered through a long description above an exact ``Red Dress'' title match. Diagnose and fix.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Enumerate the plausible mechanisms, then the fixes---this is the canonical ``do you actually understand lexical scoring'' probe.
+
+\textbf{Hypotheses:}
+\begin{enumerate}
+    \item \textbf{Per-field-sum double-dipping.} If scoring is $\sum_F w_F \cdot \text{BM25}_F$, the offending document collects a fresh saturation curve in \emph{every} field: ``red'' pays out in the title while repeated ``dress'' occurrences pay out on the body's unsaturated curve. The exact-match document, matching only in a short title, is capped by the title curve alone.
+    \item \textbf{No phrase/proximity signal.} Nothing rewards ``red'' and ``dress'' being \emph{adjacent in the same field}; bag-of-words scoring cannot distinguish the exact phrase from scattered co-occurrence.
+    \item \textbf{Length-normalization sign error on the description.} With low $b$ on the body, a long description's many ``dress'' occurrences are barely taxed; perversely, if the exact-match title is longer than the title average, moderate title-$b$ taxes it.
+    \item \textbf{Analyzer artifacts.} Check before theorizing: is the title field even indexed/boosted as intended? Did stemming or a synonym expansion change what matches?
+\end{enumerate}
+
+\textbf{Fixes, in the order a production team ships them:} phrase boost on the title (exact/adjacent match adds score---the highest-leverage single change); BM25F-style joint saturation or dismax with low \texttt{tie} instead of the raw per-field sum; low $k_1$/low $b$ on the title so title matching is essentially binary; optionally an ``all query terms present in title'' boolean boost feature. Then validate against a judgment list, and note that these hand boosts are the features an LTR model (Chapter~\ref{sr:chap:learning_to_rank}) will eventually weigh properly.
+
+\redflags
+\begin{itemize}
+    \item Jumping to ``add embeddings''---this is a lexical-scoring configuration bug, and a dense retriever bolted onto it inherits the broken candidate ordering downstream.
+    \item Not knowing that per-field-sum and BM25F differ, or why the difference pays the stuffed document.
+    \item Proposing to delete the description field from search (destroys recall) instead of fixing its weighting.
+\end{itemize}
+
+\interviewtest{Mechanistic understanding of field weighting, saturation, and phrase machinery under a realistic relevance bug---plus debugging discipline (check the analyzer before theorizing).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies missing phrase boost and field-weight imbalance; proposes title boost.
+    \item \badgeLsix{L6} Names the double-dip mechanism precisely (fresh saturation curve per field, cap $\sum_F w_F(k_1+1)$ vs.\ $(k_1+1)$) and orders fixes by leverage with a validation plan.
+    \item \badgeLseven{L7} Adds the incentive framing (seller-controlled text exploits per-field sums), quantifies with a back-of-envelope score comparison, and frames hand boosts as proto-LTR features with a migration path.
+\end{itemize}
+
+\followups{``Sellers start stuffing titles instead---now what?'' ``How would you detect this class of bug across the whole query stream rather than one anecdote?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Index-time vs.\ query-time synonyms---walk through the trade-offs and give your production policy.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Index-time expansion} (inject synonyms into the document token stream): queries stay fast (no expansion cost), and the merged synonym class accrues a shared, sensible IDF. Costs: any change to the synonym set requires reindexing (days on a large corpus); multi-word synonyms corrupt token positions---``NYC'' expanded to ``new york city'' shifts every subsequent position unless a graph-aware token filter is used---silently breaking phrase queries; and index size grows.
+
+\textbf{Query-time expansion} (rewrite the query with synonym clauses): updates deploy instantly (a config push), phrase semantics can be preserved with graph query parsing, and expansions can carry \emph{discounted weights} (a synonym match scores less than an original-term match---usually what you want). Costs: per-query latency grows with expansion fan-out, and IDF asymmetry---each expansion term keeps its own IDF, so expanding ``sofa'' with rare ``chesterfield'' makes the synonym match score \emph{higher} than the original term, a classic surprise.
+
+\textbf{Production policy:} high-confidence, stable, symmetric synonyms (units, spelling variants, canonical brand aliases) at index time; experimental, tail, and mined synonyms (from query-log click graphs---Chapter~\ref{sr:chap:search_systems_query_understanding}) at query time with discount weights, promoted to index time once proven. Always as optional lower-weighted clauses, never as equal terms; measure with interleaving before promoting (Chapter~\ref{sr:chap:evaluation_experimentation}).
+
+\redflags
+\begin{itemize}
+    \item Not knowing the multi-word/position corruption issue---it is the classic silent breakage.
+    \item Treating expansion terms as equal-weight query terms (recall up, precision down, and the IDF asymmetry unaddressed).
+    \item No mention that index-time changes require reindexing---the operational half of the trade-off.
+\end{itemize}
+
+\interviewtest{Analyzer-chain fluency and operational judgment: this is a question about deployment mechanics and failure modes as much as relevance.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly states the fast-queries-vs-flexible-updates trade-off.
+    \item \badgeLsix{L6} Adds IDF asymmetry, position corruption, discounted optional clauses, and the two-stage promote policy.
+    \item \badgeLseven{L7} Connects to the synonym supply chain (log mining, LLM-assisted candidate generation with precision filtering) and to measurement (interleaving for cheap triage), and notes learned sparse retrieval as the endgame that replaces curated synonyms with learned expansion.
+\end{itemize}
+
+\followups{``How do you mine synonym candidates without an ontology?'' ``A synonym pack tanks precision for one category---how do you scope synonyms per category?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Explain WAND and block-max WAND. Why are they safe, and when does the pruning stop helping?}
+
+\badgeLsix{L6} \quad \badgetype{Systems Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Setup: DAAT evaluation, a heap of the current top-$k$ whose $k$-th score is the threshold $\theta$, and per-term upper bounds $U(t)$ on any single document's contribution from $t$.
+
+\textbf{WAND:} sort term cursors by current docID; accumulate $U(t)$ in that order until the running sum reaches $\theta$; the cursor where it crosses defines the \emph{pivot document}. Every document before the pivot provably cannot reach $\theta$---it can only contain the terms whose cursors precede the pivot, and their bounds sum below $\theta$---so all cursors skip to the pivot (via skip lists) without scoring anything. If enough terms actually align on the pivot document, score it fully; otherwise repeat. Safety is exactly the upper-bound argument: nothing is skipped unless its \emph{maximum possible} score is below the current $k$-th best, so the returned top-$k$ is identical to exhaustive evaluation.
+
+\textbf{Block-max WAND:} global $U(t)$ is loose---one short document somewhere sets a term's global bound. BMW stores per-block maxima alongside the compressed postings blocks and rechecks the pivot against the \emph{local} maxima of the blocks containing it; if the local sum misses $\theta$, it skips whole blocks without decompressing them. Same safety argument, far tighter bounds, typically an order of magnitude or more fewer full evaluations.
+
+\textbf{When pruning degrades:}
+\begin{itemize}
+    \item \textbf{Low $\theta$ leverage}: early in evaluation ($\theta$ near 0), for large $k$, or for pure disjunctions of many common terms with similar small bounds---no prefix of bounds stays below $\theta$.
+    \item \textbf{Flat impact distributions}: pruning power comes from skew. Learned sparse models that spread weight across many mid-impact terms weaken it---one reason SPLADE-style models need FLOPS-style regularization and pruning-aware training to serve fast.
+    \item \textbf{Score components outside the bounds}: additive query-independent boosts (freshness, popularity) must be folded into the upper bounds or they break safety; rank-time features that cannot be bounded force a rescore-after-retrieve architecture instead.
+    \item \textbf{Very short lists}: for rare terms exhaustive evaluation is already cheap; pruning bookkeeping can even add overhead.
+\end{itemize}
+
+\redflags
+\begin{itemize}
+    \item Calling WAND an approximation---rank-safety up to $k$ is the whole point (impact-ordered early termination is the unsafe cousin; know the difference).
+    \item Unable to produce the pivot argument (why documents before the pivot are provably dead).
+    \item Not knowing why block-max helps (global bounds are loose; blocks localize them).
+\end{itemize}
+
+\interviewtest{Depth on the algorithm that actually makes lexical top-$k$ fast, including the boundary conditions where it fails---separates ``read a blog post'' from ``operated a search engine.''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States upper bounds + threshold and that provably-losing documents are skipped.
+    \item \badgeLsix{L6} Runs the pivot mechanics on a small example and explains block-max's tighter local bounds, with two degradation regimes.
+    \item \badgeLseven{L7} Discusses MaxScore vs.\ WAND selection by query length, boost-folding into bounds, the interaction with learned sparse impact distributions, and threshold-sharing tricks in distributed top-$k$ (shipping $\theta$ estimates to shards).
+\end{itemize}
+
+\followups{``How would you handle a query-independent popularity boost without breaking pruning?'' ``Why does a 10-term disjunction prune worse than a 3-term one?'' ``What changes for $k = 1000$ (reranker feeding)?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why do search engines compress postings so aggressively when disk is cheap? Walk through the encoding stack.}
+
+\badgeLfive{L5} \quad \badgetype{Core Concept} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Because compression is a \emph{throughput} feature; storage savings are a side effect. The argument in three steps:
+
+\textbf{1. The encoding stack.} Postings are docID-sorted, so store \emph{gaps}: $\langle 1000, 1008, 1012, 1027\rangle \rightarrow \langle 1000, 8, 4, 15\rangle$---small numbers, and frequent terms (the longest lists) have the smallest gaps, so the biggest lists compress best. Then encode gaps compactly: \textbf{varbyte} (7 payload bits + continuation bit per byte; simple, byte-aligned) or, faster, \textbf{block bit-packing/FOR} (fixed bit width per 128-value block, branchless SIMD decode), with \textbf{PForDelta} patching outliers as exceptions so one large gap does not widen the whole block. Net effect: roughly a byte per posting.
+
+\textbf{2. Why that means speed.} (a) \emph{Residency}: a several-times-smaller index fits in RAM and more of it in CPU cache---the difference between memory reads and page faults. (b) \emph{Bandwidth}: query evaluation is scan-and-decode; the bottleneck is bytes moved, and block decoders run at hundreds of millions of integers per second---cheaper than the cache misses uncompressed data would cost. (c) \emph{Structure}: block layout gives skip lists and block-max metadata their attachment points, enabling the pruning that skips most of the data entirely.
+
+\textbf{3. The skip-list interplay.} Compressed blocks cannot be binary-searched, but cursors need \texttt{advance(docID)}; per-block (last-docID, offset) skip entries let a cursor jump to the right block and decode only that---so compression and skipping are co-designed, not in tension.
+
+\redflags
+\begin{itemize}
+    \item ``To save disk''---true and secondary; missing the memory-residency/bandwidth argument is missing the point.
+    \item Storing absolute docIDs (not knowing delta encoding is what makes everything downstream work).
+    \item Claiming compression must be traded against query speed---for postings workloads it is the opposite.
+\end{itemize}
+
+\interviewtest{Systems intuition: does the candidate reason about cache, bandwidth, and data-structure co-design rather than treating compression as an ops afterthought?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Delta + varbyte with the residency argument.
+    \item \badgeLsix{L6} FOR/PForDelta and SIMD block decoding, skip-list co-design, the ``frequent terms compress best'' observation.
+    \item \badgeLseven{L7} Discusses Elias--Fano (random access within compressed lists), docID-reassignment ordering (clustering similar docs shrinks gaps further), and quantified capacity arithmetic for a shard.
+\end{itemize}
+
+\followups{``How does the engine seek into a compressed list?'' ``Why might you reorder docIDs to improve compression?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You must index 10B documents. Design the partitioning, tiering, and caching. Why did document partitioning beat term partitioning?}
+
+\badgeLseven{L7} \quad \badgetype{Systems Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Partitioning.} Document-partition: each shard is a full mini-index over a hash-slice of documents; queries scatter to all shards and gather merged top-$k$. Term partitioning---each shard owns some terms' complete postings---loses on four axes: (1) \emph{scoring locality}: BM25 needs all of a document's stats in one place; term partitioning ships postings lists (the largest objects in the system) across the network for every multi-term query; (2) \emph{load}: Zipfian term popularity melts hot-term shards, while document hashing balances; (3) \emph{failure semantics}: a lost doc-shard degrades results proportionally, a lost term-shard deletes those terms from every query; (4) \emph{indexing}: a new document writes to one doc-shard vs.\ scattering postings everywhere. The price of doc partitioning---every query pays full fan-out and latency is $\max$ over shards---is manageable (replicas, hedged requests, deadlines with partial results) and became the industry default.
+
+\textbf{Sizing.} Order-of-magnitude: 10B docs at $\sim$5--10M docs/shard $\Rightarrow$ $\sim$1000--2000 shards $\times$ replication factor 2--3 for availability and hedging; postings per shard compressed to tens of GB, held in RAM.
+
+\textbf{Tiering.} Both documents and traffic are skewed. A head tier ($\sim$1--10\% of docs by static quality/popularity/click history) on heavily replicated RAM-resident shards answers most queries; fall through to tail tiers (cheaper storage, fewer replicas) only when the head yields insufficient or low-confidence results. Fresh documents enter a small NRT tier before promotion. This is the single biggest cost lever: replica count is driven by traffic, and most traffic never leaves the head tier.
+
+\textbf{Caching.} Results cache on the exact-query key (Zipfian head queries give 30--50\% hit rates; invalidate on refresh)---which requires retrieval to stay user-independent, a real architectural constraint on personalization placement; postings/page cache for hot terms; cached filter bitsets for common structured constraints. Deep production treatment in Chapter~\ref{sr:chap:production_retrieval_rag}.
+
+Mention the two doc-partitioning corollaries interviewers fish for: per-shard IDF (harmless at scale, occasionally exchanged globally in small clusters) and the deep-pagination pathology (page $N$ requires every shard to return $N \cdot k$ candidates $\Rightarrow$ cursor APIs and page caps).
+
+\redflags
+\begin{itemize}
+    \item Choosing term partitioning for ``fewer shards per query'' without confronting postings shipping and hot-term skew.
+    \item No tiering---quoting a uniform fleet sized for peak over all 10B docs is a cost non-answer.
+    \item Ignoring tail latency under fan-out (the p99-is-max-over-shards trap).
+\end{itemize}
+
+\interviewtest{Distributed-systems judgment applied to search specifically: whether you know \emph{why} the industry converged, not just that it did, and whether cost enters your design unprompted.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct doc-partitioned scatter-gather design with replication.
+    \item \badgeLsix{L6} The four-axis argument against term partitioning, tiering with fall-through, hedged requests for p99.
+    \item \badgeLseven{L7} Capacity arithmetic, cache-hit economics, personalization-vs-cacheability constraint, IDF and pagination corollaries, and freshness tiers---an operating plan, not just an architecture diagram.
+\end{itemize}
+
+\followups{``How do you roll out a reindex with a new analyzer across 2000 shards?'' ``Where would you put a learned sparse model in this fleet?'' ``What breaks first at 10$\times$ traffic?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Explain SPLADE. What do the log-saturation and the FLOPS regularizer each do, and how does it compare to BM25 and dense retrieval at serving time?}
+
+\badgeLsix{L6} \quad \badgetype{Core Concept} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Mechanism.} SPLADE runs the document (and query) through a BERT-class encoder and projects each token's contextual embedding through the \emph{MLM head} onto the full vocabulary, producing logits $w_{ij}$. The document's weight on vocabulary term $j$ is $w_j = \max_i \log(1 + \operatorname{ReLU}(w_{ij}))$ (max over token positions in v2). Because the projection is onto the whole vocabulary, the model performs \emph{expansion}---a document about laptops can activate ``notebook''---and \emph{term weighting} in one shot, on both sides of the match. The result is a sparse vocabulary-space vector stored as ordinary postings with quantized impacts.
+
+\textbf{The two design choices.} The $\log(1+\operatorname{ReLU})$ is learned-BM25: ReLU gates negative evidence to zero (preserving sparsity), and the log makes weights concave---no term dominates, the same saturation insight as $k_1$. The FLOPS regularizer $\sum_j \bar{a}_j^2$ (squared \emph{mean} activation per vocabulary term, averaged over the batch) is a smooth proxy for the expected multiplications in a sparse dot product: because it is quadratic in each term's average activation, terms that fire in many documents are punished superlinearly. That specifically prevents the degenerate solution where the model routes weight through a few common terms in every document---which would recreate stopword-like postings lists and destroy both index balance and WAND-style pruning. Query-side regularization is set much stronger ($\lambda_q \gg \lambda_d$) because query density multiplies per-query cost.
+
+\textbf{Serving comparison.} vs.\ BM25: same inverted-index estate---compression, skipping, block-max pruning, sharding, filtering all apply; costs move to indexing (a GPU pass per document) and somewhat to query time (expansion adds terms; flatter impact distributions prune worse---efficiency variants like SPLADE-doc drop query expansion entirely). Quality: closes vocabulary mismatch, keeps term grounding, robust out-of-domain relative to dense. vs.\ dense: no separate ANN stack, exact-match behavior largely preserved, interpretable expansions, filters free; dense retains the edge where similarity is genuinely non-lexical (cross-lingual, conversational paraphrase).
+
+\redflags
+\begin{itemize}
+    \item ``SPLADE is a dense model made sparse by thresholding''---the MLM-head projection into vocabulary space is the mechanism, not post-hoc sparsification.
+    \item Not knowing what the FLOPS regularizer is \emph{for} (serving cost and index balance, not sparsity aesthetics).
+    \item Claiming learned sparse is free at query time---expansion and flatter impacts have a real latency cost vs.\ BM25.
+\end{itemize}
+
+\interviewtest{Whether you understand learned sparse as an infrastructure-riding design---the connection between a training-time regularizer and inverted-index serving economics is the staff-level tell.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct mechanism: MLM-head expansion + term weights served from an inverted index.
+    \item \badgeLsix{L6} Explains both equations' purposes, the $\lambda_q$ vs.\ $\lambda_d$ asymmetry, and the lineage (docT5query $\rightarrow$ uniCOIL $\rightarrow$ SPLADE).
+    \item \badgeLseven{L7} Discusses pruning-friendliness of impact distributions, quantization into the TF slot, efficiency variants and impact-ordered engines, and when to pick learned sparse over dense for an org with an existing Lucene estate.
+\end{itemize}
+
+\followups{``Why regularize queries harder than documents?'' ``Your SPLADE index is 3$\times$ the BM25 index and queries are 4$\times$ slower---what are your levers?'' ``How would you A/B BM25 vs.\ SPLADE fairly?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Lexical vs.\ dense vs.\ hybrid---argue the retrieval split for a marketplace search engine.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Anchor on the query mix, then assign each segment to the tool whose failure modes it avoids.
+
+\textbf{Marketplace traffic decomposes} roughly into: exact/structured queries (SKUs, model numbers, ``iphone 15 pro case magsafe''---brand/attribute-laden), head category queries (``running shoes''), and a long conceptual tail (``gift for a coffee snob,'' vernacular, misspellings, cross-lingual). Sellers control listing text; the catalog churns constantly.
+
+\textbf{Lexical carries}: identifier and attribute queries (embeddings blur \texttt{X100} vs.\ \texttt{X200} by construction---semantic geometry is the wrong tool for one-character distinctions); new listings (searchable at index time, no encoder version to wait on); structured filtering (price, category, shipping---free in the same engine); and cheap, explainable head-query serving with results caching. \textbf{Dense carries}: the conceptual tail where vocabulary mismatch dominates and there is no behavioral history to boost with; cross-lingual matching; typo robustness beyond fuzzy matching. \textbf{Both fail differently}, and the error sets are complementary---the empirical BEIR-era result---so the answer is hybrid: union the candidate sets, fuse (RRF or, better, both scores as reranker features), rerank with LTR on top.
+
+\textbf{The staff-level additions:} (1) the split is a \emph{routing} decision too---query understanding (Chapter~\ref{sr:chap:search_systems_query_understanding}) can detect identifier-like tokens and weight lexical up rather than running everything everywhere at full depth; (2) learned sparse is the credible middle path if the org already runs Lucene/Elasticsearch: most of dense's mismatch-closing with none of the ANN estate; (3) operational asymmetry: BM25 has no training pipeline, no drift, no embedding-version skew across a churning catalog---hybrid \emph{doubles} the operational surface, so a team without eval infrastructure should fix lexical + query understanding first (zero-result relaxation, spell correction, synonyms) before buying dense; (4) give the funnel argument: whatever the split, retrieval recall per source bounds everything downstream, so measure recall@k per candidate source against judgments, not just end-metric A/Bs. Fusion mechanics and when-not-to-hybridize live in Chapter~\ref{sr:chap:neural_retrieval_reranking}.
+
+\redflags
+\begin{itemize}
+    \item ``Dense replaces lexical''---instant credibility loss in a marketplace context (SKUs, freshness, filters).
+    \item A 50/50 hand-wave with no query-mix analysis or routing story.
+    \item Proposing naive weighted score summation of BM25 and cosine without flagging the scale/normalization problem (the fusion fumble test---rank-based or learned fusion).
+    \item Ignoring operational cost: two stacks, two failure surfaces, one team.
+\end{itemize}
+
+\interviewtest{Judgment under real constraints: query-mix reasoning, complementary failure modes, operational cost honesty, and sequencing---not allegiance to a paradigm.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correctly assigns identifiers/freshness/filters to lexical and tail/semantic to dense; proposes hybrid with RRF.
+    \item \badgeLsix{L6} Adds query-mix decomposition, routing via query understanding, learned sparse as the middle path, and per-source recall measurement.
+    \item \badgeLseven{L7} Sequences the investment (measurement and lexical hygiene before dense), quantifies the operational surface argument, and ties the split to caching economics and seller-adversarial dynamics (dense retrieval is also harder for sellers to game---and harder for the team to debug when they do).
+\end{itemize}
+
+\followups{``Your dense retriever tanks on part-number queries---fix without removing it.'' ``Budget for one retrieval improvement this quarter: which?'' ``How does the answer change for a documentation-search product?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: How do phrase queries actually execute, and what do positional postings cost? When would you use phrase boosts vs.\ phrase matching vs.\ shingles?}
+
+\badgeLfive{L5} \quad \badgetype{Core Concept} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{Execution.} Positional postings store, per (term, document), the token offsets of each occurrence. A phrase query ``new york'' first intersects the docID lists of both terms (cheap, skip-list-assisted), then intersects \emph{positions} within each surviving document: a match requires some occurrence of ``york'' at $p+1$ where ``new'' occurs at $p$. Proximity queries relax the constraint to a window ($|p_2 - p_1| \le w$), optionally unordered; scoring can reward tighter windows.
+
+\textbf{Costs.} Positions multiply index size roughly 2--4$\times$ (there are as many position entries as tokens in the corpus) and add a second intersection pass, so engines store positions as a separately-skippable stream that is only read when a positional query demands it---plain term queries never touch it.
+
+\textbf{The three tools:}
+\begin{itemize}
+    \item \textbf{Phrase matching} (require adjacency at retrieval): correct for quoted queries and known-phrase semantics, but recall-brittle as a default---``red cotton dress'' should still match ``red dress in cotton.''
+    \item \textbf{Phrase boosts} (retrieve bag-of-words, \emph{rescore} candidates for adjacency/proximity, dismax \texttt{pf}-style): the production default---recall preserved, precision boosted where it matters (titles), positional cost paid only over candidates.
+    \item \textbf{Shingles} (index ``new\_york'' as a term): buys frequent phrases at plain-postings speed and lets IDF price the phrase itself, at the cost of index growth; ideal for a bounded set of high-value collocations (cities, brand bigrams) and for autocomplete fields.
+\end{itemize}
+Close with the connective detail: index-time multi-word synonym injection corrupts positions unless graph-aware---the analyzer chain and the positional machinery are coupled.
+
+\redflags
+\begin{itemize}
+    \item Thinking phrase queries scan document text at query time---everything runs on the positional index.
+    \item Making all retrieval phrase-strict by default (recall collapse), or unaware positions cost anything.
+    \item Not knowing that phrase \emph{boost} on candidates is the cheap standard pattern.
+\end{itemize}
+
+\interviewtest{Working knowledge of the positional layer---the machinery beneath every ``exact phrase above scattered terms'' relevance expectation, and a dependency of the field-weighting fixes earlier in the chapter.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Position-intersection mechanics and the 2--4$\times$ cost.
+    \item \badgeLsix{L6} The boost-vs-match-vs-shingle decision framework with recall reasoning and candidate-only rescoring.
+    \item \badgeLseven{L7} Discusses position streams' skip design, graph token filters and synonym-position interaction, and where phrase signals belong once an LTR reranker exists (as features over the candidate set).
+\end{itemize}
+
+\followups{``How would you support `near' operators for legal search?'' ``Why do stopwords complicate phrases, and what is the position-increment trick?''}
+\end{interviewq}

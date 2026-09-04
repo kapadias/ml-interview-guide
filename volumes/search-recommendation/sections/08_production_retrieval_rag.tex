@@ -2,24 +2,876 @@
 \label{sr:chap:production_retrieval_rag}
 
 \begin{tldr}
-Placeholder — this chapter is written in Phase C from the vector-retrieval digest and applied-search track design (see review/search-recsys/ in the DL repo).
+This chapter is about running retrieval as a production service: decomposing a p99 latency budget across the funnel and defending it with timeouts, hedging, and graceful degradation; keeping indexes fresh when HNSW hates deletes and IVF centroids drift; serving ANN at 100M--1B-vector scale (sharding, CPU-vs-GPU economics, disk-based and quantized serving); layering caches---including LLM-era semantic caches and their false-hit risk; monitoring retrieval quality without labels (overlap-with-flat recall proxies, drift detection, canary suites) and surviving the classic incidents, above all embedding-version skew; designing the retrieval stage that feeds RAG; and the cost arithmetic---embedding compute vs.\ index memory vs.\ serving CPU---that decides when to re-embed a corpus. The RAG pipeline itself (chunking policy, prompt assembly, grounding, evaluation) is canonical in [NLP 9]; RAG's \textit{retrieval stage} is canonical here.
 \end{tldr}
 
+The previous chapters built the components: query understanding (Chapter~\ref{sr:chap:search_systems_query_understanding}), inverted indexes (Chapter~\ref{sr:chap:lexical_retrieval_inverted_indexes}), ANN structures (Chapter~\ref{sr:chap:vector_retrieval_theory}), neural retrievers and rerankers (Chapter~\ref{sr:chap:neural_retrieval_reranking}), and learned ranking (Chapter~\ref{sr:chap:learning_to_rank}). This chapter is about what happens when you turn them into a service with an SLO. Staff-level retrieval interviews increasingly live here, because the algorithms are commoditized---every team can call an embedding API and stand up an HNSW index---while the operational questions are where systems actually fail: the index that silently went stale, the embedder rollout that halved recall, the cache that serves last week's prices, the p99 that doubles every time a shard is added. The through-line of the chapter is that \textbf{retrieval quality in production is a property of the whole system over time}, not of a model checkpoint on a benchmark date.
+
+%==============================================================================
 \section{The Multi-Stage Funnel: Latency and Cost Budgets}
-% TODO Phase C
+\label{sr:sec:prod_funnel_budgets}
+%==============================================================================
 
+\subsection{A Worked p99 Budget}
+
+A production search or retrieval endpoint is governed by an end-to-end latency SLO, typically stated at a high percentile: ``p99 $\leq$ 250\,ms server-side.'' The budget is then \textit{decomposed} across the funnel stages, and each stage is engineered---and enforced with its own timeout---against its slice. Table~\ref{sr:tab:latency_budget} shows a representative decomposition for a 250\,ms p99 commerce-search endpoint; the exact numbers vary by product, but the shape and the reasoning are what interviews probe.
+
+\begin{table}[H]
+\centering
+\small
+\caption{A representative 250\,ms p99 budget for a search request}
+\label{sr:tab:latency_budget}
+\begin{tabularx}{\textwidth}{lcXX}
+\toprule
+\textbf{Stage} & \textbf{Budget} & \textbf{What runs} & \textbf{If the stage blows its budget} \\
+\midrule
+Query understanding & 15\,ms & Normalization, spell correction, intent classifier, segmentation/tagging; small distilled models & Pass the raw query through with default routing; log the skip \\
+L0 retrieval & 40\,ms & Lexical (inverted index) $\parallel$ dense (query encoding + ANN) $\parallel$ fresh-index leg, fanned out to shards; union + dedup & Serve whichever legs returned; a missing dense leg degrades tail queries, a missing lexical leg degrades identifier queries \\
+L1 ranking & 30\,ms & Cheap features + small GBDT/linear model; thousands $\to$ hundreds of candidates & Truncate by L0 scores (RRF order) \\
+L2 rerank & 90\,ms & Cross-encoder or full LTR model on 100--200 candidates, GPU-batched & Serve the L1 order---the most common degradation path \\
+Blending / business logic & 15\,ms & Diversity, dedup, merchandising rules, pagination assembly & Skip non-compliance rules only; compliance filters must never be skipped \\
+Network + serialization & 30\,ms & Ingress, RPC hops between stages, response encoding & --- \\
+Reserve & 30\,ms & Headroom for GC pauses, retries, hedges & --- \\
+\midrule
+\textbf{Total} & \textbf{250\,ms} & & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=3mm and 5mm,
+    stage/.style={draw, rounded corners, align=center, fill=lightblue, minimum height=8mm, font=\footnotesize, inner sep=2pt},
+    leg/.style={draw, rounded corners, align=center, fill=lightgray, minimum height=6mm, font=\scriptsize, inner sep=2pt},
+    lat/.style={font=\scriptsize\itshape, text=gray},
+    arr/.style={->, thick, >=stealth}
+]
+\node[stage] (qu) {QU};
+\node[leg, right=7mm of qu] (dense) {Dense:\\encode $\to$ ANN};
+\node[leg, above=of dense] (lex) {Lexical:\\inverted index};
+\node[leg, below=of dense] (fresh) {Fresh\\tier};
+\node[stage, right=7mm of dense] (merge) {Union\\+ dedup};
+\node[stage, right=of merge] (l1) {L1};
+\node[stage, right=of l1] (l2) {L2\\rerank};
+\node[stage, right=of l2] (blend) {Blend};
+\draw[arr] (qu) -- (lex);
+\draw[arr] (qu) -- (dense);
+\draw[arr] (qu) -- (fresh);
+\draw[arr] (lex) -- (merge);
+\draw[arr] (dense) -- (merge);
+\draw[arr] (fresh) -- (merge);
+\draw[arr] (merge) -- (l1);
+\draw[arr] (l1) -- (l2);
+\draw[arr] (l2) -- (blend);
+\node[lat, below=1mm of qu] {15\,ms};
+\node[lat, below=1mm of fresh] {40\,ms $\parallel$};
+\node[lat, below=13mm of l1] {30\,ms};
+\node[lat, below=13mm of l2] {90\,ms};
+\node[lat, below=13mm of blend] {15\,ms};
+\end{tikzpicture}
+\caption{The serving funnel of Table~\ref{sr:tab:latency_budget}. The three L0 legs run in parallel (latency composes by max); everything else is sequential (latencies add). Network, serialization, and reserve consume the remaining 60\,ms of the 250\,ms budget.}
+\label{sr:fig:funnel_budget}
+\end{figure}
+
+Three structural points about reading such a budget:
+
+\begin{itemize}
+    \item \textbf{Parallel legs take the max, sequential stages add.} The three L0 legs run concurrently, so L0's 40\,ms is the max over legs, not the sum---but the query \textit{encoder} call is on the critical path \textit{before} the ANN lookup inside the dense leg (a few ms on GPU, 10--20\,ms for a small transformer on CPU), which is why teams fight to keep query encoders tiny and cached. Query understanding is sequential with everything: its 15\,ms is paid by every request, which is why intent classifiers are distilled to run in single-digit milliseconds.
+    \item \textbf{The sum of stage p99s is not the p99 of the sum.} It is a deliberately conservative construction: all stages rarely hit their p99 simultaneously. Budgeting stage-p99s to sum to the SLO buys headroom; enforcing each stage with a timeout converts a latency problem into a (measurable) quality-degradation problem.
+    \item \textbf{The rerank window is the tuning knob.} L2 dominates the budget because cross-encoder cost is linear in rerank depth (Chapter~\ref{sr:chap:neural_retrieval_reranking}). Cutting depth from 200 to 100 halves L2 latency and cost; whether it costs visible NDCG is an empirical question you answer with the monitoring machinery of Section~\ref{sr:sec:monitoring}---this is the first lever pulled in every latency or cost crunch.
+\end{itemize}
+
+\subsection{Tail Latency: Why p99 Is the Number That Matters}
+
+Median latency is a vanity metric for a fan-out system. Two facts drive this. First, \textbf{high-traffic users hit the tail constantly}: a session with 20 search interactions samples the latency distribution 20 times, so the probability of experiencing at least one p99-grade response is $1-0.99^{20} \approx 18\%$ per session. Second, \textbf{fan-out amplifies the tail}: a scatter-gather query over $n$ shards completes when the \textit{slowest} shard responds.
+
+\begin{mathresult}{Fan-Out Tail Amplification (Dean and Barroso, ``The Tail at Scale,'' 2013)}
+If each of $n$ parallel components independently exceeds a latency threshold with probability $p$, the probability the \textit{request} exceeds it is
+\[
+P(\text{slow}) \;=\; 1 - (1-p)^{n}.
+\]
+With $p = 0.01$ (each shard slow 1\% of the time) and $n = 100$ shards, $P(\text{slow}) = 1 - 0.99^{100} \approx 63\%$: a per-component p99 becomes a \textit{typical} request experience. Equivalently, to keep request-level p99 with 100-way fan-out, each shard must hold roughly a p9999.
+\end{mathresult}
+
+A note on what each percentile is \textit{for}, since interviewers use the vocabulary precisely: p50 tracks the typical experience and drives capacity planning; p99 is the contract, because at scale it is what heavy users and fan-out consumers actually experience; and the \textbf{p99/p50 ratio} is a queueing-health diagnostic---a rising ratio at flat p50 means saturation, interference, or a misbehaving minority (one bad shard, one pathological query class), not a workload-wide change. Averages belong nowhere in this conversation: a mean latency blends two populations (fast hits, slow misses/degradations) into a number no user experiences.
+
+The standard countermeasures, in the order teams deploy them:
+
+\begin{itemize}
+    \item \textbf{Per-stage timeouts with degradation paths.} Every stage must have a defined answer to ``what do we serve if you don't return in time,'' and the degraded rate must be a first-class monitored metric---a system that quietly serves L1 order for 30\% of traffic has a relevance incident that no error dashboard shows. The full degradation ladder gets its own treatment below.
+    \item \textbf{Hedged requests.} After waiting the p95 delay for a shard, send a duplicate request to another replica and take whichever answers first. Dean and Barroso's canonical measurement: hedging after a 10\,ms delay cut a benchmark's p999 from 1{,}800\,ms to 74\,ms while adding only $\sim$2\% extra load. The refinement---tied requests, where the two replicas learn of each other and the loser cancels---avoids duplicate work at higher hedge rates.
+    \item \textbf{Partial-result returns.} Retrieval is naturally tolerant: if 98 of 100 shards answered, the union is almost always good enough. Return what arrived, flag the response as partial, and count it. (Contrast with exact aggregations, where partiality is wrong rather than degraded.)
+    \item \textbf{Micro-architecture hygiene.} Tail causes are usually boring: GC pauses (keep index-serving processes off managed heaps or off-heap), queueing at overloaded replicas (load-shed early, admission-control at the front), interference from background work (throttle segment merges and index builds---Section~\ref{sr:sec:index_freshness}---during peak), cold caches after deploys (warm before joining the load balancer).
+\end{itemize}
+
+\subsection{Timeouts, Graceful Degradation, and Quality Error Budgets}
+
+A timeout without a defined fallback is an outage waiting for traffic; a timeout \textit{with} one converts a latency incident into a bounded, measurable quality loss. Mature retrieval stacks therefore maintain an explicit \textbf{degradation ladder}: for every component, what is served when it fails or exceeds its budget, what that costs in quality, and which counter tracks it (Table~\ref{sr:tab:degradation_ladder}).
+
+\begin{table}[H]
+\centering
+\small
+\caption{The degradation ladder for a retrieval funnel}
+\label{sr:tab:degradation_ladder}
+\begin{tabularx}{\textwidth}{lXXl}
+\toprule
+\textbf{Component down/slow} & \textbf{Degraded behavior} & \textbf{Quality cost} & \textbf{Tracked as} \\
+\midrule
+Query understanding & Raw query passthrough with default routing & Mild on clean head queries; severe on typos, tail, non-default locales & \texttt{qu\_skip\_rate} \\
+Query encoder & Lexical-only retrieval (dense leg dropped) & Identifier and head queries fine; vocabulary-mismatch and tail queries degrade & \texttt{dense\_miss\_rate} \\
+Subset of shards & Partial union from responding shards & Small recall loss, roughly proportional to the missing corpus share & \texttt{partial\_rate} \\
+L2 reranker & Serve the L1 order (or fused L0 order) & Moderate NDCG loss at top ranks; the most frequently exercised path & \texttt{l2\_skip\_rate} \\
+Feature store / personalization & Default feature values; unpersonalized blend & Small on average; larger for heavy users and broad-intent queries & \texttt{feat\_default\_rate} \\
+Entire funnel & Serve a stale results-cache entry (\texttt{stale-if-error}) & Staleness rather than absence; invisible if within the staleness budget & \texttt{stale\_serve\_rate} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three rules give the ladder teeth:
+
+\begin{itemize}
+    \item \textbf{Fail-open vs.\ fail-closed is a per-stage policy decision, made in advance.} Ranking stages fail open---a worse ordering beats no results. Compliance filters, ACL checks, and legal/safety exclusions fail \textit{closed}: if the filter cannot run, the affected results (or the whole request) are dropped, never served unfiltered. Interviewers probe this asymmetry; ``skip whatever times out'' is the wrong answer for exactly one class of stage, and knowing which class is the point.
+    \item \textbf{Budget degradation like an SLO.} Define a \textit{quality error budget}---for example, at most 2\% of weekly traffic served on any degraded path---and alert on burn rate, exactly as for availability. Without it, timeout tuning silently converts the relevance system into its own fallback: every dashboard is green while a third of tail traffic serves without reranking.
+    \item \textbf{Shed deliberately under load (brownout), not accidentally.} When the fleet saturates, queueing into timeouts yields the worst of both worlds: full latency \textit{and} degraded results. Better is admission-controlled brownout: under load, step down the ladder on purpose---first shrink rerank depth, then skip L2, then tighten $ef$---with hysteresis so the system does not flap at the threshold. The dashboard then shows a chosen, bounded quality trade instead of a timeout storm.
+\end{itemize}
+
+\subsection{The Cost Side of the Same Budget}
+
+The latency budget has a shadow cost budget, and they are coupled through the same knobs. Representative arithmetic for a 5{,}000-QPS-peak service, to show the shape (numbers are order-of-magnitude, 2026 cloud pricing):
+
+\begin{itemize}
+    \item \textbf{L2 rerank dominates.} A distilled cross-encoder ($\sim$22M parameters) scoring 100 candidate pairs of $\sim$256 tokens each costs roughly $2 \times 22\text{M} \times 256 \times 100 \approx 1.1$ TFLOPs per query. A mid-range inference GPU delivering $\sim$50 effective TFLOP/s (peak $\times$ realistic utilization) serves $\sim$45 QPS; 5{,}000 QPS needs $\sim$110 GPUs---at $\sim$\$1/GPU-hour, roughly \$80K/month. Rerank depth, candidate truncation, and caching act directly on this line.
+    \item \textbf{ANN serving is comparatively cheap.} An in-memory HNSW shard on a 32-vCPU node ($\sim$\$1.3/hour) sustains thousands of QPS at single-digit-ms latency; the dominant ANN cost is not CPU but the \textit{RAM footprint} of the index, which is a standing cost independent of traffic (Section~\ref{sr:sec:cost_engineering}).
+    \item \textbf{Query encoding is small but on the critical path.} A 100M-parameter query encoder at 20 tokens is $\sim$4 GFLOPs/query---negligible FLOPs, but it needs a low-latency serving path (small batch windows), which is exactly the regime where GPUs are least efficient. Many stacks serve query encoders on CPU with int8 quantization, or share a GPU pool with the reranker.
+\end{itemize}
+
+Folding the arithmetic into a per-unit view makes the imbalance vivid (Table~\ref{sr:tab:stage_costs}): reranking costs an order of magnitude more than every other stage combined, which is why cache hit rate and rerank depth---the two knobs that gate traffic into L2---are the levers that move the bill.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Representative serving cost per 1{,}000 queries by stage (order-of-magnitude)}
+\label{sr:tab:stage_costs}
+\begin{tabularx}{\textwidth}{lcX}
+\toprule
+\textbf{Stage} & \textbf{\$ / 1K queries} & \textbf{Basis} \\
+\midrule
+Query understanding & $\sim$0.0002 & Distilled classifiers on shared CPU; thousands of QPS per node \\
+Query encoding & $\sim$0.0005 & Small transformer, CPU int8 or pooled GPU \\
+Lexical retrieval & $\sim$0.0002 & Inverted-index scan, amortized across a CPU fleet \\
+Dense ANN retrieval & $\sim$0.0002 & In-memory HNSW at thousands of QPS per node (RAM is the real cost---it is standing, not per-query) \\
+L2 cross-encoder rerank & $\sim$0.006 & $\sim$45 QPS per \$1/hour GPU at depth 100 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}
+The funnel is a cost--accuracy Pareto construction: each stage spends more per candidate on fewer candidates. The latency budget and the cost budget are two projections of the same allocation decision, and the rerank window is the coupling constant---the first knob turned in either crisis. A Staff-level answer to any ``design search'' question states the p99 target, decomposes it per stage, names each stage's degradation path, and identifies which stage dominates cost.
+\end{keyinsight}
+
+%==============================================================================
 \section{Index Freshness and Updates}
-% TODO Phase C
+\label{sr:sec:index_freshness}
+%==============================================================================
 
+An index is a materialized view of a corpus, and every materialized view has a staleness story. For a news or commerce product, staleness is directly user-visible (out-of-stock items ranking, breaking news missing); for RAG, staleness undermines the product's core claim of post-training-cutoff knowledge (Section~\ref{sr:sec:rag_retrieval}). The engineering question is what freshness SLO the index architecture can honor, and at what cost in recall and operations.
+
+\subsection{Batch Rebuild vs.\ Incremental Upsert}
+
+\textbf{Batch rebuild} is the simple regime: periodically re-embed changed documents, rebuild the index offline, validate it (recall against a flat-search sample, canary queries---Section~\ref{sr:sec:monitoring}), and swap it in blue/green. Its virtues are enormous and underrated: the index is immutable in serving (no locking, trivial replication by file copy), every build is validated \textit{before} traffic sees it, rollback is ``point back at yesterday's build,'' and build-time global optimizations (graph construction quality, centroid training, quantization codebooks) see the whole corpus. Its cost is the freshness floor: rebuild cadence is bounded by build time, and daily builds mean up-to-24-hour staleness.
+
+\textbf{Incremental/streaming upsert} applies document creates, updates, and deletes to a live index within seconds. Every serious product converges on needing \textit{some} streaming path---the question is how much of the index it touches, because the two dominant ANN families penalize in-place mutation differently. Table~\ref{sr:tab:freshness_regimes} summarizes the regimes this section develops.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Index freshness regimes}
+\label{sr:tab:freshness_regimes}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Regime} & \textbf{Staleness floor} & \textbf{Recall behavior} & \textbf{Operational profile} \\
+\midrule
+Periodic batch rebuild & Hours to a day (bounded by build time and cadence) & Build-quality recall, every build validated before traffic & Simplest: immutable serving artifacts, blue/green swap, trivial rollback \\
+Streaming into one mutable index & Seconds & Decays with churn between compactions (tombstones, centroid drift) & Hardest: merge scheduling, in-place mutation risk, recall monitoring mandatory \\
+Two-tier NRT (fresh + stable) & Seconds (write-path latency) & Near build-quality: fresh tier is tiny, stable tier stays immutable & Moderate: version/tombstone map, merge scheduler, per-tier monitoring \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Why HNSW Hates Deletes}
+
+HNSW (Chapter~\ref{sr:chap:vector_retrieval_theory}) supports \textit{inserts} natively---that is its design point. Deletes and updates are where it hurts:
+
+\begin{itemize}
+    \item \textbf{Tombstones, not removals.} Physically removing a node requires repairing every neighbor list that points to it, and its edges may be load-bearing for graph connectivity (a deleted hub node can disconnect a region). So implementations mark deleted nodes with a tombstone: the node is still \textit{traversed} as a routing waypoint but filtered from results. Consequences: memory is not reclaimed, per-hop work rises, and the effective $k$ shrinks unless the search widens ($ef$ must grow as tombstone density grows).
+    \item \textbf{Recall decays with churn.} An update is a delete plus an insert with a new vector. Under sustained churn the graph accumulates tombstones and stale edges built for a vector distribution that no longer exists; measured recall at fixed $ef$ drifts downward---slowly, then noticeably. There is no incremental repair that restores build-quality structure.
+    \item \textbf{The fix is compaction.} Lucene solved this for inverted indexes decades ago and vector stores reinvented the same shape: immutable \textit{segments} plus background \textbf{segment rebuilds/merges} that rewrite tombstone-heavy segments from live vectors. Serving cost: merges compete with queries for CPU and memory bandwidth---the classic ``p99 spikes every night at 2am'' incident is a merge scheduler. FreshDiskANN (2021) is the research treatment of the same idea for graph indexes: a small in-memory mutable index absorbing writes, plus a streaming background merge into the large SSD-resident graph.
+\end{itemize}
+
+\subsection{IVF Centroid Drift}
+
+IVF-family indexes (Chapter~\ref{sr:chap:vector_retrieval_theory}) take incremental writes cheaply---assign the new vector to its nearest centroid and append to that posting list; deletes are a list removal. The failure mode is slower and statistical: the \textbf{centroids are frozen at training time}. As the corpus distribution shifts (new product categories, new document types, seasonal drift), new vectors concentrate in a few lists, list sizes skew, and the fixed-$\text{nprobe}$ recall/latency trade degrades---probing the same number of lists now scans either too much (bloated lists) or misses neighbors that straddle poorly-placed boundaries. Monitoring signals: posting-list size imbalance (max/mean ratio), rising mean quantization error (distance from vectors to their centroid), recall-proxy decay (Section~\ref{sr:sec:monitoring}). The remedy is \textbf{re-clustering}---retrain centroids on the current distribution and reassign all vectors, which is effectively a rebuild; teams schedule it on a cadence (weekly/monthly) triggered by the drift metrics rather than the calendar when possible.
+
+\begin{keyinsight}
+The freshness--recall trade is not a slogan; it has a mechanism. Batch-built structures get their recall from global construction-time optimization (graph quality, trained centroids, trained codebooks). Streaming mutation invalidates exactly that optimization, so recall decays with churn until a rebuild restores it. Every production architecture is some placement on this line, and the standard answer is to \textit{split the index by age}: a small mutable fresh tier that absorbs churn badly-but-briefly, and a large immutable stable tier that is periodically rebuilt.
+\end{keyinsight}
+
+\subsection{Near-Real-Time Architecture: Small Fresh Index + Big Stable Index}
+
+The convergent design---Lucene's NRT segments, FreshDiskANN, Milvus's growing-vs-sealed segments, Vespa's memory-plus-disk store all instantiate it:
+
+\begin{enumerate}
+    \item \textbf{Write path.} Catalog/document changes flow as an event stream (CDC from the source-of-truth store). Each event carries a monotonically increasing per-document version so out-of-order delivery resolves deterministically.
+    \item \textbf{Fresh tier.} Writes land in a small in-memory index within seconds: for vectors, brute-force flat search or a low-effort HNSW over $10^4$--$10^6$ recent vectors (flat search over 100K vectors is sub-millisecond on modern CPUs---no ANN structure needed at that size); for lexical, an in-memory segment (Elasticsearch's default refresh makes documents searchable within $\sim$1\,s).
+    \item \textbf{Query path.} Every query fans out to \textit{both} tiers plus a \textbf{tombstone/version filter}: results from the stable tier are dropped if the fresh tier or version map has a newer version or a delete for that document. Merge is by score, exactly like merging shards.
+    \item \textbf{Background merge.} Periodically (minutes to hours), fresh-tier contents are folded into rebuilt stable segments and the fresh tier is truncated. The stable tier gets full rebuilds on a longer cadence (re-clustering, re-quantization, embedding refreshes).
+\end{enumerate}
+
+This bounds staleness by the write-path latency (seconds), bounds recall damage by the fresh tier's size (it is tiny relative to the corpus), and keeps the stable tier immutable with all the operational benefits above. The design also gives freshness a measurable SLO: inject synthetic probe documents and measure time-to-searchable end to end---\textbf{index lag} is a top-line dashboard metric, and a stalled indexing pipeline is one of the most common silent production incidents (Section~\ref{sr:sec:monitoring}).
+
+Two details of the write path deserve explicit treatment because interviewers probe them. First, \textbf{the embedding step sits on the freshness path} for the dense leg: a document is not dense-searchable until it has been encoded, so the freshness SLO includes encoder queueing and inference. A 60-second SLO comfortably affords a micro-batched streaming encoder; a 1-second SLO forces either a dedicated low-latency encoding tier or accepting that the fresh tier is lexical-only until the vector catches up---a perfectly reasonable degradation, since the newest documents are exactly the ones exact-match queries find. Second, \textbf{deletes must be at least as fast as inserts}: the compliance and correctness cases (takedowns, out-of-stock, permission revocations) are delete-shaped, and the version map handles them in milliseconds precisely because it never touches the index structures---the authoritative ``does this document still exist at this version'' check rides on every query, and the heavyweight structures are lazily cleaned later.
+
+\subsection{What an Embedding Refresh Costs at 100M Documents}
+
+Freshness has a second, more expensive axis: not new documents, but new \textit{representations}. Re-embedding the corpus is the unit of cost for embedder upgrades (Section~\ref{sr:sec:cost_engineering}) and it is worth being able to estimate on a whiteboard.
+
+\begin{mathresult}{Corpus Re-Embedding Cost}
+Forward-pass compute for embedding $N$ documents of $T$ tokens with a $P$-parameter encoder is approximately
+\[
+C \;\approx\; 2\,P\,T\,N \quad \text{FLOPs}, \qquad
+\text{GPU-hours} \;\approx\; \frac{2PTN}{\text{peak FLOP/s} \times \text{MFU} \times 3600}.
+\]
+For $N = 10^8$ documents, $T = 512$ tokens, $P = 10^8$ (a BERT-base-class embedder): $C \approx 10^{19}$ FLOPs $\approx$ 10 exaFLOPs. On an A100 (312 bf16 TFLOP/s peak) at 40\% utilization: $\sim$23 GPU-hours---under \$100 of spot compute. With a 7B-parameter embedder the same corpus costs $\sim$70$\times$ more: $\sim$1{,}600 GPU-hours, a few thousand dollars. Via a hosted embedding API at 2025-era prices (\$0.02--\$0.13 per million tokens), the 51B tokens cost roughly \$1K--\$7K per pass.
+\end{mathresult}
+
+Two conclusions. First, \textbf{the embedding pass is rarely the bottleneck}---at 100M-document scale it is thousands of dollars, not millions; the expensive parts of a refresh are the index rebuild, the dual-serving window during migration, and the validation/rollback risk. Second, the linear dependence on $N \times T$ is exactly why \textbf{chunk-level indexing multiplies refresh cost}: 20 chunks per document is a 20$\times$ multiplier on every future refresh (Section~\ref{sr:sec:rag_retrieval}). Refresh cost is a recurring tax fixed by representation-design decisions made on day one.
+
+%==============================================================================
+\section{Serving ANN at Scale}
+\label{sr:sec:ann_serving}
+%==============================================================================
+
+Chapter~\ref{sr:chap:vector_retrieval_theory} covered ANN data structures as algorithms; this section covers them as a fleet.
+
+\subsection{Sharding and Replication}
+
+\textbf{Sharding} (partitioning the corpus across machines) is forced when the index exceeds one node's memory, and useful before that for build and merge parallelism. The default is \textbf{random/hash document partitioning with scatter-gather}: every query fans out to all shards, each returns its local top-$k$, and the merger takes the global top-$k$. Recall is unaffected (the union covers the corpus); the costs are that per-query work scales with shard count and the tail amplification of Section~\ref{sr:sec:prod_funnel_budgets}. The alternative is \textbf{routed (semantic) partitioning}: partition by clustering (documents near each other share shards) and route each query only to the few most promising partitions---SPANN-style architectures and IVF-on-top-of-shards do this. It cuts fan-out cost by 5--10$\times$ but reintroduces a recall knob (queries near partition boundaries miss neighbors) and creates hot-shard skew when traffic concentrates on a few clusters. Practical guidance: scatter-gather until fan-out cost or tail latency forces routing; when routing, monitor per-partition recall proxies, not just the aggregate.
+
+\textbf{Replication} serves three masters at once: throughput (QPS scales with replicas), availability, and tail latency (replicas are what hedged requests hedge \textit{to}). Because ANN serving is read-dominated with immutable segments, replication is operationally cheap---copy files, warm caches, join the pool. A common Staff-level cost insight: teams over-provision replicas for p99 and never revisit; hedging plus load-shedding often lets a fleet drop a replica tier outright (Section~\ref{sr:sec:cost_engineering}).
+
+The topology arithmetic is worth having at your fingertips. With $S$ shards and $R$ replicas of each: total memory is $S \times R \times$ (shard size)---replication multiplies the standing cost, which is the argument for quantizing \textit{before} replicating; fleet QPS capacity is roughly $R \times$ (per-node QPS), since every query visits one replica of \textit{every} shard under scatter-gather; and per-query fan-out is $S$, which is what feeds the tail-amplification formula of Section~\ref{sr:sec:prod_funnel_budgets}. Concretely, 100M vectors as 4 shards $\times$ 3 replicas is 12 nodes, 4-way fan-out, 3$\times$ the single-copy memory bill, and roughly 3$\times$ one node's QPS. The design tension in one line: \textit{more shards cut per-node memory and build time but raise fan-out and tail exposure; more replicas buy QPS and hedging room but multiply the standing cost.}
+
+\subsection{CPU vs.\ GPU Economics}
+
+The instinct ``vectors $\Rightarrow$ GPU'' is mostly wrong for serving:
+
+\begin{itemize}
+    \item \textbf{Graph traversal is latency-bound pointer-chasing.} HNSW search is a sequence of dependent memory lookups with tiny compute per hop---the workload profile GPUs are worst at and large-cache CPUs are fine at. In-memory CPU HNSW at 100M scale serves single-digit-ms queries; a GPU adds a PCIe round-trip before it adds value.
+    \item \textbf{GPUs win when the work is dense and batchable}: brute-force/IVF-flat scans, large-batch offline jobs (index construction, corpus embedding, recall audits), and GPU-native graph indexes (CAGRA-class) at very high QPS where thousands of queries batch naturally. The break-even is a utilization argument: a GPU earning its cost needs sustained batch occupancy, which online low-latency traffic with small batch windows rarely provides.
+    \item \textbf{The standard split}: GPUs for embedding and reranking (dense matmul, batchable), CPUs for ANN serving, GPUs again for offline builds and audits. Exceptions exist at extreme QPS (ads candidate generation) where amortized GPU brute-force beats CPU ANN on cost per query.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Workload-to-hardware fit for retrieval serving}
+\label{sr:tab:cpu_gpu_fit}
+\begin{tabularx}{\textwidth}{lcX}
+\toprule
+\textbf{Workload} & \textbf{Fit} & \textbf{Why} \\
+\midrule
+Online graph-ANN search (HNSW-class), small batches & CPU & Dependent pointer-chasing, latency-bound, tiny compute per hop \\
+Brute-force / IVF-flat scans & GPU & Dense, regular, batchable matvec work \\
+Corpus embedding, index builds, recall audits & GPU & Offline, throughput-bound, perfectly batchable \\
+Query encoding at low latency & CPU (int8) or shared GPU pool & Tiny FLOPs but small batch windows---the GPU-hostile regime \\
+Cross-encoder reranking & GPU & Dense matmul over 100+ pairs per query batches well \\
+Extreme-QPS candidate generation & GPU (CAGRA-class or brute-force) & Sustained natural batching finally buys GPU utilization \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Disk-Based and Quantized Serving}
+
+RAM is the standing cost of vector serving (Section~\ref{sr:sec:cost_engineering}), and two families attack it; both are theory-covered in Chapter~\ref{sr:chap:vector_retrieval_theory} and appear here as cost levers.
+
+\textbf{Disk-based indexes.} DiskANN's result is the reference point: a billion-vector graph index served from NVMe with compressed (PQ) vectors in RAM for traversal ordering and full vectors + adjacency on SSD, achieving 95\%+ recall@1 at $\sim$5\,ms mean latency on a single 64\,GB workstation. The design generalizes: keep a small in-RAM sketch that decides \textit{where to look}, pay a handful of NVMe reads ($\sim$100\,$\mu$s each) per query for exactness. This trades a modest latency floor for a 10--30$\times$ reduction in the \$-per-vector standing cost, and it is the default answer once corpora pass a few hundred million vectors.
+
+\textbf{Quantized serving.} Scalar int8 cuts memory 4$\times$ with near-zero recall loss on typical embedding distributions; PQ/OPQ reaches 32--64 bytes/vector (a 48--96$\times$ cut at 768-d fp32) with real recall loss that is then \textbf{recovered by reranking}: retrieve a generous candidate set with the quantized index, re-score the top few hundred with full-precision vectors fetched from disk. Quantized-retrieve-then-exact-rerank is the production norm, not the exception. The operational caveat: codebooks are trained artifacts---they drift like IVF centroids and are versioned artifacts like embedders (Section~\ref{sr:sec:monitoring}).
+
+\textbf{The mmap trap.} Memory-mapped index files are the standard mechanism for both disk-based serving and fast process restarts, and they carry a specific tail-latency hazard: the OS page cache, not your process, decides what is actually in RAM. A freshly deployed replica whose index is mmapped but cold serves its first minutes of queries from disk at 100$\times$ the expected latency---green health checks, red p99. The fixes are mundane and mandatory: explicit warm-up (touch the hot structures, or replay a sample of recent queries) before the replica joins the load balancer, and pinning truly latency-critical structures (graph adjacency, upper layers) in anonymous memory rather than relying on cache residency under memory pressure.
+
+\textbf{Capacity planning, not autoscaling.} Stateless services autoscale in seconds; an ANN replica must first load hundreds of gigabytes and warm its caches---tens of minutes end to end. Vector serving therefore runs closer to capacity-planned than autoscaled: provision for forecast peak plus incident headroom, use load-shedding and brownout (Section~\ref{sr:sec:prod_funnel_budgets}) as the fast-reacting layer, and treat replica count changes as a planned operation. Disk-based layouts soften this (less to load, page cache fills on demand) and are part of why they win operationally, not just on \$/GB.
+
+\subsection{Multi-Tenancy}
+
+Platform retrieval (one search service, thousands of customer namespaces) adds an axis of its own:
+
+\begin{itemize}
+    \item \textbf{Namespace-per-tenant}: many small isolated indexes. Perfect isolation---no cross-tenant leakage surface, per-tenant tuning, and compliance deletion is ``drop the files.'' Costs: memory fragmentation (thousands of half-empty indexes), per-tenant cold-start latency, and metadata/orchestration overhead that dominates below a few thousand vectors per tenant.
+    \item \textbf{Shared index with tenant-ID filtering}: efficient packing and one hot structure. Costs: the filtered-ANN recall problem when a tenant is a tiny, selective slice of the graph (the tenant filter is the most selective filter there is); noisy-neighbor interference; a much larger blast radius for both incidents and bugs---a filter bug here is a cross-tenant data leak, not a relevance regression.
+    \item \textbf{The convergent tiered design}: dedicated indexes for large tenants, shared filtered indexes for the long tail of small ones, per-tenant quotas and admission control either way, and \textbf{hot/cold tiering}---idle tenants' indexes evicted to object storage and hydrated on first query, trading a cold-start hit for standing-memory savings across mostly-idle populations.
+\end{itemize}
+
+Compliance requirements (``remove this tenant entirely, provably'') strongly favor physically separable storage---one more argument for segment-oriented layouts over one giant mutable structure.
+
+\begin{keyinsight}
+ANN serving economics reduce to three observations. First, the standing cost is memory, and it multiplies by the replica count---so quantize and tier \textit{before} replicating. Second, hardware fit follows workload shape, not data type: pointer-chasing traversal wants CPUs, dense batchable matmul wants GPUs, and ``vectors'' as such want neither. Third, statefulness is the real tax: replicas that take tens of minutes to load and warm cannot autoscale, so the fast-reacting layer is degradation and load-shedding, not elasticity. Most serving-cost interviews are testing whether you know these three things and can do the shard-times-replica arithmetic out loud.
+\end{keyinsight}
+
+\subsection{The Vector-Database Landscape, Honestly}
+
+The honest one-paragraph version: a ``vector database'' is ANN search plus the database features around it---filtered queries, upserts and deletes with the freshness machinery above, replication, snapshots, access control, and hybrid (lexical+vector) query execution. The market splits into libraries you embed in your own service (Faiss, hnswlib, ScaNN---maximum control, you own all the operational machinery this chapter describes), dedicated engines (Milvus/Qdrant/Weaviate/Vespa-class, plus managed services), and vector features inside databases you already run (pgvector in Postgres, kNN in Elasticsearch/OpenSearch, and equivalents in most cloud data platforms). The build-vs-buy criteria that actually decide it: corpus size and QPS (below $\sim$10--50M vectors and moderate QPS, pgvector or your existing search engine is almost always the right answer---the marginal infrastructure is not worth a new stateful system); filtering and hybrid needs (heavily filtered, structured, ACL-gated workloads favor engines with real query planners over pure-vector stores); freshness SLO (streaming upsert quality varies more across products than benchmark recall does); and team shape (a dedicated engine is a new on-call rotation; a library is a new source of subtle bugs you own). Benchmark marketing numbers (QPS at fixed recall on frozen datasets) are the least decision-relevant input: they exclude filters, churn, and tail behavior---the three things that will actually page you.
+
+%==============================================================================
 \section{Caching}
-% TODO Phase C
+\label{sr:sec:caching}
+%==============================================================================
 
+Retrieval traffic is Zipfian (Chapter~\ref{sr:chap:search_systems_query_understanding}): a small head of queries carries a large share of traffic, which makes caching the highest-ROI cost lever in the stack. Production systems layer several caches with different keys, hit rates, and staleness contracts.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Cache layers in a retrieval stack}
+\label{sr:tab:cache_layers}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Layer} & \textbf{Keyed on} & \textbf{What it saves} & \textbf{Invalidation contract} \\
+\midrule
+Results cache & Normalized query + filters + locale (+ page) & The entire funnel & TTL (minutes) + event-driven purge on document change where feasible \\
+Query-embedding cache & Normalized query text + encoder version & Encoder forward pass on the critical path & Immutable per encoder version; flush on encoder rollout \\
+Posting-list / block cache & Term or index block & Disk reads in lexical and disk-based ANN serving & Managed by the engine; segment-immutability makes it clean \\
+Feature cache & (query, doc) or doc & L1/L2 feature computation & TTL tied to feature freshness class \\
+Semantic cache & Query \textit{embedding} (similarity hit test) & Funnel and/or LLM generation & TTL + guardrails; see below \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Results caching} is the workhorse. The key must be the \textit{canonical} query---after normalization, spell correction, and filter serialization---so that surface variants share entries; hit rates of 20--40\% on head-heavy consumer traffic are common with exact-match keys alone. Design details that interviews probe:
+
+\begin{itemize}
+    \item \textbf{Key canonicalization.} Case/whitespace normalization, the spell-corrected form (cache post-correction, or ``iphoen'' and ``iphone'' occupy separate entries), deterministic filter serialization (sorted key order), and including exactly the context that changes results---locale and index version yes, session ID no. Every unnecessary key component divides the hit rate; every missing one is a correctness bug.
+    \item \textbf{Cache where the value concentrates.} Page 1 of head queries carries most of the value; deep pages and tail queries pollute the cache for near-zero hit probability---cache-admission policies (cache on second occurrence) keep one-off tail queries out.
+    \item \textbf{Personalization is the structural enemy.} Per-user results are uncacheable across users---the strongest architectural argument for keeping candidate generation intent-driven and shared, injecting personalization late in the funnel where it reorders a cacheable candidate set. A design that personalizes retrieval itself silently forfeits this entire cost lever.
+    \item \textbf{Freshness is the other one.} The contract is a staleness budget: TTLs per query class (short for volatile verticals like news/inventory, longer for evergreen), plus event-driven invalidation where the mapping from changed document to affected cached queries is tractable---it usually is not in general (a document appears in unboundedly many query results), which is why TTL, not purge, is the primary mechanism, with targeted purges reserved for known hot mappings (a product page's own navigational queries).
+    \item \textbf{Caches are also a degradation path.} \texttt{stale-while-revalidate} (serve stale, refresh in background) keeps head-query latency flat through refreshes; \texttt{stale-if-error} means a funnel outage serves slightly old results instead of errors---by design, and counted (Table~\ref{sr:tab:degradation_ladder}).
+\end{itemize}
+
+\textbf{Semantic caching} is the LLM-era extension: instead of exact key match, embed the incoming query and do a similarity lookup against cached queries; on a hit above threshold, serve the cached retrieval set or the cached generated \textit{answer}. The motivation is real---LLM-mediated traffic pays seconds of generation latency and real GPU cost per miss, and paraphrase variants (``how do I reset my password'' / ``password reset steps'') defeat exact keys. The risk is equally real:
+
+\begin{warningbox}[title={\small Warning: The Semantic-Cache False Hit}]
+Embedding similarity is exactly the wrong instrument for deciding \textit{interchangeability}. Embeddings are trained to place related texts close together, and the pairs that sit closest are often \textit{not} interchangeable: ``flights from Boston to Denver'' vs.\ ``flights from Denver to Boston''; ``error 0x80070057'' vs.\ ``error 0x80070005''; ``is X safe \textit{with} alcohol'' vs.\ ``is X safe \textit{without} alcohol''; the same query with a different date, model number, or negation. A cosine threshold that captures paraphrases will also capture these, and a false hit serves a \textbf{confidently wrong answer to a question the user did not ask}---worse than a miss, and invisible in aggregate metrics because the response ``looks fine.''
+
+Guardrails that make semantic caching shippable: (1) a conservative threshold tuned on a labeled paraphrase-vs-near-miss set \textit{from your own traffic}, biased toward misses; (2) a secondary exactness check on extracted entities, numbers, dates, and negation---cheap lexical veto over the embedding vote; (3) scope keys: never share across users, locales, filter contexts, or permission sets; (4) cache the \textit{retrieval results} rather than the generated answer where possible (a false hit then degrades to plausible-but-suboptimal candidates that the reranker and generator can partially repair, instead of a verbatim wrong answer); (5) TTLs matched to content volatility, and shadow evaluation: continuously sample cache hits, recompute the full pipeline offline, and measure disagreement---the false-hit rate is a metric you must \textit{measure}, not assume.
+\end{warningbox}
+
+\textbf{Caching vs.\ freshness is a single design axis.} Every cache layer re-introduces the staleness the freshness architecture of Section~\ref{sr:sec:index_freshness} was built to remove; a 60-second index-lag SLO under a 10-minute results-cache TTL is a 10-minute product. State the end-to-end staleness budget once, and allocate it across index lag \textit{and} cache TTLs deliberately---and remember that an embedding or feature cache keyed without a model version becomes a version-skew incident during rollouts (Section~\ref{sr:sec:monitoring}).
+
+%==============================================================================
 \section{Retrieval Quality Monitoring}
-% TODO Phase C
+\label{sr:sec:monitoring}
+%==============================================================================
 
+Serving metrics (latency, error rate, saturation) are table stakes and will not tell you when retrieval quality regresses: the system returns 200s and ten results either way. Quality monitoring has to be built deliberately, and the constraint that shapes all of it is that \textbf{production traffic has no labels}.
+
+\subsection{Online Recall Proxies: Overlap-with-Flat Audits}
+
+ANN recall---the fraction of true nearest neighbors the index returns (Chapter~\ref{sr:chap:vector_retrieval_theory})---is measurable without any human judgment, because the ground truth is just exact search. The production pattern: continuously sample a small fraction of live queries (0.1--1\%), log their query embeddings and served candidate sets, and asynchronously run \textbf{exact (flat) search}---or a much-higher-effort ANN search as a silver standard---over the same index snapshot, computing $\text{overlap@}k = |A \cap F| / k$ between the served ANN set $A$ and the flat set $F$. Run it as a batch GPU job hourly or daily; alert on level shifts and trends (Algorithm~\ref{sr:alg:recall_audit}). This one audit catches an outsized share of real incidents: tombstone accumulation, IVF drift, quantization regressions, bad $ef$/nprobe config pushes, and---because it is computed per index segment and per shard---it localizes them. Its blind spot is equally important to name: overlap-with-flat measures whether ANN approximates \textit{exact search over the current embeddings}; it says nothing about whether the embeddings themselves are any good. A perfect overlap score is fully consistent with a broken embedder---that is what canaries and judgment sets are for.
+
+\begin{algorithm}[H]
+\caption{Online recall-proxy audit (overlap-with-flat)}
+\label{sr:alg:recall_audit}
+\begin{algorithmic}[1]
+\STATE Sample a fraction $s \in [0.001, 0.01]$ of live queries; log the query embedding, the served ANN set $A_k$, and the index snapshot, shard, and version IDs
+\FOR{each audit window (hourly or daily), as an offline batch job}
+    \STATE $F_k \gets$ exact top-$k$ by flat search over the \emph{same} snapshot (GPU batch), or a much-higher-effort ANN search as a silver standard
+    \STATE $\text{overlap@}k \gets |A_k \cap F_k| \,/\, k$ per query
+    \STATE Aggregate by shard, segment, index version, and query class
+\ENDFOR
+\STATE Alert on level shifts against a rolling baseline (config pushes, bad builds) and on monotone decay trends (tombstone accumulation, centroid/codebook drift)
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Drift Detection on Queries and Embeddings}
+
+Distribution drift arrives on two fronts. \textbf{Query drift}: the query mix shifts (seasonality, product launches, a new user geography, LLM agents suddenly generating machine-shaped queries). Monitor cheap distribution statistics of query traffic---length, language mix, intent-class mix, zero-result rate per segment, and embedding-space statistics (norm distribution, projections onto a fixed PCA basis, population histograms over a fixed cluster assignment) compared against a rolling reference window with a divergence metric. \textbf{Corpus/embedding drift}: the document distribution moves away from what centroids, codebooks, and graph structure were built on---monitored via the freshness metrics of Section~\ref{sr:sec:index_freshness} (quantization error, list imbalance) plus top-1 distance distributions (mean distance-to-nearest rising over time means queries are landing in sparser regions). Drift alarms are rarely incidents by themselves; their value is triage speed when a quality metric moves---``did the traffic change or did the system change'' is the first branch of every relevance investigation.
+
+\subsection{Canary Suites, Judgment Refresh, and Funnel Health}
+
+\textbf{Canary query suites.} A fixed set of a few hundred golden queries with asserted expectations---``query $q$ must retrieve document $d$ in the top $k$''; ``this SKU query must return its product page first''---run continuously against production (and against every index build and config push \textit{before} promotion). Canaries are the retrieval equivalent of contract tests: coarse, cheap, and the fastest possible detector for ``the new index build is broken.'' Curate them across query classes (head, tail, identifier, navigational, each locale) and refresh them as the catalog changes so they do not rot into permanent exceptions.
+
+\textbf{Judgment refresh.} The offline judgment sets of Chapter~\ref{sr:chap:evaluation_experimentation} decay: documents die, intent shifts, and a new retriever surfaces documents the pool never judged. Production monitoring closes the loop by feeding sampled live traffic into the judgment pipeline on a rolling cadence---judge-the-delta for new systems, re-judge a sliding sample for staleness---so that offline NDCG tracked week over week is measuring the system, not the fossilization of its labels.
+
+\textbf{Funnel-stage health.} Instrument each stage's \textit{output distribution}, not just its latency: candidate counts per leg (a collapsing dense-leg count is an encoder or index problem; collapsing lexical counts is an analyzer or filter problem), score distributions per stage, degradation-path activation rates (how often did we serve L1 order because L2 timed out), fresh-vs-stable tier hit mix, and index lag. Alert on these \textit{leading} indicators; engagement metrics (CTR, reformulation, abandonment---Chapter~\ref{sr:chap:evaluation_experimentation}) confirm user impact but lag by hours and confound many causes.
+
+\subsection{Alerting Design: Page on Leading Indicators}
+
+Wiring these signals into an on-call rotation is its own design problem:
+
+\begin{itemize}
+    \item \textbf{Page on leading, review on lagging.} Index lag, degradation-path activation, per-leg candidate-count collapse, canary failures, and recall-proxy level shifts page---they are specific, fast, and actionable. Engagement metrics and weekly judgment NDCG go to review dashboards---they confirm impact and catch what the proxies missed, but paging on them means paging hours late with no localization.
+    \item \textbf{Every alert names its differential.} The incident taxonomy below doubles as the runbook index: an overlap-with-flat alert points at ANN parameters, tombstones, or drift; a dense-leg canary failure with green lexical canaries points at the embedding pipeline; a per-slice zero-result spike points at filters or analyzers. Alerts that just say ``quality down'' produce hour-long war rooms; alerts that encode the differential produce ten-minute rollbacks.
+    \item \textbf{Same checks, two deployment points.} Every production monitor worth having is also a pre-promotion gate: canary suites, recall proxies against the new artifact, and score-distribution comparisons run against every index build and config push \textit{before} traffic---the cheapest incident is the one that fails CI instead.
+\end{itemize}
+
+\subsection{A Taxonomy of Retrieval Degradation Incidents}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Common production retrieval incidents and their detection signals}
+\label{sr:tab:incident_taxonomy}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Incident} & \textbf{Mechanism and symptom} & \textbf{Fastest detector} \\
+\midrule
+Stale index / pipeline stall & Indexing consumer lags or dies; new and updated documents silently missing; complaints arrive days later & Index-lag watermark from synthetic probe documents \\
+Embedding-version skew & Query encoder and index built with different embedder versions; dense-leg relevance collapses while lexical is fine & Canary suite on the dense leg; version contract check (see below) \\
+Analyzer/tokenizer mismatch & Index-time and query-time analysis chains diverge after a config push; certain query classes (hyphenated terms, CJK, identifiers) stop matching & Canary queries stratified by query class; zero-result rate by segment \\
+Filter bug & A filter predicate inverts or over-selects; candidate counts collapse for a slice (one locale, one tenant) & Per-slice candidate-count and zero-result dashboards \\
+ANN parameter regression & An $ef$/nprobe/quantization config change trades recall for latency invisibly & Overlap-with-flat recall proxy \\
+Degradation masking & Timeout storms silently serve degraded paths at high rates; every dashboard is green except quality & Degradation-path activation rate as a paged metric \\
+Cache staleness/poisoning & TTLs outlive a corpus change, or a semantic cache serves false hits & Shadow re-execution of sampled cache hits \\
+Merge/build interference & Background compaction or rebuild saturates I/O and CPU; p99 spikes on a schedule & Stage latency overlaid with build-scheduler events \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}[title={\small Warning: The Embedding-Version-Skew Incident}]
+The signature production-retrieval incident of the embedding era. The dense leg has two artifacts that must agree---the \textbf{query encoder} running in the serving path and the \textbf{document vectors} baked into the index---and any rollout that updates one without atomically updating the other breaks the geometric contract between them. Vectors from different encoder versions are \textit{not in the same space}: similarities across versions are essentially meaningless even when the model change was ``small'' (fine-tune, new pooling, new normalization, new instruction prefix). The failure is nasty because it is \textbf{partial and plausible}: results are not empty, they are subtly wrong; if the rollout was gradual, only some replicas skew; if the backfill was incomplete, only some \textit{documents} skew, so aggregate metrics sag rather than crater. Real-world variants: a query service picking up a new encoder checkpoint by floating tag while the index lags; a re-embedding backfill that dies at 60\% leaving a mixed-version index; an embedding cache keyed without the version, serving v1 query vectors long after the v2 cutover; retrained PQ codebooks applied to old vectors.
+
+\textbf{Detection}: dense-leg canary queries (lexical-leg canaries stay green---the differential is diagnostic); overlap between served dense candidates and a flat search \textit{using the correct pairing} of encoder and index; a step-change in dense-leg score distributions at rollout time.
+
+\textbf{Prevention}: (1) \textbf{versioned indexes with a manifest}---every index artifact carries \{embedding model ID and checksum, dimension, normalization, similarity metric, pooling, instruction/prefix template, tokenizer version\}; (2) a \textbf{contract test in the serving path}---the query service asserts at startup and on every index swap that its encoder version matches the index manifest, and \textit{refuses to serve} on mismatch (fail loudly beats degrade silently here, because the degraded mode is wrong answers); (3) \textbf{atomic blue/green rollout of the pair}---encoder and index promote together as one versioned unit, never independently; (4) during migrations, \textbf{dual-write/dual-serve}: embed queries with both versions, query both indexes, compare shadow metrics, then cut over; (5) version keys on every embedding cache.
+\end{warningbox}
+
+%==============================================================================
 \section{RAG's Retrieval Stage}
-% TODO Phase C
+\label{sr:sec:rag_retrieval}
+%==============================================================================
 
+Boundary first: the RAG \textit{pipeline}---chunking strategy as a text-processing problem, prompt assembly, generation grounding, faithfulness evaluation, and the failure taxonomy---is canonical in [NLP 9], and LLM serving economics in [DL 19]. What is canonical \textit{here} is RAG's retrieval stage: the index, serving, freshness, and feedback design decisions when the ``user'' of your retrieval system is a generator rather than a person scanning a results page. That change of consumer shifts the requirements in specific ways:
+
+\begin{itemize}
+    \item \textbf{Precision at small $k$ is everything.} A person scans twenty results and forgives noise; a generator receives $k \approx 5$--$20$ chunks and synthesizes from \textit{all} of them---an irrelevant chunk is not skipped, it is a distraction or a hallucination seed, and the retrieval stage's precision@$k$ directly bounds answer faithfulness.
+    \item \textbf{There is no user to recover from misses.} A searcher reformulates when page one is wrong; a single-shot RAG chain does not (agentic loops partially restore this---below). The recall ceiling argument sharpens: what retrieval misses, the answer simply lacks.
+    \item \textbf{The result set is invisible.} Users never see the ranked list, so presentation-layer signals (clicks, skips) vanish as training and monitoring data---replaced by grounding signals (below).
+\end{itemize}
+
+\subsection{Chunk-Level vs.\ Doc-Level Indexing as an Index Decision}
+
+[NLP 9] treats chunking as a text-segmentation policy; here it is a \textbf{capacity and lifecycle} decision, because the chunk is the index's unit of everything---memory, freshness, filtering, and refresh cost. Concretely: 100M documents at an average 20 chunks each is a \textbf{2B-vector index}; at 768-d fp32 that is $\sim$6\,TB of raw vectors versus $\sim$300\,GB doc-level---the difference between a modest CPU fleet and a serious disk-based, quantized deployment (Section~\ref{sr:sec:ann_serving}), and a 20$\times$ multiplier on every future re-embedding pass (Section~\ref{sr:sec:index_freshness}). Updates compound it: one edited document invalidates \textit{all} its chunk vectors, so churn amplifies by the same factor. The standard mitigations: index chunks at reduced dimension or aggressive quantization while keeping doc-level vectors full-fidelity; \textbf{parent-document retrieval} (match at chunk granularity, but dedupe/aggregate to documents before reranking, then hand the generator the best-matching chunks \textit{with} their surrounding context); hierarchical indexes (doc-level first stage routing into per-doc chunk search); and pooled-from-long-context chunk embeddings (late-chunking-style) that cut encoder passes per document. The retrieval-precision consequence also cuts both ways: chunk vectors are focused (better for pinpointing the answering passage) but context-poor (chunk 47 of a contract matches ``termination clause'' while being about a different party)---which is why chunk-hit-to-doc-context assembly, not raw chunk return, is the production default.
+
+\subsection{Hybrid Defaults, Metadata Filtering, and Freshness}
+
+\textbf{Hybrid is the default, not the option.} RAG corpora---documentation, tickets, code, contracts, logs---are saturated with identifiers, error strings, version numbers, and names: exactly the token classes dense encoders blur and lexical matching nails. The retrieval stage for RAG should default to lexical $\parallel$ dense with rank fusion and let evidence remove a leg, not add one (fusion mechanics are Chapter~\ref{sr:chap:neural_retrieval_reranking}'s territory; the RAG-side framing is [NLP 9]'s).
+
+\textbf{Metadata filtering is load-bearing, and often security-load-bearing.} Enterprise RAG queries carry filters---source system, date range, product version, and above all \textbf{ACLs}: the retriever must never surface a document the requesting user cannot read, because anything retrieved can leak into the generated answer. The pre/post-filter decision therefore splits by what the filter protects:
+
+\begin{itemize}
+    \item \textbf{Post-filtering} (search, then discard non-matching candidates) is cheap and fine for low-selectivity preference filters---but its recall collapses arithmetically with selectivity: if only 1\% of the corpus passes the filter, a top-100 ANN result set yields on the order of \textit{one} surviving candidate, and the fix---over-fetching $k/\text{selectivity}$ candidates---blows the latency budget exactly when the filter is most selective.
+    \item \textbf{Pre-filtering} (constrain the search itself) is mandatory for ACLs regardless of selectivity, for two reasons: post-filtering leaves a window where unauthorized content transits the candidate pipeline and its logs, and a security control whose recall properties depend on tuning is not a security control. The cost is that selective pre-filters are exactly where ANN structures degrade---filtered-graph connectivity, filter-aware traversal, and their remedies are Chapter~\ref{sr:chap:vector_retrieval_theory}'s territory.
+    \item \textbf{Practical resolution}: per-tenant/per-ACL-domain partitions for coarse security boundaries (isolation by construction), filter-aware ANN for fine-grained predicates, and routing highly-selective-filter queries to the lexical engine, which evaluates predicates natively in the inverted index.
+\end{itemize}
+
+\textbf{Freshness is the product claim.} RAG's pitch is knowledge past the model's training cutoff; an index that lags by a day quietly re-imposes a one-day cutoff, and the failure mode is the generator \textit{fluently asserting stale facts}---prices, on-call rotations, policy versions---with citations to superseded documents. The NRT architecture of Section~\ref{sr:sec:index_freshness} applies unchanged; what RAG adds is the requirement that \textbf{document validity metadata (effective dates, supersedes-links, deprecation flags) live in the index} so retrieval can prefer or filter to current versions, rather than hoping the generator adjudicates between a 2024 policy and its 2026 replacement in-context.
+
+\subsection{Iterative and Agentic Retrieval}
+
+Increasingly the caller is not a single RAG chain but an agent loop: the model retrieves, reads, reformulates, and retrieves again---multi-hop and self-corrective patterns are covered in [NLP 9], and agent orchestration in [DL 27]. From the retrieval-serving side, the consequences are concrete: query volume multiplies (a research-style agent issues tens of retrieval calls per user task, so ``QPS'' decouples from user count); per-call latency budgets tighten because retrieval sits inside a serial LLM loop whose end-to-end time the user feels ([DL 19] for the serving interplay); the query distribution shifts toward long, machine-generated, instruction-shaped strings your encoder may never have trained on (a drift-monitoring segment of its own---Section~\ref{sr:sec:monitoring}); and session-scoped caching becomes highly effective, since an agent's successive queries are heavily redundant. Retrieval for agents is the same system with a hostile-workload multiplier: cheaper per call, colder on average, and much less forgiving of tail latency.
+
+\subsection{Grounding-Quality Feedback into Retrieval}
+
+RAG generates a feedback signal search never had: the generator's \textit{use} of what you retrieved. Which retrieved chunks were actually cited in the answer; which were present but ignored; RAGAS-style context precision/recall and faithfulness scores computed offline ([NLP 9] for the metrics themselves); answer-level thumbs from users. Mined carefully, these become retriever training data---cited chunks as positives, retrieved-but-never-cited chunks as hard negatives---closing the loop that clicks close for classic search (Chapter~\ref{sr:chap:learning_to_rank}). The debiasing caveat carries over exactly: citation behavior is position-biased within the context window (the lost-in-the-middle effect), verbosity-biased, and generator-version-dependent, so raw citations inherit the biases of the current system just as raw clicks inherit position bias. Answer-level feedback adds a credit-assignment problem---a thumbs-down does not say \textit{which} of eight chunks failed---so chunk-level attribution signals are the usable ones. Aggregate grounding metrics also belong on the monitoring dashboards of Section~\ref{sr:sec:monitoring}: a falling citation rate per retrieved chunk is a retrieval-precision regression detector that needs no labels at all.
+
+%==============================================================================
+\section{Cost Engineering}
+\label{sr:sec:cost_engineering}
+%==============================================================================
+
+\subsection{The Three-Way Trade: Embedding Compute, Index Memory, Serving CPU}
+
+Retrieval cost decomposes into three pools that trade against each other: \textbf{embedding compute} (one-time per corpus pass plus incremental for churn---Section~\ref{sr:sec:index_freshness}'s formula), \textbf{index memory} (a standing cost, paid every hour regardless of traffic), and \textbf{serving compute} (scales with QPS and with per-query effort: $ef$, nprobe, rerank depth). The exchange rates run through the storage hierarchy:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Storage tiers for vector serving (representative 2026 cloud prices)}
+\label{sr:tab:storage_tiers}
+\begin{tabularx}{\textwidth}{lccX}
+\toprule
+\textbf{Tier} & \textbf{\$/GB-month} & \textbf{Access latency} & \textbf{What lives there} \\
+\midrule
+RAM (instance memory) & \$4--6 & $\sim$100\,ns & Graph adjacency, hot/quantized vectors, fresh tier \\
+Local NVMe & \$0.08--0.15 & $\sim$100\,$\mu$s & Full-precision vectors, DiskANN-style graphs, warm segments \\
+Object storage & \$0.02--0.03 & 10--100\,ms & Build artifacts, cold segments, snapshots, rollback versions \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Worked baseline at 100M vectors, 768-d fp32: raw vectors are $\sim$307\,GB; HNSW adjacency at $M{=}16$ adds $\sim$13\,GB; with process overhead, plan $\sim$400\,GB of RAM \textit{per replica}. At \$5/GB-month and three replicas that is $\sim$\$6K/month of standing memory cost before a single query is served. The levers, with their exchange rates: \textbf{int8 scalar quantization} $\to$ 4$\times$ memory cut, negligible recall cost; \textbf{PQ at 64\,B/vector + full-precision rerank from NVMe} $\to$ RAM drops to $\sim$20\,GB ($\sim$50$\times$), at the price of a rerank read path and a recall tail to monitor; \textbf{disk-native (DiskANN-style) layouts} $\to$ RAM holds only compressed sketches, standing cost dominated by NVMe at 40--60$\times$ cheaper per GB; \textbf{dimension reduction} (Matryoshka-style truncation, 768 $\to$ 256) $\to$ 3$\times$ across \textit{every} tier plus proportionally faster distance computation, when the encoder was trained for it. Meanwhile embedding compute (Section~\ref{sr:sec:index_freshness}: tens to low thousands of GPU-hours per full pass) is almost always the \textit{smallest} of the three pools at steady state---its real weight is organizational, as the cost of change (below). The general rule: \textbf{memory is the standing cost, serving scales with traffic, embedding is the cost of change}---and most fleets are mis-optimized toward paying standing RAM cost for recall headroom that quantize-then-rerank would deliver at a tenth the price.
+
+One serving-side lever deserves a named mention because it is underused: \textbf{adaptive per-query effort}. The parameters that set per-query cost ($ef$, nprobe, rerank depth) are almost always global constants, but query value and difficulty are not uniform: head queries are largely served from cache anyway; navigational and identifier queries are decided by the lexical leg; and it is tail, conceptual queries where extra ANN effort and deeper reranking actually buy relevance. Predicting query class in query understanding and routing effort accordingly---low $ef$ and shallow rerank for the easy majority, high effort for the hard minority---routinely recovers 20--40\% of serving compute at neutral aggregate quality, and it degrades gracefully because the effort policy is itself a brownout knob (Section~\ref{sr:sec:prod_funnel_budgets}).
+
+\textbf{A worked before/after}, pulling the chapter's levers together on the running example (100M vectors, 5{,}000 QPS peak, 3 replicas):
+
+\begin{itemize}
+    \item \textbf{Baseline}: fp32 HNSW in RAM, $\sim$400\,GB $\times$ 3 replicas at \$5/GB-month $\approx$ \$6K/month memory; cross-encoder rerank at depth 100 $\approx$ 110 GPUs $\approx$ \$80K/month; CPU serving fleet $\approx$ \$6--8K/month. Total $\sim$\$93K/month, GPU-rerank-dominated---which is typical and surprises teams who expected the vector index to be the expensive part.
+    \item \textbf{After int8 + results caching at a 30\% hit rate}: memory \$1.5K, rerank \$56K, total $\sim$\$64K. \textbf{After also halving rerank depth (validated) and PQ+NVMe tiering}: rerank \$28K, memory a few hundred dollars plus NVMe, total $\sim$\$36K. The compounding is the point: each pool has its own lever, and none of these steps required a model change or a visible quality regression---only measurement discipline at each step.
+\end{itemize}
+
+\subsection{When to Re-Embed: The Model-Upgrade Decision}
+
+Embedding models improve continuously, and every improvement presents the same decision: re-embed the corpus or skip this generation. The framework a Staff engineer should articulate:
+
+\begin{enumerate}
+    \item \textbf{Measure the gain on your task, not the leaderboard.} Benchmark deltas (MTEB-style) routinely fail to transfer to a specific corpus and query distribution. Build the comparison on your own eval: re-embed a stratified sample (say 1M docs), index both versions, run your judgment set and canary suites, and read recall@$k$/NDCG deltas per query segment---tail and identifier-heavy segments often move differently from the head.
+    \item \textbf{Price the full migration, not the embedding pass.} The pass itself is cheap (Section~\ref{sr:sec:index_freshness}); the real costs are the index rebuild, the \textbf{dual-serving window} (both index versions live during cutover---briefly doubling standing memory cost), re-tuning of ANN parameters and downstream fusion/reranker features against the new score distribution, re-validation of every canary, and the version-skew risk surface of Section~\ref{sr:sec:monitoring}. A dimension change additionally invalidates quantization codebooks and any dependent caches.
+    \item \textbf{Decide by annualized return.} A useful posture: upgrade when the measured quality delta is decisive (a retrieval-recall gain that visibly moves the product or RAG answer quality), or when a required capability lands (longer context, new languages, cheaper dimensioning); \textit{skip} incremental gains and batch upgrades---adopting every point release pays the fixed migration cost repeatedly for deltas your users cannot detect. Many strong teams upgrade embedders on a 12--24-month cadence, skipping generations deliberately.
+    \item \textbf{Migrate with the version discipline of Section~\ref{sr:sec:monitoring}}: dual-embed, dual-serve, shadow-compare, cut over atomically, keep the old index warm for rollback. Never operate a mixed-version index as a ``progressive migration''---partial backfills are the version-skew incident on a slow fuse. If standing cost forbids full dual-serving, migrate shard-by-shard with the encoder pinned per shard and both encoders live at the router.
+\end{enumerate}
+
+\begin{keyinsight}
+Embedding-model choice is an \textit{annuity}, not a purchase. The day-one decision fixes the dimension, the chunk multiplier, and the refresh cost of every future upgrade; the recurring decision is whether each new model generation clears the full migration cost---measured on your data---rather than the benchmark delta. Teams that treat re-embedding as ``just an API bill'' systematically underestimate migration cost; teams that dread it systematically over-hold obsolete embedders. The framework above is the honest middle.
+\end{keyinsight}
+
+%==============================================================================
+\section{The Production Retrieval Checklist}
+\label{sr:sec:prod_checklist}
+%==============================================================================
+
+The chapter compressed into the review you would run before (or after inheriting) a production retrieval launch---each line maps to a section above, and each is a question interviewers ask in system-design follow-ups:
+
+\begin{enumerate}
+    \item \textbf{Budget}: Is there a written p99 decomposition with a per-stage timeout, and does every stage name its degradation path---including which stages fail closed? Is the degraded-serve rate on a paged dashboard? (Section~\ref{sr:sec:prod_funnel_budgets})
+    \item \textbf{Freshness}: What is the measured index lag (synthetic probes), and does the staleness budget account for cache TTLs on top of it? Do deletes propagate as fast as the compliance story requires? (Section~\ref{sr:sec:index_freshness})
+    \item \textbf{Churn}: Who compacts tombstones, when do centroids/codebooks retrain, and what recall metric would show they are overdue? (Section~\ref{sr:sec:index_freshness})
+    \item \textbf{Serving}: Are replicas warm before joining the balancer, is capacity planned for peak plus headroom, and has anyone re-derived the CPU/GPU and RAM/NVMe placement since the corpus last doubled? (Section~\ref{sr:sec:ann_serving})
+    \item \textbf{Caching}: Are cache keys canonical and version-scoped, are semantic-cache false hits measured by shadow re-execution, and does any cache cross a user or permission boundary? (Section~\ref{sr:sec:caching})
+    \item \textbf{Monitoring}: Does every incident class in Table~\ref{sr:tab:incident_taxonomy} have a named fastest detector, and do the same checks gate promotion? Is there an overlap-with-flat audit running against live traffic? (Section~\ref{sr:sec:monitoring})
+    \item \textbf{Versioning}: Do index artifacts carry manifests, does the serving path refuse encoder/index mismatches, and do encoder and index roll out as one atomic unit? (Section~\ref{sr:sec:monitoring})
+    \item \textbf{RAG}: Are ACLs pre-filtered, is chunk granularity priced as an index decision, and are grounding signals flowing back as both monitoring and training data? (Section~\ref{sr:sec:rag_retrieval})
+    \item \textbf{Cost}: Is spend decomposed into memory/serving/embedding pools with an owner for each, and is there a written framework for the next embedder upgrade? (Section~\ref{sr:sec:cost_engineering})
+\end{enumerate}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C
+\label{sr:sec:prod_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: You own a search endpoint with a 250\,ms server-side p99 SLO. Walk me through the latency budget---where does the time go, and what do you cut when you're over?}
+
+\badgeLfive{L5} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Decompose by funnel stage and enforce per-stage timeouts: query understanding $\sim$15\,ms (sequential with everything---distilled models only); L0 retrieval $\sim$40\,ms as the \textit{max} over parallel legs (lexical, dense, fresh tier), noting the query-encoder call is serial \textit{inside} the dense leg; L1 cheap ranking $\sim$30\,ms; L2 cross-encoder rerank $\sim$90\,ms over 100--200 candidates---the biggest line because cost is linear in rerank depth; blending/business logic $\sim$15\,ms; then reserve real room ($\sim$60\,ms) for network, serialization, and hedging headroom, because RPC hops and encoding are where paper budgets die.
+
+Two structural points: parallel legs take the max while sequential stages add, so parallelism and critical-path length---not average speed---shape the budget; and the sum of stage p99s deliberately over-covers the end-to-end p99, which is the headroom that absorbs correlated bad luck.
+
+When over budget, in order: (1) cut rerank depth (200 $\to$ 100 halves the dominant term---validate the NDCG delta offline and with interleaving); (2) tighten per-stage timeouts and serve the degradation path (L1 order without L2), monitoring the activation rate as a quality metric; (3) attack tails rather than means---hedged requests to replicas, load-shedding, merge/build throttling during peak; (4) cache more aggressively (results cache on normalized keys; query-embedding cache). Only then talk about faster models.
+
+\redflags
+\begin{itemize}
+    \item Budgeting means instead of p99s, or omitting network/serialization overhead entirely.
+    \item No degradation story---a budget without timeouts is a wish.
+    \item Jumping to ``distill the reranker'' before rerank depth, the free knob.
+    \item Not knowing that parallel-leg latency composes by max and that fan-out amplifies tails.
+\end{itemize}
+
+\interviewtest{Whether you have operated (not just trained) a ranking system: p99 thinking, per-stage timeouts, degradation paths, and knowing which stage dominates both latency and cost.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Produces a sensible stage decomposition with timeouts and names rerank depth as the main knob.
+    \item \badgeLsix{L6} Adds tail mechanics (fan-out amplification, hedged requests), degradation-rate monitoring, and the cost shadow of the same budget.
+    \item \badgeLseven{L7} Treats the budget as a product decision (which stages earn their latency in measured relevance), quantifies the GPU economics of the rerank line, and describes how the budget changes when the caller is an agent loop rather than a person.
+\end{itemize}
+
+\followups{``Your p99 doubled after adding 40 shards---why?'' ``Which stage would you delete entirely under a 100\,ms SLO?'' ``How do you keep hedged requests from doubling load during an incident?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your search index must reflect catalog changes within 60 seconds---design it.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Start with the constraint's shape: 60 seconds rules out batch rebuilds as the freshness path, but full streaming mutation of large ANN/lexical structures degrades them (HNSW tombstones, IVF drift). The answer is the two-tier NRT architecture.
+
+\textbf{Write path.} CDC from the catalog's source-of-truth database into an event stream; every event carries the document ID and a monotonic version. The embedding step is on this path for the dense leg, so the freshness SLO includes encoder latency---budget it (a 60\,s SLO comfortably affords a batched streaming embed step; a 1\,s SLO would not).
+
+\textbf{Fresh tier.} Writes land within seconds in a small mutable index: an in-memory lexical segment (Lucene-style NRT refresh, $\sim$1\,s visibility) and a flat or lightweight-HNSW vector buffer---flat search over the last few hundred thousand vectors is sub-millisecond, so no structure quality is sacrificed. \textbf{Stable tier}: the large immutable index, rebuilt/merged on a slower cadence.
+
+\textbf{Query path.} Fan out to both tiers plus a version/tombstone map; drop stable-tier hits that the version map marks deleted or superseded (this is how \textit{deletes and updates}---the hard cases---meet the 60\,s SLO without touching the big graph); merge by score. \textbf{Background}: fold the fresh tier into rebuilt stable segments continuously; throttle merges during peak traffic.
+
+\textbf{Make the SLO measurable}: synthetic probe documents injected continuously, measuring end-to-end time-to-searchable (index lag) per tier and per shard, with paging alerts---a stalled consumer is the classic silent failure. Also state the cache interaction: a results cache with a 5-minute TTL silently converts your 60-second index into a 5-minute product, so cache TTLs for volatile query classes must fit inside the staleness budget.
+
+\redflags
+\begin{itemize}
+    \item ``Rebuild the index every minute''---ignores build cost and validation entirely.
+    \item Streaming everything into one mutable HNSW with no compaction story---tombstone recall decay will surface in weeks.
+    \item Forgetting deletes/updates (inserts are the easy case), or forgetting that caches sit on top of the index and extend staleness.
+    \item No measurement of index lag---an SLO you don't measure is a hope.
+\end{itemize}
+
+\interviewtest{Whether you know the convergent fresh-tier/stable-tier design and \textit{why} it exists (mutation degrades built structures), and whether you handle the full lifecycle---deletes, versions, merges, measurement---rather than just inserts.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Produces the two-tier design with a version map for deletes, and puts index lag on a dashboard.
+    \item \badgeLseven{L7} Adds ordering guarantees (per-doc versions vs.\ out-of-order delivery), merge-interference management, the cache-TTL interaction, per-tier recall monitoring, and discusses what changes at 1-second vs.\ 60-second SLOs.
+\end{itemize}
+
+\followups{``Where does the embedding step sit and what does it do to your SLO?'' ``The fresh tier grows to 10M vectors during a catalog migration---what breaks?'' ``How would you verify the version filter isn't dropping live documents?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why are deletes and updates hard in HNSW, and what does your vector database actually do when you call \texttt{delete()}?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+HNSW's search quality comes from graph structure built incrementally under the distribution seen at construction. Removing a node physically would require repairing every in-edge and risks disconnecting regions the node was routing for---a deleted hub can sever paths between clusters. So real systems don't remove: they \textbf{tombstone}. The node stays in the graph and is traversed as a waypoint but filtered from results. That has three consequences: memory is not reclaimed; per-query work rises (you traverse dead nodes and must widen $ef$ to still return $k$ live results); and under sustained churn, recall at fixed search effort decays because the graph's structure reflects a vector population that no longer exists. An \textit{update} is a delete plus re-insert---same costs.
+
+The repair mechanism is \textbf{compaction}: segment-oriented stores keep immutable segments plus tombstone bitmaps and periodically rewrite tombstone-heavy segments from live vectors (Lucene's design, reinvented for vectors; FreshDiskANN is the streaming-merge treatment for disk graphs). The operational tells that this is happening under you: recall proxies decaying between compactions, memory not shrinking after mass deletions, and scheduled p99 spikes when merges compete with queries. Contrast IVF: deletes are cheap list removals, but it pays a different churn tax---frozen centroids drift from the data distribution and require periodic re-clustering, which is effectively a rebuild.
+
+\redflags
+\begin{itemize}
+    \item ``HNSW supports deletes''---confusing an API surface with what happens underneath.
+    \item No mention of connectivity/routing (the actual reason removal is unsafe).
+    \item Not knowing compaction exists, or that recall decays with churn between rebuilds.
+\end{itemize}
+
+\interviewtest{Depth beyond the API: whether you know what the data structure does under mutation and can connect it to production symptoms (recall decay, memory growth, merge-time latency spikes).}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains tombstoning and why physical removal threatens connectivity.
+    \item \badgeLsix{L6} Connects tombstone density to $ef$ widening and recall decay under churn, and describes segment-based compaction and its serving interference.
+    \item \badgeLseven{L7} Contrasts the HNSW and IVF churn taxes, cites the FreshDiskANN-style streaming-merge design, and frames the whole thing as the mechanism behind the fresh-tier/stable-tier architecture.
+\end{itemize}
+
+\followups{``Your index reports 30\% tombstones---what do you expect to see in metrics?'' ``Why does the same problem not bite IVF, and what bites IVF instead?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Relevance regressed after last week's embedder upgrade---find it.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Structure the differential before touching anything. \textbf{Step 1: localize the leg.} Compare lexical-only, dense-only, and hybrid results on a canary set. If lexical is unchanged and dense regressed, the incident lives in the dense pipeline---which, post-embedder-upgrade, it almost certainly does.
+
+\textbf{Step 2: split model from index from integration} with the overlap-with-flat differential on a query sample: (a) new encoder + \textit{exact flat search} over new vectors---if this regressed, the model or its integration is wrong, not ANN; (b) new encoder + ANN index vs.\ (a)---if overlap dropped, the index/parameters no longer fit the new embedding geometry; (c) old encoder + old index as the baseline.
+
+\textbf{Step 3: hunt the classic integration bugs}, in observed-frequency order: \textbf{version skew}---query tower on v2 while (some of) the index is v1: check the index manifest, and check for a partial backfill (a mixed-version index makes the regression \textit{per-document}, which looks like random noise in aggregate---slice recall by document backfill timestamp, a smoking gun); a stale \textbf{query-embedding cache} keyed without model version, serving v1 query vectors post-cutover; missing \textbf{instruction prefixes} (E5-style ``query:''/``passage:'' asymmetry dropped on one side); \textbf{normalization/metric mismatch} (new model's vectors not L2-normalized while the index computes inner product as cosine); \textbf{pooling or max-length changes} (CLS vs.\ mean; truncation silently clipping documents the old tokenizer kept); \textbf{dimension handling} (Matryoshka truncation applied on one side only). If step 2(b) implicated ANN: the new geometry has different neighborhood statistics, so retune $ef$/nprobe, and retrain quantization codebooks---v1 codebooks quantizing v2 vectors is version skew's quieter sibling.
+
+\textbf{Step 4: fix forward with discipline}: roll back to the paired (encoder, index) version---which the blue/green setup should make instant---then re-migrate with dual-serve shadow comparison before cutover.
+
+\redflags
+\begin{itemize}
+    \item Retraining or ``trying another model'' before localizing model vs.\ index vs.\ integration.
+    \item Not knowing that cross-version similarities are meaningless---treating a mixed-version index as approximately fine.
+    \item No mention of prefixes, normalization, pooling, or truncation---the four integration bugs that cause most real embedder-upgrade regressions.
+    \item Debugging in production with no rollback path.
+\end{itemize}
+
+\interviewtest{This is the version-skew differential: can you design an experiment that separates the model, the index, and the glue---and do you know the specific, mundane integration failure modes of embedding pipelines?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Runs the leg-isolation and overlap-with-flat differentials and names version skew, prefixes, and normalization.
+    \item \badgeLseven{L7} Adds the partial-backfill/per-document slicing insight, codebook and cache versioning, ANN retuning for new geometry, and closes with the prevention story: manifests, contract tests at index-swap time, atomic paired rollout.
+\end{itemize}
+
+\followups{``The regression only affects 40\% of documents---what does that tell you?'' ``What contract test would have caught this before traffic did?'' ``The upgrade also changed embedding dimension---what else must be rebuilt?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You have no labels in production. How do you know your retrieval quality hasn't regressed---and how do you find out fast?}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Layer signals by what they can see and how fast they move. (1) \textbf{Overlap-with-flat recall audits}: sample 0.1--1\% of live queries, asynchronously run exact search over the same snapshot, alert on overlap@$k$ shifts---labels-free, catches ANN-side regressions (tombstones, drift, parameter pushes) and localizes to shard/segment. Name its blind spot: it validates ANN against the \textit{current embeddings}, not the embeddings against reality. (2) \textbf{Canary suites}: a few hundred golden queries with asserted must-retrieve documents, run against every build pre-promotion and continuously in production---the fast, coarse tripwire that catches broken builds, analyzer mismatches, and version skew, stratified by query class so the failure pattern is diagnostic. (3) \textbf{Funnel-health instrumentation}: per-leg candidate counts, score distributions, degradation-path activation rates, index lag, zero-result rate per slice---leading indicators that page in minutes. (4) \textbf{Drift monitors} on query and embedding distributions to answer ``did traffic change or did we''---triage, not alarm. (5) \textbf{Lagging confirmation}: engagement metrics and a rolling judgment pipeline over sampled traffic (judge-the-delta for new systems) to keep offline eval honest. For RAG surfaces, add grounding telemetry: citation rate per retrieved chunk falls when retrieval precision falls, no labels required.
+
+The design principle: every incident class in the taxonomy (stale index, version skew, filter bug, ANN param regression, degradation masking) should have a \textit{named fastest detector}, and quality-degradation rates (e.g., ``served without L2'') must be paged metrics---green latency dashboards routinely hide relevance incidents.
+
+\redflags
+\begin{itemize}
+    \item ``Watch CTR''---lagging, confounded, and useless for localization.
+    \item Believing overlap-with-flat validates embedding quality.
+    \item No pre-promotion gate---monitoring that only exists after traffic is hit.
+\end{itemize}
+
+\interviewtest{Whether you can build observability for a system whose failure mode is ``returns plausible wrong answers with a 200 status''---proxy metrics, leading vs.\ lagging signals, and detectors mapped to incident classes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Covers recall proxies, canaries, and funnel health with alerting, and knows the recall proxy's blind spot.
+    \item \badgeLseven{L7} Maps detectors to an incident taxonomy, includes degradation-rate paging and judgment refresh, and extends to RAG grounding telemetry as label-free precision monitoring.
+\end{itemize}
+
+\followups{``Overlap-with-flat is 0.98 but users are complaining---where do you look?'' ``How do you keep canary queries from rotting?'' ``Which of these run pre-promotion vs.\ in production?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Traffic to your LLM-answer product is expensive. Design a semantic cache---and tell me how it goes wrong.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Mechanics first: normalize the incoming query, check an exact-match cache, then embed the query and run a similarity lookup against cached query embeddings; above a threshold, serve the cached retrieval set or answer; below, execute the pipeline and insert. The win is real because LLM traffic is paraphrase-heavy and each miss costs seconds and GPU dollars.
+
+Then lead with the failure mode: \textbf{embedding similarity measures relatedness, not interchangeability}. The nearest neighbors of a query include its own near-misses---reversed directions (``flights Boston to Denver'' vs.\ the reverse), differing identifiers, dates, dosages, and negations---and a threshold loose enough to catch paraphrases catches these too. A false hit is a confidently wrong answer to a question the user didn't ask, invisible in aggregate because the response looks well-formed.
+
+Guardrails: conservative threshold tuned on a paraphrase-vs-near-miss set built from \textit{your} traffic; a lexical veto on extracted entities, numbers, dates, and negation before serving a hit; strict scope keys (never across users, permission sets, locales, or filter contexts); prefer caching \textbf{retrieval results over final answers} (a false hit then degrades to suboptimal candidates that downstream stages partially repair, rather than a verbatim wrong answer); TTLs by content volatility; and \textbf{shadow validation}---continuously re-execute a sample of cache hits and measure disagreement, because the false-hit rate must be a measured number. Also state where it sits: for agentic traffic, session-scoped caching captures most of the redundancy at far lower false-hit risk than a global cache.
+
+\redflags
+\begin{itemize}
+    \item Enthusiasm with no false-hit analysis, or picking a threshold ``like 0.9'' with no evaluation plan.
+    \item Caching answers across users/permission scopes---a correctness and security bug.
+    \item Not knowing that negation, direction, and identifiers are exactly what embeddings blur.
+\end{itemize}
+
+\interviewtest{Judgment about embedding similarity's semantics---the same blind spot that causes dense-retrieval identifier failures---applied to a caching decision, plus whether you insist on measuring the failure rate rather than assuming it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes the similarity-lookup mechanism and names the false-hit risk when prompted.
+    \item \badgeLsix{L6} Leads with relatedness-vs-interchangeability, proposes the lexical veto on entities/numbers/negation and strict scope keys, and insists on shadow-validated false-hit measurement.
+    \item \badgeLseven{L7} Reasons about \textit{what} to cache (retrieval sets vs.\ answers) as a blast-radius decision, ties TTLs into the end-to-end staleness budget, and distinguishes global vs.\ session-scoped caching for agentic traffic.
+\end{itemize}
+
+\followups{``Cache the answer or the retrieved chunks---which and why?'' ``How does the cache interact with your 60-second freshness SLO?'' ``What hit rate would you predict for agent-generated traffic and why?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You're building the index behind a RAG product over 100M documents. Chunk-level or doc-level vectors---and what does the choice do to your index?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Frame it as an index-capacity and lifecycle decision, not just a text-processing one (the chunking policy itself---sizes, overlap, structure-awareness---is a pipeline question; see the RAG chapter's treatment). At 20 chunks/document, chunk-level indexing is a \textbf{2B-vector index}: $\sim$6\,TB raw at 768-d fp32 vs.\ $\sim$300\,GB doc-level. That multiplier propagates everywhere: standing memory cost (forcing quantized/disk-based serving), build and merge times, \textit{churn amplification} (one document edit invalidates all its chunk vectors), and a 20$\times$ tax on every future re-embedding pass---a day-one decision that prices every future model upgrade.
+
+Retrieval quality cuts the other way: chunk vectors localize the answering passage (long documents pool into mud at doc level), which is why RAG defaults to chunk-granularity \textit{matching}. The production resolution is to decouple matching granularity from return granularity: \textbf{parent-document retrieval}---match on chunks, aggregate/dedupe to documents, return best chunks with surrounding context; hierarchical routing (doc-level index first, then within-doc chunk search) where corpus scale demands it; reduced dimension or aggressive quantization for the chunk tier while keeping a smaller full-fidelity doc tier. And carry ACL/metadata at both granularities, because permission filtering must bind at whatever granularity is retrieved.
+
+\redflags
+\begin{itemize}
+    \item Treating chunking purely as a prompt-quality question with no index-size arithmetic.
+    \item Missing churn amplification and the re-embedding multiplier---the lifecycle half of the decision.
+    \item Not knowing the parent-document pattern that dissolves the false binary.
+\end{itemize}
+
+\interviewtest{Whether you connect a seemingly NLP-side choice to its infrastructure consequences with arithmetic---the mark of someone who has paid for an index, not just queried one.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the chunk-precision vs.\ index-size trade and does the multiplication.
+    \item \badgeLsix{L6} Adds churn amplification and refresh-cost consequences, and knows the parent-document pattern decouples matching from return granularity.
+    \item \badgeLseven{L7} Designs the tiered resolution (quantized chunk tier + full-fidelity doc tier, hierarchical routing), binds ACLs at retrieval granularity, and prices the day-one decision against future embedder upgrades.
+\end{itemize}
+
+\followups{``Your docs average 3 pages but 1\% are 500-page manuals---what does that do to each design?'' ``The embedder upgrade landed---in which design is migration cheaper, and by how much?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: We have 20M vectors, moderate QPS, and we already run Postgres and OpenSearch. Do we need a vector database?}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Probably not, and the reasoning matters more than the verdict. At 20M vectors ($\sim$60\,GB at 768-d fp32, less quantized), the index fits comfortably on one node: pgvector or OpenSearch's ANN support handles this scale, and both inherit infrastructure you already operate---backups, replication, access control, on-call. The decision criteria that would flip it: \textbf{scale trajectory} (a credible path to hundreds of millions of vectors changes the answer); \textbf{query shape} (heavy metadata filtering and hybrid lexical+vector actually \textit{favor} the incumbent engines, which have real query planners; pure high-QPS vector similarity at tight latency favors dedicated engines); \textbf{freshness SLO} (compare streaming-upsert behavior, not benchmark QPS---upsert/compaction quality varies more across products than recall does); and \textbf{team shape} (a new stateful system is a new operational surface and on-call rotation; that cost is real and usually dominates at this scale). Discount benchmark marketing---QPS-at-recall on frozen, filter-free datasets excludes churn, filters, and tails, which is where production pain lives. The staff-level posture: minimize the number of stateful systems until a measured constraint (memory ceiling, tail latency, freshness, filter-recall) forces the move---and when it does, re-run this analysis against a dedicated engine \textit{and} against a library embedded in your own service, because at large scale owning the serving layer is often the right call too.
+
+\redflags
+\begin{itemize}
+    \item Resume-driven architecture: adopting a vector DB because it's the category default.
+    \item Comparing on vendor benchmarks rather than filtering, freshness, and operations.
+    \item No mention of the operational cost of a new stateful system.
+\end{itemize}
+
+\interviewtest{Build-vs-buy judgment under real constraints---whether you weigh operational surface and workload shape rather than reciting a vendor landscape.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Recommends staying on existing infrastructure at this scale and names the operational cost of a new stateful system.
+    \item \badgeLsix{L6} Articulates the criteria that would flip the decision (scale trajectory, filter/hybrid shape, freshness SLO) and discounts benchmark marketing for the right reasons.
+    \item \badgeLseven{L7} Frames it as minimizing stateful systems until a measured constraint forces the move, and includes the library-in-your-own-service option in the endgame comparison, not just engine-vs-engine.
+\end{itemize}
+
+\followups{``What measurement would tell you it's time to migrate?'' ``Same question at 500M vectors and strict ACL filtering---what changes?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Cut retrieval serving cost 5$\times$ without visible quality loss.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+First establish where the money is, because a 5$\times$ cut must attack the dominant pools: typically (1) standing index memory, (2) rerank GPU compute, (3) over-provisioned replicas; embedding compute is rarely material at steady state. Then pull levers in ascending risk, each gated by measurement:
+
+\textbf{Memory (often 3--10$\times$ on its pool):} quantize---int8 first (4$\times$, near-free), then PQ at 32--64\,B/vector with full-precision rerank from NVMe; move cold and full-precision data down the storage hierarchy (RAM \$4--6/GB-month vs.\ NVMe \$0.10)---a DiskANN-style layout trades a few ms of latency floor for an order of magnitude in standing cost; truncate dimensions if the encoder supports Matryoshka-style nesting (768 $\to$ 256 is $\sim$3$\times$ across every tier).
+
+\textbf{Compute:} cut rerank depth on measured NDCG deltas; distill the reranker; batch and consolidate GPU serving. \textbf{Traffic:} results caching on normalized keys plus (guardrailed) semantic caching---20--40\% hit rates remove that fraction of the entire funnel's cost. \textbf{Fleet:} replace p99-driven replica over-provisioning with hedged requests and load-shedding; if fan-out cost dominates at high shard counts, move from scatter-gather to routed partitioning, accepting a monitored recall knob.
+
+The L7 half of the answer is the \textbf{validation harness that makes ``without visible quality loss'' a measured claim}: overlap-with-flat recall proxies per change, canary suites per promotion, judgment-set NDCG per slice (tail and identifier segments degrade first under quantization), interleaving for the riskier steps, and staged rollout with rollback. Sequence so each step banks savings independently, and state the expected compound: quantization + tiering on memory, caching on traffic, depth + distillation on GPU---5$\times$ overall is realistic because the pools multiply.
+
+\redflags
+\begin{itemize}
+    \item One big-bang lever (``switch vendors,'' ``smaller embedder'') instead of a portfolio attacking each cost pool.
+    \item No baseline cost decomposition---optimizing before knowing where the money goes.
+    \item ``Without visible quality loss'' taken on faith: no proxy metrics, no slices, no staged rollout.
+    \item Not knowing quantize-then-exact-rerank, the single highest-leverage pattern here.
+\end{itemize}
+
+\interviewtest{Cost-engineering fluency: whether you decompose spend before optimizing, know the exchange rates of the standard levers, and---the differentiator---treat quality neutrality as something you \textit{prove} with the monitoring stack rather than assert.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Names quantization, caching, and rerank-depth cuts with plausible magnitudes.
+    \item \badgeLseven{L7} Leads with the cost decomposition, sequences levers by risk with a validation gate each, quantifies the storage-hierarchy arithmetic, and identifies which user segments would degrade first and how they'd be caught.
+\end{itemize}
+
+\followups{``Which lever would you pull first and what exactly would you measure?'' ``Finance wants 10$\times$---what visible degradation would you negotiate?'' ``Which of these savings survive a 10$\times$ traffic increase?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: A new embedding model tops the leaderboard. Do you re-embed your 100M-document corpus? Walk through the decision and the cost.}
+
+\badgeLseven{L7} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Estimate the pass first to size the problem: forward-pass FLOPs $\approx 2PTN$. At $P{=}10^8$, $T{=}512$, $N{=}10^8$: $\sim$$10^{19}$ FLOPs $\approx$ 23 A100-hours at 40\% utilization---under \$100; a 7B embedder is $\sim$70$\times$ that, still only thousands of dollars; API pricing lands at \$1K--\$7K for the $\sim$50B tokens. Conclusion: \textbf{the embedding pass is not the cost}. The real costs are the index rebuild, the dual-serving window (both indexes live during cutover---briefly doubling standing memory), retuning ANN parameters, fusion weights, and quantization codebooks against the new geometry, revalidating canaries, and the version-skew risk of the migration itself. A dimension change adds a full rebuild of everything dimension-dependent. And if the corpus is chunk-indexed at 20 chunks/doc, multiply the pass by 20.
+
+Then the decision framework: (1) \textbf{measure on your task, not MTEB}---re-embed a stratified 1M-doc sample, dual-index, run your judgment set and canaries, read deltas \textit{per segment} (tail and identifier-heavy queries often move opposite the headline). (2) \textbf{Decide on annualized return}: upgrade for decisive quality gains or required capabilities (languages, context length, cheaper dimensions); skip incremental deltas and batch generations---the migration cost is fixed per upgrade, so upgrading rarely and decisively dominates upgrading often. (3) \textbf{Migrate with version discipline}: dual-embed, shadow-compare, atomic paired cutover of encoder + index, old index warm for rollback; never run a mixed-version index as a progressive migration---partial backfill is version skew on a slow fuse.
+
+\redflags
+\begin{itemize}
+    \item Deciding on leaderboard deltas without an own-corpus eval.
+    \item Estimating only the embedding pass and calling it the migration cost.
+    \item A migration plan with a mixed-version index or no rollback.
+    \item Not knowing the arithmetic---at Staff level, $2PTN$ over a GPU's effective FLOP/s is whiteboard material.
+\end{itemize}
+
+\interviewtest{Estimation fluency plus lifecycle judgment: can you price the \textit{whole} migration, design the eval that makes the call, and execute without creating the version-skew incident?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Gets the cost arithmetic right and insists on an own-task eval before deciding.
+    \item \badgeLseven{L7} Frames embedder choice as an annuity (chunk multiplier, dimension lock-in, refresh tax), articulates the skip-a-generation posture, and details the dual-serve migration with its transient cost double and rollback story.
+\end{itemize}
+
+\followups{``The new model is 3072-d, up from 768---what does that change beyond the pass?'' ``How would you cut the dual-serving window's cost?'' ``When would an adapter mapping old vectors toward the new space be acceptable, and what would you check?''}
+\end{interviewq}
