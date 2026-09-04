@@ -2,24 +2,871 @@
 \label{cml:chap:trees_ensembles}
 
 \begin{tldr}
-Placeholder — this chapter is written per docs/coverage-spec.md, seeded by the author's own conventional-ML document when it arrives (Phase C3).
+Gradient-boosted decision trees (GBDTs) are the single most-tested classical-ML topic in 2026 interviews, and for good reason: they remain the production default for tabular prediction at almost every platform company, and the XGBoost second-order derivation is the canonical ``can you do math about a tool you use daily'' probe. This chapter builds the full stack: CART mechanics (impurity, greedy split finding, pruning, why single trees are high-variance); bagging and random forests with the correlated-variance algebra that motivates feature subsampling; gradient boosting derived properly as functional gradient descent (residual fitting is the squared-loss special case, not the definition); the XGBoost objective with the closed-form leaf weight $w^* = -G/(H+\lambda)$ and split-gain formula derived end to end; LightGBM's histogram/leaf-wise/GOSS/EFB engineering; CatBoost's ordered target statistics and ordered boosting; the eight hyperparameters that actually matter; the honest 2026 state of GBDT vs.\ neural networks on tabular data; and TreeSHAP, monotonic constraints, and serving-latency practicalities. This is the program's canonical GBDT home---the learning-to-rank chapter [SR 5] builds LambdaMART on top of exactly this machinery.
 \end{tldr}
 
-\section{Decision Tree Mechanics}
-% TODO Phase C3
+%==============================================================================
+\section{Decision Trees: CART Mechanics}
+\label{cml:sec:cart}
+%==============================================================================
 
+Everything in this chapter is built from one primitive: a binary decision tree grown by recursive greedy splitting, in the CART (Classification and Regression Trees, Breiman et al., 1984) tradition. Interviewers rarely ask about single trees for their own sake anymore---they ask because the tree-level details (impurity concavity, split-finding complexity, categorical handling, the variance problem) are exactly the load-bearing parts of every ensemble question that follows.
+
+\subsection{Greedy Recursive Partitioning}
+
+A CART tree partitions the feature space into axis-aligned boxes and predicts a constant in each box. Training proceeds top-down: at each node, consider every feature $j$ and every threshold $t$, evaluate the candidate split $\{x_j \le t\}$ vs.\ $\{x_j > t\}$ by how much it improves a purity criterion, take the best, and recurse on the two children until a stopping rule fires.
+
+Two facts frame everything else:
+\begin{itemize}
+    \item \textbf{Greedy is a heuristic, not an optimum.} Finding the globally optimal decision tree is NP-hard (Hyafil \& Rivest, 1976), so every practical learner is greedy and one-step myopic: a split that looks mediocre now but enables a great split below is invisible to it. Nobody fixes this---ensembles paper over it instead.
+    \item \textbf{The prediction is piecewise constant.} A tree can only output values seen in its leaves (class votes, or means of training targets). This single property explains both the axis-aligned inductive bias that makes trees great on tabular data (Section~\ref{cml:sec:tabular_nn}) and their total inability to extrapolate a trend (Chapter~\ref{cml:chap:time_series}).
+\end{itemize}
+
+\subsection{Impurity Measures}
+
+For a classification node with class proportions $p_1, \ldots, p_K$:
+
+\begin{mathresult}{The Three Classification Impurities}
+\begin{align}
+\text{Gini:} \quad G &= \sum_{k=1}^{K} p_k(1 - p_k) = 1 - \sum_{k=1}^{K} p_k^2 \\
+\text{Entropy:} \quad H &= -\sum_{k=1}^{K} p_k \log_2 p_k \\
+\text{Misclassification error:} \quad E &= 1 - \max_k p_k
+\end{align}
+All three are maximized at the uniform distribution and zero for a pure node. A split of node $P$ (with $n$ samples) into children $L, R$ (with $n_L, n_R$) is scored by the \textbf{impurity decrease} (``information gain'' when the impurity is entropy):
+\begin{equation}
+\Delta = I(P) - \frac{n_L}{n} I(L) - \frac{n_R}{n} I(R)
+\end{equation}
+which is always $\ge 0$ for concave $I$ (Jensen's inequality).
+\end{mathresult}
+
+\textbf{Why Gini and entropy, not misclassification error?} Because Gini and entropy are \textit{strictly} concave in the class proportions, they reward a split that makes children purer even when no child's majority class changes---misclassification error is piecewise linear and often cannot tell two candidate splits apart. The standard worked example: a parent with $(4{+}, 4{-})$.
+\begin{itemize}
+    \item \textbf{Split A} produces children $(3{+}, 1{-})$ and $(1{+}, 3{-})$. Misclassification: each child errs at $1/4$, weighted error $= 1/4$. Gini: each child has $2 \cdot \tfrac{3}{4} \cdot \tfrac{1}{4} = 0.375$, weighted $= 0.375$.
+    \item \textbf{Split B} produces children $(2{+}, 4{-})$ and $(2{+}, 0{-})$. Misclassification: $\tfrac{6}{8}\cdot\tfrac{1}{3} + \tfrac{2}{8}\cdot 0 = 1/4$---\textit{identical} to Split A. Gini: $\tfrac{6}{8}\cdot\tfrac{4}{9} + \tfrac{2}{8}\cdot 0 = 0.333$---strictly better.
+\end{itemize}
+Split B has created a pure node, which is obviously the more promising tree to keep growing, and only the strictly concave criteria can see it. In practice Gini vs.\ entropy is a non-event: they disagree on roughly 2\% of splits and yield indistinguishable trees; Gini is the common default because it avoids the $\log$. Misclassification error still has a role in \textit{pruning}, where the quantity you actually care about is held-out error, not growth potential.
+
+\textbf{A worked information-gain computation} (interviewers ask for numbers, not formulas). Eight emails, 4 spam / 4 ham, so parent entropy $H = 1$ bit. Candidate feature \texttt{contains\_link}: splits into $(3\text{ spam}, 1\text{ ham})$ and $(1\text{ spam}, 3\text{ ham})$; each child has $H = -\tfrac{3}{4}\log_2\tfrac{3}{4} - \tfrac{1}{4}\log_2\tfrac{1}{4} = 0.811$, weighted $0.811$, so $\text{IG} = 1 - 0.811 = 0.189$ bits. Candidate feature \texttt{all\_caps\_subject}: splits into $(2\text{ spam}, 0\text{ ham})$ and $(2\text{ spam}, 4\text{ ham})$; children have $H = 0$ and $H = -\tfrac{1}{3}\log_2\tfrac{1}{3} - \tfrac{2}{3}\log_2\tfrac{2}{3} = 0.918$, weighted $\tfrac{2}{8}\cdot 0 + \tfrac{6}{8}\cdot 0.918 = 0.689$, so $\text{IG} = 0.311$ bits. The second split wins despite touching fewer rows on its pure side---purity gain, weighted by mass, is the whole criterion, and being able to produce this arithmetic unprompted in under a minute is the difference between knowing the formula and owning it.
+
+\textbf{Regression trees} replace impurity with the sum of squared errors around the leaf mean: splitting minimizes $\sum_{i \in L}(y_i - \bar{y}_L)^2 + \sum_{i \in R}(y_i - \bar{y}_R)^2$, i.e., maximizes \textbf{variance reduction}, and the leaf predicts $\bar{y}$ (the SSE-minimizing constant). Everything below about split finding carries over with class counts replaced by running sums.
+
+\subsection{Split Finding and Its Complexity}
+
+The naive algorithm---for each candidate threshold, re-partition the node and recount---is $O(n^2)$ per feature and is the classic thing interviewers watch you avoid in a coding round (Chapter~\ref{cml:chap:coding_canon}). The right algorithm:
+
+\begin{enumerate}
+    \item \textbf{Sort} the node's samples by feature $j$: $O(n \log n)$.
+    \item \textbf{Sweep} left to right, moving one sample at a time from the right child to the left child, updating class counts (classification) or the running $\sum y$ and $\sum y^2$ (regression) in $O(1)$ per step, evaluating the criterion at each boundary between distinct values (thresholds are conventionally midpoints between consecutive distinct values).
+\end{enumerate}
+
+For regression the $O(1)$ update works because $\text{SSE} = \sum y_i^2 - (\sum y_i)^2 / n$: two accumulators per side suffice. (This identity is also why an MAE splitting criterion is dramatically slower---there is no constant-time update for a median.) Per node this is $O(d \, n \log n)$; production implementations sort each feature \textit{once} for the whole tree and maintain sorted order through splits, so a depth-$D$ tree costs $O(d\,n \log n)$ for the presort plus $O(d\,n)$ per level, $O(d\,n(\log n + D))$ total. XGBoost's ``exact greedy'' mode is precisely this, engineered around a pre-sorted columnar layout (Section~\ref{cml:sec:xgboost}); LightGBM replaces the sorted sweep with histograms (Section~\ref{cml:sec:lightgbm}).
+
+\subsection{Stopping and Cost-Complexity Pruning}
+
+Unregularized, a tree grows until every leaf is pure---memorizing the training set. Two control strategies:
+
+\textbf{Pre-stopping (what GBDT libraries use):} \texttt{max\_depth}, minimum samples (or hessian mass) per leaf, minimum impurity decrease. Cheap, but greedy stopping can quit right before a good split.
+
+\textbf{Post-pruning (classic CART):} grow a large tree $T_0$, then minimize the \textbf{cost-complexity criterion}
+\begin{equation}
+R_\alpha(T) = R(T) + \alpha \, |T|,
+\end{equation}
+where $R(T)$ is training error and $|T|$ the number of leaves. As $\alpha$ increases from $0$, the optimal subtree shrinks through a \textit{nested} sequence found by weakest-link pruning (repeatedly collapse the internal node whose removal costs the least per leaf saved); $\alpha$ is then chosen by cross-validation (sklearn's \texttt{ccp\_alpha}). The idea survives in modern form: XGBoost's $\gamma$ is exactly a per-leaf complexity charge applied \textit{inside} the split-gain formula (Section~\ref{cml:sec:xgboost}), so pruning happens against the boosting objective rather than as a separate pass.
+
+\subsection{Categorical Features and Missing Values at the Tree Level}
+
+\textbf{Categoricals.} A categorical feature with $k$ levels admits $2^{k-1}-1$ possible binary partitions---exponential. Two classical escapes:
+\begin{itemize}
+    \item \textbf{The sorting trick.} For binary classification or squared-error regression, sorting the categories by their mean target value and then scanning that ordering as if it were numeric provably finds the \textit{optimal} binary partition (Fisher, 1958; used by CART and, in gradient-statistics form, by LightGBM). This turns $2^{k-1}-1$ candidates into $k-1$.
+    \item \textbf{Encode first.} One-hot works for small $k$ but explodes memory and produces many near-useless binary features at high cardinality (each split isolates one level); target encoding is powerful but is a target-leakage machine unless done out-of-fold---CatBoost's ordered target statistics (Section~\ref{cml:sec:catboost}) are the principled version, and the general leakage taxonomy lives in Chapter~\ref{cml:chap:applied_craft}.
+\end{itemize}
+
+\textbf{Missing values.} Classic CART used \textit{surrogate splits}: at each node, learn backup splits on other features that best mimic the primary split, and route missing values by the best surrogate. Modern GBDTs do something simpler and better: learn a \textbf{default direction} per split by trying missing-goes-left and missing-goes-right and keeping whichever reduces the loss more (Section~\ref{cml:sec:xgboost}). The practical consequence---trees handle missing values natively and can even \textit{exploit informative missingness}---is a genuine advantage over most NN pipelines, which must impute.
+
+\subsection{Why Single Trees Are Not Enough}
+
+\begin{keyinsight}[The Tree Trade: Low Bias Available, High Variance Guaranteed]
+A deep tree is a low-bias, extremely high-variance estimator: it can represent nearly any function on the training data, but tiny perturbations of the data change the root split, and every decision below it, giving a completely different tree. Additionally, the axis-aligned, piecewise-constant hypothesis class means a diagonal linear boundary costs a staircase of many splits, and any smooth trend is approximated by steps that end at the training range. Ensembles exist to fix the variance problem while keeping the (useful) axis-aligned bias: \textbf{bagging/random forests average many high-variance trees to cancel variance; boosting adds many high-bias shallow trees to cancel bias.} That one sentence organizes the entire chapter.
+\end{keyinsight}
+
+Additional single-tree properties worth stating on demand: invariance to any monotone transform of a feature (only the sort order matters---so no scaling, no log-transforms needed for fit, though they may help interpretation); native mixed-type feature handling; interpretability of a \textit{small} tree (a depth-3 tree is a flowchart; a 500-tree ensemble is not, hence Section~\ref{cml:sec:interpretation}); and the extrapolation ceiling (predictions are bounded by the range of training-leaf values---the standard time-series trap, Chapter~\ref{cml:chap:time_series}).
+
+%==============================================================================
 \section{Bagging and Random Forests}
-% TODO Phase C3
+\label{cml:sec:bagging_rf}
+%==============================================================================
 
-\section{Gradient Boosting, Derived Properly}
-% TODO Phase C3
+\subsection{Bootstrap Aggregation and the Variance Algebra}
 
-\section{XGBoost, LightGBM, CatBoost Internals}
-% TODO Phase C3
+Bagging (Breiman, 1996): draw $B$ bootstrap samples (sample $n$ points with replacement), train one deep tree on each, and average their predictions (majority vote for classification). Why this works is a two-line variance calculation that interviewers ask verbatim.
 
-\section{GBM vs.\ Neural Networks for Tabular Data}
-% TODO Phase C3
+\begin{mathresult}{Variance of an Average of Correlated Estimators}
+Let $T_1, \ldots, T_B$ be identically distributed predictors with $\Var(T_b) = \sigma^2$ and pairwise correlation $\rho \ge 0$. Then
+\begin{equation}
+\Var\!\left(\frac{1}{B}\sum_{b=1}^B T_b\right)
+= \frac{1}{B^2}\Big[\, B\sigma^2 + B(B-1)\rho\sigma^2 \Big]
+= \underbrace{\rho\sigma^2}_{\text{correlation floor}} + \underbrace{\frac{1-\rho}{B}\sigma^2}_{\to\, 0 \text{ as } B \to \infty}
+\end{equation}
+Averaging kills the $\frac{1-\rho}{B}\sigma^2$ term but is powerless against $\rho\sigma^2$. Bagging leaves the (small) bias of a deep tree essentially unchanged---the average of identically distributed estimators has the same expectation---so \textbf{bagging is purely a variance-reduction device, and its effectiveness is capped by tree correlation.}
+\end{mathresult}
 
+Bagged trees are substantially correlated in practice: every bootstrap sample contains most of the same strong features, so most trees pick the same root split and resemble each other. That residual $\rho\sigma^2$ is exactly the term random forests attack.
+
+\subsection{Random Forests: Decorrelation by Feature Subsampling}
+
+A random forest (Breiman, 2001) is bagging plus one modification: at \textit{each split}, only a random subset of \texttt{max\_features} (``mtry'') features is eligible---classically $\sqrt{d}$ for classification, $d/3$ for regression. A dominant feature now sits out many splits, forcing trees to discover different structure. In the algebra above, feature subsampling lowers $\rho$ at the cost of somewhat increasing each tree's $\sigma^2$ (and bias); the product $\rho\sigma^2$ usually drops sharply, which is the entire trick. Stated as a slogan for interviews: \textbf{bagging reduces variance; the random-subspace trick reduces the correlation that limits how much variance bagging can remove.}
+
+Because variance decreases monotonically in $B$ and bias is fixed, \textbf{adding trees to a random forest cannot overfit}---performance asymptotes, and the only cost of large $B$ is compute. (``More trees overfit'' is a red-flag confusion with boosting \textit{rounds}, which absolutely do overfit.) The bias claim deserves its one-line justification: each tree is identically distributed, so $\E[\frac{1}{B}\sum_b T_b] = \E[T_1]$---averaging changes nothing about where the estimator points, only how much it wobbles. This is also why RF wants \textit{deep, unpruned} trees: the base learner should carry as little bias as possible, since bias is the one thing the ensemble cannot remove.
+
+Two variations worth knowing at name-drop depth. \textbf{Extremely randomized trees} (ExtraTrees; Geurts et al., 2006) push decorrelation further: thresholds are drawn at \textit{random} per candidate feature rather than optimized, buying lower $\rho$ (and faster training---no split sweep) at the price of more per-tree bias; on noisy data they sometimes edge out RF. And \textbf{subsampling without replacement} ($\sim$63\% draws, ``subagging'') behaves nearly identically to the bootstrap in practice---the bootstrap is not sacred, the perturb-and-average principle is.
+
+\subsection{Out-of-Bag Estimation}
+
+\begin{mathresult}{Each Tree Sees About 63.2\% of the Data}
+The probability that a given training point is absent from one bootstrap draw is $(1 - \tfrac{1}{n})$; absent from all $n$ draws,
+\begin{equation}
+\Big(1 - \frac{1}{n}\Big)^n \;\xrightarrow{\;n \to \infty\;}\; e^{-1} \approx 0.368.
+\end{equation}
+So each tree trains on $\approx 63.2\%$ of the unique points; the remaining $\approx 36.8\%$ are that tree's \textbf{out-of-bag (OOB)} set. Predicting each point using only the trees that did \textit{not} see it (about $B/e$ of them) yields the OOB error---an approximately unbiased generalization estimate obtained \textbf{for free}, with no held-out split.
+\end{mathresult}
+
+OOB error is the random forest's built-in cross-validation: use it to pick \texttt{max\_features} and to monitor whether the forest has enough trees (OOB error plateaus). It is slightly pessimistic (each OOB prediction ensembles only $\sim B/e$ trees rather than $B$), which is worth saying before an interviewer does. OOB samples also power OOB permutation importance.
+
+\subsection{Hyperparameters, Honestly}
+
+The honest headline---backed by the tunability literature (Probst et al., 2019)---is that \textbf{random forests barely need tuning}: defaults (deep unpruned trees, $\sqrt{d}$ features, a few hundred trees) are near-optimal on most problems, which is precisely why RF remains the best ``strong baseline before lunch'' model. The knobs, in order of the little tunability that exists: \texttt{max\_features} (the bias-correlation dial; the one worth a small sweep), \texttt{min\_samples\_leaf} (smooths predictions, helps on noisy targets), \texttt{n\_estimators} (more is monotonically better; pick by compute budget and OOB plateau), \texttt{max\_depth} (rarely needed; RF wants deep trees). Claiming a large RF tuning campaign was decisive is itself a mild red flag---the headroom is usually a point or two, unlike GBDTs where tuning genuinely matters (Section~\ref{cml:sec:hyperparam}).
+
+\subsection{Feature Importance: MDI, Permutation, and the Traps}
+
+\textbf{Mean decrease in impurity (MDI)}---sum each feature's impurity decreases, weighted by node size, across the forest---is the ``free'' importance every library prints, and it is the one you should trust least:
+\begin{itemize}
+    \item \textbf{Cardinality bias.} High-cardinality categoricals and continuous features offer far more candidate split points, so they win splits by chance and accumulate importance even when pure noise. A random ID column can outrank genuinely predictive features.
+    \item \textbf{Computed on training data.} MDI credits splits that memorized noise; an overfit forest reports its overfitting as ``importance.''
+    \item \textbf{Correlated features split credit arbitrarily}, depending on which one each tree happened to pick first.
+\end{itemize}
+
+\textbf{Permutation importance}---shuffle one feature column on \textit{held-out} data and measure the metric drop---fixes the first two problems (it is model-agnostic and evaluated out-of-sample) but not the third: correlated features still dilute each other's scores, and permuting one member of a correlated pair creates off-manifold feature combinations the model never saw. The fuller trap catalog (grouped permutation, drop-column retraining, SHAP's versions of the same diseases) lives in Chapter~\ref{cml:chap:applied_craft}; the interview-safe summary is:
+
+\begin{warningbox}
+Feature importance is a statement about \textit{this model's internals}, not about the world. Never read MDI as ground truth (cardinality bias, train-set computation), never read any importance as causal, and treat a single dominant feature as a \textbf{leakage alarm} before treating it as an insight.
+\end{warningbox}
+
+%==============================================================================
+\section{Gradient Boosting as Functional Gradient Descent}
+\label{cml:sec:boosting_theory}
+%==============================================================================
+
+\subsection{Forward Stagewise Additive Modeling}
+
+Boosting builds an additive model
+\begin{equation}
+F_M(x) = F_0(x) + \sum_{m=1}^{M} \eta\, f_m(x),
+\end{equation}
+where each $f_m$ is a small tree (the ``weak learner''), $\eta$ is the learning rate, and $F_0$ is a constant base score (the target mean for squared loss; the log-odds prior for log loss). Training is \textbf{forward stagewise}: at stage $m$, all previous trees are frozen and we greedily pick the next tree to most reduce the loss:
+\begin{equation}
+f_m = \argmin_{f \in \mathcal{F}} \sum_{i=1}^n L\big(y_i,\; F_{m-1}(x_i) + f(x_i)\big).
+\end{equation}
+This inner problem is itself intractable over the space of trees $\mathcal{F}$, and the entire content of ``gradient'' boosting is the trick that makes it tractable.
+
+\subsection{The Functional Gradient Descent View}
+
+\begin{mathresult}{Gradient Boosting = Gradient Descent in Function Space}
+Treat the vector of training predictions $\bm{F} = (F(x_1), \ldots, F(x_n))$ as the ``parameters.'' The steepest-descent direction for the empirical loss is the negative gradient with one coordinate per training point:
+\begin{equation}
+r_i^{(m)} = -\left.\frac{\partial L\big(y_i, F(x_i)\big)}{\partial F(x_i)}\right|_{F = F_{m-1}} \qquad \text{(the \textbf{pseudo-residuals})}.
+\end{equation}
+An unconstrained gradient step $F(x_i) \mathrel{+}= \eta\, r_i$ would only update predictions at the $n$ training points---useless for generalization. Instead, \textbf{project the step onto the weak-learner class}: fit a small tree to the pseudo-residuals by least squares,
+\begin{equation}
+f_m = \argmin_{f \in \mathcal{F}} \sum_{i=1}^n \big(r_i^{(m)} - f(x_i)\big)^2,
+\end{equation}
+then update $F_m = F_{m-1} + \eta f_m$ (Friedman's TreeBoost additionally re-solves the optimal constant per leaf by line search). Each boosting round is one gradient-descent step in function space, with the tree as a smoothed, generalizable stand-in for the gradient; $\eta$ is the step size.
+
+\textbf{Special cases every candidate must produce on demand:}
+\begin{itemize}
+    \item Squared loss $L = \tfrac{1}{2}(y - F)^2$: $\;r_i = y_i - F_{m-1}(x_i)$ --- pseudo-residuals are \textit{literal residuals}. This is where the folk description ``boosting fits the residuals'' comes from.
+    \item Log loss with $F$ a logit, $p_i = \sigma(F_{m-1}(x_i))$: $\;r_i = y_i - p_i$.
+    \item Absolute loss: $\;r_i = \operatorname{sign}(y_i - F_{m-1}(x_i))$ --- fitting signs, not residuals, which is why quantile/MAE boosting behaves differently.
+\end{itemize}
+\end{mathresult}
+
+\begin{warningbox}
+``Gradient boosting fits the residuals'' stated as the general mechanism is a classic red flag. Residual fitting is the \textbf{squared-loss special case}; the general mechanism is fitting the \textbf{negative gradient of whatever loss you chose}. The distinction is not pedantry---it is the entire reason GBDTs can optimize log loss, quantile loss, Poisson deviance, or a ranking objective like LambdaRank [SR 5] with the same tree machinery.
+\end{warningbox}
+
+Table~\ref{cml:tab:boosting_losses} collects the gradient interface for the losses that actually come up---this is the table to have memorized, because ``what are the pseudo-residuals for loss X'' is the standard follow-up chain, and the zero-hessian rows explain real library behavior (second-order methods must fall back to unit hessians or per-leaf line search for MAE/quantile objectives).
+
+\begin{table}[H]
+\centering
+\small
+\caption{The gradient interface: $g_i = \partial L / \partial F(x_i)$, $h_i = \partial^2 L / \partial F(x_i)^2$}
+\label{cml:tab:boosting_losses}
+\begin{tabularx}{\textwidth}{llllX}
+\toprule
+\textbf{Task} & \textbf{Loss} & $\bm{-g_i}$ \textbf{(pseudo-residual)} & $\bm{h_i}$ & \textbf{Note} \\
+\midrule
+Regression & Squared $\tfrac{1}{2}(y-F)^2$ & $y_i - F(x_i)$ & $1$ & The ``fit the residuals'' special case \\
+Regression & Absolute $|y-F|$ & $\operatorname{sign}(y_i - F(x_i))$ & $0$ & Fits signs; robust; needs line search \\
+Regression & Huber & clipped residual & $1$ or $0$ & Quadratic near, linear far; robust compromise \\
+Classification & Log loss ($F$ = logit) & $y_i - p_i$ & $p_i(1-p_i)$ & $p_i = \sigma(F(x_i))$; hessian $\le 1/4$ \\
+Counts & Poisson ($F = \log\mu$) & $y_i - \mu_i$ & $\mu_i$ & $\mu_i = e^{F(x_i)}$; insurance/demand workhorse \\
+Quantiles & Pinball at $\tau$ & $\tau - \mathds{1}[y_i < F(x_i)]$ & $0$ & Prediction intervals from GBDTs (Chapter~\ref{cml:chap:probabilistic_foundations}) \\
+Ranking & LambdaRank & $\lambda_i$ (NDCG-weighted pairs) & pair-based & LambdaMART [SR 5] \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Why the weak learners are shallow.} A depth-$D$ tree can represent interactions among at most $D$ features along any root-to-leaf path, so tree depth is an \textit{interaction-order} dial: stumps ($D=1$) yield a purely additive model (a GAM fit by boosting), depth 2 admits pairwise interactions, and so on. Most tabular signal lives at low interaction order, which is why depth 3--8 covers almost every problem and why cranking depth mostly buys variance. This ``interaction depth'' reading is the substantive answer to ``why does boosting use shallow trees while RF uses deep ones''---it is not a compute shortcut, it is a bias budget allocated one interaction order at a time.
+
+\textbf{AdaBoost, in one paragraph.} AdaBoost (Freund \& Schapire, 1997) predates this view and is recovered as forward stagewise minimization of the \textit{exponential loss} $L = e^{-yF}$, $y \in \{-1,+1\}$: the stagewise algebra turns into the familiar recipe of reweighting misclassified samples ($w_i \propto e^{-y_i F(x_i)}$) and combining stumps with weights $\alpha_m = \tfrac{1}{2}\log\frac{1-\text{err}_m}{\text{err}_m}$. The correct modern framing for the inevitable follow-up: AdaBoost is gradient boosting with a specific (exponential) loss, discovered before the general theory (Friedman, Hastie \& Tibshirani, 2000); the exponential loss's aggressive weighting of hard examples also explains AdaBoost's outlier sensitivity, and log loss is preferred today.
+
+\subsection{Shrinkage and Stochastic Subsampling}
+
+\textbf{Shrinkage.} The learning rate $\eta \in (0, 1]$ scales every tree's contribution. Small $\eta$ with proportionally more rounds almost always generalizes better than large $\eta$ with few rounds: each step corrects less, leaving more of the signal to be re-examined by later trees under fresh subsamples---a regularization effect empirically robust since Friedman (2001). The operational consequence is that $\eta$ and $M$ (\texttt{n\_estimators}) are \textbf{one joint knob}: halve $\eta$, roughly double $M$, and always let early stopping on a validation set choose $M$ rather than tuning it directly (Section~\ref{cml:sec:hyperparam}).
+
+\textbf{Stochastic gradient boosting} (Friedman, 2002): fit each tree on a random subsample of rows (without replacement, typically 50--80\%). This decorrelates consecutive trees, adds variance reduction reminiscent of bagging, and speeds training; column subsampling per tree/level/split does the same on the feature side. Modern libraries expose both (\texttt{subsample}, \texttt{colsample\_*} / \texttt{feature\_fraction}).
+
+\subsection{Second-Order (Newton) Boosting}
+
+First-order boosting fits the gradient; nothing stops us from using curvature too. Define, per sample,
+\begin{equation}
+g_i = \frac{\partial L(y_i, F(x_i))}{\partial F(x_i)}\bigg|_{F_{m-1}}, \qquad
+h_i = \frac{\partial^2 L(y_i, F(x_i))}{\partial F(x_i)^2}\bigg|_{F_{m-1}}.
+\end{equation}
+A second-order Taylor expansion of the stagewise objective turns each round into a \textbf{weighted least-squares} problem: minimize $\sum_i \tfrac{1}{2} h_i \big(f(x_i) - (-g_i/h_i)\big)^2 + \text{const}$, i.e., fit the Newton step $-g_i/h_i$ with sample weights $h_i$. For log loss, $g_i = p_i - y_i$ and $h_i = p_i(1-p_i)$: confidently predicted samples get tiny hessians and correspondingly little say in where splits go. This Newton view---LogitBoost was the early instance---is the mathematical foundation of XGBoost, where it is combined with explicit regularization and solved in closed form per leaf. That derivation is the next section, and it is the single most-asked whiteboard exercise in the classical-ML canon.
+
+\begin{keyinsight}[Boosting Attacks Bias; Bagging Attacks Variance]
+A boosted ensemble is a sum of \textit{shallow, high-bias} trees, each correcting the systematic errors of the sum so far: sequential error-fixing drives bias down, and with enough rounds the ensemble can fit anything---\textbf{including noise, so boosting overfits in $M$} and demands early stopping and shrinkage. A random forest is an average of \textit{deep, low-bias, high-variance} trees: averaging drives variance down and \textbf{cannot overfit in $B$}. This asymmetry---which knob fights which error term, and which ensemble can be run ``too long''---is the cleanest bias-variance instantiation in classical ML ([DL 2] for the decomposition itself) and the backbone of the random-forest-vs-GBDT interview answer.
+\end{keyinsight}
+
+%==============================================================================
+\section{XGBoost Internals}
+\label{cml:sec:xgboost}
+%==============================================================================
+
+XGBoost (Chen \& Guestrin, 2016) is Newton boosting with regularization built into the objective, plus a set of systems contributions (sparsity-aware split finding, weighted quantile sketch, cache-aware columnar layout) that made it the tool that won half a decade of Kaggle and became the tabular workhorse. Interviews at senior levels reliably probe the objective derivation---it is short, closed-form, and cleanly separates ``used XGBoost'' from ``understands XGBoost.''
+
+\subsection{The Regularized Objective}
+
+At round $m$, with predictions $\hat{y}_i^{(m-1)} = F_{m-1}(x_i)$ frozen, XGBoost seeks the tree $f$ minimizing
+\begin{equation}
+\loss^{(m)} = \sum_{i=1}^{n} L\big(y_i,\, \hat{y}_i^{(m-1)} + f(x_i)\big) + \Omega(f), \qquad
+\Omega(f) = \gamma T + \frac{\lambda}{2} \sum_{j=1}^{T} w_j^2 \;\big(+\, \alpha \|w\|_1\big),
+\end{equation}
+where the tree is parameterized by its structure $q: \R^d \to \{1, \ldots, T\}$ (which leaf each point falls in) and its leaf weights $w \in \R^T$, so $f(x) = w_{q(x)}$. The complexity penalty is \textit{part of the training objective}, not a bolt-on: $\gamma$ charges for each leaf, $\lambda$ (L2) shrinks leaf values, $\alpha$ (L1) can zero them. This is the first structural difference from classic gradient boosting, which regularizes only implicitly (shrinkage, depth limits).
+
+\begin{mathresult}{The Classic Derivation: Optimal Leaf Weights and Split Gain}
+\textbf{Step 1 --- Taylor-expand the loss to second order} around the current predictions:
+\begin{equation}
+L\big(y_i, \hat{y}_i^{(m-1)} + f(x_i)\big) \approx L\big(y_i, \hat{y}_i^{(m-1)}\big) + g_i f(x_i) + \frac{1}{2} h_i f(x_i)^2,
+\end{equation}
+with $g_i, h_i$ the first and second derivatives of the loss w.r.t.\ the prediction. Dropping the constant first term:
+\begin{equation}
+\tilde{\loss}^{(m)} = \sum_{i=1}^n \Big[ g_i f(x_i) + \frac{1}{2} h_i f(x_i)^2 \Big] + \gamma T + \frac{\lambda}{2}\sum_{j=1}^T w_j^2.
+\end{equation}
+\textbf{Step 2 --- Group by leaf.} Let $I_j = \{i : q(x_i) = j\}$, $G_j = \sum_{i \in I_j} g_i$, $H_j = \sum_{i \in I_j} h_i$. Since $f(x_i) = w_j$ for all $i \in I_j$:
+\begin{equation}
+\tilde{\loss}^{(m)} = \sum_{j=1}^{T} \Big[ G_j w_j + \frac{1}{2}\big(H_j + \lambda\big) w_j^2 \Big] + \gamma T.
+\end{equation}
+The objective has \textbf{decoupled into $T$ independent one-dimensional quadratics} in the $w_j$.
+
+\textbf{Step 3 --- Minimize each quadratic.} Setting $\partial/\partial w_j = G_j + (H_j + \lambda) w_j = 0$:
+\begin{equation}
+\boxed{\; w_j^{*} = -\frac{G_j}{H_j + \lambda} \;}
+\qquad \text{giving} \qquad
+\tilde{\loss}^{(m)}(q) = -\frac{1}{2} \sum_{j=1}^{T} \frac{G_j^2}{H_j + \lambda} + \gamma T.
+\end{equation}
+The quantity $\frac{G_j^2}{H_j+\lambda}$ is the \textbf{structure score} of a leaf: how much loss reduction the leaf buys. It depends only on sums of gradients and hessians---one reason the whole algorithm vectorizes and distributes so well.
+
+\textbf{Step 4 --- Score a split.} Splitting a node with statistics $(G, H)$ into children $(G_L, H_L)$ and $(G_R, H_R)$ ($G = G_L + G_R$, $H = H_L + H_R$) changes the objective by
+\begin{equation}
+\boxed{\;\text{Gain} = \frac{1}{2}\left[ \frac{G_L^2}{H_L + \lambda} + \frac{G_R^2}{H_R + \lambda} - \frac{(G_L + G_R)^2}{H_L + H_R + \lambda} \right] - \gamma \;}
+\end{equation}
+Grow the tree by taking the split with the largest gain at each node; a split with $\text{Gain} < 0$ is not worth its $\gamma$ price---cost-complexity pruning re-derived inside the boosting objective.
+
+\textbf{Sanity checks worth saying aloud.} For squared loss ($g_i = \hat{y}_i - y_i$, $h_i = 1$): $w_j^* = \frac{\sum_{i \in I_j}(y_i - \hat{y}_i)}{|I_j| + \lambda}$---the mean residual, ridge-shrunk toward zero; with $\lambda = 0$ classic residual-fitting TreeBoost is recovered exactly. For log loss: $g_i = p_i - y_i$, $h_i = p_i(1-p_i)$, and $w_j^*$ is a regularized Newton step in logit space.
+\end{mathresult}
+
+\subsection{Reading the Formulas Like an Interviewer}
+
+\begin{itemize}
+    \item \textbf{$\lambda$ acts through every leaf value and every gain.} Larger $\lambda$ shrinks $w^*$ and deflates structure scores of small-$H$ leaves the most---leaves supported by little (hessian-weighted) evidence.
+    \item \textbf{$\gamma$ is a split admission fee}, directly comparable to gain units; it is the modern $\alpha$ of cost-complexity pruning.
+    \item \textbf{\texttt{min\_child\_weight} is a hessian floor, not a sample count.} It requires $H_{\text{child}} \ge$ threshold. For squared loss $h_i = 1$, so it literally is a minimum child size; for log loss $h_i = p_i(1-p_i) \le 1/4$, so regions where the model is already confident have small hessian mass and get split-blocked early. That is the intended behavior---confident regions provide almost no curvature information, and splits there fit noise---and it is why the same \texttt{min\_child\_weight} value means very different things across objectives (a favorite follow-up).
+\end{itemize}
+
+\subsection{Split Finding: Exact Greedy vs.\ Approximate}
+
+\textbf{Exact greedy}: for each node and feature, scan all sorted feature values accumulating $(G_L, H_L)$ and evaluate the gain at each boundary---the CART sweep of Section~\ref{cml:sec:cart} with $(g, h)$ sums instead of class counts. Exact but expensive at scale and awkward to distribute.
+
+\textbf{Approximate split finding}: propose a small candidate-threshold set (``global'' per tree, or ``local'' per node) and bucket samples into it. The subtlety is how to choose candidates: plain quantiles of the feature are wrong because samples are not equally important to the second-order objective. Since round-$m$ training is weighted least squares with weights $h_i$ (Section~\ref{cml:sec:boosting_theory}), XGBoost uses a \textbf{weighted quantile sketch}: candidates are equi-mass quantiles under the \textit{hessian} distribution, computed by a mergeable, prunable sketch structure with provable approximation bounds so it works on distributed shards. One sentence of intuition suffices in interviews: ``split candidates should be evenly spaced in evidence, not in feature value, and $h_i$ is the evidence weight the Taylor expansion hands you.''
+
+\textbf{Sparsity-aware default directions.} Real tabular matrices are full of missing values, zeros from one-hot blocks, and sparse counts. XGBoost scans only the \textit{non-missing} values of a feature---twice, once assigning all missing-value samples to the left child and once to the right---and keeps the better \textbf{default direction} per split. Cost becomes linear in non-missing entries (a huge win on sparse data), and missingness itself becomes learnable signal. At prediction time, a missing value simply follows the stored default arrow.
+
+\textbf{Systems, in one paragraph.} XGBoost stores data in compressed column (CSC) blocks pre-sorted by feature value once before training, so split scans are sequential reads rather than re-sorts; gradient lookups from sorted feature order are cache-hostile, so scans prefetch gradient statistics into per-thread buffers; blocks shard across disk/machines for out-of-core and distributed training. None of this changes the math---it is why the math runs fast---and modern XGBoost defaults to the histogram method (\texttt{tree\_method=hist}), adopting the binning strategy that LightGBM proved out, which is the next section.
+
+\subsection{One Boosting Round, End to End}
+
+Worth being able to narrate as a closed loop---it is also the skeleton of the coding-round exercise (Chapter~\ref{cml:chap:coding_canon}):
+\begin{enumerate}
+    \item From current predictions $\hat{y}^{(m-1)}$, compute $g_i, h_i$ for every sample (one vectorized pass; for log loss, $p_i = \sigma(\hat{y}_i)$, $g_i = p_i - y_i$, $h_i = p_i(1-p_i)$).
+    \item Optionally subsample rows (\texttt{subsample}/GOSS) and columns for this round.
+    \item Grow the tree greedily: at each node, for each (sampled) feature, scan candidate thresholds---exact sorted sweep or histogram bins---accumulating $(G_L, H_L)$ and scoring the gain formula; respect \texttt{min\_child\_weight} ($H$ floors) and learn the missing-value default direction; recurse until depth/leaf limits.
+    \item Prune: drop splits whose gain does not cover $\gamma$ (bottom-up for depth-wise growth).
+    \item Set leaf values $w_j^* = -G_j/(H_j + \lambda)$ and update $\hat{y}^{(m)} = \hat{y}^{(m-1)} + \eta\, w_{q(x)}$.
+    \item Score the validation set; early stopping ends training when it stops improving.
+\end{enumerate}
+Two loops, a sort or histogram, and a ratio---the entire mystique of the tool that wins tabular ML reduces to this, which is exactly why interviewers feel entitled to ask for it from memory.
+
+%==============================================================================
+\section{LightGBM}
+\label{cml:sec:lightgbm}
+%==============================================================================
+
+LightGBM (Ke et al., 2017) keeps XGBoost's second-order objective and changes the engineering around it: histogram split finding, leaf-wise growth, and two sampling tricks (GOSS, EFB) aimed at very large $n$ and very wide, sparse $d$.
+
+\subsection{Histogram-Based Split Finding}
+
+Discretize each feature once, up front, into at most \texttt{max\_bin} buckets (default 255, so a bin index fits in one byte). Split finding at a node then has two phases:
+\begin{itemize}
+    \item \textbf{Build}: one pass over the node's samples accumulating $(\sum g, \sum h)$ per bin --- $O(n \cdot d)$ with tiny constants (byte reads, no sort).
+    \item \textbf{Scan}: evaluate the gain at each bin boundary --- $O(\texttt{bins} \cdot d)$, independent of $n$.
+\end{itemize}
+Two multipliers make this even better. First, the \textbf{histogram subtraction trick}: a node's histogram equals its parent's minus its sibling's, so only the \textit{smaller} child ever needs a build pass---the larger child's histograms come from a subtraction at $O(\texttt{bins} \cdot d)$. Second, binning shrinks memory (uint8 bins vs.\ sorted 32-bit indices), which is often the difference between in-memory and out-of-core training. The accuracy cost of coarse thresholds is negligible in practice---boosting's later trees mop up quantization error, and 255 thresholds per feature is plenty.
+
+\subsection{Leaf-Wise Growth with a Depth Guard}
+
+Classic XGBoost grows \textbf{level-wise} (depth-wise): expand every node at the current depth, yielding balanced trees. LightGBM grows \textbf{leaf-wise} (best-first): repeatedly split the single leaf with the largest gain anywhere in the tree, until \texttt{num\_leaves} is reached. For a fixed leaf budget, leaf-wise growth achieves lower training loss---it spends its budget where the gain is, producing deep, lopsided trees that chase structure (and, on small or noisy data, chase noise). Hence the standard discipline: \textbf{\texttt{num\_leaves} is the capacity knob} (default 31), \texttt{max\_depth} is a guard against pathological depth, and \texttt{min\_data\_in\_leaf} (default 20) keeps lopsided branches honest. The classic failure mode of an untuned LightGBM on 10K rows---train metric superb, validation mediocre---is usually \texttt{num\_leaves} left large with no leaf-size floor.
+
+\subsection{GOSS: Gradient-Based One-Side Sampling}
+
+Samples with small gradients are already well fit; they contribute little to gain estimates. GOSS keeps the information-dense samples and subsamples the rest:
+\begin{itemize}
+    \item Keep the top $a \times 100\%$ of samples by $|g_i|$.
+    \item Randomly sample $b \times 100\%$ of the remaining small-gradient samples.
+    \item Multiply the sampled small-gradient samples' statistics by $\frac{1-a}{b}$ in the gain computation, compensating for the ones dropped so the data distribution (and the split-gain estimates) stay approximately unbiased.
+\end{itemize}
+The result is bagging-like speedup concentrated where it is safe. GOSS is off by default (\texttt{boosting=goss} enables it); it typically buys 2--3$\times$ per-iteration speedups at little to no accuracy cost on large data, and matters less on small data where you would not subsample anyway.
+
+\subsection{EFB: Exclusive Feature Bundling}
+
+Wide sparse data (one-hot blocks, count features) contains many features that are almost never nonzero \textit{simultaneously}---mutually exclusive in the graph-coloring sense. EFB greedily bundles nearly-exclusive features into one composite feature, giving each member its own bin range inside the bundle so the histogram can still tell them apart. Histogram cost drops from $O(n \cdot d)$ to $O(n \cdot \texttt{bundles})$, which on one-hot-heavy data is the difference between ``wide'' and ``narrow.'' Conceptually: EFB recovers, automatically and lossily-but-boundedly, the compactness that one-hot encoding destroyed.
+
+\subsection{Native Categorical Splits}
+
+LightGBM implements the Fisher sorting trick under the second-order objective: at a node, order a feature's categories by $\sum g / \sum h$ (their gradient-statistics ``mean response''), then scan that ordering for the best split into two category sets---an optimal-partition search in $O(k \log k)$ rather than $2^{k-1}-1$. Guards against high-cardinality overfitting: \texttt{max\_cat\_threshold} caps the partition search, \texttt{cat\_smooth} shrinks per-category statistics, \texttt{min\_data\_per\_group} floors category support. Native splits usually beat one-hot for $k \gtrsim 10$ and are far cheaper; at very high cardinality (user IDs), target-statistics encoding or embeddings remain the better tool (Section~\ref{cml:sec:catboost}, Chapter~\ref{cml:chap:applied_craft}).
+
+\subsection{LightGBM vs.\ XGBoost in Practice}
+
+The 2026-honest summary: \textbf{accuracy differences are small and dataset-dependent; the choice is about speed, features, and ecosystem.} LightGBM typically trains fastest at large $n$/wide $d$ and popularized the histogram + leaf-wise combination; XGBoost has since adopted histograms (\texttt{hist}, GPU variants) and closed most of the speed gap, retains more conservative level-wise defaults (harder to overfit out of the box), and has the deepest ecosystem integration (Spark, Ray, SageMaker, every serving stack). Interview-safe guidance: on large tabular data default to LightGBM for iteration speed; on small data prefer conservative settings whichever library you use; treat a claimed accuracy edge of either as noise until proven on \textit{your} data; and consider CatBoost when categoricals dominate---next section.
+
+%==============================================================================
+\section{CatBoost}
+\label{cml:sec:catboost}
+%==============================================================================
+
+CatBoost (Prokhorenkova et al., 2018) is the third member of the trinity, built around one statistical idea---\textbf{both categorical encoding and boosting itself leak the target if a row's own label influences the statistics used to fit that row}---and one architectural one (oblivious trees).
+
+\subsection{Target Statistics and the Leakage Problem}
+
+Target encoding replaces category $c$ with a statistic of the target over rows in that category, typically smoothed toward the global prior $P$:
+\begin{equation}
+\hat{x}_i = \frac{\sum_{j \ne i} \mathds{1}[c_j = c_i]\, y_j + a P}{\sum_{j \ne i} \mathds{1}[c_j = c_i] + a}.
+\end{equation}
+It is the only encoding that scales to very high cardinality with no dimensionality cost---and computed naively (over the \textit{full} training set, including row $i$ itself), it is a target-leakage machine.
+
+\begin{warningbox}
+\textbf{Worked mini-example of the leak.} Suppose \texttt{merchant\_id = M1729} appears exactly once in training, on a fraudulent transaction ($y=1$). Naive unsmoothed target encoding assigns that row the feature value $1.0$---\textit{the row's own label, copied into a feature}. Even with smoothing $a$, the row's encoding is pulled toward its own label; across thousands of rare categories the encoded feature becomes a noisy copy of $y$, trees split on it immediately, training metrics soar, and validation collapses. The signature is unmistakable: a target-encoded high-cardinality feature at the top of the importance list with a too-good-to-be-true training score. The general taxonomy of such bugs is Chapter~\ref{cml:chap:applied_craft}; the fix used outside CatBoost is out-of-fold encoding (compute row $i$'s statistic from folds not containing $i$).
+\end{warningbox}
+
+\subsection{Ordered Target Statistics}
+
+CatBoost's fix is a streaming version of ``only use the past'': draw a random permutation $\sigma$ of the training rows and encode row $i$ using \textbf{only the rows that precede it in $\sigma$}:
+\begin{equation}
+\hat{x}_i = \frac{\sum_{\sigma(j) < \sigma(i)} \mathds{1}[c_j = c_i]\, y_j + a P}{\sum_{\sigma(j) < \sigma(i)} \mathds{1}[c_j = c_i] + a}.
+\end{equation}
+Row $i$'s own label can never touch row $i$'s feature---the estimate behaves like an online mean over an artificial ``history.'' Early rows get noisy, prior-dominated encodings, so CatBoost uses several permutations across iterations to average that noise out. It also generates \textit{combinations} of categorical features (greedy, per split) with the same ordered statistics, capturing interactions like region $\times$ device that a single encoding misses.
+
+\subsection{Ordered Boosting and Prediction Shift}
+
+The subtler observation of the CatBoost paper: \textbf{plain gradient boosting has the same disease}. The residual/gradient $g_i$ for row $i$ is computed from $F_{m-1}$---a model that was itself \textit{fit on row $i$}. Predictions on training rows are systematically closer to their labels than predictions on fresh data would be, so the gradients are biased (``prediction shift''), and each round compounds the bias: the ensemble is slightly overfit by construction, most visibly on small datasets. \textbf{Ordered boosting} applies the permutation idea to the boosting loop itself: conceptually, maintain models such that the residual for row $i$ comes from a model trained only on rows preceding $i$ in $\sigma$---never on $i$ itself. Maintaining $n$ models is infeasible, so CatBoost approximates with a logarithmic number of support models over a few permutations; the cost is extra training time, which is why ordered boosting is the default only up to moderate dataset sizes (its \texttt{Plain} mode is standard boosting). Intuition-level fluency here is enough for interviews: \textit{ordered statistics fix target leakage through features; ordered boosting fixes target leakage through the residuals}.
+
+\subsection{Oblivious (Symmetric) Trees}
+
+CatBoost's base learner uses the \textbf{same split (feature, threshold) across an entire level}: a depth-$D$ oblivious tree is a sequence of $D$ binary tests, and every sample's leaf is just the $D$-bit vector of test outcomes indexing a $2^D$-entry table. Consequences: each tree is a weaker, heavily regularized learner (good for generalization, more rounds needed); and inference is spectacular---no per-node branching, just $D$ comparisons and a table lookup, vectorizing across trees and samples---which is why CatBoost routinely wins pure model-inference latency benchmarks among the three libraries.
+
+\subsection{When CatBoost Wins}
+
+Choose CatBoost when categorical features carry the signal---especially many mid-to-high-cardinality ones---on small-to-mid data where leakage and prediction shift bite hardest, or when you want strong accuracy with minimal tuning (its defaults, including an auto-set learning rate, are the most robust of the three). Costs: typically the slowest training of the trio at large scale, and a smaller ecosystem. Table~\ref{cml:tab:gbdt_libraries} summarizes the trinity.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The GBDT trinity at a glance}
+\label{cml:tab:gbdt_libraries}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Dimension} & \textbf{XGBoost} & \textbf{LightGBM} & \textbf{CatBoost} \\
+\midrule
+Tree growth & Level-wise default (leaf-wise available) & Leaf-wise, \texttt{num\_leaves} capacity & Oblivious (symmetric) trees \\
+Split finding & Exact greedy or histogram; weighted quantile sketch & Histogram (binned, subtraction trick) & Histogram on top of ordered statistics \\
+Categoricals & Native support recent; commonly encoded upstream & Native $\sum g/\sum h$-sorted optimal partitions & Ordered target statistics + feature combinations (the headline feature) \\
+Overfitting posture & Conservative defaults; explicit $\gamma, \lambda, \alpha$ & Fastest, most eager; needs care with \texttt{num\_leaves} and \texttt{min\_data\_in\_leaf} & Most regularized by construction (ordered boosting, symmetric trees) \\
+Speed profile & Fast; deepest distributed/ecosystem support & Usually fastest training at scale (GOSS, EFB) & Slowest training; fastest model inference \\
+Pick when & Default ecosystem choice; ranking objectives mature [SR 5] & Large $n$ or wide sparse $d$; iteration speed matters & Heavy categoricals; small-mid data; minimal tuning budget \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Hyperparameter Craft}
+\label{cml:sec:hyperparam}
+%==============================================================================
+
+GBDTs expose dozens of parameters; roughly eight matter, and interviewers care less about the list than about whether you know \textit{which direction each one moves the bias-variance needle} and \textit{in what order to touch them}.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The eight knobs that matter (XGBoost / LightGBM names)}
+\label{cml:tab:gbdt_knobs}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Knob} & \textbf{What it controls} & \textbf{Overfitting? Move it\ldots} \\
+\midrule
+\texttt{n\_estimators} + early stopping & Number of boosting rounds $M$ & Set $M$ high, let early stopping on a validation set choose; never hand-tune \\
+\texttt{learning\_rate} ($\eta$) & Step size per round; joint knob with $M$ & Down (with more rounds); 0.02--0.1 typical for final models \\
+\texttt{max\_depth} / \texttt{num\_leaves} & Per-tree capacity (interaction order) & Down; depth 3--8 / leaves 15--127 cover most problems \\
+\texttt{min\_child\_weight} / \texttt{min\_data\_in\_leaf} & Evidence floor per leaf (hessian mass / row count) & Up; blocks noise-chasing splits \\
+\texttt{subsample} / \texttt{bagging\_fraction} & Row sampling per round (stochastic GB) & Down toward 0.6--0.8; adds decorrelation \\
+\texttt{colsample\_bytree} / \texttt{feature\_fraction} & Column sampling & Down toward 0.6--0.8; the RF trick inside boosting \\
+$\lambda$, $\alpha$ (\texttt{reg\_lambda}, \texttt{reg\_alpha}), $\gamma$ & Leaf-value shrinkage (L2/L1), split admission fee & Up; acts inside every gain via Section~\ref{cml:sec:xgboost} \\
+Categorical handling & Native vs.\ one-hot vs.\ target/ordered statistics & Not a dial but a decision; wrong choice dominates all other tuning on categorical-heavy data \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{A sane tuning order.} (1) Fix $\eta \approx 0.05$--$0.1$, \texttt{n\_estimators} large, early stopping on (say 50--200 rounds patience). (2) Tune capacity: \texttt{max\_depth}/\texttt{num\_leaves} together with the leaf floor \texttt{min\_child\_weight}/\texttt{min\_data\_in\_leaf}---this pair moves validation metrics most. (3) Tune \texttt{subsample} and \texttt{colsample} (coarse grid, 0.6--1.0). (4) Nudge $\lambda$/$\gamma$ if the train-validation gap is still wide. (5) For the final model, halve $\eta$, refit with early stopping, and stop---returns beyond this are usually noise. Random or Bayesian search over this space beats grid search (Chapter~\ref{cml:chap:applied_craft}); and any tuning claim needs an honest validation protocol, or the winner's curse eats the reported gain.
+
+\textbf{The overfitting-diagnosis loop.} This is bias-variance triage ([DL 2] owns the decomposition; here it is instantiated):
+\begin{itemize}
+    \item \textbf{Train metric excellent, validation flat or degrading (variance problem---the common case):} early stopping first (it is the fix for ``got worse after round $k$'' by construction); then capacity down, leaf floors up, subsampling on, regularization up, $\eta$ down with more rounds.
+    \item \textbf{Train and validation both poor (bias problem):} capacity up, leaf floors down, more rounds at lower $\eta$; if the ceiling persists, the model is not the bottleneck---engineer features (interactions trees cannot see, e.g., ratios; better encodings) or question the labels.
+    \item \textbf{Validation great, production poor:} not a hyperparameter problem---suspect leakage or drift before touching a knob (Chapter~\ref{cml:chap:applied_craft}, [DL 22]).
+\end{itemize}
+
+%==============================================================================
+\section{GBDT vs.\ Neural Networks on Tabular Data}
+\label{cml:sec:tabular_nn}
+%==============================================================================
+
+The full decision-framework interview question lives in the deep-learning volume [DL 24]; this section supplies the classical-side mechanism---\textit{why} the inductive bias of trees fits tabular data---plus the 2024--26 status update.
+
+\subsection{The Inductive-Bias Story}
+
+Grinsztajn et al.\ (2022, NeurIPS Datasets \& Benchmarks) ran the cleanest controlled comparison to date (45 mid-size tabular datasets, tuned baselines on both sides: XGBoost/RF vs.\ MLP/ResNet/FT-Transformer) and, more usefully, isolated \textbf{three mechanisms} for why tuned GBDTs still won on medium data:
+\begin{enumerate}
+    \item \textbf{Tabular target functions are irregular.} NN training is biased toward smooth functions (a feature, not a bug, for images and audio); tabular targets are full of sharp thresholds and plateaus. Smoothing the targets hurt trees and barely affected NNs---evidence the un-smooth component is real signal that piecewise-constant splits capture natively.
+    \item \textbf{Uninformative features hurt NNs more.} Tabular datasets carry many weakly-or-un-informative columns. Removing them narrowed the tree-NN gap; adding noise features widened it. Trees simply stop splitting on useless features; MLP-class models must learn to ignore them in every direction of a rotating representation.
+    \item \textbf{Rotation invariance is the wrong symmetry.} An MLP's first layer sees the data only up to rotation of feature space; randomly rotating tabular features leaves MLP performance roughly unchanged but degrades trees badly---and after rotation, NNs come out \textit{ahead}. Read correctly, this says the original feature axes carry meaning (\texttt{age}, \texttt{income}, \texttt{days\_since\_last\_login} are individually semantic), and the tree's axis-aligned ``bias'' is precisely the alignment with how tabular data is generated. Trees are \textbf{not} rotation-invariant, and on tables that is a feature.
+\end{enumerate}
+
+\begin{keyinsight}[Inductive-Bias Match Beats Capacity]
+Nothing about tables makes them ``too hard'' for neural networks---the point is the opposite. NNs bring smoothness and rotation invariance as priors; tabular data offers irregular, axis-aligned structure with junk columns, heterogeneous scales, and missing values. GBDTs bring exactly matching priors (piecewise-constant, axis-aligned, monotone-transform-invariant, split-level feature selection, native missingness) plus a training procedure that is minutes-fast and hard to destabilize. When the modality changes---raw text, images, sequences, or IDs needing learned embeddings---the matching prior flips sides, and so does the winner. Framing the question as ``which model is stronger'' rather than ``whose prior matches the data'' is itself the junior tell.
+\end{keyinsight}
+
+\subsection{Pragmatics the Benchmarks Undersell}
+
+Real tabular pipelines tilt further toward GBDTs than accuracy deltas suggest: heterogeneous types and NaNs work with zero preprocessing (no imputation, no scaling, no embedding plumbing); training is minutes on CPUs (no GPU queue, cheap retrains under drift); hyperparameters fail gracefully (a bad GBDT config underperforms; a bad NN config diverges); and small-team maintainability favors the two-hundred-line training script. These operational facts, not benchmark wins, are why fraud, credit, pricing, and churn systems at platform companies still default to GBDTs in 2026.
+
+\subsection{The 2024--26 Status of Tabular Deep Learning}
+
+An honest update, because ``GBDTs always win on tables'' is now stale:
+\begin{itemize}
+    \item \textbf{Small data has genuinely shifted.} TabPFN v2 (Hollmann et al., \textit{Nature} 2025) is a transformer pre-trained on synthetic tabular tasks that performs \textit{in-context} prediction---no gradient training on your dataset at all---and outperforms tuned GBDTs on many small datasets (up to roughly 10K rows / 500 features), in seconds. In-context tabular learners are real competition in the small-data regime and a strong name-drop with follow-up risk: know that it is a prior-fitted network, that inference cost grows with the training set carried in context, and that the regime cap is the point.
+    \item \textbf{Mid-scale tables: GBDT remains the default.} Post-2022 re-evaluations (e.g., McElfresh et al., 2023) soften the headline to ``dataset-dependent, GBDTs win more often and are vastly cheaper to get right''; improved NN recipes (FT-Transformer descendants, ensemble-style MLPs such as TabM) narrow but do not close the mid-scale gap, and cost 10--100$\times$ more tuning compute to reach parity.
+    \item \textbf{NNs win with cause}: very large data with dense feature interactions; high-cardinality IDs where learned embeddings are the representation (the recommender regime---[SR 5] and the wide ranking literature); multimodal inputs (table + text + image); online/continual learning where incremental gradient updates beat periodic retrains; or when the tabular signal feeds a larger neural system anyway.
+    \item \textbf{The practical ensemble-of-both pattern}: blending a GBDT and a tabular NN reliably adds a small gain (their errors decorrelate---exactly the $\rho$ logic of Section~\ref{cml:sec:bagging_rf}); AutoML stacks (AutoGluon-style) institutionalize this.
+\end{itemize}
+
+%==============================================================================
+\section{Interpretation: SHAP, TreeSHAP, Partial Dependence}
+\label{cml:sec:interpretation}
+%==============================================================================
+
+\subsection{Shapley Values and TreeSHAP}
+
+SHAP (Lundberg \& Lee, 2017) attributes a single prediction to features using the Shapley value from cooperative game theory: feature $j$'s attribution $\phi_j$ is its contribution to the prediction averaged over all orders in which features could be ``revealed,'' with the model's expectation over hidden features filling in for the unrevealed ones. Two properties make it the standard:
+\begin{itemize}
+    \item \textbf{Efficiency/additivity}: $\sum_j \phi_j = f(x) - \E[f(X)]$---attributions exactly decompose the prediction's deviation from the baseline, so they can be summed, compared, and audited.
+    \item \textbf{Consistency}: if a model changes so a feature matters more everywhere, its attribution cannot decrease (the axiom MDI violates).
+\end{itemize}
+Exact Shapley values cost $O(2^d)$ in general---but trees make the coalition expectations computable by dynamic programming over paths. \textbf{TreeSHAP} (Lundberg et al., 2020) computes exact SHAP values for tree ensembles in polynomial time---$O(T L D^2)$ per prediction for $T$ trees, $L$ leaves, depth $D$---which is \textit{the} reason SHAP-based explanation is ubiquitous for GBDTs and comparatively rare (approximate, sampled) for NNs. Global importance is the mean $|\phi_j|$ over a dataset; summary (beeswarm) plots add direction and distribution.
+
+\subsection{Caveats That Interviewers Probe}
+
+The additivity guarantee is about the \textit{model}, not the world. The three standard traps: \textbf{(1) bar plots are interaction-blind}---mean-$|\phi|$ rankings collapse a feature whose effect flips sign across segments into a mid-table entry (dependence/interaction plots exist for this); \textbf{(2) correlated features dilute and redistribute credit}, and the choice between interventional and observational (conditional) expectations changes answers precisely when correlation is strong---off-manifold evaluation again; \textbf{(3) SHAP is not causal}: a high $\phi$ for \texttt{discount\_rate} on churn says the model uses it, not that changing it changes outcomes. The full trap catalog, including background-set sensitivity and retrain instability, is centralized in Chapter~\ref{cml:chap:applied_craft}.
+
+\textbf{Partial dependence, one paragraph.} A PDP plots the prediction averaged over the data as one feature is swept across its range---the model-level analogue of a dose-response curve. It assumes the swept feature is independent of the rest (the sweep creates impossible combinations otherwise), and averaging hides heterogeneous effects; ICE curves (one line per sample) reveal what the average conceals. PDPs remain the quickest sanity check that a fitted GBDT's shape matches domain knowledge---and when the shape \textit{must} match, enforce it instead: monotonic constraints, next section.
+
+%==============================================================================
+\section{Production Notes}
+\label{cml:sec:production}
+%==============================================================================
+
+\textbf{Size and latency: trees vs.\ depth.} Model size is dominated by leaf count: $T$ trees $\times$ $L$ leaves, each internal node storing (feature id, threshold, child pointers), each leaf a value---a 1{,}000-tree, 64-leaf model is a few MB, trivially cacheable. Inference cost is $T \times$ (average depth) branchy comparisons per row; the trade that matters is that \textbf{many shallow trees beat few deep trees at equal accuracy for latency}, because shallow trees vectorize and mispredict branches less---and lower $\eta$/more trees pushes the other way, so serving-constrained teams tune $(T, \text{depth}, \eta)$ jointly against a latency budget. CatBoost's oblivious trees are the extreme point: pure table lookups, typically the fastest inference of the trio.
+
+\textbf{Compilation, one-liner.} Do not serve GBDTs through a Python training API: compile the model---Treelite/tl2cgen or lleaves (LLVM) for optimized native code, or export to ONNX for runtime-agnostic serving---for typically 2--10$\times$ single-row latency improvements; and in real systems, profile end-to-end first, since feature fetching usually dwarfs model compute [DL 22].
+
+\textbf{Monotonic constraints.} XGBoost/LightGBM/CatBoost can constrain the prediction to be monotone in chosen features by refusing violating splits (enforced at split time: a constrained feature's split is admitted only if child values respect the direction). Use them when policy or physics demands it---credit score vs.\ probability of approval, price vs.\ demand---accepting a small accuracy cost for guaranteed shape, audit-friendliness, and robustness to sparse regions. This is ``interpretability by construction'' and a strong senior signal to volunteer.
+
+\textbf{Calibration pointer.} Boosted-tree scores optimized with early stopping on log loss are reasonably calibrated but drift toward extremes with heavy rounds, and class weights or resampling distort them badly; random-forest vote fractions are compressed away from 0 and 1. If downstream consumers threshold on probabilities, calibrate and monitor---mechanics in Chapter~\ref{cml:chap:probabilistic_foundations} and [DL 23].
+
+\textbf{Ranking pointer.} The dominant industrial learning-to-rank method, LambdaMART, is exactly this chapter's machinery with $(g_i, h_i)$ supplied by LambdaRank's NDCG-weighted pairwise gradients---the GBDT is the optimizer, the ranking loss is plugged in through the gradient interface of Section~\ref{cml:sec:boosting_theory}. Full treatment in [SR 5].
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C3
+\label{cml:sec:trees_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: Derive the optimal leaf weight and the split-gain formula in XGBoost.}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Set up the round-$m$ objective: loss over frozen predictions plus a new tree $f$, with regularization $\gamma T + \tfrac{\lambda}{2}\sum_j w_j^2$. Taylor-expand the loss to second order in $f(x_i)$, defining $g_i$ and $h_i$ as the first and second derivatives at the current prediction, and drop the constant term. Then group the sum by leaf: with $G_j = \sum_{i \in I_j} g_i$ and $H_j = \sum_{i \in I_j} h_i$, the objective becomes $\sum_j [G_j w_j + \tfrac{1}{2}(H_j + \lambda) w_j^2] + \gamma T$---$T$ independent quadratics. Each is minimized at
+\begin{equation*}
+w_j^* = -\frac{G_j}{H_j + \lambda}, \qquad \text{leaving objective } -\frac{1}{2}\sum_j \frac{G_j^2}{H_j + \lambda} + \gamma T.
+\end{equation*}
+A split's value is the change in this objective:
+\begin{equation*}
+\text{Gain} = \frac{1}{2}\left[\frac{G_L^2}{H_L+\lambda} + \frac{G_R^2}{H_R+\lambda} - \frac{(G_L+G_R)^2}{H_L+H_R+\lambda}\right] - \gamma.
+\end{equation*}
+Close with the sanity check: for squared loss ($h_i = 1$), $w^*$ is the ridge-shrunk mean residual; for log loss, $g = p - y$, $h = p(1-p)$, and $w^*$ is a regularized Newton step. Note what the derivation buys: regularization inside the objective, $\gamma$ as principled pruning, and split scoring from $(G, H)$ sums alone---which is why it distributes.
+
+\redflags
+\begin{itemize}
+    \item Writing the first-order expansion only---the closed form does not exist without $h_i$, and ``XGBoost is just gradient boosting but faster'' misses the Newton objective entirely.
+    \item Forgetting $\lambda$ in the denominator or $\gamma$ in the gain, i.e., reciting an unregularized formula for the library whose selling point is regularization.
+    \item Unable to say what $g_i$ and $h_i$ are for log loss.
+\end{itemize}
+
+\interviewtest{Whether you can execute a short constrained-optimization derivation about a tool you claim daily fluency with. The grouping-by-leaf step (sum over samples $\to$ sum over leaves) is where shaky candidates stall.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Clean derivation to both boxed formulas with correct $g, h$ for log loss.
+    \item \badgeLsix{L6} Adds the sanity checks, explains $\gamma$ as in-objective cost-complexity pruning and \texttt{min\_child\_weight} as a hessian floor, and notes the weighted-least-squares reading (weights $h_i$, targets $-g_i/h_i$) that justifies the weighted quantile sketch.
+    \item \badgeLseven{L7} Connects the derivation to systems consequences (gain from $(G,H)$ sums $\Rightarrow$ histograms, distribution, GPU) and to LambdaMART, where custom $(g,h)$ plug ranking losses into the same solver.
+\end{itemize}
+
+\followups{``What changes with L1 ($\alpha$) on leaf weights?'' ``Why is \texttt{min\_child\_weight} different for regression vs.\ classification?'' ``Where does the histogram method approximate this derivation, if anywhere?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Random forest vs.\ gradient boosting---how do they differ, and when do you reach for each?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+They are opposite answers to the single-tree variance problem. \textbf{RF}: average $B$ deep, independently perturbed (bootstrap + feature-subsampled) low-bias trees; variance falls as $\rho\sigma^2 + \frac{1-\rho}{B}\sigma^2$, bias stays put---so RF \textit{reduces variance}, trains in parallel, cannot overfit in $B$, and gives OOB estimates for free. \textbf{GBDT}: sequentially add shallow high-bias trees, each fit to the negative gradient of the loss at current predictions---so boosting \textit{reduces bias}, must train sequentially, and overfits in rounds, demanding shrinkage and early stopping.
+
+When each: RF when you want a strong, nearly tuning-free baseline, robustness on small/noisy data, free validation via OOB, and trivially parallel training; GBDT when you want peak tabular accuracy, custom losses (quantile, Poisson, ranking), monotonic constraints, and can pay the tuning/early-stopping discipline. In 2026 practice: RF is the first-hour baseline; a tuned LightGBM/XGBoost/CatBoost is the production model; the gap is usually a few points in the GBDT's favor.
+
+\redflags
+\begin{itemize}
+    \item Inverting the mechanism: ``RF reduces bias'' / ``boosting reduces variance.''
+    \item ``More trees in a random forest overfits''---confusing $B$ with boosting rounds $M$.
+    \item Unable to state why RF trees are deep while GBDT trees are shallow (each ensemble needs its base learner's error profile: low-bias for averaging, high-bias for sequential correction).
+\end{itemize}
+
+\interviewtest{Whether ensembles are organized in your head by \textit{which error term they attack}, not as two library names. The deep-vs-shallow base learner question is the standard depth probe.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct variance-vs-bias framing, parallel-vs-sequential, overfitting-in-$B$ vs.\ -in-$M$.
+    \item \badgeLsix{L6} Writes the correlated-variance decomposition and uses it to explain \texttt{max\_features}; mentions OOB mechanics and RF's low tunability vs.\ GBDT's high tunability.
+    \item \badgeLseven{L7} Notes stochastic GBDT imports RF's tricks (row/column subsampling) so modern GBDTs attack both error terms, and discusses when RF still wins (tiny noisy data, no validation set to stop on, massively parallel training budget).
+\end{itemize}
+
+\followups{``Derive the variance of an average of correlated estimators.'' ``Why does feature subsampling help RF but column subsampling is optional for GBDT?'' ``Which is more robust to label noise, and why?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Explain gradient boosting to someone who already understands gradient descent.}
+
+\badgeLfive{L5} \quad \badgetype{First Principles} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Gradient descent updates a parameter vector by stepping against the gradient of the loss. Gradient boosting does the same thing where the ``parameter vector'' is \textit{the model's predictions at the training points}---gradient descent in function space. Each round: (1) compute the negative gradient of the loss with respect to each prediction (the pseudo-residuals $r_i = -\partial L / \partial F(x_i)$); (2) you cannot apply that step directly---it is only defined at $n$ points and would not generalize---so \textit{project it onto a function class} by fitting a small tree to the $r_i$ by least squares; (3) update $F \leftarrow F + \eta f$, with the learning rate $\eta$ as the step size. ``Fit the residuals'' is what this reduces to under squared loss, where $r_i = y_i - F(x_i)$; under log loss the tree fits $y_i - p_i$; under a ranking loss it fits Lambda gradients [SR 5]. The tree is the descent direction; boosting rounds are iterations; early stopping is the convergence check against a validation set.
+
+\redflags
+\begin{itemize}
+    \item Presenting residual-fitting as the definition rather than the squared-loss special case.
+    \item No answer for why the raw gradient step must be replaced by a fitted tree (the generalization/projection point).
+    \item Confusing the learning rate on leaf values with the gradient-descent learning rate on parameters inside some tree (there is no such thing---trees are fit greedily, not by SGD).
+\end{itemize}
+
+\interviewtest{Whether you hold the functional-gradient abstraction or a memorized recipe. The projection step---why a tree stands in for the gradient---is the discriminator.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Clean function-space analogy with the squared-loss and log-loss special cases.
+    \item \badgeLsix{L6} Adds the second-order upgrade (Newton step $-g/h$ with hessian weights; XGBoost's closed-form leaves) and shrinkage-vs-rounds as step-size-vs-iterations.
+    \item \badgeLseven{L7} Places AdaBoost as the exponential-loss special case, and explains what the gradient interface buys in production: any differentiable loss---quantile, Poisson, LambdaRank---rides the same tree engine.
+\end{itemize}
+
+\followups{``What are the pseudo-residuals for absolute loss, and what does that imply?'' ``Why does a lower learning rate generalize better?'' ``How does AdaBoost fit into this picture?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: XGBoost vs.\ LightGBM vs.\ CatBoost: 600K rows, 45 features of which 14 are categorical including a 40K-cardinality \texttt{merchant\_id}. Choose and defend.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+First name the decision axes: all three share the second-order objective, so accuracy deltas are small and dataset-dependent---the choice turns on \textbf{categorical handling, scale/speed, overfitting posture, and ecosystem}. Here the dominant fact is 14 categoricals with one at 40K cardinality. One-hot is out (40K columns of near-useless indicators); naive target encoding is a leakage trap. That points to \textbf{CatBoost}: ordered target statistics handle \texttt{merchant\_id} natively and leak-free, feature combinations capture categorical interactions, and 600K rows is comfortably within its speed envelope. The defensible alternative is \textbf{LightGBM} with its native $\sum g / \sum h$-sorted splits for the mid-cardinality categoricals plus a properly out-of-fold target (or frequency) encoding for \texttt{merchant\_id}---faster iteration, at the cost of owning the encoding hygiene yourself. XGBoost is the fallback if the surrounding platform (Spark pipelines, existing serving) already speaks it; nothing about the data demands it. State the tie-breakers you would actually run: one afternoon, all three with early stopping on an identical temporal validation split, compare metric, training time, and inference latency; expect differences of tenths of a point and pick on operational grounds.
+
+\redflags
+\begin{itemize}
+    \item One-hot encoding the 40K-cardinality feature without hesitation---the cardinality-explosion red flag.
+    \item Choosing on ``X is more accurate'' folklore without mentioning categorical handling at all.
+    \item Proposing naive (in-fold) target encoding, or not knowing why CatBoost's version avoids the leak.
+\end{itemize}
+
+\interviewtest{Judgment under a concrete dataset: whether you map data properties to library mechanisms rather than reciting a favorite. The high-cardinality categorical is planted; the interviewer is watching what you do with it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Picks a reasonable library with a coherent reason touching categoricals.
+    \item \badgeLsix{L6} Names the leakage mechanism of naive target encoding, CatBoost's ordered fix, LightGBM's sorted-partition trick and its high-cardinality guards, and proposes the empirical bake-off with a temporal split.
+    \item \badgeLseven{L7} Extends to system context: embedding-based alternatives if a neural stack already exists for \texttt{merchant\_id}, inference-latency implications (oblivious trees), retraining cadence under merchant churn, and cold-start merchants (prior-dominated encodings degrade gracefully).
+\end{itemize}
+
+\followups{``What exactly goes wrong if you target-encode with the full training set?'' ``New merchants appear daily---what happens to each library's encoding?'' ``Now the dataset is 500M rows---does your answer change?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why does a gradient-boosted tree beat your MLP on this tabular dataset---and when would it not?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Lead with the mechanism, not the benchmark: it is an inductive-bias match. Three findings from the controlled comparison literature (Grinsztajn et al., 2022): (1) tabular targets are \textit{irregular}---sharp thresholds and plateaus that piecewise-constant splits fit natively while NN training is biased toward smooth functions; (2) tables carry \textit{uninformative features} that trees ignore by never splitting on them, while MLPs must learn to suppress them; (3) MLPs are \textit{rotation-invariant} and tabular data is not---feature axes are individually meaningful, and the tree's axis-aligned ``limitation'' is exactly the right prior (randomly rotating features barely affects an MLP but wrecks trees, confirming the axes carry the signal). Add the pragmatics: native NaN and mixed types, monotone-transform invariance, minutes of CPU training, graceful hyperparameter failure. Then give the honest flip side: NNs win with heavy learned embeddings (high-cardinality IDs, the recommender regime), multimodal inputs, online/continual updates, very large data with dense interactions---and on \textit{small} tables, in-context learners like TabPFN v2 (Nature 2025) now beat tuned GBDTs outright. GBDT is the mid-scale tabular default, not a law of nature.
+
+\redflags
+\begin{itemize}
+    \item ``NNs are more powerful, it must be a tuning issue''---capacity is not the axis; prior match is.
+    \item No mechanism at all, just ``trees are better on tabular'' as folklore.
+    \item Unaware the small-data regime has shifted (TabPFN-class models) or that the recommender world is neural for a reason.
+\end{itemize}
+
+\interviewtest{Whether you can explain a well-known empirical regularity with mechanisms, and whether your knowledge has a 2024--26 update attached. The full decision framework is a deep-learning-volume staple [DL 24]; this version drills the ``why.''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Two or three correct mechanisms plus the standard when-NNs-win list.
+    \item \badgeLsix{L6} All three Grinsztajn mechanisms with the rotation experiment stated correctly, plus the TabPFN v2 small-data update and the ensemble-of-both pattern.
+    \item \badgeLseven{L7} Discusses what would change the answer (embeddings as features feeding the GBDT, distillation across the boundary, the operational-cost asymmetry) and treats the boundary as an engineering decision with measurable criteria.
+\end{itemize}
+
+\followups{``Design the experiment to test whether the NN's problem is the uninformative features.'' ``What is TabPFN actually doing at inference time?'' ``Your tabular data has one text column---now what?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your LambdaMART ranker's training NDCG keeps improving, but validation NDCG peaked at tree 200 and is now degrading. Walk me through your response.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Diagnose first: monotone train improvement with validation peak-then-decline is textbook \textbf{variance overfitting in boosting rounds}---the ensemble is past its optimal $M$ and now fitting noise (label noise is endemic in ranking data: clicks are noisy relevance). The response, in order: (1) \textbf{early stopping} on validation NDCG with patience---this is the fix for the stated symptom by construction; take the tree-200 model today. (2) Rebalance the $\eta$--$M$ trade: lower the learning rate, refit with early stopping; if the peak moves later and higher, capacity per round was too aggressive. (3) Reduce per-tree capacity (\texttt{num\_leaves}/depth down, \texttt{min\_data\_in\_leaf} up) and enable row/column subsampling. (4) \textbf{Audit the validation protocol before trusting any of it}: ranking data must be split \textit{by query} (and temporally, if queries repeat)---a query with documents in both train and validation is group leakage that makes validation optimistic and the divergence look milder than it is; also confirm the validation query count is large enough that NDCG differences are not noise. (5) If degradation is severe and early, check the objective's metric weighting (NDCG truncation depth) matches the evaluation metric.
+
+\redflags
+\begin{itemize}
+    \item Not saying ``early stopping'' in the first breath, or proposing to tune \texttt{n\_estimators} by grid search.
+    \item Treating it as a mystery rather than expected boosting behavior---this is what overfitting in $M$ looks like.
+    \item No mention of query-level split integrity---the ranking-specific leakage check is the seniority marker here.
+\end{itemize}
+
+\interviewtest{Debugging discipline on the most common GBDT pathology, plus whether you know the ranking-specific traps (query-grouped splits, noisy click labels, NDCG variance). LambdaMART internals live in [SR 5]; this question tests the boosting-side hygiene.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Early stopping plus the standard variance-reduction knob list.
+    \item \badgeLsix{L6} Adds the validation-protocol audit (query grouping, temporal split, metric noise) before knob-turning, and the $\eta$--$M$ joint reasoning.
+    \item \badgeLseven{L7} Asks what changed if this is a retrain of a previously stable pipeline (data drift, label pipeline bug, position-bias correction change), and quantifies the decision: ship tree-200 now, investigate in parallel.
+\end{itemize}
+
+\followups{``Why are click labels particularly conducive to overfitting?'' ``Your validation NDCG is flat across all settings---what do you suspect?'' ``How would position bias in the training clicks show up here?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why do trees split on Gini or entropy instead of misclassification error, since error is what we ultimately care about?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Because splitting needs a criterion that rewards \textit{progress toward} purity, not just purity's final cash value. Misclassification error is piecewise linear in the class proportions: any split that does not change a child's majority class can look worthless. Gini and entropy are strictly concave, so making children purer \textit{always} scores positive gain, even when the argmax class is unchanged. Give the canonical example: parent $(4{+},4{-})$; split A $\to (3{+},1{-}), (1{+},3{-})$ and split B $\to (2{+},4{-}), (2{+},0{-})$ have \textit{identical} weighted misclassification error ($1/4$), but Gini prefers B (0.333 vs.\ 0.375), which created a pure node---obviously the better tree to keep growing. Greedy growth needs the strictly concave criterion to see one step ahead; held-out error remains the right quantity for \textit{pruning} and evaluation. Gini vs.\ entropy itself is a non-event (they disagree on a few percent of splits); Gini skips the log.
+
+\redflags
+\begin{itemize}
+    \item ``Gini is more accurate''---it is about strict concavity and split sensitivity, not accuracy.
+    \item Unable to produce any example where misclassification error is indifferent and Gini is not.
+    \item Confusing the splitting criterion with the evaluation metric, or claiming trees minimize accuracy loss directly.
+\end{itemize}
+
+\interviewtest{A concavity-of-the-criterion argument delivered with a concrete two-line example. This is a warm-up question; fumbling it colors the rest of the tree discussion.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} The concavity argument plus the worked example.
+    \item \badgeLsix{L6} Notes Jensen's inequality guarantees nonnegative gain for concave impurities, and that misclassification error still serves pruning; mentions the regression analogue (variance reduction).
+\end{itemize}
+
+\followups{``When do Gini and entropy actually disagree?'' ``What is the regression-tree splitting criterion and why does it admit an $O(1)$ update?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What fraction of the training data does each tree in a random forest see? Derive it, and explain what the rest is used for.}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+A bootstrap sample draws $n$ times with replacement. The probability a given point is missed by one draw is $1 - \tfrac{1}{n}$; by all $n$ draws, $(1 - \tfrac{1}{n})^n$, which converges to $e^{-1} \approx 36.8\%$ (from $(1+x/n)^n \to e^x$ with $x = -1$). So each tree trains on about $63.2\%$ of the unique points; the missed $36.8\%$ are its \textbf{out-of-bag} set. Aggregating, for each point, only the $\approx B/e$ trees that never saw it gives OOB predictions---an approximately unbiased generalization estimate with \textit{no held-out data and no extra training}: free cross-validation. Uses: model selection (pick \texttt{max\_features} by OOB error), ensemble sizing (grow $B$ until OOB error plateaus), and OOB permutation importance. Caveat worth volunteering: OOB error is slightly pessimistic since each OOB prediction ensembles only $\sim B/e$ trees rather than all $B$.
+
+\redflags
+\begin{itemize}
+    \item ``Bootstrap samples contain almost all the points''---not knowing the $1/e$ result at all.
+    \item Deriving the limit but having no idea what OOB estimation is for.
+    \item Claiming OOB replaces a test set for the \textit{final} performance claim (it is still training-distribution data used during model development).
+\end{itemize}
+
+\interviewtest{A thirty-second limit derivation plus whether you know the free lunch it powers. This is a fluency check---hesitation on $(1-1/n)^n$ suggests the bagging story is memorized, not owned.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct derivation and the OOB-as-free-validation story.
+    \item \badgeLsix{L6} Adds the $B/e$-trees pessimism caveat and OOB permutation importance; notes GBDTs have no OOB analogue (sequential fitting), which is one reason they need explicit validation sets.
+\end{itemize}
+
+\followups{``Why doesn't gradient boosting have an OOB equivalent?'' ``How would you use OOB error to size the forest?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: How does CatBoost avoid target leakage with categorical features, and what is ``ordered boosting'' fixing?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Two leaks, one idea. \textbf{Leak 1, through features}: target encoding computed over the full training set includes row $i$'s own label in row $i$'s feature---for a singleton category the feature \textit{is} the label, and rare categories generally get label-contaminated encodings that trees exploit, inflating train metrics and collapsing in validation. CatBoost's \textbf{ordered target statistics}: draw a random permutation, encode each row using only rows \textit{before} it (smoothed toward the prior), so no row's label ever touches its own feature; multiple permutations average out the noisy early-row encodings. \textbf{Leak 2, through residuals}: in any boosting, row $i$'s gradient is computed from a model that was trained on row $i$, so training-set gradients are systematically biased (``prediction shift''), compounding across rounds---boosting mildly overfits by construction, worst on small data. \textbf{Ordered boosting} applies the same permutation discipline to the loop: each row's residual comes (conceptually) from a model trained only on preceding rows, approximated tractably with a small set of support models. The unifying principle---never let an example's label influence the statistics used to fit that example---is the same one behind out-of-fold target encoding and temporal validation splits.
+
+\redflags
+\begin{itemize}
+    \item Explaining ordered statistics but drawing a blank on ordered boosting (the question names it).
+    \item ``Just use label encoding instead''---misses that the entire point of target statistics is scaling to high cardinality.
+    \item Not connecting to the general out-of-fold principle---this signals the fix is memorized trivia.
+\end{itemize}
+
+\interviewtest{Whether you understand leakage as a mechanism (own-label contamination) rather than a checklist, and can follow it into the less obvious residual pathway. The general leakage taxonomy is a sibling-chapter staple; this is its sharpest instance.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} The singleton-category example and the ordered-statistics fix.
+    \item \badgeLsix{L6} Both leaks, the prediction-shift argument at intuition level, and the out-of-fold unification.
+    \item \badgeLseven{L7} Discusses the compute trade (why ordered boosting is default only at moderate scale), permutation-count variance, and when plain mode plus out-of-fold encoding is the pragmatic equivalent.
+\end{itemize}
+
+\followups{``Why multiple permutations?'' ``How would you get the same protection in LightGBM?'' ``Does prediction shift matter at 100M rows?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why can't a tree-based model extrapolate, and where does that bite in practice?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+A tree predicts a constant per leaf, and every leaf value is a statistic (mean, vote, shrunk Newton step) of \textit{training} targets in that region. Outside the training range of a feature, the sample falls into the outermost leaf and receives that leaf's value---the prediction surface is flat beyond the data, and no ensemble of trees fixes it: sums and averages of range-bounded piecewise-constant functions are still range-bounded and piecewise-constant. Contrast a linear model, whose slope extends everywhere. Where it bites: \textbf{time series with trend} (a GBDT forecaster flatlines at roughly the training maximum while demand keeps growing---the canonical symptom), pricing/volume features drifting beyond history, and any covariate-shift regime. Fixes: transform the problem so the target is range-stationary---predict differences or growth rates, detrend first, or use a hybrid (linear/ETS trend plus GBDT on residuals); details in Chapter~\ref{cml:chap:time_series}.
+
+\redflags
+\begin{itemize}
+    \item ``Just add more trees / deeper trees''---capacity is irrelevant; the hypothesis class is range-bounded.
+    \item Unable to name the time-series consequence, the context where this question is nearly always asked.
+    \item Claiming trees can't handle trends at all (they can, \textit{within} the training range---the failure is specifically beyond it).
+\end{itemize}
+
+\interviewtest{Whether you can reason from the hypothesis class to a deployment failure and its standard fixes---a small question that reliably exposes memorized-vs-understood tree knowledge.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Piecewise-constant argument plus the flatlining-forecast example and one fix.
+    \item \badgeLsix{L6} Multiple fixes with trade-offs (differencing changes the noise structure; hybrids add moving parts) and the covariate-shift generalization beyond time series.
+\end{itemize}
+
+\followups{``Your GBM forecast flatlines at the recent maximum---walk me through the fix.'' ``Does this affect classification too?'' ``How would you detect that you're in extrapolation territory at serving time?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your random forest's impurity-based feature importance says \texttt{session\_id\_hash} is the top feature. The PM wants to build product strategy around the ranking. What do you tell them?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Two separate alarms. \textbf{Alarm 1: the ranking is untrustworthy.} MDI is biased toward high-cardinality features---more candidate split points means more chances to cut impurity by luck---and it is computed on training data, so it rewards memorization. A hash of a near-unique ID at the top of an MDI list is close to a textbook artifact. \textbf{Alarm 2: it may not be an artifact---it may be leakage.} If splits on an ID-like feature genuinely predict the target out-of-sample, some target information is riding on it (group structure, temporal ordering encoded in ID assignment, duplicates across train/validation). So: recompute importance properly---permutation importance on a \textit{held-out, group-aware} split (or drop-column retraining for the features that matter)---and audit \texttt{session\_id\_hash} for leakage before anything else. If permutation importance on clean held-out data sends it to zero, it was MDI cardinality bias; if it survives, chase the leak. And for the PM: \textit{no} importance method supports causal product strategy---importance describes what the model uses, not what moves the outcome; if strategy hangs on it, that is an experiment (Chapter~\ref{cml:chap:experimentation_causal}).
+
+\redflags
+\begin{itemize}
+    \item Taking the MDI ranking at face value, or ``fixing'' it by just deleting the feature without asking why it scored.
+    \item Not knowing MDI's cardinality bias or that it is computed on training data.
+    \item Endorsing a causal reading of any feature importance for strategy decisions.
+\end{itemize}
+
+\interviewtest{Applied skepticism in the right order: distrust the estimator, then suspect the data, then guard the decision. Candidates who know all three importance pathologies but skip the leakage hypothesis miss the highest-stakes branch.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names MDI's biases and proposes permutation importance on held-out data.
+    \item \badgeLsix{L6} Adds the leakage branch with the group-aware split, drop-column as the arbiter, and the not-causal boundary for the PM conversation.
+    \item \badgeLseven{L7} Sketches the full audit (feature-timestamp check, single-feature-dominance test, retrain-without and compare), and frames what \textit{would} justify strategy: an experiment or causal analysis, with the model's importance as hypothesis generator only.
+\end{itemize}
+
+\followups{``Permutation importance also has a correlated-features problem---explain it.'' ``How exactly could a session ID leak the target?'' ``What would you show the PM instead?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design the serving story for a GBDT fraud model: p99 model latency under 2\,ms at 20K QPS, with a compliance requirement that risk never decreases as chargeback count increases.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Decompose into model shape, execution, and the constraint. \textbf{Model shape}: inference cost $\approx T \times$ average depth; at equal accuracy prefer more, shallower trees (better vectorization and branch behavior), and treat $(T, \text{depth}, \eta)$ as jointly tuned against the latency budget---train several accuracy-latency points and pick on the Pareto frontier. If a large model is materially better, distill: refit a smaller ensemble on the large model's scores. Consider CatBoost-style oblivious trees, whose lookup-table inference is the fastest of the tree family. \textbf{Execution}: never serve through a Python training API---compile (Treelite/lleaves-class native code or ONNX Runtime) for 2--10$\times$ single-row gains; batch scoring where the product allows; pin the model in memory (a few MB); and profile end to end, because at 20K QPS feature fetching, not the model, is usually the p99 driver---push feature retrieval to a low-latency store and precompute aggregates [DL 22]. \textbf{The constraint}: this is exactly a \textbf{monotonic constraint} on \texttt{chargeback\_count}---enforced at split time by the library, guaranteed by construction, auditable to compliance---at a small, measurable accuracy cost. Close the loop with calibration (thresholded risk scores must mean what they say---Chapter~\ref{cml:chap:probabilistic_foundations}) and a shadow-deployment latency test before cutover.
+
+\redflags
+\begin{itemize}
+    \item Reaching for ``smaller model'' without the compile-and-profile step, or ignoring that features dominate p99.
+    \item Hand-rolling the monotonicity requirement (post-hoc score clamping, feature tricks) when every major library enforces it natively.
+    \item No calibration story for a model whose scores gate money decisions.
+\end{itemize}
+
+\interviewtest{Whether GBDT knowledge extends past training into the serving and governance realities where staff engineers actually spend time: latency decomposition, compilation, constraints as first-class tools.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Trees-times-depth cost model, compilation, monotonic constraints named.
+    \item \badgeLsix{L6} The Pareto-frontier tuning framing, feature-fetch-dominates-p99 insight, and the split-time enforcement mechanism for monotonicity.
+    \item \badgeLseven{L7} Distillation option, oblivious-tree trade-off, calibration and shadow-test governance, and a crisp accounting of which risks are model-side vs.\ platform-side.
+\end{itemize}
+
+\followups{``How do monotonic constraints actually restrict split finding?'' ``Where does the 2\,ms actually go---break down a request.'' ``The compliance team wants an explanation per declined transaction---what do you serve, at what cost?''}
+\end{interviewq}

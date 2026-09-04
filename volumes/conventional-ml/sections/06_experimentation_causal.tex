@@ -2,21 +2,511 @@
 \label{cml:chap:experimentation_causal}
 
 \begin{tldr}
-Placeholder — this chapter is written per docs/coverage-spec.md, seeded by the author's own conventional-ML document when it arrives (Phase C3).
+This chapter is the program's canonical home for experimentation statistics. It starts where a first course stops: not ``what is a p-value'' but why your flat result is a power problem, how CUPED buys you a 2$\times$ sample-size saving for free, what to do when you must monitor a running test, and why a user-randomized test on a marketplace measures the wrong thing. It then covers uplift modeling (targeting persuadables, not the already-loyal), bandits (regret instead of inference), and the observational toolkit you reach for when randomization is impossible---each with the assumption that does all the work and the one failure mode that kills it. Ranking-specific experimentation (interleaving) lives in [SR 7]; LLM-evaluation statistics live in [DL 23]; both point here for the machinery.
 \end{tldr}
 
-\section{A/B Beyond the Basics}
-% TODO Phase C3
+\section{Hypothesis Testing, Rebuilt}
+\label{cml:sec:testing_rebuilt}
+
+Every experiment answers one question: is the difference I measured bigger than the difference I would expect from noise alone? The null hypothesis $H_0$ says the treatment changed nothing; the test statistic measures the observed gap in units of its own standard error; the p-value is the probability of seeing a gap at least this extreme \emph{if the null were true}. That conditional is the whole subject, and it is where interview answers go wrong.
+
+\begin{keyinsight}
+\textbf{What a p-value is not.} It is not the probability that the null is true. It is not the probability your result was a fluke. It is not one minus the probability the treatment works, and $p = 0.04$ does not mean a 96\% chance of a real effect---that quantity depends on the prior probability that your idea was any good, which at most companies is well under half. A p-value is a statement about data given a hypothesis, never about a hypothesis given data. The practical consequence: in an organization shipping mostly neutral ideas, a large share of ``significant'' wins at $p<0.05$ are false, which is why replication and holdbacks exist.
+\end{keyinsight}
+
+For a binary metric---conversion, click, signup---the workhorse is the two-proportion z-test. With $\hat p_A, \hat p_B$ and sizes $n_A, n_B$, the statistic is the difference over its pooled standard error, $z = (\hat p_B - \hat p_A)/\sqrt{\hat p(1-\hat p)(1/n_A + 1/n_B)}$ with $\hat p$ the pooled rate. For a continuous metric---revenue per user, session length, latency---use Welch's t-test, which does not assume equal variances across arms; equal-variance Student's t buys nothing in practice and fails exactly when treatment changes the spread rather than the mean, which is a real and interesting outcome.
+
+The central limit theorem is what makes this work on metrics that are nothing like normal. Revenue per user is a spike at zero plus a long right tail; the \emph{mean} of millions of such draws is still approximately normal, so the test is valid at experiment scale even though the underlying data is grotesque. The caveats are practical, not theoretical: with heavy tails, convergence is slower and a handful of whales can dominate the variance, so cap or winsorize the metric at a pre-registered percentile (and report both capped and uncapped), analyze log or rank transforms as secondary readouts, or bootstrap when $n$ is small and the tail is fat. Choosing the transform after seeing which one gives significance is p-hacking, so fix it in the plan.
+
+\begin{warningbox}
+\textbf{One-sided tests.} A one-sided test is legitimate only when a negative effect would lead to exactly the same decision as a null effect---rare, since most launches have guardrails you would honor if the metric moved down. Switching to one-sided after seeing the direction of the estimate is not a test; it is a 10\% test wearing a 5\% label. Default to two-sided.
+\end{warningbox}
+
+\section{Power and Sample Size}
+\label{cml:sec:power}
+
+Power is the probability of detecting an effect that is genuinely there. Underpowered tests are the single largest source of wasted experiment capacity in industry: they produce a stream of ambiguous flat results, and---worse---the ones that do reach significance are systematically overestimated (Section~\ref{cml:sec:pathologies}).
+
+\begin{mathresult}
+\textbf{Sample size per arm.} For a two-sided test at level $\alpha$ with power $1-\beta$, detecting an absolute difference $\delta$ in a metric with per-unit variance $\sigma^2$:
+\begin{equation*}
+n \;\approx\; \frac{2\sigma^2\left(z_{1-\alpha/2} + z_{1-\beta}\right)^2}{\delta^2}.
+\end{equation*}
+At the conventional $\alpha=0.05$, $1-\beta=0.8$: $(1.96 + 0.84)^2 = 7.84$, so $n \approx 15.7\,\sigma^2/\delta^2$, universally quoted as
+\begin{equation*}
+n \approx \frac{16\sigma^2}{\delta^2}, \qquad\text{and for a proportion } (\sigma^2 = p(1-p)):\quad n \approx \frac{16\,p(1-p)}{\delta^2}.
+\end{equation*}
+Three consequences worth internalizing: sample size scales with the \emph{square} of the inverse effect size (halving the detectable effect costs 4$\times$ the traffic); it is linear in variance (hence Section~\ref{cml:sec:variance_reduction}); and $\alpha$ and $\beta$ enter only through a constant.
+\end{mathresult}
+
+Work the canonical case. A 2\% baseline click rate, and you want to detect a 1\% \emph{relative} lift---that is $\delta = 0.02 \times 0.01 = 0.0002$ absolute. Then $n \approx 16 (0.02)(0.98)/(0.0002)^2 = 0.3136/4\times10^{-8} \approx 7.84$ million users per group, 15.7M total. If the product sees 2M eligible users per day, that is about eight days---and only if every user is exposed. This arithmetic is why ``we'll just run it for a week'' is not a plan and why 1\%-relative effects are undetectable at most companies: the honest answer is often ``we cannot measure this, so decide it on other grounds or bundle it into a bigger change.''
+
+Run the formula backwards more often than forwards. Fix the traffic you actually have and solve for $\delta$: that is the minimum detectable effect (MDE), and it belongs in the design doc before anyone builds anything. If the MDE is 3\% and no one believes the feature moves the metric by more than 1\%, the experiment is decoration. Note also that MDE is a threshold for \emph{detection}, not the effect you should expect to see.
+
+Duration is not just $n/\text{traffic}$. Weekly seasonality means an experiment must cover whole weeks (weekday and weekend populations differ in composition and behavior); a Tuesday-to-Friday test measures Tuesday-to-Friday users. Learning and novelty effects (Section~\ref{cml:sec:pathologies}) argue for at least one full cycle, typically 1--2 weeks minimum regardless of what power says. Cookie churn and multi-device users erode assignment stability in longer tests, which argues against running for months. And the unit of analysis must match the unit of randomization---see the delta method in Section~\ref{cml:sec:metric_design}.
+
+\section{Variance Reduction}
+\label{cml:sec:variance_reduction}
+
+Since $n \propto \sigma^2$, halving variance halves the traffic bill---or halves the MDE-squared at fixed traffic. This is the highest-leverage statistical work in an experimentation platform, and CUPED is the standard tool.
+
+\begin{mathresult}
+\textbf{CUPED (Controlled-experiment Using Pre-Experiment Data).} Let $Y$ be the metric and $X$ a pre-experiment covariate---almost always the \emph{same metric measured before the experiment}---which is unaffected by treatment. Define the adjusted metric
+\begin{equation*}
+Y' = Y - \theta\,(X - \bar X), \qquad \theta^\star = \frac{\operatorname{Cov}(Y, X)}{\operatorname{Var}(X)}.
+\end{equation*}
+$Y'$ is unbiased for the same treatment effect ($\mathbb{E}[Y'] = \mathbb{E}[Y]$ because $\mathbb{E}[X - \bar X] = 0$), and at $\theta^\star$ its variance is
+\begin{equation*}
+\operatorname{Var}(Y') = \operatorname{Var}(Y)\,(1 - \rho^2), \qquad \rho = \operatorname{Corr}(Y, X).
+\end{equation*}
+\end{mathresult}
+
+The mechanism is worth stating in words, because that is what an interviewer wants: users differ enormously in their baseline activity, and that between-user heterogeneity is noise with respect to the treatment effect. CUPED subtracts off the part of each user's outcome that was predictable from their own past, leaving a smaller residual to compare across arms. It is ordinary regression adjustment, chosen so the adjustment cannot itself be affected by treatment.
+
+The payoff is concrete. With $\rho = 0.7$---typical when the covariate is the same metric over the prior two weeks---variance drops by $1 - 0.49 = 0.51$, so you need about 51\% of the sample, close to a 2$\times$ saving; the 7.84M-per-group test above becomes roughly 4M per group. With $\rho = 0.5$ the saving is 25\%. With $\rho = 0.3$, 9\%---real but not worth much complexity.
+
+CUPED fails, or does nothing, in identifiable situations: new users have no pre-period (run CUPED on the returning-user stratum and report the new-user stratum separately, or use a covariate available at signup); metrics with weak self-correlation, such as rare conversions, give small $\rho$; and any covariate contaminated by treatment---measured after assignment, or a post-treatment segment---reintroduces bias, which is the one genuine danger. Estimating $\theta$ on the pooled experiment data is standard and its bias is $O(1/n)$, negligible at experiment scale.
+
+Two simpler cousins are worth knowing. \emph{Stratification} (assign within strata, e.g., country $\times$ platform $\times$ activity decile) removes the same between-group variance by design rather than by adjustment; \emph{post-stratification} does it in analysis. And CUPED generalizes: replace the single covariate with a regression on many pre-period features, or a model prediction of $Y$---variance reduction is then governed by the model's $R^2$. The intuition is unchanged: any variance you can explain without touching treatment is variance you do not have to pay for.
+
+\section{Sequential Testing and the Cost of Peeking}
+\label{cml:sec:sequential}
+
+The fixed-horizon test is a promise: choose $n$ in advance, look once. Everyone breaks it, because dashboards update hourly and a bad launch should be killed today, not next Thursday.
+
+\begin{warningbox}
+\textbf{Quantify the peeking problem.} Under a true null, a fixed-horizon test crosses $p < 0.05$ at some point with probability far above 5\% if you keep looking: roughly 14\% with 5 equally spaced looks and around 20--25\% with daily looks over two weeks, rising toward 100\% as monitoring becomes continuous and $n$ grows without bound. ``We only shipped it because it hit significance'' is, under repeated peeking, a statement about your stopping rule rather than about your feature.
+\end{warningbox}
+
+Three legitimate responses. \emph{Group-sequential} designs (alpha spending) pre-specify $K$ interim analyses and split $\alpha$ across them: O'Brien--Fleming spends almost nothing early---so early stopping requires an overwhelming effect---and nearly the full $\alpha$ at the final look, which keeps final-analysis power close to the fixed-horizon design; Pocock spends evenly, stopping earlier for smaller effects at the cost of final power. \emph{Always-valid inference} (mixture SPRT, confidence sequences) gives p-values and intervals valid at \emph{every} sample size, so you may stop whenever you like; the price is width---an always-valid interval is materially wider than a fixed-horizon one at the same $n$, i.e., you pay in sample size for the right to look continuously. \emph{Bayesian monitoring} with a decision rule on posterior quantities is defensible when the prior and loss are honestly specified, but is not a loophole around the multiplicity it looks like it evades.
+
+The pragmatic answer for most organizations, and the one to give in an interview: fix the horizon and pre-register the duration for the launch decision, monitor \emph{guardrails only} for harm with an explicit stopping rule (large regressions warrant killing a test on a much stricter threshold, and stopping early for harm does not inflate false wins), and adopt always-valid inference platform-wide if teams genuinely need to act on interim readouts. What is not defensible is the unstated hybrid: monitoring everything daily, stopping on the first green, and reporting a fixed-horizon p-value.
+
+\section{Multiple Testing}
+\label{cml:sec:multiple_testing}
+
+Every experiment reads out dozens of metrics across dozens of segments; at $\alpha=0.05$, twenty independent null comparisons produce one ``significant'' result on average. Two different error rates are worth controlling, and the choice is about consequences.
+
+Family-wise error rate (FWER) is the probability of \emph{any} false positive; control it when a single false alarm is expensive---the primary metric, and the guardrail set that gates the launch. Bonferroni ($\alpha/m$) is crude and conservative but unimpeachable and fine for the handful of decision metrics. False discovery rate (FDR) is the expected \emph{fraction} of false positives among rejections; control it with Benjamini--Hochberg when you are scanning many exploratory metrics or segments and can tolerate some false leads, because BH is far more powerful than Bonferroni at scale.
+
+\begin{warningbox}
+\textbf{Segment fishing.} Slicing a flat experiment by country $\times$ platform $\times$ tenure $\times$ acquisition channel generates hundreds of comparisons; some will be ``significant,'' and the story you tell about the winner will be plausible. Pre-register the segments that matter, apply FDR to exploratory slices, and treat anything surviving only in one unregistered cell as a hypothesis for the next experiment---never as a finding, and never as a reason to ship to that segment.
+\end{warningbox}
+
+\section{Metric Design and the Randomization Unit}
+\label{cml:sec:metric_design}
+
+The OEC (overall evaluation criterion) is the metric the experiment is allowed to be judged on, chosen in advance. It should be sensitive enough to move within a reasonable horizon, aligned with long-term value, and hard to game. The politics are the hard part: a single OEC forces the trade-offs into the open (engagement versus revenue, growth versus quality), which is why organizations avoid choosing one and end up shipping on whichever metric happened to move. Guardrail metrics---latency, crash rate, unsubscribe, support contacts, revenue---exist so a win on the OEC cannot silently break the business, and they are evaluated as non-inferiority checks, not as things to be maximized.
+
+Ratio metrics are where careful candidates separate themselves. Click-through rate is $\sum \text{clicks} / \sum \text{impressions}$, but randomization is by user; the denominator is itself random and correlated with the numerator, so the naive standard error computed over events is wrong---usually too small, sometimes badly, because it ignores within-user correlation and treats every event as independent.
+
+\begin{mathresult}
+\textbf{Delta method for a ratio.} For $R = \bar X / \bar Y$ with per-user totals $X_i$ (clicks) and $Y_i$ (impressions),
+\begin{equation*}
+\operatorname{Var}(R) \;\approx\; \frac{1}{\mu_Y^2}\operatorname{Var}(\bar X) \;-\; \frac{2\mu_X}{\mu_Y^3}\operatorname{Cov}(\bar X, \bar Y) \;+\; \frac{\mu_X^2}{\mu_Y^4}\operatorname{Var}(\bar Y),
+\end{equation*}
+with all moments taken over the \emph{randomization unit}. Equivalently, bootstrap over users, or run the test on the per-user linearized metric $L_i = (X_i - R\,Y_i)/\mu_Y$---all three agree and all three respect the clustering.
+\end{mathresult}
+
+The general rule: \textbf{analyze at the unit you randomized}. If you randomize users and analyze sessions, your effective sample size is inflated by the number of sessions per user and your p-values are optimistic; the fix is clustered standard errors, the delta method, or a per-user metric.
+
+Interference breaks the deeper assumption (SUTVA): that one unit's outcome does not depend on another unit's assignment. On a two-sided marketplace, treatment users who book more leave less supply for control users, so the measured gap overstates the true effect---a pure transfer can look like growth. In social products, treatment users change the experience of their control-group friends, diluting the measured effect toward zero. The designs that address it: \emph{cluster randomization} (randomize by region, network community, or supply pool; unbiased, but the effective sample size becomes the number of clusters, which is a brutal variance cost), \emph{switchback} (randomize region $\times$ time bucket, alternating treatment on and off; well-suited to marketplace pricing/dispatch, with carryover bias handled by burn-in periods within each bucket), and \emph{budget-split} designs in ads. The interview signal is not knowing the names---it is spotting that a user-randomized marketplace test answers the wrong question at all.
+
+\section{The Pathologies That Decide Interviews}
+\label{cml:sec:pathologies}
+
+\begin{keyinsight}
+\textbf{SRM is the first thing you check.} Sample ratio mismatch means the observed split differs from the intended one---50/50 designed, 50.4/49.6 observed. A chi-square goodness-of-fit test against the intended ratio, flagged at $p < 0.001$, catches it. At experiment scale even a 0.2\% deviation is wildly improbable by chance, so an SRM means the assignment or logging pipeline is broken: bot filtering applied asymmetrically, redirect latency dropping treatment users, a crash in one arm removing its worst-affected users, triggering logic evaluated differently across arms, or dedup joining on a field one arm populates differently. \textbf{An experiment with an SRM is not analyzable}---the arms are no longer comparable populations, and the very users who dropped are usually the ones most affected. Debug it; never ``adjust for'' it.
+\end{keyinsight}
+
+Novelty and primacy effects: users react to change itself. A new UI draws exploratory clicks that decay (novelty), or long-tenured users are temporarily slower under a changed layout and recover (primacy). Both mean the week-one effect is not the steady-state effect. Detect them by plotting effect-by-exposure-day and by comparing new versus existing users; measure the steady state with a longer test or a holdback (Section~\ref{cml:sec:culture}).
+
+Twyman's law: any figure that looks interesting or unusual is usually wrong. A +30\% revenue result is a logging bug, a bot, or a whale until proven otherwise---check SRM, check the distribution and the top percentile, check whether the metric definition changed, and only then celebrate. In practice the largest observed effects are dominated by instrumentation errors, because the true distribution of effect sizes is concentrated near zero.
+
+The winner's curse: conditional on being significant, an estimate is biased upward---selection on the noisy estimate favors draws where noise helped. The bias is severe exactly when power is low: with 20\% power, a significant estimate can overstate the truth several-fold, which is the arithmetic reason underpowered experiment programs report launch effects that never appear in the annual numbers. Remedies: raise power, apply shrinkage (empirical-Bayes toward the prior mean of effects, which at most companies is near zero), and validate the biggest wins with a replication or a holdback.
+
+Finally, A/A tests and pre-experiment bias checks: run the analysis pipeline on two identical arms and confirm the p-value distribution is uniform and the false-positive rate is nominal. A/A failures reveal exactly the bugs that make A/B results untrustworthy---clustered units treated as independent, ratio metrics with wrong standard errors, assignment leakage---and they are the cheapest audit an experimentation platform can run continuously.
+
+\section{Heterogeneous Treatment Effects}
+\label{cml:sec:hte}
+
+The average treatment effect hides that the same change may help one group and harm another. Legitimate HTE analysis is pre-registered (``we expect the effect to be larger on mobile, where the old flow was worst''), corrected for multiplicity, and treated as directional unless replicated. Illegitimate HTE analysis is the segment fishing of Section~\ref{cml:sec:multiple_testing} with a machine-learning veneer.
+
+Modern approaches estimate the conditional average treatment effect $\tau(x) = \mathbb{E}[Y(1) - Y(0) \mid X = x]$ directly---causal forests, DR-learners, and the meta-learners of Section~\ref{cml:sec:uplift}---and then validate the \emph{ranking} they induce on held-out randomized data rather than reporting per-segment p-values. That reframing is what makes HTE actionable: you rarely need the effect for a segment, you need to know whom to target, which is precisely uplift modeling.
 
 \section{Uplift Modeling}
-% TODO Phase C3
+\label{cml:sec:uplift}
+
+The motivating story is a retention campaign. You have a churn model, so you send the discount to the users most likely to churn---and the campaign loses money. The reason is that churn probability is not treatment effect.
+
+\begin{keyinsight}
+\textbf{The four quadrants.} Every user is one of: \emph{persuadables} (convert only if treated---the only group worth spending on), \emph{sure things} (convert either way---the discount is pure margin loss), \emph{lost causes} (convert neither way---wasted spend), and \emph{sleeping dogs} (treatment makes them \emph{worse}: the reactivation email reminds a dormant user to cancel). Targeting by outcome probability buys sure things and wakes sleeping dogs. Targeting by \emph{uplift}---the individual treatment effect $\tau(x)$---buys persuadables. This is the whole subject in one paragraph, and it is the answer to the most common interview question in the area.
+\end{keyinsight}
+
+Meta-learners turn any supervised model into a CATE estimator. The \emph{S-learner} fits one model on the pooled data with treatment as a feature and predicts $\hat\tau(x) = f(x, 1) - f(x, 0)$; simple, but any regularization that shrinks the treatment coefficient shrinks the estimated effect toward zero, which is fatal when effects are small relative to outcome signal. The \emph{T-learner} fits separate models on treated and control and differences them; it avoids that bias but differencing two independently noisy models amplifies variance, and it wastes the shared structure. The \emph{X-learner} imputes individual effects using the cross-model predictions, fits models on those imputed effects, and combines them weighted by the propensity---designed for badly imbalanced treatment groups, which is the common industry case (a 5\% campaign holdout). Doubly-robust learners (DR-learner) and \emph{causal forests}, which split on effect heterogeneity rather than outcome and give honest confidence intervals via sample splitting, are the current defaults when data volume allows.
+
+Evaluation is the part people get wrong, because ground-truth individual effects do not exist. Outcome AUC validates nothing about uplift---a perfect churn model can have zero targeting value. Instead, on \emph{randomized} held-out data, sort users by predicted uplift and compare the observed treatment-versus-control outcome gap in the top $k\%$ against the overall gap: that is the uplift curve, and its cumulative form (incremental conversions gained versus the random-targeting diagonal) is the Qini curve, summarized by the area between them. Randomized holdout data is not optional here; without it you cannot observe the counterfactual gap at all.
 
 \section{Bandits}
-% TODO Phase C3
+\label{cml:sec:bandits}
+
+An A/B test is designed for \emph{inference}: a clean, unbiased estimate of an effect. A bandit is designed for \emph{regret minimization}: cumulative reward, allocating traffic toward arms that look good while retaining enough exploration to notice when they are not. Regret is the objective, $R_T = \sum_t (\mu^\star - \mu_{a_t})$.
+
+\emph{$\epsilon$-greedy} plays the best-known arm with probability $1-\epsilon$ and a random arm otherwise---trivial to implement, but a fixed $\epsilon$ never stops exploring, giving linear regret; decaying $\epsilon_t \propto 1/t$ fixes the asymptotics. \emph{UCB} is optimism under uncertainty: play $\arg\max_a \hat\mu_a + \sqrt{2\ln t / n_a}$, where the bonus is a confidence radius that shrinks as an arm is pulled, so arms are abandoned only once their uncertainty is small enough to rule them out. \emph{Thompson sampling} is posterior sampling: maintain a posterior per arm, draw one sample from each, play the argmax. For Bernoulli rewards with a Beta prior the mechanics are three lines---arm $a$ has $\text{Beta}(\alpha_a + s_a, \beta_a + f_a)$ after $s_a$ successes and $f_a$ failures; sample $\theta_a$ from each; play the max; update---and its exploration is automatically proportional to the probability that an arm is optimal. Thompson sampling generally matches or beats UCB empirically, handles delayed and batched feedback gracefully (the posterior simply lags), and needs no tuning constant, which is why it is the production default.
+
+Bandits win when there are many arms and little traffic per arm, when content is perishable (news, promotions, creatives) so that a two-week test outlives the item, when the reward is cheap and immediate, and when regret genuinely matters because traffic sent to bad arms is money lost. A/B wins when you need an unbiased, precisely quantified effect with guardrails---a launch decision, a pricing change, anything with a legal or financial commitment---because adaptive allocation makes naive post-hoc analysis invalid (the data is no longer i.i.d. across arms). Rewards that arrive days later, strong non-stationarity, and the need to explain a single number to a review board all favor the fixed test.
+
+Contextual bandits condition the arm choice on features: LinUCB models each arm's reward as linear in the context with a ridge estimate and adds a confidence bonus from the covariance, giving a per-context optimism rule. The essential companion is off-policy evaluation: because you logged the propensity $p(a \mid x)$ under the deployed policy, you can estimate a new policy's value from logs by importance weighting, $\hat V_{\text{IPS}} = \frac{1}{n}\sum_i \frac{\mathbb{1}[a_i = \pi(x_i)]}{p(a_i \mid x_i)} r_i$---unbiased when every action had nonzero logging probability, but high-variance when the new policy diverges from the logged one, which is why you clip weights, use self-normalized or doubly-robust variants, and \emph{log propensities from day one}. Practical failure modes to name: delayed feedback (update with partial rewards or model the delay), non-stationarity (discount old data or use sliding windows---a bandit that has converged is blind to a changed world), and batch updates (real systems update hourly, not per-request, which slows learning and must be simulated before launch).
 
 \section{Observational Causal Inference}
-% TODO Phase C3
+\label{cml:sec:observational}
+
+Sometimes randomization is impossible: the feature shipped to everyone, prices cannot be varied by user for fairness and legal reasons, or the question is retrospective. The potential-outcomes framework makes the target explicit: each unit has $Y(1)$ and $Y(0)$, only one is observed (the fundamental problem of causal inference), and we estimate averages---ATE over everyone, ATT over the treated, CATE within covariate strata.
+
+\begin{keyinsight}
+\textbf{Three assumptions do all the work.} \emph{Ignorability} (no unmeasured confounding): treatment is as-good-as-random given the observed covariates---untestable, always the weak link, and the honest headline of any observational analysis. \emph{Positivity/overlap}: every covariate profile has a nonzero chance of both treatments, or you are extrapolating rather than comparing. \emph{SUTVA}: no interference and one version of treatment. Method choice is really the choice of which assumption you find least implausible in this dataset.
+\end{keyinsight}
+
+\emph{Propensity scores and IPW.} The propensity $e(x) = P(T=1 \mid X=x)$ summarizes confounding in one number; weighting each unit by $1/e(x)$ (treated) and $1/(1-e(x)$) (control) reconstructs a pseudo-population where treatment is independent of $X$. The failure mode is arithmetic and severe: units with propensities near 0 or 1 receive enormous weights, so a handful of observations dominate the estimate and variance explodes. Trim extreme propensities or use stabilized weights, always inspect the overlap of the propensity distributions across arms (non-overlapping regions are not estimable and should be excluded and reported), and check covariate balance after weighting via standardized mean differences rather than by re-running significance tests. Doubly-robust (AIPW) combines an outcome model with the propensity model and is consistent if \emph{either} is correctly specified---worth naming, and worth being honest that it does not rescue you from unmeasured confounding.
+
+\emph{Difference-in-differences.} With a treatment that turned on for one group at a known time, compare the change over time in the treated group to the change in an untreated group: $\hat\tau = (\bar Y^{\text{post}}_{T} - \bar Y^{\text{pre}}_{T}) - (\bar Y^{\text{post}}_{C} - \bar Y^{\text{pre}}_{C})$, which differences away both fixed group differences and common time shocks. Everything rests on \emph{parallel trends}: absent treatment, the two groups would have moved together. Probe it by plotting pre-period trends and running an event-study specification with leads and lags---a pre-trend that diverges before treatment falsifies the design. A concrete failure: a feature rolled out to the most engaged market first, whose growth was already accelerating; DiD attributes the acceleration to the feature. Staggered adoption across many units needs the modern estimators rather than naive two-way fixed effects, which is worth one sentence of awareness.
+
+\emph{Instrumental variables.} An instrument $Z$ moves treatment but affects the outcome \emph{only} through treatment (relevance plus the exclusion restriction), so the Wald estimator $\hat\tau = \frac{\operatorname{Cov}(Y,Z)}{\operatorname{Cov}(T,Z)}$ (2SLS in general) recovers a causal effect despite unmeasured confounding. The industry-realistic version is an encouragement design: randomize an \emph{invitation} to use a feature you cannot force people to adopt, then use assignment as the instrument for actual usage. Caveats to state unprompted: weak instruments (low first-stage correlation) produce badly biased and unstable estimates---report the first-stage F; the exclusion restriction is untestable and usually the point of attack (does the invitation itself change behavior, apart from adoption?); and IV identifies a LATE, the effect for \emph{compliers} only, which may not be the population you care about.
+
+\emph{Regression discontinuity.} Where treatment is assigned by a threshold on a running variable---a credit score cutoff, a pricing tier boundary, a rank-based promotion---units just above and just below are comparable, so a local comparison at the cutoff is nearly experimental. Sharp RD assigns deterministically at the threshold, fuzzy RD only shifts probability (and is then an IV). It is credible but local (the effect at the cutoff), sensitive to bandwidth choice, and invalidated by manipulation of the running variable, which is checked with a density test at the threshold.
+
+\begin{warningbox}
+\textbf{The decision guide.} Experiment if you can---including on a small slice, in one market, or via an encouragement design, all of which beat any observational estimate. If you cannot: a threshold rule in the assignment mechanism points to RD; a staggered rollout across units points to DiD; a randomized nudge you can exploit points to IV; rich covariates plus a plausible selection story and good overlap points to propensity/DR methods. State the identifying assumption out loud, run the diagnostic that could falsify it, and report the estimate with that caveat attached. And never read a causal effect off a predictive model's feature importances or SHAP values---those describe the model, not the world.
+\end{warningbox}
+
+\section{Experimentation at Staff Level}
+\label{cml:sec:culture}
+
+Individual tests are the easy part; the staff-level question is whether the organization's experiments add up. Experiment review---a lightweight design check before launch (OEC, MDE, duration, guardrails, segments pre-registered) and a results check before shipping---catches most of the pathologies in this chapter at the point where they are still cheap to fix. Institutional memory matters as much: a searchable archive of past experiments, including the failures, prevents the same idea from being re-run every eighteen months and enables meta-analysis of the effect-size distribution, which in turn calibrates priors, shrinkage, and how much to believe the next surprising win.
+
+The recurring hard call is shipping on flat. A flat result is not evidence of no effect; it is evidence that the effect is smaller than your MDE. The decision then rests on asymmetric costs: if the change reduces technical debt, unblocks future work, or is strategically necessary, ship it on flat and say so explicitly; if it adds complexity or risk with no measured payoff, do not. Long-run effects deserve separate machinery---holdback groups (a small population kept on the old experience for months) measure the accumulated effect of many launches and routinely reveal that the sum of individually significant wins is smaller than their arithmetic total.
 
 \section{Interview Questions}
-% TODO Phase C3
+\label{cml:sec:experimentation_interview}
 
+\begin{interviewq}
+\textbf{Q: We want to detect a 1\% relative lift on a 2\% click-through rate. How many users do we need, and how long should we run?}
+
+\badgeLfive{L5} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Convert to an absolute effect first: 1\% relative on a 2\% base is $\delta = 0.0002$. Use $n \approx 16\,p(1-p)/\delta^2$ at 80\% power and $\alpha = 0.05$ (the 16 is $2 \times 2.8^2$, from $z_{0.975} + z_{0.8} = 1.96 + 0.84$). That gives $n \approx 16(0.02)(0.98)/4\times10^{-8} \approx 7.84$M per group, about 15.7M users total. At 2M eligible users per day that is roughly eight days of exposure, and you round up to two full weeks so the test covers whole weekly cycles rather than a weekday-skewed population.
+
+Then say the things that separate levels. The honest framing is MDE, not sample size: with the traffic we have, what is the smallest effect we can see? If the answer is larger than any plausible effect, do not run the test. Variance reduction changes the arithmetic materially---CUPED on the pre-period click rate with $\rho \approx 0.7$ cuts required $n$ roughly in half. Only users who actually reach the surface count, so if the feature triggers for 30\% of traffic, the exposure-based denominator is what matters and the calendar time triples. And CTR is a ratio metric: if we randomize by user, compute the variance by the delta method or bootstrap over users rather than over impressions, or the standard error will be too small.
+
+\redflags
+\begin{itemize}
+    \item Applying the relative lift as if it were absolute ($\delta = 0.01$), which understates the requirement by four orders of magnitude.
+    \item Quoting a sample-size number with no $\alpha$, power, or variance assumption attached.
+    \item Ignoring the trigger/exposure population and computing duration off total site traffic.
+    \item Treating impressions as independent samples for a user-randomized test.
+\end{itemize}
+
+\interviewtest{Whether experiment sizing is a reflex or a formula you half-remember. The relative-to-absolute conversion and the square dependence on $\delta$ are where most candidates fail; the strong ones volunteer MDE and CUPED without being asked.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct arithmetic with stated assumptions.
+    \item \badgeLsix{L6} Reframes as MDE, adds CUPED and the exposure denominator, handles the ratio-metric variance.
+    \item \badgeLseven{L7} Questions whether a 1\% CTR lift is the right thing to measure at all, and proposes bundling small changes or measuring a downstream metric with better signal-to-noise.
+\end{itemize}
+
+\followups{``How does the answer change at 95\% power?'' (the constant moves from 15.7 to about 26). ``What if the metric is revenue per user instead?'' (use the observed variance, expect heavy tails, cap or bootstrap.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your test came back flat, but you are confident the feature helps. What do you do?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Start by refusing the framing: flat is not ``no effect,'' it is ``no effect larger than my MDE,'' so the first move is to compute the confidence interval and ask what it excludes. A CI of $[-0.5\%, +0.7\%]$ is uninformative about a 0.3\% effect; a CI of $[-0.05\%, +0.06\%]$ genuinely rules out anything worth shipping for. That distinction determines everything that follows.
+
+If the test was underpowered, buy power rather than looking harder: CUPED or stratification on pre-period behavior (a 2$\times$ effective saving at $\rho = 0.7$), restrict to the triggered population so untouched users stop diluting the effect, choose a more sensitive metric closer to the mechanism (the specific click the feature changes, not sitewide revenue), extend duration in whole weeks, or increase allocation. If power is adequate and the interval is tight, take the result seriously: check whether the feature actually shipped correctly (instrumentation, exposure rates, an SRM check), then look at pre-registered segments and the effect-by-day curve for novelty or dilution masking a real subgroup effect---and treat any unregistered segment win as a hypothesis for a follow-up test, not a finding. Sequential or always-valid monitoring is the answer to ``can I keep looking,'' not a way to rescue this result.
+
+Close on the decision, because that is what the interviewer wants: if the change is cheap, reduces complexity, or is strategically required, ship on flat and say explicitly that we are shipping without measured benefit; if it adds risk or maintenance cost, do not ship. Either way, record the MDE so the next team knows what this experiment could and could not have detected.
+
+\redflags
+\begin{itemize}
+    \item Peeking until it turns significant, or slicing segments until one is.
+    \item Treating $p > 0.05$ as proof of no effect.
+    \item Extending the test indefinitely with no pre-specified stopping rule.
+    \item Shipping anyway while claiming the experiment supported it.
+\end{itemize}
+
+\interviewtest{Whether you distinguish absence of evidence from evidence of absence, and whether your instinct under pressure is to buy power or to fish for significance.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Notes the test may be underpowered and suggests running longer.
+    \item \badgeLsix{L6} Uses the CI to decide, applies variance reduction and trigger-based analysis, keeps segment analysis disciplined.
+    \item \badgeLseven{L7} Turns it into a program question---our MDEs are too large for the effects we ship, so invest in variance reduction and metric sensitivity rather than re-running this test.
+\end{itemize}
+
+\followups{``How would you decide whether to ship on flat?'' ``What would you tell a PM who wants the win?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your treatment shows +2\% on the primary metric, but the SRM check fired. What now?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Stop and discard the result---an SRM means the arms are no longer comparable populations, so the +2\% is uninterpretable, not merely noisy. Say that first and without hedging; the instinct to ``adjust'' or to ship because the number is good is the failure mode being tested.
+
+Then debug systematically, from assignment to analysis. Confirm the mismatch is real (chi-square against the intended ratio, $p < 0.001$; at scale a 0.2\% deviation is not chance). Check the assignment layer for a bucketing bug, an off-by-one hash range, or overlapping experiment layers. Check exposure logging: latency or crashes in one arm silently drop users, and a redirect that adds 200ms to treatment removes exactly the impatient users. Check triggering logic---if the trigger condition is evaluated after a code path that differs across arms, the populations diverge by construction. Check downstream filters: bot removal, dedup joins, and outlier exclusions applied asymmetrically are extremely common causes. Segment the ratio by day, platform, country, and app version to localize where the imbalance appears, which usually names the bug.
+
+Note why the direction of the bias is unpredictable and often self-serving: if treatment lost its slowest, least engaged users to a crash, treatment's average looks better for a reason unrelated to the feature. After the fix, re-run---and consider an A/A test on the same pipeline to confirm the fix took.
+
+\redflags
+\begin{itemize}
+    \item Reweighting the arms to ``correct'' the imbalance and reporting the effect anyway.
+    \item Dismissing a 50.4/49.6 split as too small to matter at 10M users.
+    \item Shipping because the effect is large and the SRM is ``probably logging.''
+    \item No systematic hypothesis order---just re-running the query.
+\end{itemize}
+
+\interviewtest{Whether you know SRM invalidates rather than perturbs an experiment, and whether you can generate a concrete, ordered list of pipeline causes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Recognizes SRM as a red flag and escalates.
+    \item \badgeLsix{L6} Declares the result unusable and runs the assignment $\to$ exposure $\to$ trigger $\to$ filter differential.
+    \item \badgeLseven{L7} Fixes the class of bug---automated SRM alerting on every experiment, A/A coverage, and a policy that blocks readouts on SRM.
+\end{itemize}
+
+\followups{``What threshold would you alert on?'' ``How does an SRM in the trigger step differ from one in assignment?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Explain CUPED to a PM, and quantify what it buys us.}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The PM version: our users differ wildly---some visit daily, some monthly---and most of the variation in any metric is that pre-existing difference, not anything our feature did. CUPED subtracts each user's own historical baseline before comparing groups, so we are measuring the change in behavior rather than the level. It cannot bias the result, because the baseline was measured before the experiment started and cannot be affected by treatment.
+
+The quantified version: adjust $Y' = Y - \theta(X - \bar X)$ with $\theta^\star = \operatorname{Cov}(Y,X)/\operatorname{Var}(X)$, which leaves the expectation unchanged and multiplies variance by $1 - \rho^2$. Since required sample size is proportional to variance, at $\rho = 0.7$ we need about 51\% of the users---a two-week test becomes one week, or the same two weeks detect an effect $1/\sqrt{2}$ as large. At $\rho = 0.5$ the saving is 25\%; below $\rho \approx 0.3$ it is not worth the plumbing.
+
+Then the honest limits: it does nothing for new users (no pre-period), it is weak for rare conversions where self-correlation is low, and the covariate must be strictly pre-treatment---using a post-assignment covariate introduces real bias, which is the one way to get this wrong. Mention that stratified assignment achieves the same variance reduction by design, and that the idea generalizes to a regression on many pre-period features.
+
+\redflags
+\begin{itemize}
+    \item Claiming CUPED increases power ``by reducing bias'' or that it changes the estimand.
+    \item Using a post-treatment covariate, or the metric itself during the experiment window.
+    \item Quoting a fixed speedup with no reference to $\rho$.
+\end{itemize}
+
+\interviewtest{Whether you can translate a variance-reduction technique into business terms and back, and whether you know its failure conditions rather than just its formula.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes it as ``controlling for pre-period behavior.''
+    \item \badgeLsix{L6} Gives $\theta^\star$, the $1-\rho^2$ result, and the sample-size consequence with numbers.
+    \item \badgeLseven{L7} Frames it as platform infrastructure---compute covariates once for all experiments---and connects it to stratification and regression adjustment as one family.
+\end{itemize}
+
+\followups{``What if $\theta$ is estimated on the experiment data itself?'' ``How would you handle new users?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your marketplace A/B test shows +2\% GMV in treatment. Why might the true effect be smaller, or negative?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Because user-level randomization violates SUTVA on a two-sided platform. Treatment and control users compete for the same finite supply: if the treatment ranking converts better, treated users book the scarce inventory first and control users find less of it, so control is actively depressed by the experiment. The measured gap is then part real effect and part transfer, and in the extreme---a pure reallocation with no new demand---the true incremental effect is zero while the test reads +2\%. Related mechanisms: sellers reacting to changed demand, budget-constrained advertisers, and shared ranking models retrained on treatment-influenced data.
+
+The designs that fix it: cluster randomization at the level where the market clears (city, region, supply pool), which is unbiased but reduces the effective sample size to the number of clusters and therefore costs a great deal of variance; switchback, randomizing region $\times$ time bucket and alternating the treatment on and off, which suits dispatch and pricing decisions and needs burn-in within each bucket to handle carryover; and budget-split designs in ads. A cheap diagnostic before any of that: vary the treatment allocation (say 10\% versus 50\%) and see whether the measured effect changes---a treatment-share-dependent effect is direct evidence of interference. Also check supply-side and marketplace-wide guardrails rather than only the treatment arm's GMV.
+
+And run the ordinary checks too, since they explain many +2\% results: SRM first, then novelty effects and whale concentration in the metric.
+
+\redflags
+\begin{itemize}
+    \item Accepting the +2\% at face value with no interference discussion.
+    \item Proposing user-level randomization with more users as the fix.
+    \item Naming switchback without knowing what is randomized or why burn-in exists.
+\end{itemize}
+
+\interviewtest{Whether you notice that the standard experimental assumption fails in two-sided markets---the single most-tested causal-inference idea at platform companies.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Mentions novelty and seasonality but misses interference.
+    \item \badgeLsix{L6} Diagnoses cannibalization, proposes cluster or switchback with the variance trade-off stated.
+    \item \badgeLseven{L7} Adds the allocation-varying diagnostic and reasons about which market-level metric would actually settle the question.
+\end{itemize}
+
+\followups{``How would you choose the cluster granularity?'' ``What breaks in a switchback if effects persist across buckets?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why not send retention offers to the users with the highest churn probability?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Because churn probability is not treatment effect. Sorting by churn risk buys three kinds of users you do not want---sure things who would have stayed anyway (pure margin loss), lost causes who leave regardless (wasted spend), and sleeping dogs whom the offer actively reminds to cancel---and only incidentally the persuadables, the users whose behavior the offer actually changes. What you want to rank by is uplift $\tau(x) = \mathbb{E}[Y(1) - Y(0) \mid x]$.
+
+To build it: run a randomized campaign with a proper holdout, then estimate CATE. A T-learner (separate retention models on treated and untreated) is the obvious start, an X-learner is better when the treated group is small---which it usually is with a 5\% holdout---and a causal forest or DR-learner is the modern default with enough data. Validate on randomized held-out data with an uplift/Qini curve: sort by predicted uplift, and check that the observed treatment-minus-control gap in the top decile substantially exceeds the overall gap. Outcome AUC is not a validation of an uplift model and saying so is a differentiator.
+
+Then the economics: target down the uplift ranking until incremental margin equals offer cost, and explicitly exclude negative-uplift users. Mention that this requires ongoing randomized holdouts---the moment you target purely by model score, you lose the data that lets you re-estimate the effect.
+
+\redflags
+\begin{itemize}
+    \item Treating a churn model as a targeting model with no notion of counterfactuals.
+    \item Evaluating the uplift model with outcome AUC or accuracy.
+    \item Training on observational campaign data where treatment was already targeted, without addressing confounding.
+    \item Never mentioning that some users are harmed by the intervention.
+\end{itemize}
+
+\interviewtest{Whether you can separate prediction from causation in a setting where a predictive model is right there and superficially plausible.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Says ``we should target users the offer will change'' without method.
+    \item \badgeLsix{L6} Gives the four quadrants, a meta-learner choice with justification, and Qini evaluation on randomized data.
+    \item \badgeLseven{L7} Adds the cost-based targeting threshold and the standing-holdout design that keeps the system measurable over time.
+\end{itemize}
+
+\followups{``Which meta-learner for a 5\% treated group, and why?'' ``How do you detect sleeping dogs?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Thompson sampling, UCB, or $\epsilon$-greedy---mechanics, and when would you use a bandit instead of an A/B test?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Mechanics, briefly. $\epsilon$-greedy: exploit the empirical best, explore uniformly with probability $\epsilon$; trivial, but constant $\epsilon$ gives linear regret and explores arms already known to be bad. UCB: play $\arg\max \hat\mu_a + \sqrt{2\ln t/n_a}$---optimism in the face of uncertainty, where the bonus shrinks with pulls so an arm is dropped only once its uncertainty is small. Thompson sampling: keep a posterior per arm, draw one sample from each, play the argmax; for Bernoulli rewards with Beta priors that is $\text{Beta}(\alpha + s_a, \beta + f_a)$, sample, take the max, update. TS explores each arm in proportion to its probability of being optimal, needs no tuning constant, and degrades gracefully under delayed or batched feedback because the posterior simply lags---which is why it is the production default.
+
+When a bandit: many arms with thin traffic, perishable content (creatives, headlines, promotions) whose value expires before a fixed test would finish, cheap immediate rewards, and a genuine cost to sending traffic to losers. When A/B: you need an unbiased, precisely quantified effect with confidence intervals for a launch or pricing decision; you have guardrails that must be evaluated on comparable populations; rewards are delayed by days; or the result must be legible to people who will not accept ``the allocation adapted.'' The subtle point worth making: adaptive allocation breaks naive post-hoc inference, so if you need both selection and estimation, use a bandit for allocation and reserve a small fixed-allocation slice for clean measurement.
+
+\redflags
+\begin{itemize}
+    \item ``Bandits are strictly better because they waste less traffic''---ignores inference, guardrails, and delayed rewards.
+    \item Describing Thompson sampling as ``random exploration'' with no posterior.
+    \item Not knowing that adaptively collected data invalidates standard confidence intervals.
+\end{itemize}
+
+\interviewtest{Whether you understand that bandits and A/B tests optimize different objectives---regret versus inference---rather than being faster and slower versions of the same thing.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes explore/exploit and names the algorithms.
+    \item \badgeLsix{L6} Gives correct mechanics including Beta-Bernoulli updates, and a decision rule grounded in the objective.
+    \item \badgeLseven{L7} Adds contextual bandits, propensity logging for off-policy evaluation, and non-stationarity handling.
+\end{itemize}
+
+\followups{``How would you evaluate a new policy offline from bandit logs?'' ``What breaks under weekly seasonality?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: We cannot randomize prices. How would you estimate price elasticity from historical data?}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Lead with the confounding story, because it is the whole problem: prices were not set randomly---they were raised when demand was strong and cut when inventory was stale---so a naive regression of quantity on price recovers the pricing policy, not the demand curve, and frequently returns an upward-sloping ``demand.'' Controlling for observed covariates helps only if the pricing rule used nothing you cannot observe, which is rarely true.
+
+Then map data shapes to designs. If prices follow a rule with a threshold (tier boundaries, an algorithmic cutoff), that is regression discontinuity---compare just above and below, check the density for manipulation, report bandwidth sensitivity. If price changes rolled out across markets at different times, that is difference-in-differences, and I would show the pre-trend/event-study plot before trusting it, being alert to the rollout order being correlated with market growth. If there is a supply-side cost shock or exchange-rate movement that shifts price without otherwise touching demand, that is an instrument---state the exclusion restriction and report the first-stage F. Panel data with market and time fixed effects absorbs a lot of the confounding but not time-varying market-level demand shocks, which is exactly the omitted variable here.
+
+Close by pushing for an experiment, because that is the staff-level move: even a small randomized price test in a few markets, or a randomized promotion/discount as an encouragement design, identifies elasticity far more credibly than any of the above, and it is usually more feasible than people assume once the fairness and legal concerns are addressed (uniform published prices with randomized discounts, or geography-level randomization with disclosure). Propose the observational estimate as the interim answer with its assumption stated, and the experiment as the thing that settles it.
+
+\redflags
+\begin{itemize}
+    \item Regressing quantity on price with controls and calling it elasticity.
+    \item Naming IV or DiD without stating the assumption each requires.
+    \item Never questioning whether an experiment is truly impossible.
+    \item Claiming propensity scores handle unobserved demand shocks.
+\end{itemize}
+
+\interviewtest{Whether you reason from data-generating process to identification strategy, and whether you retain the instinct that a small experiment beats a clever observational estimate.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Recognizes confounding, proposes controls.
+    \item \badgeLsix{L6} Matches a specific quasi-experimental design to the data shape with its assumption and diagnostic.
+    \item \badgeLseven{L7} Sequences it: interim observational estimate with caveats, a targeted price experiment to validate, and a plan for continuous elasticity measurement via ongoing randomized variation.
+\end{itemize}
+
+\followups{``What is the LATE here and who are the compliers?'' ``How would you detect a violation of parallel trends?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What assumption does difference-in-differences require, and how would you probe it?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Parallel trends: absent the treatment, treated and control groups would have followed the same trajectory. Note precisely what it does \emph{not} require---the groups may differ in level by any amount, since the first difference removes fixed group differences and the second removes shocks common to both.
+
+Probe it by plotting the outcome for both groups over several pre-periods and running an event-study specification with leads and lags: coefficients on the leads should be statistically and visually flat. Supporting checks: a placebo test on a fake treatment date, a placebo outcome that treatment should not affect, and sensitivity to the choice of control group. State the honest caveat that parallel pre-trends are evidence, not proof---the assumption concerns the unobserved counterfactual path, and a differential shock coinciding with treatment breaks it regardless of clean pre-trends. Give a concrete violation: the feature launched in markets that were already accelerating, or a competitor exited one market at the same time. Composition change also breaks it---if treatment changes who is in the sample, the two periods measure different populations.
+
+\redflags
+\begin{itemize}
+    \item Saying the groups must be ``similar'' or ``balanced'' rather than parallel in trend.
+    \item Treating matching pre-period \emph{levels} as the assumption.
+    \item Claiming a pre-trend check proves the assumption.
+\end{itemize}
+
+\interviewtest{Whether you can state an identifying assumption precisely and name a diagnostic that could falsify it---the core competency for all observational work.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States parallel trends and suggests plotting pre-periods.
+    \item \badgeLsix{L6} Adds event-study leads/lags, placebo tests, and a concrete violation story.
+    \item \badgeLseven{L7} Notes staggered-adoption problems with two-way fixed effects and when to reach for modern estimators.
+\end{itemize}
+
+\followups{``What if only one treated unit exists?'' (synthetic control). ``How does staggered rollout complicate this?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design the experimentation platform for a 200-engineer organization.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Scope it as making correct experiments the path of least resistance, since at 200 engineers the bottleneck is not statistics but the number of teams able to run a trustworthy test unaided.
+
+Assignment and exposure: deterministic hashing of unit ID plus experiment salt for reproducible, stateless bucketing; a layered design (orthogonal domains) so many experiments run concurrently without colliding, with mutual-exclusion groups for changes that interact; exposure logged at the moment of \emph{trigger}, not at page load, because trigger-based analysis is what makes small features detectable. Metrics: a central definition repository so ``revenue'' means one thing, with each experiment declaring one OEC plus a standard guardrail set that is evaluated automatically; per-metric variance and pre-period correlation precomputed so the platform can offer CUPED by default and quote an MDE at design time.
+
+Analysis: automatic SRM checks that block a readout, delta-method or bootstrap standard errors for ratio metrics with clustering at the randomization unit, CUPED applied where $\rho$ justifies it, Benjamini--Hochberg across exploratory metrics with the OEC and guardrails held at FWER, and pre-registered segments only. Fix a monitoring policy---fixed horizon by default, always-valid inference for teams that must act early, guardrail alerting always on---and enforce it in the tool rather than in documentation.
+
+Trust and process: continuous A/A tests validating the pipeline's false-positive rate, an experiment registry that records hypothesis, MDE, duration, and outcome including failures, a lightweight design review for high-stakes tests and results review before launch, and long-run holdbacks to measure accumulated effects. Then the organizational half: a small central team owning the platform and methodology plus embedded analysts, self-serve documentation with the three or four rules that matter, and meta-analysis over the archive to calibrate how much to believe the next win. Success metrics for the platform itself: experiments per quarter, share with adequate power, share invalidated by SRM, and the gap between predicted and holdback-realized impact.
+
+\redflags
+\begin{itemize}
+    \item Only describing bucketing infrastructure, with no metric governance or trust layer.
+    \item No SRM/A/A validation---the platform is then untrustworthy by construction.
+    \item Letting every team define its own metrics and stopping rules.
+    \item Ignoring the human process: reviews, registry, education.
+\end{itemize}
+
+\interviewtest{Whether you think in systems and incentives rather than statistics alone---the platform's job is to make the statistically correct action the default one.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes assignment and a results dashboard.
+    \item \badgeLsix{L6} Adds metric governance, CUPED, SRM gating, and multiplicity policy.
+    \item \badgeLseven{L7} Adds trust infrastructure (A/A, registry, holdbacks), an explicit monitoring policy, and platform-level success metrics.
+\end{itemize}
+
+\followups{``How would you handle interference at this scale?'' ``What would you centralize versus federate?''}
+\end{interviewq}
