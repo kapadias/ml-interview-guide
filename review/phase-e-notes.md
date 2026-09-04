@@ -30,6 +30,13 @@ Still accurate at the time of checking: ch6 rows for memory estimation (179,
 703), BPE interaction (180, 564), debugging embedding quality (181, 762),
 clustering diagnosis (330, 761), and collapse (332, 565).
 
+Deep-learning ch21 dropped eight RAG questions to [NLP 9]/[SR 4]/[SR 8]; the
+index still routes them to this chapter at lines 65, 271, 272, 466-469, 520,
+521, 597, 677, 679, 680, 793, 794, 861, 862, and states a chapter question count
+of 10 at line 936 against an actual 4. DL ch16 merged two PEFT-comparison
+questions and added a rank/alpha question; entries 64 and 83 still list both
+halves of the merged one, and the chapter tally says 10 against an actual 12.
+
 Also note: DL ch7 merged two near-identical HNSW throughput questions into one,
 and dropped three questions to pointers ([SR 3], [SR 4], [SR 8]); NLP ch3
 dropped one; NLP ch6's PEFT question bank was revisited. Any hand-patch of the
@@ -62,3 +69,18 @@ from the generated index rather than by hand.
 - DL ch9 retains a stale "in-context learning emerges around 10B+" line and a
   "GPT-4 via API" phrasing in a design answer; both were outside the assigned
   scope when spotted.
+
+## 5. Homeless content created by the Phase D dedup
+
+- **High-stakes/legal RAG design detail** (citation-graph indexing, jurisdictional
+  metadata, attorney-privilege ACLs, audit logging) came out of DL ch21's deleted
+  legal-platform question. [NLP 9]'s Q1 (customer support) and Q10 (scaling) do
+  not carry it. Worth an L7 rung on NLP 9 Q1, or a note in [SR 8].
+- **A multi-hop/reasoning RAG failure question** is not asked anywhere. DL ch21's
+  "works for factual queries but fails for reasoning queries" was deleted as
+  pipeline material, but [NLP 9] has no equivalent question, only body coverage.
+  Best candidate for a new NLP 9 question.
+- **GraphRAG, contextual retrieval, and late chunking** exist only in DL ch21. A
+  strict reading of the treaty puts them in [NLP 9]'s advanced patterns; they
+  were kept because NLP 9 has no coverage at all. If a later phase wants strict
+  conformity, move them rather than delete them.
