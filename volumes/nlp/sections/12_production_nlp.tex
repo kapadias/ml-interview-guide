@@ -1,23 +1,29 @@
 % ============================================================================
 % CHAPTER 12: PRODUCTION NLP AND DEPLOYMENT
 % ============================================================================
-% Covers tokenization algorithms, model serving infrastructure, quantization,
-% distillation, speculative decoding, efficiency techniques, multilingual
-% production challenges, and MLOps for NLP.
+% Canonical home for tokenization algorithms (BPE, WordPiece, Unigram,
+% SentencePiece).  Around it: the LLM application layer -- serving primitives
+% and their application consequences, the compression decision, cost
+% engineering, multilingual production challenges, and operating an LLM
+% feature.  Serving/compression mechanics are canonical in [DL 19] / [DL 14];
+% the MLOps lifecycle is [DL 22].
 % ============================================================================
 
 \chapter{Production NLP and Deployment}
 \label{chap:production_nlp}
 
 \begin{tldr}
-Bridging the gap from research to production is where senior engineers differentiate
-themselves.  This chapter covers the complete production NLP stack: tokenization algorithms
-(BPE, WordPiece, Unigram), model serving infrastructure (KV-cache, continuous batching,
-PagedAttention), efficiency techniques (quantization, distillation, speculative decoding),
-and MLOps practices.  Every concept is grounded in concrete numbers---memory budgets,
-latency targets, throughput benchmarks---because interviewers at L5+ expect you to reason
-quantitatively about deployment tradeoffs, not just recite architectures.  Production
-awareness in every answer signals staff-level thinking.
+This chapter is the program's canonical home for \textbf{tokenization
+algorithms}---BPE, WordPiece, Unigram, SentencePiece, byte-level BPE, and the vocabulary
+trade-offs that follow---and, around that core, the \textbf{LLM application layer}: the
+serving primitives an application team must specify and design prompts around, the
+precision-and-compression decision it actually makes, cost engineering (routing, semantic
+caching, prefix-cache-friendly prompts, output-length control), the multilingual tokenizer
+tax, and what it takes to operate an LLM feature whose quality has no label.  The serving
+and compression \emph{mechanics} are canonical in [DL~19] and [DL~14]; the MLOps lifecycle
+is [DL~22].  Every concept is grounded in concrete numbers---memory budgets, latency
+targets, cost per request---because interviewers at L5+ expect you to reason quantitatively
+about deployment tradeoffs, not just recite architectures.
 \end{tldr}
 
 \bigskip
@@ -33,6 +39,15 @@ one of the most consequential design decisions in any NLP system.  The choice of
 determines the vocabulary size, the sequence length (and therefore compute cost), the model's
 ability to handle rare words and multiple languages, and even whether the model can perform
 character-level tasks like spelling.
+
+\emph{This section is the program's canonical home for tokenization algorithms}: the
+derivations, the vocabulary trade-offs, and the comparison table below are the reference the
+other volumes point to.  Two companions live elsewhere: the from-scratch BPE
+\emph{implementation drill} (train the merges, encode, handle the degenerate cases) is
+[DL~28], and the \emph{interaction effects}---how tokenizer choice couples to the
+embedding table, the architecture, and downstream quality---are [DL~9], with the
+embedding-side diagnostics in [DL~6].  The multilingual consequences of these algorithms
+are developed later in this chapter (Section~\ref{sec:tokenizer_tax}).
 
 \subsection{Why Tokenization Matters}
 
@@ -289,570 +304,176 @@ to any input text.}
 
 
 % ============================================================================
-% SECTION 2: MODEL SERVING INFRASTRUCTURE
+% SECTION 2: SERVING AND EFFICIENCY (APPLICATION VIEW)
 % ============================================================================
-\section{Model Serving Infrastructure}
+\section{Serving and Efficiency: The Application View}
 \label{sec:model_serving}
 
-Serving LLMs in production is fundamentally different from training them.  Training is
-throughput-optimized (process as many tokens as possible per second); serving is
-latency-optimized (minimize time-to-first-token and inter-token latency for each user).
-This section covers the infrastructure primitives that make production LLM serving possible.
+Serving is latency-optimized where training is throughput-optimized, and the
+machinery that makes it work is canonical in \textbf{[DL~19]}: the KV cache
+and its memory arithmetic, MLA, PagedAttention, prefix caching and
+RadixAttention, continuous batching, the prefill/decode split and the
+TTFT--throughput frontier, speculative decoding, structured and constrained
+decoding, quantization for inference, serving parallelism and MoE serving,
+and capacity planning for reasoning models.  The compression methods
+themselves---PTQ and QAT, GPTQ and AWQ, pruning, distillation---are canonical
+in \textbf{[DL~14]}, and the training-side techniques a serving discussion
+tends to collect by accident---mixed precision, gradient checkpointing---are
+canonical in \textbf{[DL~15]}.
 
-\subsection{KV-Cache: The Essential Optimization}
+This section keeps the half that belongs to the \emph{application} team---the
+team that usually does not own the serving stack but must specify it, budget
+for it, and design prompts and traffic around it: which primitives to demand,
+what each one buys, and how the cost arithmetic falls out.
+
+\subsection{The Serving Primitives and What Each One Buys}
 \label{sec:kv_cache}
-
-In autoregressive generation, each new token attends to \emph{all} previous tokens.
-Without caching, generating the $t$-th token requires recomputing the key and value
-projections for all $t-1$ previous tokens---$O(t)$ redundant computation per step,
-and $O(T^2)$ total for a sequence of length $T$.
-
-The \textbf{KV-cache} stores the key and value tensors from all previous positions so
-they are computed only once.
-
-\paragraph{Two-phase generation.}
-\begin{enumerate}
-    \item \textbf{Prefill (prompt processing):}  Process all $n$ prompt tokens in
-          parallel (like training).  Compute and store $\mK, \mV \in \R^{n \times d}$
-          for every layer.  This is compute-bound.
-    \item \textbf{Decode (token generation):}  Generate one token at a time.  For each
-          new token, compute its query $\vq_t$, attend to the cached keys and values,
-          then \emph{append} the new key and value to the cache.  This is
-          memory-bandwidth-bound (reading the entire cache for a single token).
-\end{enumerate}
-
-\begin{keyinsight}[KV-Cache Is the Main Inference Bottleneck]
-During decoding, the model reads the entire KV-cache from GPU memory for every single
-token generated.  For a 70B parameter model with GQA ($H_{\text{kv}}{=}8$) at 128K
-context, the KV-cache alone exceeds 40\,GB \emph{per request}---larger than the INT4-quantized
-weights ($\sim$35\,GB), and across even a few concurrent long-context requests the total
-cache outgrows the 140\,GB of FP16 weights.  This makes LLM inference
-\textbf{memory-bandwidth-bound}, not compute-bound.  Understanding this distinction is
-essential: most serving optimizations (GQA, quantization, PagedAttention) target
-KV-cache memory, not raw compute.
-\end{keyinsight}
-
-\paragraph{KV-cache memory calculation.}
-For a single request:
-\[
-    \text{KV memory} = 2 \times L \times H \times S \times d_h \times b
-\]
-where $L$ is the number of layers, $H$ is the number of KV heads, $S$ is the sequence
-length, $d_h$ is the head dimension, $b$ is bytes per element (2 for FP16), and the
-factor of 2 accounts for both keys and values.
-
-\begin{mathresult}{KV-Cache Memory Budget}
-\[
-    M_{\text{KV}} = 2 \cdot L \cdot H_{\text{kv}} \cdot S \cdot d_h \cdot b
-\]
-\textbf{Concrete example} (LLaMA-2 7B, FP16):\\
-$L = 32$, $H_{\text{kv}} = 32$ (MHA), $d_h = 128$, $b = 2$ bytes, $S = 2048$:
-\[
-    M_{\text{KV}} = 2 \times 32 \times 32 \times 2048 \times 128 \times 2
-    = 1.07\;\text{GB per request}
-\]
-With GQA ($H_{\text{kv}} = 8$ instead of 32): $M_{\text{KV}} = 268\;\text{MB}$---a $4\times$ reduction.\\
-At 128K context: $M_{\text{KV}} = 67\;\text{GB}$ (MHA) or $16.8\;\text{GB}$ (GQA).
-\end{mathresult}
-
-\subsection{TikZ: KV-Cache During Autoregressive Decoding}
-
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-    node distance=0.5cm and 0.4cm,
-    cachebox/.style={rectangle, draw=deepblue, fill=lightblue, minimum width=0.6cm,
-                     minimum height=0.6cm, font=\scriptsize\sffamily, thick},
-    newbox/.style={rectangle, draw=deepgreen!80, fill=green!12, minimum width=0.6cm,
-                   minimum height=0.6cm, font=\scriptsize\sffamily, thick},
-    emptybox/.style={rectangle, draw=gray!40, fill=gray!5, minimum width=0.6cm,
-                     minimum height=0.6cm, font=\scriptsize\sffamily, dashed},
-    lbl/.style={font=\small\sffamily\bfseries, text=deepblue},
-    sublbl/.style={align=center, font=\scriptsize\sffamily, text=gray!70!black},
-    arr/.style={-{Stealth[length=4pt]}, thick, deepblue!60},
-    brace/.style={decorate, decoration={brace, amplitude=5pt, raise=2pt}, thick, deepblue!60}
-]
-
-% Labels
-\node[lbl] at (-1.5, 2.5) {Step};
-\node[lbl] at (2.0, 2.5) {KV-Cache Contents};
-\node[lbl] at (6.5, 2.5) {New Token};
-
-% Step 1: Prefill
-\node[sublbl] at (-1.5, 1.5) {Prefill};
-\node[cachebox] (p1) at (0.5, 1.5) {$k_1$};
-\node[cachebox, right=0.08cm of p1] (p2) {$k_2$};
-\node[cachebox, right=0.08cm of p2] (p3) {$k_3$};
-\node[cachebox, right=0.08cm of p3] (p4) {$k_4$};
-\node[emptybox, right=0.08cm of p4] (pe) {};
-\node[emptybox, right=0.08cm of pe] (pf) {};
-\node[sublbl, right=0.3cm of pf] {(compute-bound)};
-
-% Step 2: Decode t=5
-\node[sublbl] at (-1.5, 0.5) {Decode $t{=}5$};
-\node[cachebox] (d1) at (0.5, 0.5) {$k_1$};
-\node[cachebox, right=0.08cm of d1] (d2) {$k_2$};
-\node[cachebox, right=0.08cm of d2] (d3) {$k_3$};
-\node[cachebox, right=0.08cm of d3] (d4) {$k_4$};
-\node[newbox, right=0.08cm of d4] (d5) {$k_5$};
-\node[emptybox, right=0.08cm of d5] (de) {};
-\node[newbox] at (6.5, 0.5) {$t_5$};
-
-% Step 3: Decode t=6
-\node[sublbl] at (-1.5, -0.5) {Decode $t{=}6$};
-\node[cachebox] (e1) at (0.5, -0.5) {$k_1$};
-\node[cachebox, right=0.08cm of e1] (e2) {$k_2$};
-\node[cachebox, right=0.08cm of e2] (e3) {$k_3$};
-\node[cachebox, right=0.08cm of e3] (e4) {$k_4$};
-\node[cachebox, right=0.08cm of e4] (e5) {$k_5$};
-\node[newbox, right=0.08cm of e5] (e6) {$k_6$};
-\node[newbox] at (6.5, -0.5) {$t_6$};
-
-% Arrows showing cache growth
-\draw[arr] (d5.south) -- ([yshift=0.15cm]e5.north);
-\draw[arr, deepgreen!70] (6.5, 0.2) -- (6.5, -0.2);
-
-% Annotation
-\node[sublbl, align=left] at (3.0, -1.3) {Cache grows by one K/V pair per decode step.\\
-Each step reads the \emph{entire} cache (memory-bandwidth-bound).};
-
-\end{tikzpicture}
-\caption{KV-cache during autoregressive generation.  The prefill phase computes keys
-and values for all prompt tokens in parallel.  Each subsequent decode step appends one
-new K/V pair and reads the full cache to compute attention over all previous tokens.}
-\label{fig:kv_cache}
-\end{figure}
-
-\subsection{Continuous Batching}
 \label{sec:continuous_batching}
-
-Traditional \textbf{static batching} pads all sequences in a batch to the same length
-and waits for the longest sequence to finish before starting a new batch.  If one
-request generates 10 tokens and another generates 500, the short request's GPU slot is
-wasted for 490 steps.
-
-\textbf{Continuous batching} (also called \emph{iteration-level scheduling}) solves this:
-\begin{itemize}
-    \item At \emph{every} decode step, check for completed sequences and newly arrived
-          requests.
-    \item Remove completed sequences immediately, freeing their KV-cache memory.
-    \item Insert new requests into the batch without waiting for others to finish.
-    \item Result: GPU utilization approaches 100\%, throughput increases 2--8$\times$
-          over static batching in practice.
-\end{itemize}
-
-This is the default scheduling strategy in production serving frameworks (vLLM,
-TensorRT-LLM, TGI).
-
-\subsection{PagedAttention (vLLM)}
 \label{sec:paged_attention}
-
-The KV-cache is typically allocated as a contiguous block per request.  Since the final
-sequence length is unknown in advance, systems over-allocate, wasting 60--80\% of
-KV-cache memory on average.
-
-\textbf{PagedAttention} (Kwon et al., SOSP 2023) applies the operating system concept
-of \emph{virtual memory} to KV-cache management:
-\begin{itemize}
-    \item KV-cache is divided into fixed-size \textbf{blocks} (e.g., 16 tokens per block).
-    \item Blocks are allocated \emph{on demand} as the sequence grows, from a shared
-          pool---no contiguous allocation required.
-    \item A \textbf{block table} (analogous to a page table) maps each sequence's
-          logical token positions to physical memory blocks.
-    \item \textbf{Result:} Near-zero memory waste.  Memory utilization improves from
-          $\sim$20\% to $\sim$95\%, enabling 2--4$\times$ higher batch sizes.
-\end{itemize}
-
-An additional benefit: sequences that share a common prefix (e.g., the same system
-prompt) can share the same physical blocks via \textbf{copy-on-write}, dramatically
-reducing memory for multi-turn conversations and batched requests with identical
-system prompts.
-
-\subsection{Parallelism Strategies}
+\label{sec:prefix_caching}
 \label{sec:parallelism}
+\label{sec:speculative_decoding}
 
-When a model does not fit on a single GPU, or when throughput requirements demand
-multiple GPUs, there are two primary parallelism strategies:
+Generation runs in two phases, and every serving decision traces back to the
+split.  \textbf{Prefill} processes all $n$ prompt tokens in parallel and is
+compute-bound; it sets time-to-first-token.  \textbf{Decode} emits one token
+at a time, re-reading the whole cache per token, and is
+memory-bandwidth-bound; it sets inter-token latency.  The cache itself costs
+$M_{\mathrm{KV}} = 2 \cdot L \cdot H_{\mathrm{kv}} \cdot S \cdot d_h \cdot b$
+bytes per request---linear in context length, which is why long prompts are a
+memory decision and not only a token-price decision (worked numbers, GQA/MLA
+reductions, and the full derivation: [DL~19]).
+% label preserved from the pre-dedup KV-cache figure (Phase D); the diagram is canonical in [DL 19]
+\label{fig:kv_cache}
 
 \begin{table}[H]
 \centering
 \small
 \begin{tabularx}{\textwidth}{@{}l X X@{}}
 \toprule
-\textbf{Strategy} & \textbf{Tensor Parallelism (TP)} & \textbf{Pipeline Parallelism (PP)} \\
+\textbf{Primitive} & \textbf{Mechanism in one line} & \textbf{What it buys, and what it means for your application} \\
 \midrule
-What is split & Individual layers split across GPUs & Different layers on different GPUs \\
-Communication & All-reduce after every layer & Point-to-point between stages \\
-Latency       & Low (all GPUs process each token) & Higher (pipeline bubbles) \\
-Throughput    & Limited by communication bandwidth & High with micro-batching \\
-Typical use   & Within a single node (fast NVLink) & Across nodes (slower network) \\
+KV cache & Store per-position keys/values so each new token attends to cached state instead of recomputing it & Turns $O(t)$ work per token into $O(1)$; makes decode bandwidth-bound. Your context length is a memory budget \\
+GQA / MLA & Fewer KV heads, or a compressed latent cache & $4$--$8\times$ smaller cache, so more concurrent requests and longer contexts per GPU \\
+Continuous batching & Iteration-level scheduling: finished sequences leave the batch, new ones join at any decode step & $2$--$8\times$ throughput over static batching. Your p99 now depends on co-tenant traffic, so measure under realistic load \\
+PagedAttention & Block-allocated cache with a page table, no contiguous reservation & Memory utilization $\sim$20\% $\to$ $\sim$95\%, larger batches, no over-allocation for unknown output length \\
+Prefix caching & Reuse the computed KV of a shared prefix across requests & Cuts prefill cost and TTFT for a shared system prompt. \emph{Design consequence:} put stable content first and per-request content last---one interpolated timestamp or user ID at the top invalidates the prefix for every request \\
+Speculative decoding & Small draft model proposes $k$ tokens, target model verifies them in one pass; rejection sampling keeps the output distribution exact & $2$--$3\times$ faster decode with no quality change. Helps latency at moderate load; at saturation it spends compute you needed for throughput \\
+Tensor / pipeline parallelism & Split each layer across GPUs (TP) or assign layer ranges to stages (PP) & Fits models that exceed one GPU. TP inside an NVLink node, PP across nodes; both add failure modes to your capacity plan \\
 \bottomrule
 \end{tabularx}
-\caption{Tensor parallelism vs.\ pipeline parallelism for LLM serving.}
+\caption{Serving primitives an LLM application depends on, and the consequence
+each one has for application design.  Mechanisms, memory math, and the
+throughput/latency frontier are canonical in [DL~19].}
 \label{tab:parallelism}
 \end{table}
 
-In practice, production deployments often combine both: TP within a node (e.g., 8 GPUs
-connected by NVLink) and PP across nodes.
+\begin{keyinsight}[Prompt Design Is Latency Design]
+The application team controls one input to the serving stack that dominates
+TTFT: prompt length and prompt \emph{stability}.  Prefill cost is linear in
+prompt tokens, so a 4,000-token system prompt that could have been 800 tokens
+is a $5\times$ prefill bill on every request; and because prefix caching keys
+on an exact shared prefix, ordering the prompt as
+\texttt{[stable instructions][retrieved context][user turn]} is worth more
+than most infrastructure tuning available to you.  This is the cheapest
+latency work in the stack and it belongs to the people writing the prompts,
+not the people running the GPUs.
+\end{keyinsight}
 
-\subsection{Prefix Caching}
-\label{sec:prefix_caching}
-
-Many production workloads share a common prefix: the same system prompt is prepended to
-every user request.  \textbf{Prefix caching} precomputes the KV-cache for this shared
-prefix once and reuses it for all requests:
-\begin{itemize}
-    \item For a 2,000-token system prompt on LLaMA-2 7B, prefix caching saves
-          $\sim$1\,GB of KV-cache memory per request and eliminates
-          $\sim$100\,ms of prefill latency.
-    \item This is implemented in vLLM (automatic prefix caching), TGI, and
-          TensorRT-LLM.
-    \item Combined with PagedAttention's copy-on-write, prefix caching enables
-          serving thousands of concurrent requests with a shared system prompt.
-\end{itemize}
-
-
-% ============================================================================
-% SECTION 3: QUANTIZATION
-% ============================================================================
-\section{Quantization}
+\subsection{Precision and Compression: The Application-Side Decision}
 \label{sec:quantization}
-
-Quantization reduces the numerical precision of model weights and/or activations,
-trading a small amount of quality for significant improvements in memory, speed, and cost.
-For LLMs, quantization is often the difference between a model fitting on available
-hardware or not.
-
-\subsection{Fundamentals}
-
-\begin{mathresult}{Uniform Quantization}
-A floating-point value $x$ is quantized to an integer representation:
-\[
-    q = \text{round}\!\left(\frac{x}{s} + z\right), \qquad
-    \hat{x} = s \cdot (q - z)
-\]
-where $s$ is the \textbf{scale factor} (maps the floating-point range to integer range),
-$z$ is the \textbf{zero point} (ensures zero maps exactly), and $\hat{x}$ is the
-dequantized approximation.  The quantization error is $|x - \hat{x}|$.
-\end{mathresult}
-
-\paragraph{Key precision levels.}
-\begin{itemize}
-    \item \textbf{FP16 / BF16 (16-bit):}  Standard training and inference precision.
-          BF16 preferred for training (larger dynamic range, same as FP32 exponent).
-          No quality loss versus FP32 for most models.
-    \item \textbf{INT8 (8-bit):}  $2\times$ memory reduction, $\sim$$2\times$ speedup.
-          Per-channel weight quantization with per-token activation quantization yields
-          minimal quality loss ($<$1\% on most benchmarks).
-    \item \textbf{INT4 (4-bit):}  $4\times$ memory reduction.  Requires careful
-          quantization methods (GPTQ, AWQ) to preserve quality.  Typical quality loss:
-          1--3\% on standard benchmarks.
-    \item \textbf{FP8:}  Hardware-supported on NVIDIA H100 and later.  Combines the
-          simplicity of floating-point with 8-bit efficiency.  Increasingly the default
-          for inference.
-\end{itemize}
-
-\subsection{Post-Training Quantization (PTQ)}
-
-PTQ quantizes a pre-trained model without retraining.  The challenge is minimizing the
-quantization error, which is uneven across weights---a few ``outlier'' weights with large
-magnitude contribute disproportionately to the output.
-
-\paragraph{GPTQ} (Frantar et al., ICLR 2023) performs \textbf{layer-wise quantization}
-using second-order information:
-\begin{itemize}
-    \item Quantize weights one column at a time.
-    \item For each quantized column, adjust the \emph{remaining} unquantized columns to
-          compensate for the error, using the inverse Hessian of the layer's output.
-    \item This ``error compensation'' preserves the layer's output much better than
-          naive rounding.
-    \item \textbf{Result:} 4-bit weight quantization with near-FP16 quality.
-          A 70B model fits on a single 48\,GB GPU (vs.\ 140\,GB in FP16).
-\end{itemize}
-
-\paragraph{AWQ} (Lin et al., MLSys 2024) takes a different approach---\textbf{activation-aware}
-quantization:
-\begin{itemize}
-    \item Observation: not all weights are equally important.  Weights corresponding
-          to large-magnitude activations matter more.
-    \item Scale up the important weight channels before quantization (equivalent to
-          finding the optimal per-channel scale that minimizes quantization error
-          weighted by activation magnitude).
-    \item \textbf{Advantage over GPTQ:} Simpler, faster to apply, and often produces
-          better quality at 4-bit because it directly accounts for which weights
-          the model relies on most.
-\end{itemize}
-
-\subsection{Quantization-Aware Training (QAT)}
-
-QAT simulates quantization during training by inserting ``fake quantization'' operations
-in the forward pass: weights are quantized and immediately dequantized, so the forward
-pass sees quantized values but gradients still flow through (using the straight-through
-estimator).  QAT consistently outperforms PTQ but requires full training infrastructure,
-making it expensive for large models.
-
-\subsection{Quality--Speed--Memory Tradeoffs}
-
-\begin{table}[H]
-\centering
-\small
-\begin{tabularx}{\textwidth}{@{}l c c c c X@{}}
-\toprule
-\textbf{Precision} & \textbf{Mem.\ Saving} & \textbf{Speed} & \textbf{Quality} & \textbf{Method} & \textbf{Notes} \\
-\midrule
-FP16/BF16 & $1\times$ (baseline) & $1\times$    & Baseline    & None  & Standard \\
-INT8      & $2\times$            & $\sim$$2\times$ & $<$1\% drop & LLM.int8()  & Safe default \\
-FP8       & $2\times$            & $\sim$$2\times$ & $<$0.5\% drop & Native H100 & Best 8-bit \\
-INT4 (GPTQ) & $4\times$         & $\sim$$3\times$ & 1--3\% drop & GPTQ  & Hessian-aware \\
-INT4 (AWQ) & $4\times$          & $\sim$$3\times$ & 1--2\% drop & AWQ   & Activation-aware \\
-INT3/INT2 & $5$--$8\times$      & $\sim$$4\times$ & 5--15\% drop & Experimental & Research only \\
-\bottomrule
-\end{tabularx}
-\caption{Quantization precision levels with typical tradeoffs.  Numbers are approximate
-and vary significantly by model size and task.}
-\label{tab:quantization_tradeoffs}
-\end{table}
-
-\begin{warningbox}
-Quantization quality loss varies dramatically across models, tasks, and evaluation
-benchmarks.  A 4-bit quantized model might show only 1\% degradation on MMLU but 10\%
-on a math reasoning benchmark.  \emph{Always evaluate quantized models on your specific
-task before deploying.}  The ``1--3\% quality loss'' numbers widely cited are averages
-over easy benchmarks and may not reflect your use case.
-\end{warningbox}
-
-
-% ============================================================================
-% SECTION 4: KNOWLEDGE DISTILLATION
-% ============================================================================
-\section{Knowledge Distillation}
 \label{sec:distillation}
+\label{sec:efficiency}
 
-Knowledge distillation (Hinton et al., 2015) trains a small \textbf{student} model to
-mimic the behavior of a large \textbf{teacher} model.  The key insight is that the
-teacher's \emph{soft probability distribution} over classes contains far more information
-than the hard labels alone.
-
-\paragraph{Why soft labels are more informative.}
-When a teacher classifies an image of a car, its softmax output might be
-$[0.85, 0.10, 0.03, 0.02]$ over $[\text{car}, \text{truck}, \text{bus},
-\text{bicycle}]$.  The hard label says only ``car,'' but the soft distribution reveals
-that this image is somewhat truck-like and slightly bus-like---\emph{inter-class
-similarity} information that hard labels destroy.
-
-\begin{mathresult}{Distillation Loss}
-The student is trained with a weighted combination of two losses:
-\[
-    \loss = \alpha \cdot \loss_{\text{soft}} + (1 - \alpha) \cdot \loss_{\text{hard}}
-\]
-where:
-\begin{align*}
-    \loss_{\text{soft}} &= T^2 \cdot \KL\!\Big(\softmax\!\big(\vz_t / T\big) \;\big\|\; \softmax\!\big(\vz_s / T\big)\Big) \\
-    \loss_{\text{hard}} &= \text{CrossEntropy}\!\big(\vy,\; \softmax(\vz_s)\big)
-\end{align*}
-$\vz_t$ and $\vz_s$ are the teacher and student logits, $T$ is the \textbf{temperature}
-(typically 2--20), and $\alpha$ balances the two losses (typically 0.5--0.9).  The $T^2$
-factor corrects for the gradient magnitude reduction when dividing logits by $T$.
-\end{mathresult}
-
-\paragraph{Temperature intuition.}
-At $T = 1$ (standard softmax), the teacher's distribution is peaky---the correct class
-dominates.  As $T$ increases, the distribution softens, revealing more of the relative
-structure among classes.  Higher $T$ transfers more ``dark knowledge'' but makes the
-signal noisier.
-
-\subsection{Distillation in NLP}
-
-\paragraph{DistilBERT} (Sanh et al., 2019): 6-layer student distilled from 12-layer
-BERT-base.  \textbf{Result:} 60\% the size, 60\% faster inference, retaining 97\% of
-BERT's performance on GLUE.  The distillation used a combination of language modeling
-loss, distillation loss, and cosine embedding loss (aligning hidden states).
-
-\paragraph{Modern LLM distillation.}
-Distilling from large LLMs (e.g., GPT-4, Claude) into smaller open models has become
-a standard practice:
-\begin{itemize}
-    \item \textbf{Output distillation:} Generate responses from the teacher, train the
-          student on these (input, response) pairs via standard SFT.  This is the
-          simplest form and does not require access to teacher logits.
-    \item \textbf{Logit distillation:} When teacher logits are available, use the
-          full KL-divergence loss.  Produces better students but requires access to
-          the teacher's internals.
-    \item \textbf{On-policy distillation:} The student generates outputs, the teacher
-          scores or corrects them, and the student trains on the corrections.
-          Avoids the distribution mismatch of pure offline distillation.
-\end{itemize}
-
-\paragraph{Phi models} (Microsoft, 2023--2024) demonstrated that training on
-``textbook quality'' synthetic data generated by a larger model can produce small models
-(1.3B--14B parameters) with outsized performance---a form of implicit distillation
-through data curation.
-
-\subsection{Distillation vs.\ Quantization vs.\ Pruning}
+Three levers shrink a model, and an application team picks among them far more
+often than it implements them.  \textbf{Quantization} lowers numerical
+precision (FP16 $\to$ FP8/INT8 $\to$ INT4 via GPTQ or AWQ): no retraining,
+$2$--$4\times$ memory and a similar speedup, and it is the default first move.
+\textbf{Distillation} trains a smaller student on a larger teacher's outputs
+or logits: it needs training data and a training loop, but it is the only
+lever that changes the architecture, and for a narrow application task a
+distilled small model routinely beats a quantized large one at equal cost.
+\textbf{Pruning} removes weights or whole heads and layers: structured
+pruning yields a plain dense model, while unstructured sparsity needs
+hardware support to turn into speed.  They compose---distill, then quantize
+the student---and the mechanics of all three are canonical in [DL~14], with
+inference-time quantization in [DL~19].
 
 \begin{table}[H]
 \centering
 \small
 \begin{tabularx}{\textwidth}{@{}l X X X@{}}
 \toprule
-& \textbf{Distillation} & \textbf{Quantization} & \textbf{Pruning} \\
+& \textbf{Quantization} & \textbf{Distillation} & \textbf{Pruning} \\
 \midrule
-\textbf{What changes}    & Architecture (fewer layers) & Numerical precision & Sparsity (remove weights) \\
-\textbf{Training needed}  & Yes (full student training) & No (PTQ) or minimal (QAT) & Minimal to moderate \\
-\textbf{Typical speedup}  & $2$--$6\times$               & $2$--$4\times$              & $1.5$--$3\times$ \\
-\textbf{Quality}          & 90--97\% of teacher          & 95--99\% of original        & 90--98\% of original \\
-\textbf{Combinable?}      & Yes (distill then quantize)  & Yes (quantize anything)     & Yes (prune then quantize) \\
+\textbf{What changes} & Numerical precision & Architecture (smaller student) & Sparsity / removed heads \\
+\textbf{Cost to apply} & Hours (PTQ), no training data & A training run plus teacher outputs & Minutes to a short fine-tune \\
+\textbf{Typical gain} & $2$--$4\times$ memory, $2$--$3\times$ speed & $2$--$6\times$ speed at 90--97\% of teacher & $1.5$--$3\times$, hardware permitting \\
+\textbf{Best when} & You need the same model, cheaper & The task is narrow and you own data & You need a dense model slightly smaller \\
 \bottomrule
 \end{tabularx}
-\caption{Comparison of model compression techniques.  In practice, these are often
-combined: distill a large model into a smaller one, then quantize the student to INT4.}
+\caption{The three compression levers as an application team experiences them.
+Method-level detail (GPTQ vs.\ AWQ, QAT, structured vs.\ unstructured pruning,
+distillation objectives) is canonical in [DL~14].}
+\label{tab:quantization_tradeoffs}
 \label{tab:compression_comparison}
 \end{table}
 
+\begin{warningbox}
+Quantization quality loss varies dramatically across models, tasks, and
+evaluation benchmarks.  A 4-bit quantized model might show only 1\%
+degradation on MMLU but 10\% on a math reasoning benchmark, and long-context
+or tool-calling behavior often degrades before any headline benchmark moves.
+\emph{Always evaluate quantized models on your specific task, with your own
+prompts, before deploying.}  The ``1--3\% quality loss'' numbers widely cited
+are averages over easy benchmarks and are not a warranty for your use case.
+\end{warningbox}
 
-% ============================================================================
-% SECTION 5: SPECULATIVE DECODING
-% ============================================================================
-\section{Speculative Decoding}
-\label{sec:speculative_decoding}
+\subsection{Cost Engineering for LLM Applications}
+\label{sec:cost_engineering}
 
-Autoregressive generation is inherently sequential: each token depends on the previous
-one.  For a 70B parameter model, generating a single token takes $\sim$70\,ms of pure
-memory traffic on A100-class hardware (reading 140\,GB of weights at $\sim$2\,TB/s
-aggregate memory bandwidth across the GPUs holding the shards).  With speculative
-decoding, we can generate 2--3$\times$ more tokens per second without any change in
-output quality.
+Application cost is an arithmetic identity before it is an optimization
+problem: cost per request $=$ (prompt tokens $\times$ input price) $+$ (output
+tokens $\times$ output price), summed over every model call the request makes,
+including the ones users never see---guardrail classifiers, rerankers,
+LLM-judge sampling, and retries.  Two consequences follow immediately: a
+feature's cost is set by its \emph{prompt architecture}, not by its model
+choice alone, and the tokenizer tax (Section~\ref{sec:tokenizer_tax}) silently
+multiplies both terms for non-English users.
 
-\subsection{The Algorithm}
-
-\begin{enumerate}
-    \item \textbf{Draft:} A small, fast \emph{draft model} (e.g., 1B parameters)
-          autoregressively generates $k$ candidate tokens ($k$ is typically 4--8).
-          This is cheap: $\sim$2\,ms per token.
-    \item \textbf{Verify:} The large \emph{target model} processes all $k$ draft tokens
-          \emph{in a single forward pass} (parallel, like prefill).  This produces
-          the target model's probability distribution at each position.
-    \item \textbf{Accept/reject:} Compare the draft model's distribution to the target
-          model's distribution at each position, left to right.  Accept tokens as long
-          as the draft distribution ``matches'' the target distribution; reject from the
-          first mismatch onward.  Sample a correction token from a modified distribution
-          at the rejection point.
-\end{enumerate}
-
-\begin{keyinsight}[Speculative Decoding Is ``Free'' Quality]
-The accept/reject step is designed so that the \emph{final output distribution is
-mathematically identical} to sampling from the target model alone.  There is zero quality
-loss---the speedup is obtained purely by replacing sequential target-model calls with a
-combination of cheap sequential draft-model calls and a single parallel target-model call.
-This is provable, not just empirical.
-\end{keyinsight}
-
-\paragraph{Why it works: verification is cheaper than generation.}
-Generating $k$ tokens sequentially with the target model requires $k$ forward passes
-(each reading the full model weights from memory).  Verifying $k$ tokens requires only
-\emph{one} forward pass (processing all $k$ tokens in parallel), with compute cost
-roughly equal to generating a single token.  The speedup comes from this asymmetry
-between sequential generation and parallel verification.
-
-\paragraph{Acceptance rate.}
-If the draft model closely approximates the target model, most tokens are accepted.
-In practice, acceptance rates of 70--90\% are typical for well-matched draft-target
-pairs.  The effective speedup is approximately:
-\[
-    \text{Speedup} \approx \frac{\text{avg.\ accepted tokens} + 1}{1 + k \cdot (c_{\text{draft}} / c_{\text{target}})}
-\]
-where $c_{\text{draft}} / c_{\text{target}} \ll 1$.  Worked through: with $k = 5$, a
-per-token acceptance rate of $0.8$ (expected accepted tokens
-$\sum_{i=1}^{5} 0.8^i \approx 2.7$), and a cost ratio
-$c_{\text{draft}}/c_{\text{target}} \approx 0.03$, the formula gives
-$(2.7 + 1)/(1 + 5 \times 0.03) \approx 3.2\times$; scheduling overhead and imperfect
-batching bring realized speedups down to the commonly quoted $2$--$3\times$.
-
-\paragraph{Variants.}
 \begin{itemize}
-    \item \textbf{Self-speculative decoding:} Use the target model itself as the draft
-          by skipping layers (early exit).  No separate draft model needed.
-    \item \textbf{Medusa:} Add multiple prediction heads to the target model that predict
-          future tokens in parallel.  Train the extra heads; no separate model needed.
-    \item \textbf{EAGLE:} Train a lightweight feature-level draft model on top of the
-          target model's hidden states.  Higher acceptance rates than token-level drafting.
+    \item \textbf{Model routing.}  Classify the query and send easy traffic to
+          a small model, hard traffic to a large one.  A well-tuned router
+          cuts average cost $5$--$10\times$ while holding quality on the hard
+          slice; the engineering risk is the router itself, which needs its
+          own eval set and a fail-open path to the large model.
+    \item \textbf{Semantic caching.}  Return a stored response when a new
+          query's embedding is within a threshold of a cached one.  Excellent
+          for FAQ-shaped traffic; dangerous when near-duplicate phrasings
+          carry different intent (``how do I cancel'' vs.\ ``how do I cancel
+          \emph{without a fee}''), when responses are personalized, or when
+          the underlying data changes.  Treat the threshold as a
+          precision/recall decision, scope keys by user and tenant, and set a
+          TTL tied to how fast the source data moves.
+    \item \textbf{Prefix and prompt caching.}  The billing-visible form of the
+          serving primitive above: providers charge less for cached prefix
+          tokens, so prompt \emph{stability} converts directly into money.
+    \item \textbf{Prompt compression.}  Shorten system prompts, summarize
+          conversation history beyond a horizon, and retrieve fewer, better
+          chunks rather than more ([NLP~9]).  Prefill is linear in tokens, so
+          this is the one lever that cuts latency and cost together.
+    \item \textbf{Output-length control.}  Output tokens are priced higher and
+          are serialized through decode; a response-format instruction and a
+          \texttt{max\_tokens} ceiling are cost controls, not cosmetics.
+    \item \textbf{Batch and off-peak tiers.}  Anything that does not need an
+          interactive answer---backfills, evaluation runs, bulk
+          classification---belongs on a batch endpoint at a fraction of the
+          interactive price.
 \end{itemize}
 
 
 % ============================================================================
-% SECTION 6: ADDITIONAL EFFICIENCY TECHNIQUES
-% ============================================================================
-\section{Additional Efficiency Techniques}
-\label{sec:efficiency}
-
-\subsection{Pruning}
-
-Pruning removes unnecessary weights, heads, or layers from a trained model.
-
-\paragraph{Unstructured pruning.}
-Set individual weights to zero based on magnitude.  Can achieve 90\%+ sparsity with
-minimal quality loss, but \emph{requires hardware that accelerates sparse operations}
-(sparse tensor cores, N:M sparsity support on Ampere+).  Without hardware support,
-unstructured sparsity provides no speedup---the zero weights are still stored and
-multiplied.
-
-\paragraph{Structured pruning.}
-Remove entire attention heads, FFN neurons, or even full layers.  The resulting model
-is a standard dense model with fewer parameters---no special hardware needed.  Typical
-findings: 30--50\% of attention heads can be removed with $<$2\% quality loss
-(Michel et al., NeurIPS 2019).
-
-\subsection{Flash Attention}
-
-Flash Attention (Dao et al., NeurIPS 2022; covered in detail in Chapter~\ref{chap:transformers})
-is an \textbf{IO-aware} exact attention implementation that avoids materializing the
-full $n \times n$ attention matrix in HBM:
-\begin{itemize}
-    \item Tiles the Q, K, V matrices into blocks that fit in SRAM (on-chip cache).
-    \item Computes attention block-by-block using online softmax (numerically stable
-          incremental computation).
-    \item \textbf{Result:} $2$--$4\times$ speedup and $O(n)$ memory instead of $O(n^2)$.
-    \item Flash Attention 2 adds further optimizations (better work partitioning,
-          reduced non-matmul FLOPs).
-    \item This is now the default attention implementation in PyTorch 2.0+
-          (\texttt{scaled\_dot\_product\_attention}).
-\end{itemize}
-
-\subsection{Mixed Precision Training and Inference}
-
-\begin{itemize}
-    \item \textbf{FP16:}  Half the memory of FP32, hardware-accelerated on all modern GPUs.
-          Requires loss scaling to handle the reduced dynamic range.
-    \item \textbf{BF16:}  Same exponent range as FP32 (8 bits) with reduced mantissa
-          (7 bits vs.\ 23).  No loss scaling needed.  The standard for LLM training.
-    \item \textbf{FP8:}  Supported on H100+.  Two formats: E4M3 (4 exponent, 3 mantissa---better
-          for weights) and E5M2 (5 exponent, 2 mantissa---better for gradients/activations).
-\end{itemize}
-
-\subsection{Gradient Checkpointing}
-
-During training, all intermediate activations are stored for the backward pass.  For a
-70B model with 2K context, this can exceed 100\,GB.  \textbf{Gradient checkpointing}
-(also called activation recomputation) stores only a subset of activations (e.g., one
-per layer) and recomputes the rest during the backward pass.  This trades $\sim$$33\%$
-extra compute for a $\sim$$5\times$ reduction in activation memory.
-
-\subsection{Model Compilation}
-
-\begin{itemize}
-    \item \textbf{\texttt{torch.compile}:} PyTorch 2.0's compiler.  Traces the
-          computation graph, applies operator fusion, and generates optimized kernels.
-          Typical speedup: 20--40\% for inference, with no code changes.
-    \item \textbf{TensorRT / TensorRT-LLM:} NVIDIA's inference compiler.  Fuses operations,
-          selects optimal kernels, applies quantization.  Aggressive optimization for
-          NVIDIA hardware, 2--5$\times$ speedup over naive PyTorch.
-    \item \textbf{ONNX Runtime:} Cross-platform inference optimization.  Useful for
-          deploying on diverse hardware (CPU, mobile, edge).
-\end{itemize}
-
-
-% ============================================================================
-% SECTION 7: MULTILINGUAL PRODUCTION CHALLENGES
+% SECTION 3: MULTILINGUAL PRODUCTION CHALLENGES
 % ============================================================================
 \section{Multilingual Production Challenges}
 \label{sec:multilingual_production}
@@ -924,103 +545,94 @@ natively), language-aware tokenization, and training on code-switched data.
 
 
 % ============================================================================
-% SECTION 8: MLOPS FOR NLP
+% SECTION 4: OPERATING AN LLM APPLICATION
 % ============================================================================
-\section{MLOps for NLP}
+\section{Operating an LLM Application}
 \label{sec:mlops_nlp}
 
-Deploying a model is the beginning, not the end.  Production NLP systems require
-continuous monitoring, evaluation, and improvement.
+The MLOps lifecycle---the drift taxonomy and its detection tests, monitoring
+architecture, retraining triggers and cadence, CI/CD for models, deployment
+patterns (shadow, canary, blue-green), feature stores and training--serving
+skew---is canonical in \textbf{[DL~22]}, and the statistics of the A/B tests
+that gate those rollouts are canonical in \textbf{[CML~6]}.  None of it is
+repeated here.  What follows is what changes when the artifact you operate is
+an LLM feature rather than a classifier.
 
-\subsection{Monitoring}
+\subsection{What to Watch That a Classifier Never Made You Watch}
 
-\paragraph{Latency metrics.}
-\begin{itemize}
-    \item \textbf{Time to first token (TTFT):}  From request arrival to first generated
-          token.  Dominated by prefill time.  Target: $<$500\,ms for interactive
-          applications, $<$100\,ms for search.
-    \item \textbf{Inter-token latency (ITL):}  Time between consecutive generated tokens.
-          Determines perceived streaming speed.  Target: $<$50\,ms (20+ tokens/sec)
-          for smooth reading experience.
-    \item \textbf{End-to-end latency:}  Total time from request to complete response.
-          P50 is the median; P95 and P99 capture tail latency.  SLAs are typically
-          set on P99.
-    \item \textbf{Throughput:}  Tokens per second (total across all requests) or
-          requests per second.  The primary capacity planning metric.
-\end{itemize}
+\paragraph{Latency has two clocks.}  \textbf{TTFT} (prefill-dominated; target
+$<$500\,ms interactive, $<$100\,ms for search-like surfaces) and
+\textbf{inter-token latency} (target $<$50\,ms, i.e.\ 20+ tokens/s, for
+comfortable reading) are separate SLOs with separate fixes: TTFT is prompt
+length and prefix-cache hit rate, ITL is decode and batch pressure.  A single
+end-to-end p99 hides both.  Alert on each, and watch \textbf{output-length
+distribution} as a leading indicator---a prompt change that makes responses
+40\% longer is a latency and cost regression that no accuracy metric shows.
 
-\paragraph{Quality metrics.}
-\begin{itemize}
-    \item \textbf{Online evaluation:} User feedback (thumbs up/down), click-through
-          rates, task completion rates, session length.
-    \item \textbf{Automated evaluation:} Run shadow traffic through evaluation pipelines
-          (LLM-as-judge, factuality checkers, toxicity classifiers).
-    \item \textbf{Regression detection:} Maintain a golden test set; run every model
-          update against it and block deployment on quality regression.
-\end{itemize}
+\paragraph{Quality has no label.}  There is no ground truth arriving
+downstream, so quality monitoring is assembled from three sources: implicit
+signals (regeneration clicks, copy rates, abandonment, thumbs), automated
+judging over sampled traffic (LLM-as-judge, factuality and toxicity
+classifiers---methodology in [NLP~10]), and a \textbf{golden set} that every
+candidate model, prompt, and decoding-parameter change must pass before it
+ships.  Track \textbf{refusal rate} and \textbf{cache hit rate} alongside
+them: both move sharply on changes nobody expected to affect them.
 
-\subsection{Data Drift Detection}
+\paragraph{Drift arrives as text.}  The NLP-specific drift signals are input
+length distribution (sudden shifts often mean bot traffic or a new client),
+input token-frequency divergence from the reference window, embedding
+centroid and spread, and per-language traffic mix.  \textbf{Slice every metric
+by language}: the tokenizer tax (Section~\ref{sec:tokenizer_tax}) means
+non-English users already pay more tokens for the same request, so their
+latency and cost regress first and their quality regresses invisibly if the
+dashboard is English-weighted.
 
-Input distributions shift over time: new topics emerge, user demographics change,
-adversarial inputs evolve.  Monitor for:
-\begin{itemize}
-    \item \textbf{Input length distribution:} Sudden changes may indicate bot traffic
-          or new use patterns.
-    \item \textbf{Token distribution:} Track KL divergence between current input token
-          frequencies and the training distribution.
-    \item \textbf{Embedding drift:} Monitor the centroid and spread of input embeddings;
-          significant movement indicates distribution shift.
-    \item \textbf{Confidence distribution:} A shift toward lower (or uniformly high)
-          confidence scores signals that the model is encountering unfamiliar inputs.
-\end{itemize}
+\subsection{Prompt and Version Management}
 
-\subsection{Cost Optimization}
-
-\begin{itemize}
-    \item \textbf{Model routing:}  Use a small classifier to route easy queries to a
-          small model (7B, INT4) and hard queries to a large model (70B, FP16).  This
-          can reduce average cost by 5--10$\times$ while maintaining quality on
-          difficult queries.
-    \item \textbf{Semantic caching:}  Cache responses for semantically similar queries.
-          If a new query's embedding is within a threshold distance of a cached query,
-          return the cached response.  Effective for FAQ-like workloads.
-    \item \textbf{Prompt compression:}  Summarize or truncate long system prompts
-          to reduce prefill cost.
-    \item \textbf{Batching:}  Continuous batching maximizes GPU utilization; larger
-          batch sizes amortize the fixed cost of reading model weights.
-\end{itemize}
-
-\subsection{Model Versioning and A/B Testing}
-
-\begin{itemize}
-    \item \textbf{Model registry:}  Version every model artifact (weights, tokenizer,
-          config, evaluation results) with immutable identifiers.
-    \item \textbf{A/B testing:}  Split traffic between model versions; measure
-          quality and latency with statistical significance before full rollout.
-    \item \textbf{Canary deployment:}  Route 1--5\% of traffic to the new model;
-          monitor error rates and latency; gradually increase if metrics are stable.
-    \item \textbf{Rollback:}  Maintain the ability to instantly revert to the previous
-          model version if quality degrades.
-\end{itemize}
+The deployed artifact of an LLM feature is not a model file.  It is a tuple:
+\emph{model version + tokenizer + prompt template + decoding parameters +
+tool/function schemas + retrieval index version}.  Any one of them can change
+behavior on its own, so pin them together, version them together, and record
+the tuple with every logged request---an incident you cannot attribute to a
+specific tuple is an incident you cannot fix.  Prompts in particular are
+code: they belong in the repository, in review, with an eval suite that runs
+in CI and a canary rollout by prompt version, not in a spreadsheet or an
+untracked console.  Keep instant rollback for every element of the tuple, and
+remember that a provider-side model update is a version change you did not
+make---pin model versions explicitly and re-run the golden set when a pin
+expires.
 
 \subsection{Feedback Loops}
 
 \begin{enumerate}
-    \item \textbf{Implicit feedback:}  User behavior signals (regenerate button clicks,
-          copy-paste rates, session abandonment).
-    \item \textbf{Explicit feedback:}  Thumbs up/down, star ratings, corrections.
-    \item \textbf{Active learning:}  Route low-confidence examples to human annotators;
-          retrain on the expanded dataset.
-    \item \textbf{RLHF/DPO loops:}  Collect preference data from production; retrain
-          reward models or run DPO on the preference data.
+    \item \textbf{Implicit feedback:}  Behavioral signals---regenerate clicks,
+          copy-paste rates, session abandonment, follow-up rephrasings.  Cheap
+          and plentiful, but confounded by UI and position effects.
+    \item \textbf{Explicit feedback:}  Thumbs up/down, ratings, user
+          corrections.  Sparse, biased toward extremes, and the only signal
+          that names \emph{why}.
+    \item \textbf{Active learning:}  Route low-confidence or
+          high-disagreement traffic to human annotators and fold the results
+          into the golden set and the training data.
+    \item \textbf{Preference loops:}  Production preference data feeds reward
+          models and DPO-style updates; the alignment machinery it feeds is
+          canonical in [NLP~8].  Guard the loop: a model trained on its own
+          accepted outputs narrows over time, so hold out a slice of
+          unfiltered traffic to measure what the loop is quietly removing.
 \end{enumerate}
 
 
 % ============================================================================
-% SECTION 9: INTERVIEW QUESTIONS
+% SECTION 5: INTERVIEW QUESTIONS
 % ============================================================================
 \section{Interview Questions}
 \label{sec:production_interview_questions}
+
+Several questions below drill serving and compression mechanics whose canonical
+treatment is [DL~19] and [DL~14]; they are kept here because an NLP application
+engineer is expected to produce these numbers on demand, and the answers are written
+from the application side.  [DL~19] carries a separate and larger bank of
+serving-design questions---work both if serving is your interview surface.
 
 % --- Question 1: Serving at Scale ---
 \begin{interviewq}
@@ -1700,33 +1312,36 @@ silently (confidently wrong)?  How does routing interact with latency SLAs?}
           (merging by likelihood), and Unigram (top-down pruning by likelihood loss)
           are the three core algorithms.  Byte-level BPE eliminates UNK tokens entirely.
 
-    \item \textbf{KV-cache} is the essential inference optimization for autoregressive
-          transformers.  Memory scales as $2 \times L \times H_{\text{kv}} \times S
-          \times d_h \times b$ and is the primary bottleneck for long-context serving.
-          GQA reduces KV-cache memory by $4$--$8\times$.
+    \item \textbf{The serving primitives} you depend on---KV cache (memory
+          $2 \times L \times H_{\text{kv}} \times S \times d_h \times b$ per request),
+          GQA/MLA, continuous batching, PagedAttention, prefix caching, speculative
+          decoding, TP/PP---each buy a specific thing and each impose a specific
+          application constraint.  Their mechanics are canonical in [DL~19];
+          what belongs to you is prompt length and prompt stability, which set
+          prefill cost and prefix-cache hit rate.
 
-    \item \textbf{Continuous batching} and \textbf{PagedAttention} are the infrastructure
-          primitives that make production LLM serving viable, improving throughput by
-          $2$--$5\times$ and memory utilization from $\sim$20\% to $\sim$95\%.
+    \item \textbf{Compression is a three-way choice}: quantize (no retraining,
+          $2$--$4\times$, the default first move), distill (needs a training run, but
+          the only lever that changes architecture), or prune (needs hardware support
+          to become speed).  Methods are canonical in [DL~14]; the application-side
+          rule is to evaluate the compressed model on \emph{your} task, since
+          benchmark-average quality loss hides task-specific collapse.
 
-    \item \textbf{Quantization} (INT8, INT4 via GPTQ/AWQ) provides $2$--$4\times$
-          memory and speed improvements with $<$3\% quality loss.  Always evaluate on
-          your specific task.
-
-    \item \textbf{Knowledge distillation} trains a small student to mimic a large
-          teacher using soft labels.  The temperature-scaled KL-divergence loss
-          transfers ``dark knowledge'' about inter-class relationships.
-
-    \item \textbf{Speculative decoding} uses a small draft model to propose tokens
-          verified by the target model in parallel, providing $2$--$3\times$ speedup
-          with provably identical output distribution.
+    \item \textbf{Cost is an identity, not a mystery}: prompt tokens $\times$ input
+          price plus output tokens $\times$ output price, over every model call the
+          request makes.  Routing, semantic caching, prefix-cache-friendly prompt
+          ordering, prompt compression, output-length control, and batch tiers are the
+          levers---and the tokenizer tax multiplies the whole bill for non-English users.
 
     \item \textbf{Multilingual deployment} requires awareness of the tokenizer tax,
           cross-lingual transfer limitations, and per-language quality monitoring.
 
-    \item \textbf{MLOps} for NLP encompasses latency monitoring (TTFT, ITL, P99),
-          quality tracking, data drift detection, cost optimization via model routing,
-          and continuous feedback loops.
+    \item \textbf{Operating an LLM feature} means two latency clocks (TTFT and
+          inter-token latency) with separate fixes, quality monitoring assembled from
+          implicit signals, sampled automated judging, and a golden set, every metric
+          sliced by language---and versioning the whole deployed tuple (model, tokenizer,
+          prompt, decoding parameters, tool schemas, index version), not just the model.
+          The general lifecycle---drift, retraining, CI/CD, canaries---is [DL~22].
 \end{enumerate}
 
 \begin{keyinsight}[Chapter 12 Summary: What Interviewers Are Really Testing]
@@ -1734,9 +1349,9 @@ When interviewers ask production NLP questions, they are testing three things:
 (1)~\emph{Do you think in numbers?}---Can you estimate KV-cache memory, prefill latency,
 and throughput for a specific model?  Candidates who reason quantitatively signal that
 they have actually deployed models, not just trained them.
-(2)~\emph{Do you know the full stack?}---Tokenization, serving, optimization, and
-monitoring are all part of production NLP.  Depth in any one of these is valuable, but
-breadth across all of them signals a staff-level engineer.
+(2)~\emph{Do you know the full stack?}---Tokenization, serving, cost, and monitoring are
+all part of production NLP.  Depth in any one of these is valuable, but breadth across all
+of them signals a staff-level engineer.
 (3)~\emph{Can you make tradeoffs?}---Every optimization trades something (quality, cost,
 complexity, generality).  The best candidates do not just list techniques---they reason
 about when each technique is appropriate and when it is not.

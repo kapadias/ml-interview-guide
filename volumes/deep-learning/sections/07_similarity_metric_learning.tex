@@ -2,7 +2,7 @@
 \label{chap:similarity_architectures}
 
 \begin{tldr}
-This chapter covers architectures for learning similarity and embeddings: Siamese networks for verification, Triplet networks for ranking, Two-Tower (Dual Encoder) for large-scale retrieval, Cross-Encoder for high-precision reranking, and Poly-Encoder as a middle ground. Understanding when to use each architecture—and how to combine them in production systems—is critical for staff-level ML interviews.
+This chapter is the \emph{training} theory of similarity: how to learn an embedding space in which geometric distance means semantic relevance. It covers Siamese networks and contrastive loss, triplet networks and the mining problem that makes or breaks them (easy/semi-hard/hard, batch-hard, margin selection), the two-tower (dual-encoder) architecture and how it is actually trained (InfoNCE with in-batch negatives, hard-negative mixing, temperature, when to share weights), and the cross-encoder as the full-interaction contrast that fixes the quality ceiling. The \emph{systems} half of this material lives in Volume III: ANN index internals and index sizing are [SR 3]; the retrieval funnel, late interaction, and reranker design are [SR 4]; index freshness, embedding refresh, and serving are [SR 8]. What stays here is what an interviewer probes when the question is how the embeddings were learned---the objective, the negatives, and the geometry.
 \end{tldr}
 
 \section{The Similarity Learning Problem}
@@ -678,8 +678,8 @@ A two-tower model might struggle because ``apple'' and ``price'' appear in both.
 
 For 1 million items with a 12-layer BERT:
 \begin{itemize}
-    \item Two-tower: a few milliseconds per query (ANN lookup over pre-computed embeddings; see Q10)
-    \item Cross-encoder: minutes per query on a GPU---batched BERT-base at sequence length 256 sustains $\sim$2--3K pairs/s on an A100 (see Q12), so 1M forward passes take $\sim$5--8 minutes; on CPU it is hours. Either way, orders of magnitude outside any online latency budget.
+    \item Two-tower: a few milliseconds per query (ANN lookup over pre-computed embeddings; see the QPS estimation question in Section~\ref{sec:similarity_questions})
+    \item Cross-encoder: minutes per query on a GPU---batched BERT-base at sequence length 256 sustains $\sim$2--3K pairs/s on an A100 (same estimate), so 1M forward passes take $\sim$5--8 minutes; on CPU it is hours. Either way, orders of magnitude outside any online latency budget.
 \end{itemize}
 
 \subsection{When to Use Cross-Encoder}
@@ -692,330 +692,81 @@ For 1 million items with a 12-layer BERT:
 \end{itemize}
 
 %==============================================================================
-\section{Poly-Encoder: A Middle Ground}
+\section{Poly-Encoder and the Architecture Comparison}
 \label{sec:poly_encoder}
 %==============================================================================
 
-\subsection{Architecture Overview}
-
-Poly-encoder uses learned ``global features'' for the query, attended by the item embedding.
-
-{%
-% \newcommand{\vh}{\mathbf{h}}%
-% \newcommand{\vc}{\mathbf{c}}%
-% \newcommand{\vy}{\mathbf{y}}%
-% \newcommand{\vk}{\mathbf{k}}%
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-    node distance=1cm,
-    box/.style={rectangle, draw, minimum width=2cm, minimum height=0.7cm, rounded corners, align=center},
-    encoder/.style={box, fill=lightblue, align=center},
-    input/.style={box, fill=lightgray},
-    output/.style={box, fill=lightgreen}
-]
-    % Query side
-    \node[input] (q) {Query};
-    \node[encoder, below=0.8cm of q, minimum height=1.2cm] (qenc) {Query\\Encoder};
-    \node[below=0.8cm of qenc] (qtok) {$\vh_1^q, \ldots, \vh_n^q$};
-    
-    % Code vectors
-    \node[box, fill=lightyellow, right=0.5cm of qtok] (codes) {Code Vectors\\$\vc_1, \ldots, \vc_m$};
-    
-    % Attention
-    \node[box, fill=orange!20, below=0.8cm of $(qtok)!0.5!(codes)$] (attn1) {Attention};
-    \node[below=0.6cm of attn1] (yq) {$\vy_1^q, \ldots, \vy_m^q$};
-    
-    % Item side
-    \node[input, right=4cm of q] (i) {Item};
-    \node[encoder, below=0.8cm of i, minimum height=1.2cm] (ienc) {Item\\Encoder};
-    \node[below=0.8cm of ienc] (itok) {$\vk = \vh_{{[CLS]}}^i$};
-    
-    % Final attention
-    \node[box, fill=orange!20, below=1.5cm of $(yq)!0.5!(itok)$] (attn2) {Attention};
-    
-    % Score
-    \node[output, below=0.8cm of attn2] (score) {Score};
-    
-    % Edges
-    \draw[->] (q) -- (qenc);
-    \draw[->] (qenc) -- (qtok);
-    \draw[->] (i) -- (ienc);
-    \draw[->] (ienc) -- (itok);
-    \draw[->] (qtok) -- (attn1);
-    \draw[->] (codes) -- (attn1);
-    \draw[->] (attn1) -- (yq);
-    \draw[->] (yq) -- (attn2);
-    \draw[->] (itok) -- (attn2);
-    \draw[->] (attn2) -- (score);
-\end{tikzpicture}
-\caption{Poly-encoder architecture with learned code vectors.}
-\label{fig:poly_encoder}
-\end{figure}
-}%
-
-\subsection{Mathematical Formulation}
-
-\textbf{Step 1}: Encode query and item separately
-\begin{align}
-\mH^q &= \text{Encoder}(q) \in \R^{n \times d} \\
-\vk &= \text{Encoder}(i)_{[CLS]} \in \R^d
-\end{align}
-
-\textbf{Step 2}: Compute $m$ global query features using code vectors $\{\vc_i\}_{i=1}^m$
+The poly-encoder is the historical middle ground between the two extremes above, and it is worth knowing as the argument that interaction and pre-computation are a dial rather than a binary. The item is encoded to a single vector offline, exactly as in a bi-encoder, but the query is summarized into $m$ learned ``code'' vectors: each $\vy_i^q$ is an attention-weighted pooling of the query token states under a learned code $\vc_i$. The item vector $\vk$ then attends over those codes before scoring:
 \begin{equation}
-\vy_i^q = \sum_j \text{softmax}\left(\vc_i^T \mH^q_{:,j}\right) \cdot \mH^q_{:,j}
+\text{score}(q, i) = \vk^\top \sum_i \text{softmax}\!\left(\vk^\top \vy_i^q\right) \vy_i^q .
 \end{equation}
+Item embeddings stay pre-computable, so the index is unchanged; scoring costs $O(md)$ per candidate instead of the bi-encoder's $O(d)$, with $m$ typically 16--360, and buys a limited amount of query--item interaction without paying the cross-encoder's $O(L^2)$ per pair.
 
-\textbf{Step 3}: Attend from item to query features
-\begin{equation}
-\text{score} = \vk^T \sum_i \text{softmax}(\vk^T \vy_i^q) \cdot \vy_i^q
-\end{equation}
-
-\subsection{Complexity Analysis}
-
-\begin{itemize}
-    \item \textbf{Query encoding}: $O(n^2)$ — done once per query
-    \item \textbf{Item encoding}: $O(m^2)$ — can be pre-computed
-    \item \textbf{Scoring per item}: $O(m \cdot d)$ where $m$ = number of codes (typically 16-360)
-\end{itemize}
-
-\textbf{Poly-Encoder Trade-off.} With $m$ code vectors, poly-encoder:
-\begin{itemize}
-    \item Has $m \times$ more computation than two-tower per item
-    \item Has $O(N)$ cost (vs. $O(N \cdot L^2)$ for cross-encoder where $L$ = sequence length)
-    \item Captures more query-item interaction than two-tower
-\end{itemize}
-
-\subsection{Comparison Summary}
+In current practice the poly-encoder has largely been superseded by \textit{late interaction} (ColBERT and its descendants), which keeps a vector per \textit{token} rather than $m$ learned codes and scores by MaxSim---more expressive, and with a serving story the poly-encoder never got. The late-interaction line, its storage math, and when it earns its cost are [SR 4].
 
 \begin{table}[H]
 \centering
-\caption{Comprehensive comparison of similarity architectures}
-\begin{tabularx}{\textwidth}{lXXXX}
+\caption{Similarity architectures: what each buys, and what it costs per candidate}
+\label{fig:poly_encoder}% label retained; the poly-encoder schematic is folded into this table
+\begin{tabularx}{\textwidth}{lXXX}
 \toprule
-\textbf{Aspect} & \textbf{Two-Tower} & \textbf{Poly-Encoder} & \textbf{Cross-Encoder} \\
+\textbf{Aspect} & \textbf{Bi-encoder (two-tower)} & \textbf{Poly-encoder / late interaction} & \textbf{Cross-encoder} \\
 \midrule
-Item pre-compute & Yes & Yes & No \\
-Query-item interaction & None & Limited & Full \\
-Scoring complexity & $O(d)$ & $O(md)$ & $O(L^2)$ \\
+Item pre-compute & Yes (one vector) & Yes ($m$ codes, or one vector per token) & No \\
+Query--item interaction & None (dot product) & Limited (attention over codes/tokens) & Full self-attention \\
+Scoring cost per candidate & $O(d)$ & $O(md)$ & $O(L^2)$ \\
 Quality (typical) & Good & Better & Best \\
-Scale & Billions & Millions & Thousands \\
-Use case & Retrieval & Retrieval + light rerank & Reranking \\
+Practical corpus scale & Billions & Millions & Thousands \\
+Funnel position & Retrieval & Retrieval or mid-funnel & Reranking \\
 \bottomrule
 \end{tabularx}
 \end{table}
 
 %==============================================================================
-\section{Two-Stage Retrieval Systems}
+\section{From Architectures to a Funnel}
 \label{sec:two_stage}
 %==============================================================================
 
-\subsection{The Standard Pattern}
+The architectures above are not alternatives; production systems compose them. Because per-candidate cost and per-candidate quality move together, the only way to afford the expensive model is to run it on few candidates---so each stage spends more compute on fewer items than the stage before it. The canonical shape narrows $10^9$ items to $\sim$1000 with a bi-encoder over an ANN index (tens of milliseconds, tuned for \textit{recall}), then to $\sim$100 with a cross-encoder rerank (tuned for \textit{precision at the top}), then to a page with business logic (diversity, freshness, policy).
+\label{fig:two_stage}% label retained; the funnel diagram is canon in [SR 4]
 
-Production systems almost always use multiple stages:
+Two consequences are worth carrying into any interview. First, the \textbf{recall ceiling}: a candidate the first stage misses cannot be recovered downstream, so the retrieval stage is evaluated on recall@$k$ at its handoff depth, never on precision---and the most common funnel misdiagnosis is tuning the reranker when the candidate set never contained the answer. Second, the cross-encoder sits \textit{last} for an arithmetic reason rather than a stylistic one: it cannot pre-compute anything, so its cost is linear in candidates scored, and a full BERT-base pass over even $10^3$ candidates already blows a typical online budget.
 
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-    node distance=0.8cm,
-    box/.style={rectangle, draw, minimum width=3cm, minimum height=1cm, rounded corners},
-    stage/.style={box, fill=lightblue, align=center},
-    arrow/.style={->, thick}
-]
-    % Query
-    \node[box, fill=lightgray] (query) {Query};
-    
-    % Stage 1
-    \node[stage, right=1.5cm of query] (retrieval) {Retrieval\\(Two-Tower + ANN)};
-    \node[below=0.3cm of retrieval, font=\small] {1B items $\rightarrow$ 1K candidates};
-    
-    % Stage 2
-    \node[stage, right=1.5cm of retrieval] (rerank) {Reranking\\(Cross-Encoder)};
-    \node[below=0.3cm of rerank, font=\small] {1K $\rightarrow$ 10--100};
-    
-    % Output
-    \node[box, fill=lightgreen, right=1.5cm of rerank] (output) {Results};
-    
-    % Edges
-    \draw[arrow] (query) -- (retrieval);
-    \draw[arrow] (retrieval) -- (rerank);
-    \draw[arrow] (rerank) -- (output);
-    
-    % Timing
-    \node[above=0.5cm of retrieval, font=\small\itshape] {$\sim$10ms};
-    \node[above=0.5cm of rerank, font=\small\itshape] {$\sim$50ms};
-\end{tikzpicture}
-\caption{Two-stage retrieval pipeline combining speed and accuracy.}
-\label{fig:two_stage}
-\end{figure}
-
-\subsection{Stage 1: Retrieval}
-
-\textbf{Objective}: High recall, acceptable precision
-
-\textbf{Architecture}: Two-tower with approximate nearest neighbor (ANN) index
-
-\textbf{Metrics}: Recall@K (e.g., Recall@1000)
-
-\textbf{ANN Options}:
-\begin{itemize}
-    \item \textbf{HNSW}: Graph-based, best quality, more memory
-    \item \textbf{IVF}: Inverted index, good balance
-    \item \textbf{LSH}: Hash-based, fastest, lower quality
-    \item \textbf{ScaNN}: Google's optimized, state-of-art
-\end{itemize}
-
-\subsection{Stage 2: Reranking}
-
-\textbf{Objective}: High precision in top results
-
-\textbf{Architecture}: Cross-encoder or feature-rich ranking model
-
-\textbf{Metrics}: NDCG@K, MRR (for top results)
-
-\textbf{Features can include}:
-\begin{itemize}
-    \item Semantic score from cross-encoder
-    \item Lexical features (BM25, TF-IDF)
-    \item Popularity, freshness
-    \item User-item interaction history
-    \item Business rules
-\end{itemize}
-
-\subsection{Optional Stage 3: Re-reranking / Business Logic}
-
-Final adjustments for:
-\begin{itemize}
-    \item Diversity (avoid showing similar items)
-    \item Freshness boosting
-    \item Personalization
-    \item Business rules (promotions, etc.)
-\end{itemize}
+\begin{keyinsight}[Where the Funnel Is Canon]
+The funnel as a design object---stage-by-stage candidate counts, a worked latency budget, hybrid lexical/dense fusion, late interaction, LLM rerankers and their economics, and how handoff depths are actually chosen from marginal recall curves---is Volume III, [SR 4]. Index internals and sizing are [SR 3]; caching, freshness, and serving are [SR 8]. This chapter stops where the question stops being ``how were these embeddings trained?''
+\end{keyinsight}
 
 %==============================================================================
-\section{Approximate Nearest Neighbor (ANN) Algorithms}
+\section{Approximate Nearest Neighbor Search, in Brief}
 \label{sec:ann}
 %==============================================================================
 
-\subsection{Why ANN?}
-
-Exact nearest neighbor search is $O(N)$—too slow for millions of items. ANN trades small accuracy loss for massive speedup.
-
-\subsection{HNSW (Hierarchical Navigable Small World)}
-
-\textbf{Idea}: Build a hierarchy of proximity graphs.
-
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[scale=0.8]
-    % Layer 2 (sparse)
-    \node at (-3, 4) {\textbf{Layer 2}};
-    \fill[blue] (0, 4) circle (3pt);
-    \fill[blue] (3, 4) circle (3pt);
-    \draw (0, 4) -- (3, 4);
-    
-    % Layer 1 (medium)
-    \node at (-3, 2) {\textbf{Layer 1}};
-    \fill[blue] (0, 2) circle (3pt);
-    \fill[blue] (1.5, 2) circle (3pt);
-    \fill[blue] (3, 2) circle (3pt);
-    \fill[blue] (4.5, 2) circle (3pt);
-    \draw (0, 2) -- (1.5, 2) -- (3, 2) -- (4.5, 2);
-    \draw (0, 2) -- (3, 2);
-    
-    % Layer 0 (dense)
-    \node at (-3, 0) {\textbf{Layer 0}};
-    \foreach \x in {0, 0.75, 1.5, 2.25, 3, 3.75, 4.5, 5.25} {
-        \fill[blue] (\x, 0) circle (3pt);
-    }
-    \draw (0, 0) -- (0.75, 0) -- (1.5, 0) -- (2.25, 0) -- (3, 0) -- (3.75, 0) -- (4.5, 0) -- (5.25, 0);
-    \draw (0, 0) -- (1.5, 0);
-    \draw (1.5, 0) -- (3, 0);
-    \draw (3, 0) -- (4.5, 0);
-    
-    % Vertical connections
-    \draw[dashed] (0, 4) -- (0, 2) -- (0, 0);
-    \draw[dashed] (3, 4) -- (3, 2) -- (3, 0);
-    \draw[dashed] (1.5, 2) -- (1.5, 0);
-    \draw[dashed] (4.5, 2) -- (4.5, 0);
-    
-    % Query path
-    \fill[red] (2, -0.5) circle (4pt) node[below] {Query};
-    \draw[->, thick, red] (2, -0.3) -- (0, 3.8);
-    \draw[->, thick, red] (0.1, 3.9) -- (2.9, 3.9);
-    \draw[->, thick, red] (2.9, 3.8) -- (3, 2.1);
-    \draw[->, thick, red] (2.9, 2) -- (2.3, 0.1);
-    
-\end{tikzpicture}
-\caption{HNSW structure: Navigate from sparse upper layers to dense lower layers.}
-\label{fig:hnsw}
-\end{figure}
-
-\textbf{Search}: Start at top layer, greedily descend, refine at bottom.
-
-\textbf{Complexity}: $O(\log N)$ with high probability.
-
-\textbf{Trade-offs}:
-\begin{itemize}
-    \item Best recall-speed trade-off
-    \item High memory (graph structure + vectors)
-    \item Slow index construction
-\end{itemize}
-
-\subsection{IVF (Inverted File Index)}
-
-\textbf{Idea}: Cluster vectors, search only relevant clusters.
-
-\begin{enumerate}
-    \item Cluster all vectors into $k$ centroids (k-means)
-    \item At query time, find $n_{probe}$ nearest centroids
-    \item Search only vectors in those clusters
-\end{enumerate}
-
-\textbf{Trade-offs}:
-\begin{itemize}
-    \item Lower memory than HNSW
-    \item Faster index construction
-    \item Quality depends on clustering
-\end{itemize}
-
-\subsection{Product Quantization (PQ)}
-
-\textbf{Idea}: Compress vectors by quantizing subspaces.
-
-\begin{enumerate}
-    \item Split $d$-dimensional vector into $m$ subvectors
-    \item Quantize each subvector to one of $k$ centroids
-    \item Store $m$ centroid indices (typically 1 byte each)
-\end{enumerate}
-
-\textbf{Compression}: $d \times 4$ bytes → $m$ bytes (e.g., 768×4=3KB → 96 bytes)
-
-\textbf{Used with}: IVF-PQ combines clustering with quantization.
-
-\subsection{ANN Algorithm Selection}
+A trained item tower is only useful if its output can be searched quickly. Exact search costs $O(Nd)$ per query---at $N = 10^8$ and $d = 768$ that is hundreds of gigabytes of memory traffic per query---so serving uses an \textit{approximate} index that trades a few points of recall for two to three orders of magnitude in speed. The consequence that matters on the training side: brute-force recall measured offline is only an \textit{upper bound} on what the served system delivers, so ANN recall@$k$ has to be monitored as a quantity separate from model quality. A model improvement hidden behind an index regression is indistinguishable from a model regression.
 
 \begin{table}[H]
 \centering
-\caption{ANN algorithm comparison}
-\begin{tabularx}{\textwidth}{lXXXX}
+\caption{ANN index families at a glance (768-d embeddings; the one-line version)}
+\label{fig:hnsw}% label retained; the HNSW layer diagram and its mechanics are canon in [SR 3]
+\begin{tabularx}{\textwidth}{lXX}
 \toprule
-\textbf{Algorithm} & \textbf{Recall} & \textbf{Speed} & \textbf{Memory} & \textbf{Build Time} \\
+\textbf{Index} & \textbf{Mechanism} & \textbf{Reach for it when} \\
 \midrule
-HNSW & Best & Fast & High & Slow \\
-IVF & Good & Fast & Medium & Medium \\
-IVF-PQ & Good & Very fast & Low & Medium \\
-LSH & Lower & Very fast & Low & Fast \\
-ScaNN & Best & Very fast & Medium & Medium \\
+Flat (exact) & Full SIMD/GPU scan; recall $=1$ & The corpus is small ($\lesssim$ a few million), or exactness and constant churn matter more than latency \\
+HNSW & Hierarchical proximity graph; greedy descent from sparse upper layers to a dense base layer & You want the best recall--QPS trade and can afford vectors $+$ graph resident in RAM \\
+IVF-PQ & $k$-means cells plus product-quantized codes; scan only \texttt{nprobe} cells & Memory or cost is the binding constraint; pair with an exact rerank to recover the recall quantization gives up \\
+DiskANN & Graph on NVMe with quantized codes in RAM & The corpus is far larger than one node's RAM \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+The full treatment---why high dimensions break exact indexes, LSH amplification, HNSW graph construction and its $M$/\texttt{ef} parameters, the \texttt{nprobe} recall curve, the quantization ladder from int8 through OPQ and anisotropic PQ, Johnson--Lindenstrauss sketching, and the recall--latency--memory triangle with worked sizing---is Volume III, [SR 3]. Deletes, centroid drift, and reindexing are [SR 8]. What belongs in a training chapter is only the interface: the index searches whatever geometry the loss produced, so a scoring function that disagrees with the index metric---dot-product-trained embeddings served on a cosine index, say---silently costs recall without any error surfacing anywhere. That failure mode is the subject of the cosine-versus-dot-product question below.
 
 %==============================================================================
 \section{Architecture Selection Guide}
 \label{sec:similarity_arch_selection}
 %==============================================================================
+
+This guide is about choosing the architecture you \textit{train}---what the encoders see, and what can be pre-computed. Choosing the serving stack that goes with it (index family, number of stages, latency budget per stage) is [SR 3] and [SR 4].
 
 \begin{figure}[H]
 \centering
@@ -1034,7 +785,7 @@ ScaNN & Best & Very fast & Medium & Medium \\
     
     % Results
     \node[result, below left=1cm and 0cm of small] (cross) {Cross-Encoder};
-    \node[result, below right=1cm and 0cm of small] (poly) {Poly-Encoder};
+    \node[result, below right=1cm and 0cm of small] (poly) {Poly-Encoder /\\Late Interaction};
     \node[result, below left=1cm and 0cm of large] (twostage) {Two-Stage\\(Two-Tower + Rerank)};
     \node[result, below right=1cm and 0cm of large] (tower) {Two-Tower Only};
     
@@ -1073,6 +824,10 @@ Few-shot classification & Siamese & Compare to class examples \\
 \section{Interview Questions}
 \label{sec:similarity_questions}
 %==============================================================================
+
+\begin{keyinsight}[Questions That Moved to Volume III]
+Three questions this chapter used to carry are canon elsewhere now, because they are systems questions rather than training questions. \textbf{``Design a multi-stage retrieval pipeline''}---the one canonical retrieval-design answer, with per-stage candidate counts and a worked latency budget---is [SR 4]. \textbf{``Estimate the ANN index size and query latency for 1B 768-dim embeddings''} is [SR 3], which works the sizing arithmetic for flat, HNSW, IVF-PQ, and DiskANN side by side. \textbf{``Update embeddings in production without re-indexing''} is [SR 8], alongside blue-green reindexing, why HNSW hates deletes, and what an embedding refresh actually costs. Prepare those there; the questions below are the ones whose answer is about the objective, the negatives, and the geometry.
+\end{keyinsight}
 
 %--- Q1 ---
 
@@ -1119,44 +874,6 @@ This is a classic failure mode: the two-tower model has learned \textit{lexical 
 %--- Q2 ---
 
 \begin{interviewq}
-\textbf{Q: Design a multi-stage retrieval pipeline: candidate generation, reranking, and final scoring.}
-
-\badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqhigh}
-
-\stronganswer
-
-Production retrieval systems use a funnel architecture: each stage reduces the candidate set while increasing scoring quality. I would design three stages.
-
-\textbf{Stage 1 --- Candidate Generation (target: 10ms, 1B $\to$ 1K).} Architecture: Two-tower model with separate query and document encoders. Pre-compute all document embeddings offline (768-dim, stored in FP16 $\to$ $768 \times 2$ bytes $\times$ 1B = 1.5 TB). Use HNSW index sharded across machines (e.g., 20 shards of 50M each, queried in parallel). Each shard returns top-50, merge and take global top-1000. Latency budget: $\sim$10ms with proper sharding. Key metric: Recall@1000---this is the ceiling for downstream stages. If a relevant document is missed here, no subsequent stage can recover it.
-
-\textbf{Stage 2 --- Reranking (target: 40ms, 1K $\to$ 100).} Architecture: Cross-encoder processes [CLS] query [SEP] document [SEP] for each of the 1000 candidates. Do the FLOPs math before promising a latency: 1000 pairs through a 12-layer BERT-base at sequence length 256 is $1000 \times 56$ GFLOPs $\approx 56$ TFLOPs, which is $\geq$180ms on an A100 even at 100\% FP16 utilization---realistically 300--500ms at achievable utilization. A 40ms budget therefore cannot be met with a full BERT-base over 1000 candidates on one GPU; it requires a distilled cross-encoder (2--6 layers, knowledge distilled from the 12-layer teacher), sequence length trimmed to $\sim$128, and/or sharding the candidates across multiple GPUs. For example, a 2-layer MiniLM-style reranker at sequence length 128 cuts the work by roughly an order of magnitude, scoring 1000 candidates in $\sim$30--50ms on a single A100; splitting across two GPUs brings it safely under budget. The cross-encoder provides full query-document interaction, capturing fine-grained semantic matching that the two-tower misses.
-
-\textbf{Stage 3 --- Final scoring and business logic (target: 5ms, 100 $\to$ 10).} Combine the cross-encoder score with additional features: BM25 lexical score, document freshness, popularity (click count), user personalization signals, and business rules (promoted content, diversity constraints). Use a lightweight gradient-boosted tree or linear model to combine these features. Apply diversity re-ranking (MMR or similar) to avoid showing redundant results.
-
-\textbf{Optimizations across stages:} (1) \textit{Embedding quantization}: Compress 768-dim FP16 to INT8 or use product quantization (96 bytes per vector $\to$ 96 GB total, fits in memory on a single large machine). (2) \textit{Query caching}: Cache results for the top 10K most frequent queries (can serve 30--50\% of traffic from cache). (3) \textit{Asynchronous pre-computation}: When a new document is added, compute its embedding and insert into the ANN index asynchronously. (4) \textit{Tiered reranking}: Rerank top-200 with the full cross-encoder, top-1000 with a lightweight scorer.
-
-\redflags
-\begin{itemize}
-    \item Proposing a cross-encoder on all 1B documents---this is computationally infeasible.
-    \item Not estimating latency per stage---the interviewer expects back-of-envelope math.
-    \item Skipping the business logic stage---real systems always have non-ML scoring factors.
-\end{itemize}
-
-\interviewtest{System design thinking---the funnel architecture pattern, latency budgeting across stages, the trade-off between scoring quality and computational cost, and awareness of production concerns beyond just the model.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} Describes the two-stage pattern (retrieval + reranking) with reasonable architecture choices.
-    \item \badgeLsix{L6} Adds the third stage (business logic), provides latency estimates per stage, discusses sharding for the ANN index, and proposes specific optimizations (PQ, caching, distillation).
-    \item \badgeLseven{L7} Designs for operational reality---monitoring per-stage recall/latency, A/B testing framework for model updates, graceful degradation (if the reranker is slow, fall back to two-tower scores), and discusses how feedback loops (user clicks) can improve both the retrieval and reranking models over time.
-\end{itemize}
-
-\followups{``How would you shard the ANN index?'' ``What if the latency budget were 20ms instead of 100ms?'' ``How do you evaluate each stage independently?''}
-\end{interviewq}
-
-%--- Q3 ---
-
-\begin{interviewq}
 \textbf{Q: Siamese vs Triplet vs Two-Tower---decision framework for a new retrieval project.}
 
 \badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
@@ -1200,50 +917,7 @@ In practice, modern systems often skip the Siamese/Triplet distinction and go di
 \followups{``When would you use both a Siamese and a two-tower model in the same system?'' ``How does the loss function choice differ across architectures?'' ``What is the minimum training data needed for each?''}
 \end{interviewq}
 
-%--- Q4 ---
-
-\begin{interviewq}
-\textbf{Q: Estimate the ANN index size and query latency for 1B 768-dim embeddings.}
-
-\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
-
-\stronganswer
-
-\textbf{Raw embedding storage.} $10^9 \times 768 \times 4$ bytes (FP32) = 3.07 TB. In FP16: 1.54 TB. This is the baseline---the index metadata adds overhead on top.
-
-\textbf{HNSW index.} HNSW stores the vectors plus a graph structure. Each vector has $M$ neighbors per layer (typically $M=16$). The graph overhead is approximately $M \times L_{avg} \times 4$ bytes per vector---standard implementations (hnswlib, Faiss) store neighbor IDs as 32-bit internal integers, which cover up to $\sim$4B vectors per shard---where $L_{avg}$ is the average number of layers per node ($\approx 1.5$ for random level assignment). Per-vector graph overhead: $16 \times 1.5 \times 4 \approx 96$ bytes. Total graph overhead: $96 \times 10^9 \approx 96$ GB. Total HNSW index: $\sim$1.54 TB (vectors in FP16) + $\sim$96 GB (graph) $\approx$ \textbf{1.64 TB}. This requires distributed deployment---e.g., 20 machines with 96 GB RAM each, 50M vectors per shard.
-
-\textbf{With product quantization (IVF-PQ).} Compress each 768-dim vector to 96 bytes (split into 96 subvectors of 8 dims, each quantized to 1 byte = 256 centroids). Storage: $96 \times 10^9 = 96$ GB for vectors + IVF structure overhead ($\sim$10 GB) $\approx$ \textbf{106 GB}. This fits on a single high-memory machine (128 GB RAM).
-
-\textbf{Query latency estimates.}
-\begin{itemize}
-    \item \textit{HNSW (per shard, 50M vectors)}: $\sim$1--5ms per query (log-scale traversal, $\sim$200--500 distance computations). With 20 shards queried in parallel: $\sim$5ms (dominated by the slowest shard + merge).
-    \item \textit{IVF-PQ (1B vectors, single machine)}: $\sim$5--20ms per query depending on $n_{probe}$ (number of clusters searched). With $n_{probe}=64$ out of $\sqrt{10^9} \approx 32K$ clusters, approximately $64/32K \times 10^9 = 2M$ vectors scanned with PQ distance, which takes $\sim$10ms.
-    \item \textit{Flat exhaustive search (for reference)}: $\sim$2--5 seconds per query. Completely impractical.
-\end{itemize}
-
-\textbf{Trade-off summary:} HNSW gives better recall ($>$95\% at reasonable parameters) but requires $\sim$16$\times$ more memory than IVF-PQ. IVF-PQ is more memory-efficient but recall degrades for very high-precision requirements. For 1B vectors, the practical choice is often HNSW with FP16/INT8 quantized vectors, or IVF-PQ with aggressive compression.
-
-\redflags
-\begin{itemize}
-    \item Getting the order of magnitude wrong on storage (it's TB-scale for 1B FP32 vectors, not GB-scale).
-    \item Not mentioning that HNSW at 1B scale requires sharding---it won't fit on a single machine.
-    \item Assuming flat exhaustive search is feasible at this scale.
-\end{itemize}
-
-\interviewtest{Ability to estimate storage and latency from first principles, understanding of the memory-quality-latency trade-off for ANN algorithms, and awareness of practical deployment constraints.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} Correct storage calculation, knows HNSW is $O(\log N)$ and IVF is $O(\sqrt{N})$, estimates latency within an order of magnitude.
-    \item \badgeLsix{L6} Includes graph overhead for HNSW, PQ compression ratio, and discusses sharding strategy. Compares recall-latency trade-offs between HNSW and IVF-PQ.
-    \item \badgeLseven{L7} Discusses hybrid approaches (IVF + HNSW within each cluster), tiered storage (hot vectors in memory, cold on SSD with DiskANN), and how to scale to 10B+ vectors with multi-tier architectures.
-\end{itemize}
-
-\followups{``How would you shard the index---by hash or by cluster?'' ``What is the recall@100 for HNSW vs IVF-PQ at this scale?'' ``How do you handle index updates when new documents arrive?''}
-\end{interviewq}
-
-%--- Q5 ---
+%--- Q3 ---
 
 \begin{interviewq}
 \textbf{Q: Your two-tower model's recall@10 is good but precision@10 is poor. What's wrong?}
@@ -1288,7 +962,7 @@ Good recall@10 means the model \textit{can} retrieve relevant documents in the t
 \followups{``How would you measure ranking quality vs retrieval quality separately?'' ``What is a late-interaction model and how does it help?'' ``How does ColBERT compare to a standard cross-encoder?''}
 \end{interviewq}
 
-%--- Q6 ---
+%--- Q4 ---
 
 \begin{interviewq}
 \textbf{Q: Cross-encoder vs bi-encoder---when is the quality gap worth the latency cost?}
@@ -1338,7 +1012,7 @@ A bi-encoder (two-tower) computes query and document embeddings independently, e
 \followups{``How would you distill a cross-encoder into a bi-encoder?'' ``What is ColBERT and how does it compare?'' ``How do you decide the candidate set size for reranking?''}
 \end{interviewq}
 
-%--- Q7 ---
+%--- Q5 ---
 
 \begin{interviewq}
 \textbf{Q: Hard negative mining strategies---how to choose and when each fails.}
@@ -1380,7 +1054,7 @@ Hard negative mining is the process of selecting training negatives that are cha
 \followups{``How do you detect that your hard negatives contain false negatives?'' ``How often should you re-mine?'' ``What is the interaction between negative difficulty and learning rate?''}
 \end{interviewq}
 
-%--- Q8 ---
+%--- Q6 ---
 
 \begin{interviewq}
 \textbf{Q: Cosine similarity vs dot product vs L2 distance for embeddings---when each?}
@@ -1425,7 +1099,7 @@ These three metrics are closely related but differ in whether they account for e
 \followups{``How does the choice of similarity metric interact with ANN algorithms?'' ``What is MIPS and why is it the standard retrieval primitive?'' ``How would you handle a case where you want cosine for ranking but dot product for speed?''}
 \end{interviewq}
 
-%--- Q9 ---
+%--- Q7 ---
 
 \begin{interviewq}
 \textbf{Q: Your contrastive model produces good embeddings for frequent items but poor for rare items. Why?}
@@ -1473,143 +1147,45 @@ This is a fundamental challenge in contrastive learning: \textit{frequency bias}
 \followups{``How do you measure embedding quality separately for frequent and rare items?'' ``How does this interact with the ANN index?'' ``What is the cold-start problem for new items and how does it relate?''}
 \end{interviewq}
 
-%--- Q10 ---
+%--- Q8 ---
 
 \begin{interviewq}
-\textbf{Q: Estimate the QPS of a retrieval system using HNSW on 100M documents.}
+\textbf{Q: Estimate the QPS of a retrieval system using HNSW on 100M documents. Then add a cross-encoder reranker over the top 100---what changes?}
 
 \badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
 
 \stronganswer
 
-To estimate QPS (queries per second), I need to estimate per-query latency and then account for parallelism.
+Two stages with two different bottlenecks: retrieval is memory-bound on CPU, reranking is compute-bound on GPU. Estimate them separately, then quote the binding one.
 
-\textbf{Per-query latency for HNSW.} HNSW search involves traversing the graph from top layers to bottom. At each step, the algorithm evaluates $ef\_search$ candidates (a tunable parameter, typically 64--256 for good recall). Each evaluation requires computing a distance (768-dim dot product or L2 distance). With $ef\_search = 128$ and $\sim 2 \times$ overhead for graph traversal bookkeeping, we compute approximately 256 distance calculations.
+\textbf{Stage 1: HNSW per-query latency.} Search evaluates roughly $ef\_search$ candidates (typically 64--256 for good recall); at $ef\_search = 128$ plus traversal bookkeeping, call it $\sim$256 distance computations. The arithmetic is negligible---$256 \times 768 \times 2 \approx 400$K FLOPs, microseconds on an AVX-512 core. The cost is memory access, and the right unit is a \textit{full vector fetch}, not a single cache miss: each 768-dim FP32 vector is 3\,KB $=$ 48 cache lines, and graph traversal jumps to random neighbors, so those lines mostly come from DRAM at $\sim$100\,ns. That gives $256 \times 48 \times 100\,\mathrm{ns} \approx 1.2$\,ms, clawed back somewhat by hardware prefetching within each contiguous vector and L3 hits on hot graph regions. Call it \textbf{0.5--2\,ms per query per thread}.
 
-Each 768-dim FP32 distance computation: $768 \times 2$ FLOPS (multiply + add) = 1536 FLOPS. Total: $256 \times 1536 \approx 400K$ FLOPS. On a modern CPU with AVX-512 at $\sim$100 GFLOPS single-thread throughput: $400K / 100G = 4 \mu s$ for pure compute. But memory access dominates, and the right unit of cost is a \textit{full vector fetch}, not a single cache miss: each candidate vector is 3 KB ($768 \times 4$ bytes) $= \sim$48 cache lines of 64 bytes, and because graph traversal jumps to random neighbors, those fetches mostly go to DRAM at $\sim$100ns per line. Cost per query: $256 \text{ candidates} \times 48 \text{ lines} \times 100\text{ns} \approx 1.2$ ms. Hardware prefetching within each contiguous vector and L3 hits on hot graph regions claw back some of this.
+\textbf{Memory check, always.} $10^8 \times 768 \times 2$ bytes (FP16) $= 154$\,GB, plus $\sim$96\,B/vector of graph ($M = 16$, 32-bit neighbor IDs) $\approx 10$\,GB, so $\sim$164\,GB fits one 256\,GB machine. Had it not fit, the whole estimate changes shape---sharding, or a compressed index ([SR 3]).
 
-\textbf{Total per-query latency}: $\sim$0.5--2 ms per query per thread---the memory-bound estimate above, faster when prefetching and cache hits help (hot regions), slower for cold DRAM-resident traversals.
+\textbf{Stage-1 QPS.} 32--64 cores at $\sim$1\,ms per query is tens of thousands of QPS in principle; after network, serialization, and load balancing, \textbf{$\sim$10--20K QPS per machine} is the number to quote. Serving 100K QPS is then 5--10 replicas of the full index behind a load balancer: replication buys QPS, sharding buys corpus size. INT8 or scalar quantization shrinks the footprint \textit{and} improves cache hit rate, roughly doubling QPS.
 
-\textbf{QPS per machine.} Modern servers have 32--64 cores. With multi-threaded search: $64 \text{ cores} / 1 \text{ ms per query} = \sim$64K QPS for hot workloads, $\sim$16--32K QPS for mixed workloads. In practice, with overhead (network, serialization, load balancing): $\sim$10--20K QPS per machine is a conservative estimate for 100M vectors on a single machine.
+\textbf{Stage 2: cross-encoder over the top 100.} The arithmetic inverts. One BERT-base pass at sequence length 256 is $\sim$56 GFLOPs, so 100 pairs is $\sim$5.6 TFLOPs; at a realistic 30--50\% of an A100's 312 TFLOPS dense FP16 peak, that is \textbf{$\sim$35--60\,ms} for a batch of 100---call it 45\,ms. Sanity-check whatever number you are about to say: ``10--15\,ms for 100 pairs'' implies $\sim$470 TFLOPS sustained, above the hardware peak, so it cannot be right. A 6-layer DistilBERT reranker halves it to $\sim$20--30\,ms.
 
-\textbf{Memory requirement check.} 100M vectors $\times$ 768 dims $\times$ 4 bytes = 307 GB (FP32) or 154 GB (FP16). Plus HNSW graph ($\sim$96 bytes/vector with 32-bit neighbor IDs): $\sim$10 GB. Total: $\sim$164 GB in FP16. This fits on a single machine with 256 GB RAM.
+\textbf{End to end.} $\sim$2\,ms retrieval $+$ $\sim$45\,ms rerank $+$ $\sim$2\,ms overhead $\approx$ \textbf{50\,ms per query}, and throughput is now set entirely by the GPU: one A100 serves $1000/45 \approx 22$ queries/s, so 1000 QPS needs $\sim$45 A100s---at \$3 per GPU-hour, $\sim$\$135/hour, order \$100K/month (roughly half with the distilled reranker). The CPU tier can feed hundreds of GPUs, so retrieval is never the bottleneck once a reranker is in the loop. \textbf{Adding the reranker cost three orders of magnitude of throughput}, and that single fact is what the follow-up is testing.
 
-\textbf{Scaling.} To serve 100K QPS: $\sim$5--10 replicas of the same index, behind a load balancer. Each replica is a separate machine with the full 100M vector index. Total cost: 5--10 machines with 256 GB RAM each.
-
-\textbf{With product quantization.} Compress to INT8 ($\sim$77 GB) or use scalar quantization. This both reduces memory and improves cache hit rates, potentially doubling QPS to $\sim$20--40K per machine.
+\textbf{Levers, most cost-effective first.} Rerank the top 50 rather than 100 ($\sim$2$\times$); distill the cross-encoder to 2--6 layers ($\sim$2--5$\times$); INT8 with TensorRT ($\sim$2--3$\times$); accumulate requests over a $\sim$5\,ms window so the GPU sees full batches; and skip reranking outright when retrieval is already decisive (a large top-1 to top-2 score gap), which converts a fixed cost into an average one. Reranker latency by candidate count and model class is tabulated in [SR 4].
 
 \redflags
 \begin{itemize}
-    \item Ignoring memory access patterns---distance computation is memory-bound, not compute-bound.
-    \item Assuming single-threaded execution---modern ANN libraries are heavily multi-threaded.
-    \item Not checking whether the index fits in memory on a single machine.
+    \item Treating HNSW search as compute-bound---the distance arithmetic is nothing, the random DRAM access is everything.
+    \item Assuming single-threaded retrieval, or never checking whether the index fits in RAM.
+    \item Scoring cross-encoder pairs one at a time, or quoting a batch latency that implies more FLOPS than the GPU physically has.
+    \item Not identifying the reranker as the bottleneck once it is added, and not costing it---at staff level the economics are part of the answer.
 \end{itemize}
 
-\interviewtest{Ability to reason about system performance from first principles---understanding the bottleneck (memory access, not compute), accounting for parallelism, and checking resource requirements.}
+\interviewtest{Back-of-envelope system reasoning: finding the true bottleneck at each stage (memory bandwidth vs.\ GPU FLOPs), checking that resources fit, and knowing what a reranking stage does to throughput and cost.}
 
 \goodgreat
 \begin{itemize}
-    \item \badgeLfive{L5} Estimates per-query latency within an order of magnitude ($\sim$1ms), knows to multiply by core count for QPS.
-    \item \badgeLsix{L6} Identifies memory access as the bottleneck, estimates cache miss impact, and checks memory requirements. Proposes quantization to improve cache efficiency.
-    \item \badgeLseven{L7} Discusses the interaction between $ef\_search$ and recall (higher $ef\_search$ = better recall but lower QPS), proposes profiling the Pareto frontier of recall vs. QPS for the specific dataset, and discusses techniques like prefetching and SIMD-optimized distance computation (ScaNN) that push the frontier further.
+    \item \badgeLfive{L5} Estimates HNSW latency within an order of magnitude ($\sim$1\,ms), multiplies by core count for QPS, and identifies the GPU reranker as the slower stage.
+    \item \badgeLsix{L6} Names memory access as the retrieval bottleneck, checks the RAM requirement, does the reranker FLOPs math instead of guessing, and proposes quantization, distillation, and a shallower rerank depth with quantified gains.
+    \item \badgeLseven{L7} Ties $ef\_search$ to the recall--QPS Pareto frontier and proposes profiling it on the actual dataset; designs adaptive reranking (invoke the cross-encoder only when retrieval confidence is low), a cost-per-quality-point metric for comparing configurations, and graceful degradation under traffic spikes by falling back to two-tower scores.
 \end{itemize}
 
-\followups{``How does ef\_search affect the recall-latency trade-off?'' ``What if you needed to serve 1M QPS?'' ``How would you handle a workload with very skewed query popularity?''}
-\end{interviewq}
-
-%--- Q11 ---
-
-\begin{interviewq}
-\textbf{Q: How would you update embeddings in production without re-indexing the entire ANN?}
-
-\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqlow}
-
-\stronganswer
-
-This is an operational challenge that arises whenever the embedding model is retrained. New embeddings live in a \textit{different} embedding space than old ones (even small model changes rotate the space), so mixing old and new embeddings in the same index produces incorrect similarity scores. Full re-indexing (re-encoding all documents and rebuilding the ANN) is correct but expensive---for 1B documents, re-encoding takes hours to days, and index rebuilding takes additional hours.
-
-\textbf{Strategy 1: Shadow indexing (blue-green deployment).} Build the new index alongside the old one. When ready, atomically swap traffic. \textit{Pros}: Clean separation, no mixed-space contamination, simple to reason about. \textit{Cons}: Requires 2$\times$ memory/storage during transition, re-encoding all documents takes hours. \textit{Best for}: Periodic model updates (weekly/monthly) where the re-encoding cost is amortized.
-
-\textbf{Strategy 2: Incremental re-encoding with compatibility.} Re-encode documents in batches (e.g., 1\% per hour over 4 days). During transition, the index contains a mix of old and new embeddings. To make this work, the new model must produce embeddings that are \textit{backward-compatible} with the old model. \textit{Approach}: Train the new model with a backward-compatibility loss: $\loss = \loss_{\text{task}} + \lambda \cdot \|\vz_{\text{new}}(x) - \vz_{\text{old}}(x)\|^2$, constraining new embeddings to be close to old ones. \textit{Pros}: No downtime, gradual rollout, can detect quality regressions early. \textit{Cons}: Backward-compatibility constraint limits improvement, the model can't freely reorganize the embedding space.
-
-\textbf{Strategy 3: Adapter/projection layer.} Keep the base model frozen, add a trainable projection layer on top: $\vz_{\text{final}} = \text{Proj}(\vz_{\text{base}})$. When updating, only retrain the projection layer (much faster) and apply it to all documents. \textit{Pros}: Base embeddings don't change, re-indexing only requires a matrix multiply over stored base embeddings (fast, can be done in minutes). \textit{Cons}: Limited expressivity---the projection can only perform linear transformations of the embedding space.
-
-\textbf{Strategy 4: Model versioning with version-aware retrieval.} Maintain separate index partitions per model version. At query time, encode the query with \textit{all} active model versions, search each partition with the corresponding version, merge results, and rerank. \textit{Pros}: No compatibility constraints on the model. \textit{Cons}: Increases query latency linearly with the number of active versions, and index memory scales with versions.
-
-\textbf{Strategy 5: Matryoshka + dimension-aligned training.} Train all model versions with Matryoshka objectives and enforce that the first $k$ dimensions are semantically stable across versions. This allows partial compatibility---the first 128 dimensions can be compared across versions for coarse retrieval, then the full embedding (which differs across versions) is used for fine reranking.
-
-\textbf{Recommended approach for most teams:} Shadow indexing (Strategy 1) for its simplicity and correctness. Invest in making re-encoding fast (batch GPU inference, distributed processing) rather than in complex compatibility schemes. For very large corpora ($>$10B documents) where re-encoding is impractical, use the adapter approach (Strategy 3).
-
-\redflags
-\begin{itemize}
-    \item ``Just update embeddings in-place''---new and old embeddings are in different spaces, mixing them is incorrect.
-    \item ``The new model's embeddings are similar enough''---even small rotations of the embedding space destroy ANN retrieval quality.
-    \item Not considering the backward-compatibility problem at all.
-\end{itemize}
-
-\interviewtest{Operational thinking about ML systems---understanding that model updates have ripple effects on serving infrastructure, and designing strategies that balance freshness, correctness, and cost.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} Recognizes the embedding space incompatibility problem and proposes shadow indexing.
-    \item \badgeLsix{L6} Adds backward-compatible training and the adapter approach, discusses the trade-offs between strategies.
-    \item \badgeLseven{L7} Designs a complete embedding lifecycle management system: automated re-encoding pipelines, A/B testing framework for embedding model updates, rollback capability, and monitoring for embedding space drift. Discusses how companies like Google (ScaNN) and Meta (FAISS) handle this operationally at billion-scale.
-\end{itemize}
-
-\followups{``How do you verify that new embeddings are better before switching?'' ``What is the cost of re-encoding 1B documents?'' ``How would you handle rollback if the new embeddings are worse?''}
-\end{interviewq}
-
-%--- Q12 ---
-
-\begin{interviewq}
-\textbf{Q: Estimate the QPS of a retrieval system using HNSW on 100M documents with a cross-encoder reranker on the top 100.}
-
-\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
-
-\stronganswer
-
-This is a two-stage system, so I need to estimate each stage separately and then combine.
-
-\textbf{Stage 1: HNSW retrieval.} As estimated previously (for 100M vectors): $\sim$1--2ms per query per thread, $\sim$10--20K QPS per machine with multi-threading. This stage runs on CPU.
-
-\textbf{Stage 2: Cross-encoder reranking on top 100.} The cross-encoder processes 100 query-document pairs. Each pair is a BERT-base forward pass (12 layers, 110M parameters, sequence length $\sim$256 tokens).
-
-Per forward pass on GPU: BERT-base at sequence length 256 takes $\sim$2--3ms on an A100 (batch=1, latency-bound at low utilization). But we can batch all 100 pairs: batch=100, sequence length=256. Sanity-check with FLOPs before quoting a number: $100 \times 56$ GFLOPs per pair $\approx 5.6$ TFLOPs; at a realistic 30--50\% of the A100's 312 TFLOPS dense FP16 peak, that is $\sim$\textbf{35--60ms} for batch=100 (call it $\sim$45ms). A figure like 10--15ms would imply $\sim$470 TFLOPS sustained---above the hardware peak---so it cannot be right.
-
-With a DistilBERT cross-encoder (6 layers, 66M params, roughly half the FLOPs): $\sim$20--30ms for batch=100.
-
-\textbf{Combined per-query latency}: $\sim$2ms (HNSW) + $\sim$45ms (cross-encoder) + $\sim$2ms (overhead: network, serialization, merge) $\approx$ \textbf{50ms per query}.
-
-\textbf{System QPS.} The bottleneck is the cross-encoder (GPU-bound). An A100 can process $1000/45 \approx 22$ queries/second (each query = one batch of 100 pairs). With 4 A100s: $\sim$90 QPS. With 10 A100s: $\sim$220 QPS.
-
-The HNSW stage is CPU-bound and runs in parallel. At 20K QPS per CPU machine, a single CPU machine can feed hundreds of A100s, so the GPU reranker is always the bottleneck.
-
-\textbf{Cost analysis.} At \$3/hr per A100, serving 1000 QPS takes $1000/22 \approx 45$ GPUs, costing $\sim$\$3 $\times$ 45 = \$135/hr or roughly \$100K/month (about half that with a DistilBERT reranker). This is why companies use the reranker selectively---only on queries where it adds value (e.g., ambiguous queries, high-revenue queries), or use distilled/smaller rerankers.
-
-\textbf{Optimizations to increase QPS:}
-\begin{enumerate}
-    \item \textbf{Reduce reranking set}: Top-50 instead of top-100 ($\sim$2$\times$ QPS, small quality loss).
-    \item \textbf{Smaller cross-encoder}: DistilBERT or TinyBERT ($\sim$2$\times$ QPS).
-    \item \textbf{FP16/INT8 quantization}: BERT in INT8 is $\sim$2--3$\times$ faster with TensorRT.
-    \item \textbf{Batched request queuing}: Accumulate requests for 5ms, batch-process for better GPU utilization.
-    \item \textbf{Skip reranking for easy queries}: If HNSW top-1 score is much higher than top-2, the ranking is likely correct---skip the reranker.
-\end{enumerate}
-
-\redflags
-\begin{itemize}
-    \item Not identifying the cross-encoder as the bottleneck---the HNSW stage is much faster.
-    \item Assuming the cross-encoder processes one pair at a time---batching is essential.
-    \item Not estimating cost---at staff level, system design must consider economics.
-\end{itemize}
-
-\interviewtest{End-to-end system throughput estimation, ability to identify bottlenecks, and awareness of the cost-quality trade-off in serving infrastructure.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} Estimates per-query latency for both stages, identifies the GPU reranker as the bottleneck.
-    \item \badgeLsix{L6} Adds cost analysis, proposes specific optimizations (INT8, smaller model, reduced reranking set), and estimates the QPS improvement from each optimization.
-    \item \badgeLseven{L7} Designs an adaptive system that dynamically decides whether to invoke the reranker based on retrieval confidence, proposes a cost-per-quality-point metric for comparing system configurations, and discusses how to handle traffic spikes (graceful degradation by disabling the reranker).
-\end{itemize}
-
-\followups{``How would you decide which queries get reranked?'' ``What is the cost-quality Pareto frontier for this system?'' ``How does the reranking set size affect end-to-end quality?''}
+\followups{``How does ef\_search affect the recall--latency trade-off?'' ``What if you needed 1M QPS?'' ``If you could only afford to rerank half your traffic, which half?'' ``How would you handle very skewed query popularity?''}
 \end{interviewq}

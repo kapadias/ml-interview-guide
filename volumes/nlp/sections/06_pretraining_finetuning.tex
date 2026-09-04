@@ -10,8 +10,8 @@
 The pre-train then fine-tune paradigm is the backbone of modern NLP.  This chapter
 covers pre-training objectives (MLM, CLM, span corruption, replaced token detection,
 denoising, contrastive), the pre-training data pipeline, full fine-tuning with
-catastrophic forgetting mitigation, and the critical PEFT landscape---LoRA (the most
-frequently asked topic), QLoRA, prefix tuning, adapters, and prompt tuning.
+catastrophic forgetting mitigation, and how to choose an adaptation method---full
+fine-tuning, LoRA, QLoRA, or the additive PEFT family (per-method mechanics: [DL~16]).
 Understanding \emph{when} and \emph{how} to adapt foundation models is one of the
 most practically relevant interview topics: every production NLP system built today
 either fine-tunes a pre-trained model or uses one directly, and interviewers want to
@@ -626,360 +626,93 @@ when the task vocabulary matches the pre-trained tokenizer exactly.
 \section{Parameter-Efficient Fine-Tuning (PEFT)}
 \label{sec:peft}
 
-As models grow to billions or hundreds of billions of parameters, full
-fine-tuning becomes prohibitively expensive in memory, compute, and storage.
-\textbf{Parameter-Efficient Fine-Tuning (PEFT)} methods train only a small
-fraction of parameters while keeping the vast majority frozen, achieving
-near-full-fine-tuning quality at a fraction of the cost.
+Every stage of the adaptation lifecycle---continued pre-training, SFT,
+preference tuning---can be run full-weight or with only a small set of added
+parameters trained on top of a frozen base.  That second option,
+\textbf{parameter-efficient fine-tuning (PEFT)}, recovers most of full
+fine-tuning's quality at a fraction of its memory and storage cost.  PEFT is
+not a stage of its own but a knob on every stage; this section sets the knob.
 
-\subsection{LoRA: Low-Rank Adaptation --- Deep Dive}
+\subsection{What LoRA Is}
 \label{sec:lora}
 
-LoRA (Hu et al., ICLR 2022) is the most widely used PEFT method and the
-single most frequently asked fine-tuning topic in NLP interviews.
-
-\subsubsection{Core Hypothesis: Low-Rank Updates}
-
-The key insight behind LoRA is that \emph{the weight updates during fine-tuning
-occupy a low-rank subspace}.  Pre-trained models already have high-quality
-representations; fine-tuning only needs to make small, structured adjustments
-to adapt them.  Aghajanyan et al.\ (2021) formalized this as the
-\textbf{intrinsic dimensionality} hypothesis: the optimization landscape of
-fine-tuning can be effectively navigated in a subspace of dimension much
-smaller than the full parameter space.
-
-\subsubsection{Mathematical Formulation}
-
-For a pre-trained weight matrix $\mW_0 \in \R^{d \times k}$, LoRA
-parameterizes the update as a low-rank factorization:
-
-\begin{mathresult}{LoRA: Low-Rank Adaptation}
+LoRA (Hu et al., ICLR 2022) is the default PEFT method.  It freezes each
+pre-trained weight matrix $\mW_0 \in \R^{d \times k}$ and learns the
+\emph{update} in factored form:
 \[
-    \mW = \mW_0 + \Delta\mW = \mW_0 + \mB\mA
+    \mW = \mW_0 + \frac{\alpha}{r}\,\mB\mA,
+    \qquad
+    \mB \in \R^{d \times r},\;\; \mA \in \R^{r \times k},\;\; r \ll \min(d, k),
 \]
-where $\mB \in \R^{d \times r}$, $\mA \in \R^{r \times k}$, and $r \ll \min(d, k)$.
+so a rank-16 adapter on a 7B model trains on the order of $0.1\%$ of the
+parameters.  The justification is the \textbf{intrinsic dimensionality} result
+(Aghajanyan et al., 2021): the directions that matter when adapting a
+pre-trained model span a subspace far smaller than the parameter space, so a
+low-rank $\Delta\mW$ gives up little.  Two consequences drive the lifecycle
+decisions that follow.  The base weights are never touched, so one frozen copy
+backs many few-MB task adapters instead of a full model copy per task.  And
+because $\mB\mA$ is only a weight delta, it can be \textbf{merged} into
+$\mW_0$ after training, leaving the original architecture and \emph{zero}
+added inference latency---the property separating LoRA from the additive
+methods below.
 
-During training, $\mW_0$ is \textbf{frozen} (no gradient updates).
-Only $\mA$ and $\mB$ are trained.  The forward pass becomes:
-\[
-    \vh = \mW_0 \vx + \mB\mA\vx = \mW_0 \vx + \Delta\mW\,\vx
-\]
-
-With scaling:
-\[
-    \vh = \mW_0 \vx + \frac{\alpha}{r}\,\mB\mA\vx
-\]
-where $\alpha$ is a constant scaling factor.
-\end{mathresult}
-
-\subsubsection{Initialization}
-
-Correct initialization is critical for stable training:
-\begin{itemize}
-    \item $\mA$ is initialized with a random Gaussian: $A_{ij} \sim \mathcal{N}(0, \sigma^2)$.
-    \item $\mB$ is initialized to \textbf{zero}: $\mB = \mathbf{0}$.
-\end{itemize}
-This ensures that $\Delta\mW = \mB\mA = \mathbf{0}$ at initialization, so the
-model starts from exactly the pre-trained weights.  During training, $\mB$
-gradually moves away from zero as gradients flow.  This zero initialization is
-analogous to the residual connection design principle: start as identity, learn
-the residual.
-
-\subsubsection{Rank $r$: The Key Hyperparameter}
-
-The rank $r$ controls the expressiveness of the update:
-
-\begin{itemize}
-    \item \textbf{Typical range:} $r = 8$ to $64$.
-    \item \textbf{Low rank ($r = 4$--$8$):} Sufficient for tasks similar to the
-          pre-training domain.  Extremely parameter-efficient.
-    \item \textbf{Medium rank ($r = 16$--$32$):} Good default for most
-          fine-tuning scenarios.
-    \item \textbf{High rank ($r = 64$--$128$):} Approaches full fine-tuning
-          capacity.  Diminishing returns beyond $r = 64$ for most tasks.
-    \item \textbf{Rule of thumb:} More complex tasks or larger domain shifts
-          require higher rank.  But the relationship is sublinear---doubling
-          $r$ does not double quality.
-\end{itemize}
-
-\subsubsection{Alpha ($\alpha$) Scaling}
-
-The effective magnitude of the LoRA update is:
-\[
-    \text{effective update} = \frac{\alpha}{r} \cdot \mB\mA
-\]
-
-The ratio $\alpha/r$ controls how strongly the adaptation modifies the original
-weights.  Common practice:
-\begin{itemize}
-    \item Set $\alpha = 2r$ (so the effective scaling is 2) as a starting point.
-    \item Higher $\alpha$ means stronger adaptation; lower means more conservative.
-    \item When sweeping $r$, keeping $\alpha/r$ constant maintains similar
-          update magnitude across different rank settings.
-\end{itemize}
-
-\subsubsection{Which Modules to Apply LoRA}
-
-\begin{itemize}
-    \item \textbf{Modern default:} Apply LoRA to \emph{all} linear layers---the
-          attention projections ($\mW_Q$, $\mW_K$, $\mW_V$, $\mW_O$) \emph{and}
-          the FFN projections ($\mW_1$, $\mW_2$, and gate projection for
-          SwiGLU).  This is the default in the current PEFT ecosystem.
-    \item \textbf{Historical minimal config:} The original LoRA paper (2021)
-          adapted only the query ($\mW_Q$) and value ($\mW_V$) projections.
-          Q+V-only saves parameters and can suffice for tasks close to the
-          pre-training distribution, but it is the paper's minimal
-          configuration, not current best practice.
-    \item \textbf{Empirical finding:} The QLoRA ablations (Dettmers et al.,
-          2023) showed that adapting all linear layers---FFN included---is
-          what closes the gap to full fine-tuning; attention-only
-          configurations underperform, especially when the task requires
-          significant knowledge adaptation (e.g., domain-specific fine-tuning).
-\end{itemize}
-
-\subsubsection{Parameter Count}
-
-For a single weight matrix $\mW_0 \in \R^{d \times k}$:
-\begin{align*}
-    \text{Full fine-tuning params} &= d \times k \\
-    \text{LoRA params} &= d \times r + r \times k = r(d + k)
-\end{align*}
-
-For a 7B-parameter model with $d = 4096$, applying rank-16 LoRA to Q and V
-projections across 32 layers:
-\[
-    \text{LoRA params} = 32 \times 2 \times 16 \times (4096 + 4096)
-    = 8{,}388{,}608 \approx 8.4\text{M}
-\]
-That is approximately \textbf{0.12\%} of the full model parameters.
-
-\subsubsection{Inference: Zero Overhead via Merging}
-
-\begin{keyinsight}[LoRA Merging: Zero Inference Overhead]
-After training, the LoRA matrices can be \emph{merged} into the base weights:
-$\mW_{\text{merged}} = \mW_0 + (\alpha/r) \cdot \mB\mA$.  The merged model has
-\emph{exactly the same architecture and inference cost} as the original---no
-additional latency, no additional memory for LoRA matrices.  This is a
-decisive advantage over methods like adapters or prefix tuning that add
-inference overhead.  Furthermore, you can maintain multiple LoRA adapters
-(one per task) and swap them at serving time by loading different $\mA, \mB$
-matrices without reloading the base model.
-\end{keyinsight}
-
-\subsubsection{Multi-task LoRA Serving}
-
-In production, a common pattern is to serve multiple tasks from a single base
-model with different LoRA adapters:
-
-\begin{enumerate}
-    \item Load the base model once into GPU memory.
-    \item For each task, load the corresponding $\mA, \mB$ matrices
-          (typically a few MB per adapter).
-    \item At request time, select the appropriate adapter based on the task
-          and either merge on-the-fly or maintain pre-merged copies.
-    \item This enables a single infrastructure to serve dozens of specialized
-          tasks with minimal memory overhead.
-\end{enumerate}
-
-\subsubsection{Why Low-Rank Works: The Intrinsic Dimensionality Argument}
-
-\begin{keyinsight}[Intrinsic Dimensionality of Fine-Tuning]
-Aghajanyan et al.\ (2021) showed that the effective dimensionality of the
-fine-tuning optimization landscape is orders of magnitude smaller than the
-full parameter count.  For BERT-base (110M parameters), the intrinsic
-dimension for many NLP tasks is as low as $\sim$200--800.  This means the
-``useful'' directions for adaptation lie in a tiny subspace of the full
-parameter space.  LoRA directly exploits this structure: rank $r = 16$ provides
-a $16$-dimensional adaptation per weight matrix, and across all adapted matrices,
-the total intrinsic dimensionality easily covers the effective subspace needed
-for most tasks.
-\end{keyinsight}
-
-\subsection{QLoRA: Quantized LoRA}
+\paragraph{Quantized and refined variants.}
 \label{sec:qlora}
-
-QLoRA (Dettmers et al., NeurIPS 2023) makes LoRA applicable to models that
-would otherwise not fit in memory by combining quantization with low-rank
-adaptation.
-
-\subsubsection{Three Key Innovations}
-
-\begin{enumerate}
-    \item \textbf{4-bit NormalFloat (NF4) quantization:} The base model
-          weights are stored in 4-bit precision using a data type optimized
-          for the normal distribution of pre-trained weights.  NF4 quantization
-          bins are spaced to minimize quantization error for normally
-          distributed values, unlike uniform INT4.
-
-    \item \textbf{Double quantization:} The quantization constants (scales
-          and zero-points, one per block of 64 weights) are themselves quantized
-          to 8-bit, reducing the memory overhead of quantization metadata from
-          $\sim$0.5 bits/parameter to $\sim$0.13 bits/parameter.
-
-    \item \textbf{Paged optimizers:} Use CPU RAM to handle GPU memory spikes
-          during gradient computation via unified memory, preventing
-          out-of-memory errors during training.
-\end{enumerate}
-
-\subsubsection{Computation Flow}
-
-During the forward pass, 4-bit weights are \emph{dequantized} on-the-fly to
-16-bit for matrix multiplication.  The LoRA adapters ($\mA, \mB$) are always
-stored and computed in 16-bit (BF16 or FP16).  Gradients flow only through the
-LoRA parameters---the quantized base weights are never updated.
-
-\begin{mathresult}{QLoRA Memory Savings}
-For a model with $N$ parameters:
-\begin{align*}
-    \text{Full fine-tuning memory} &\approx 16N \text{ bytes}
-    \quad \text{(FP16 weights + FP32 optimizer states)} \\[4pt]
-    \text{QLoRA memory} &\approx 0.5N + 16 \cdot r(d+k) \cdot L_{\text{adapted}}
-    \text{ bytes}
-\end{align*}
-where the first term is the 4-bit base model ($\sim$0.5 bytes/parameter) and
-the second term is the 16-bit LoRA parameters.  For a 65B model with rank-16 LoRA:
-full fine-tuning requires $\sim$780\,GB; QLoRA requires $\sim$33\,GB (single
-48GB GPU).
-\end{mathresult}
-
-\paragraph{Quality.}
-QLoRA quality is \emph{configuration-dependent}, not a fixed quantization
-penalty.  With the paper's full recipe---NF4 with double quantization and LoRA
-adapters on \emph{all} linear layers---Dettmers et al.\ report matching 16-bit
-LoRA and 16-bit full fine-tuning; this parity claim is the paper's headline
-result (Guanaco).  Gaps of a few percent do appear with weaker configurations:
-low rank, adapters restricted to a subset of modules (e.g., attention-only),
-or harder domain shifts.  State the parity result first, then the caveats.
-
-\subsection{DoRA: Decomposed Weight-Magnitude and Direction}
 \label{sec:dora}
+QLoRA (Dettmers et al., 2023) holds the frozen base in 4-bit NormalFloat and
+trains 16-bit adapters on top---this is what puts a 65B fine-tune on one
+48\,GB GPU, and configured well it matches 16-bit LoRA rather than paying a
+fixed quantization penalty.  DoRA (2024) and the rest of the LoRA lineage
+refine how the update is parameterized without changing the picture above.
 
-DoRA (Liu et al., 2024) improves on LoRA by decomposing the weight update into
-\emph{magnitude} and \emph{direction} components:
-
-\[
-    \mW' = m \cdot \frac{\mW_0 + \mB\mA}{\norm{\mW_0 + \mB\mA}_c}
-\]
-
-where $m$ is a learnable magnitude vector and $\norm{\cdot}_c$ denotes
-column-wise normalization.  The direction is updated via LoRA, and the magnitude
-is updated independently.  This decomposition is inspired by weight normalization
-(Salimans \& Kingma, 2016) and allows the model to adjust the ``how much''
-and ``in which direction'' of the update separately.  DoRA consistently
-outperforms LoRA by 0.5--1\% across benchmarks with the same parameter budget.
-
-\subsection{Prefix Tuning}
-\label{sec:prefix-tuning}
-
-Prefix tuning (Li \& Liang, ACL 2021) prepends learnable continuous vectors
-(``virtual tokens'') to the keys and values at every transformer layer:
-
-\[
-    \mK' = [\mK_{\text{prefix}};\; \mK], \qquad
-    \mV' = [\mV_{\text{prefix}};\; \mV]
-\]
-
-where $\mK_{\text{prefix}} \in \R^{p \times d_k}$ and
-$\mV_{\text{prefix}} \in \R^{p \times d_v}$ are $p$ learnable prefix vectors
-per layer.  The actual input tokens attend to both the prefix and each other,
-while the prefix is trained end-to-end.
-
-\paragraph{Key properties.}
-Trainable parameters: $2 \times p \times d \times L$ (prefix length $\times$
-dimension $\times$ layers, for K and V).  Typically $p = 10$--$50$, yielding
-$\sim$0.1\% of total parameters.  Quality: 85--95\% of full fine-tuning, best
-when the task is well-defined and does not require substantial knowledge
-adaptation.
-
-\paragraph{Limitation.}
-The prefix consumes context window positions, effectively reducing the usable
-context length.  Also, prefix tuning adds inference overhead because the
-prefix vectors must be processed at every layer for every forward pass.
-
-\subsection{Prompt Tuning}
-\label{sec:prompt-tuning}
-
-Prompt tuning (Lester et al., EMNLP 2021) is the simplest PEFT method:
-prepend $p$ learnable soft tokens to the input embedding only (not at every
-layer, unlike prefix tuning):
-
-\[
-    \mX' = [\mE_{\text{prompt}};\; \mX]
-\]
-
-where $\mE_{\text{prompt}} \in \R^{p \times d}$ are learnable embeddings.
-
-\paragraph{Key properties.}
-Fewest trainable parameters of any PEFT method ($< 0.1\%$).  Performance
-improves with model scale: for models under 1B parameters, prompt tuning
-underperforms significantly; for models above 10B, it approaches full
-fine-tuning quality.  The intuition: larger models can ``interpret'' soft
-prompts more effectively because their in-context learning ability is
-stronger.
-
-\subsection{Adapters}
-\label{sec:adapters}
-
-Adapter layers (Houlsby et al., ICML 2019) insert small bottleneck modules
-between existing transformer sublayers:
-
-\[
-    \vh = \vh + f(\vh\,\mW_{\text{down}})\,\mW_{\text{up}}
-\]
-
-where $\mW_{\text{down}} \in \R^{d \times m}$ projects to a bottleneck
-dimension $m \ll d$, a nonlinearity $f$ (ReLU or GELU) is applied, and
-$\mW_{\text{up}} \in \R^{m \times d}$ projects back.  A residual connection
-ensures the adapter starts as identity.
-
-\paragraph{Trainable parameters:} $\sim$1--5\% of the model, depending on
-bottleneck size $m$.  Quality: 95--99\% of full fine-tuning.  Limitation:
-unlike LoRA, adapters cannot be merged into the base weights, so they add
-inference latency (two additional matrix multiplications per layer).
-
-\subsection{IA3: Infused Adapter by Inhibiting and Amplifying Inner Activations}
-\label{sec:ia3}
-
-IA3 (Liu et al., 2022) learns three vectors $\mathbf{l}_k, \mathbf{l}_v,
-\mathbf{l}_{ff}$ that \emph{rescale} the keys, values, and FFN activations
-element-wise:
-
-\[
-    \vk' = \mathbf{l}_k \odot \vk, \qquad
-    \mathbf{v}' = \mathbf{l}_v \odot \mathbf{v}, \qquad
-    \vh'_{ff} = \mathbf{l}_{ff} \odot \vh_{ff}
-\]
-
-This is the most extreme form of parameter efficiency: only three vectors per
-layer, yielding $\sim$0.01\% trainable parameters.  Quality: 85--90\% of full
-fine-tuning, best for few-shot adaptation.
-
-\subsection{Comprehensive PEFT Comparison}
+\subsection{Choosing an Adaptation Method}
 
 \begin{table}[H]
 \centering
 \small
-\begin{tabularx}{\textwidth}{@{}l l c c X@{}}
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
 \toprule
-\textbf{Method} & \textbf{Mechanism} & \textbf{\% Params} & \textbf{Quality vs.\ Full FT} & \textbf{Inference Overhead} \\
+\textbf{Method} & \textbf{Choose it when} & \textbf{What it costs} \\
 \midrule
-LoRA          & Low-rank matrices on attn   & 0.1--1\%    & 90--99\%  & None (merge) \\
-QLoRA         & LoRA on 4-bit base model    & 0.1--1\%    & 90--100\% & None (merge) \\
-DoRA          & Magnitude + direction LoRA  & 0.1--1\%    & 92--99\%  & None (merge) \\
-Prefix Tuning & Virtual KV tokens per layer & $\sim$0.1\% & 85--95\%  & Extra KV at every layer \\
-Prompt Tuning & Soft input tokens only      & $< 0.1$\%   & 80--90\%  & Extra input tokens \\
-Adapters      & Bottleneck modules          & 1--5\%      & 95--99\%  & Two MatMuls per layer \\
-IA3           & Learned scaling vectors     & $\sim$0.01\%& 85--90\%  & Negligible (element-wise) \\
+Full fine-tuning & $>$100K examples, or a real distribution shift (new
+  language or domain); maximum quality bar &
+  Multi-GPU memory; a model copy per task; forgetting must be managed
+  (Section~\ref{sec:catastrophic-forgetting}) \\
+LoRA & Default for $10^3$--$10^5$ examples on a 7--13B base; many tasks over
+  one shared base &
+  Small gap on far-from-pretraining tasks unless rank and target modules rise \\
+QLoRA & The base does not fit unquantized (33--70B on one GPU) &
+  Slower steps; merging needs a dequantize--merge--requantize trip \\
+Adapters & Multi-task serving with per-task modules kept separate by design &
+  Cannot merge: extra matmuls at every layer, permanently \\
+Prefix / prompt tuning & Very large base ($\gtrsim$10B), light task, smallest
+  per-task artifact &
+  Weakest below $\sim$10B; eats context positions, adds per-pass cost \\
+IA3 & Few-shot adaptation where even LoRA's budget is too much &
+  Least expressive; rescaling cannot express arbitrary weight updates \\
 \bottomrule
 \end{tabularx}
-\caption{Comprehensive comparison of PEFT methods.  ``Quality vs.\ Full FT'' indicates
-the typical fraction of full fine-tuning performance retained.  QLoRA reaches
-the top of its range (parity with 16-bit LoRA/full FT) when configured with
-all-linear-layer NF4 adapters (Dettmers et al., 2023); weaker configurations
-land lower.}
+\caption{Choosing an adaptation method from the lifecycle perspective.
+Per-method mechanics and quality numbers are in [DL~16].}
 \label{tab:peft-comparison}
 \end{table}
 
+\paragraph{The rest of the vocabulary.}
+\textbf{Prefix tuning}\label{sec:prefix-tuning} (2021) prepends learnable
+key/value vectors at every layer; \textbf{prompt
+tuning}\label{sec:prompt-tuning} (2021) prepends soft tokens at the input
+embedding only; \textbf{adapters}\label{sec:adapters} (2019) insert bottleneck
+MLPs between sublayers; \textbf{IA3}\label{sec:ia3} (2022) learns element-wise
+scaling vectors for keys, values, and FFN activations.  All four are
+additive---none folds back into the base weights, which is why LoRA won.
+
+\begin{keyinsight}[Where the PEFT Mechanics Live]
+The mechanics are canonical in \textbf{[DL~16]}: zero-initialization of $\mB$,
+choosing rank $r$ and the $\alpha/r$ scaling, which modules to target (and why
+all-linear beats attention-only), merging and un-merging, QLoRA's NF4 /
+double-quantization / paged-optimizer internals, the DoRA and rsLoRA lineage,
+the full method comparison, and serving many adapters behind one base model.
+\end{keyinsight}
 
 % ============================================================================
 % SECTION 6: SUPERVISED FINE-TUNING (SFT) FOR LLMs

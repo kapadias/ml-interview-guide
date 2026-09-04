@@ -42,7 +42,7 @@ def main():
             for tex in glob.glob(os.path.join(vdir, "**", "*.tex"), recursive=True):
                 text = open(tex, errors="ignore").read()
                 for pat in f["forbid"]:
-                    for m in re.finditer(pat, text):
+                    for m in re.finditer(pat, text, re.IGNORECASE):
                         line = text[:m.start()].count("\n") + 1
                         print(f"DRIFT [{f['id']}] {tex}:{line}: matches forbidden /{pat}/")
                         print(f"    canonical: {f['fact']}")

@@ -2,7 +2,7 @@
 \label{chap:attention_transformers}
 
 \begin{tldr}
-Attention mechanisms enable neural networks to dynamically focus on relevant parts of the input. This chapter covers the mathematical foundations of attention (additive, multiplicative, scaled dot-product), self-attention and multi-head attention, the complete Transformer architecture, positional encodings (sinusoidal, learned, RoPE, ALiBi), efficient attention variants (fixed and trainable sparsity, linear attention, FlashAttention 1--3 and Flash-Decoding, MQA/GQA/MLA), and modern design choices (pre-norm, GQA, SwiGLU, and the 2024--26 refinements: QK-norm, interleaved sliding-window attention, large vocabularies). Understanding attention deeply---including computational complexity and memory requirements---is essential for staff-level ML interviews.
+This chapter is the program's \textbf{quantitative-systems} home for attention: parameter counting, FLOPs per token, KV-cache byte math, the MHA $\to$ GQA/MQA $\to$ MLA cache ladder, FlashAttention 1--3 and Flash-Decoding, trainable sparse attention (NSA, MoBA, DSA), and the GPT-2 $\to$ LLaMA $\to$ 2024--26 design evolution with worked LLaMA and H100 anchors. It also carries the attention lineage (Bahdanau/Luong $\to$ scaled dot-product), RoPE at working depth---the base-frequency knob that the context-extension methods in Chapter~\ref{chap:long_context_rag} turn---and the modern design choices (pre-norm, RMSNorm, SwiGLU, QK-norm, interleaved sliding-window attention, large vocabularies). The step-by-step \textit{derivations}---self-attention from first principles, transformer block anatomy, and the positional-encoding schemes other than RoPE---are canon in [NLP 5] and are pointed to rather than repeated. Come here for the arithmetic that decides what fits on a GPU.
 \end{tldr}
 
 \section{Attention as a Computational Primitive}
@@ -159,16 +159,9 @@ The $O(n^2)$ complexity is the fundamental limitation for long sequences.
 \label{sec:multi_head}
 %==============================================================================
 
-\subsection{Motivation}
+\subsection{Formulation and Parameter Cost}
 
-Single attention head learns one type of relationship. Multiple heads learn diverse patterns:
-\begin{itemize}
-    \item Some heads focus on local context
-    \item Some heads capture long-range dependencies
-    \item Different heads for different syntactic/semantic roles
-\end{itemize}
-
-\subsection{Mathematical Formulation}
+A single head learns one relationship type; $h$ heads run in parallel over $d/h$-dimensional subspaces so that one layer can attend on several criteria at once, with the output projection $\mW^O$ mixing them. The motivation, the subspace/ensemble argument, and why single-head attention underperforms are developed in [NLP 5]. What the rest of this chapter needs from multi-head attention is its shape and its parameter cost.
 
 \begin{mathresult}{Multi-Head Attention}
 \begin{align}
@@ -199,14 +192,7 @@ For model dimension $d$ with $h$ heads:
 
 \subsection{What Different Heads Learn}
 
-Empirical observations:
-\begin{itemize}
-    \item \textbf{Positional heads}: Attend to fixed relative positions
-    \item \textbf{Syntactic heads}: Subject-verb, modifier-noun relationships
-    \item \textbf{Rare word heads}: Attend to infrequent tokens
-    \item \textbf{Delimiter heads}: Attend to [SEP], periods
-    \item \textbf{Previous/next token heads}: Local context
-\end{itemize}
+BERT-era probing catalogued head types---positional, syntactic, rare-word, delimiter, previous-token---and that taxonomy is surveyed in [NLP 5]. The answer that matters at staff level is circuit-level, not taxonomic.
 
 \begin{keyinsight}[Induction Heads: The Mechanistic View]
 Mechanistic interpretability decomposes a head into two circuits: the \textbf{QK circuit} decides \textit{where} to attend, and the \textbf{OV circuit} decides \textit{what} information is copied to the output once attention lands there. The best-understood composite mechanism is the \textbf{induction head}: given a repeated pattern $[A][B] \ldots [A]$, it attends from the second $[A]$ to the token \textit{after} the previous occurrence of $[A]$ and copies it---predicting $[B]$. It works via two-layer composition: an earlier ``previous-token head'' writes each token's predecessor into the residual stream, so the induction head's QK circuit can match ``current token $=$ token that preceded you,'' and its OV circuit copies the matched token forward. Olsson et al.\ (2022) showed induction heads form abruptly during a phase change early in training, coincident with the emergence of in-context learning---the leading mechanistic account of why Transformers can learn from their prompt. The modern answer to ``what do attention heads do'' is this circuit-level story, not BERT-era probing taxonomies.
@@ -217,123 +203,27 @@ Mechanistic interpretability decomposes a head into two circuits: the \textbf{QK
 \label{sec:transformer_arch}
 %==============================================================================
 
-\subsection{Overview}
+\subsection{Block Anatomy: What This Chapter Assumes}
 
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-    node distance=0.7cm,
-    box/.style={rectangle, draw, minimum width=3cm, minimum height=0.7cm, rounded corners},
-    block/.style={box, fill=lightblue},
-    norm/.style={box, fill=lightyellow, minimum width=2.5cm},
-    ffn/.style={box, fill=lightgreen},
-    input/.style={box, fill=lightgray},
-    attention/.style={box, fill=orange!30}
-]
-    % Input
-    \node[input] (input) {Input Embeddings + Position};
+A Transformer layer is two residual sublayers: multi-head self-attention followed by a position-wise FFN, each wrapped in a residual connection and a normalization. The encoder block runs unmasked self-attention over the whole sequence; the decoder block adds a \textbf{causal mask} ($M_{ij} = -\infty$ for $j > i$, added to the logits before the softmax, so position $i$ sees only $j \leq i$) and, in encoder--decoder models, a cross-attention sublayer whose queries come from the decoder stream while keys and values come from the encoder stack. The FFN expands by a factor $f$: $f = 4$ for a two-matrix GELU FFN, $f \approx 8/3$ for SwiGLU, whose gating adds a third matrix at matched parameter count.
 
-    % Encoder block
-    \node[attention, above=0.5cm of input] (attn1) {Multi-Head Self-Attention};
-    \node[norm, above=0.3cm of attn1] (norm1) {Add \& LayerNorm};
-    \node[ffn, above=0.3cm of norm1] (ffn1) {Feed-Forward Network};
-    \node[norm, above=0.3cm of ffn1] (norm2) {Add \& LayerNorm};
-
-    % Block indicator
-    \draw[thick, decorate, decoration={brace, amplitude=10pt, raise=5pt}]
-        ($(attn1.south west)+(-0.5,0)$) -- ($(norm2.north west)+(-0.5,0)$)
-        node[midway, left=15pt, font=\small] {$\times N$};
-
-    % Output
-    \node[above=0.5cm of norm2] (output) {To next layer / Output};
-
-    % Residual connections
-    \draw[->] (input) -- (attn1);
-    \draw[->] (attn1) -- (norm1);
-    \draw[->] (norm1) -- (ffn1);
-    \draw[->] (ffn1) -- (norm2);
-    \draw[->] (norm2) -- (output);
-
-    % Residual arrows
-    \draw[->, dashed, gray] (input.east) -- ++(0.8,0) |- (norm1.east);
-    \draw[->, dashed, gray] (norm1.east) -- ++(0.5,0) |- (norm2.east);
-
-\end{tikzpicture}
-\caption{Single Transformer encoder block (post-norm variant).}
+The block-by-block walkthrough, the encoder--decoder diagram, and the encoder-only / decoder-only / encoder--decoder family comparison are canon in [NLP 5] and are not repeated here. This chapter treats the block as a \textit{cost model}: every parameter, FLOP, and KV-cache byte counted in Section~\ref{sec:transformer_compute} falls straight out of the structure above---$4d^2$ of attention projections and $2fd^2$ of FFN weights per layer, $2 n_{kv} d_{head}$ cached elements per token per layer.
+% label preserved from the encoder-block figure; the diagram is now carried by [NLP 5]
 \label{fig:transformer_block}
-\end{figure}
-
-\subsection{Encoder Block}
-
-Each encoder block consists of:
-
-\begin{enumerate}
-    \item \textbf{Multi-Head Self-Attention}
-    \begin{equation}
-    \tilde{\mH} = \text{MultiHeadAttention}(\mH, \mH, \mH)
-    \end{equation}
-
-    \item \textbf{Residual Connection + Layer Normalization}
-    \begin{equation}
-    \mH' = \text{LayerNorm}(\mH + \tilde{\mH})
-    \end{equation}
-
-    \item \textbf{Position-wise Feed-Forward Network}
-    \begin{equation}
-    \text{FFN}(\vx) = \mW_2 \cdot \sigma(\mW_1 \vx + \vb_1) + \vb_2
-    \end{equation}
-    Typically with expansion factor 4: $\mW_1 \in \R^{d \times 4d}$, $\mW_2 \in \R^{4d \times d}$.
-
-    \item \textbf{Another Residual + LayerNorm}
-    \begin{equation}
-    \mH'' = \text{LayerNorm}(\mH' + \text{FFN}(\mH'))
-    \end{equation}
-\end{enumerate}
-
-\subsection{Decoder Block}
-
-Decoder adds:
-\begin{enumerate}
-    \item \textbf{Masked Self-Attention}: Prevents attending to future positions
-    \item \textbf{Cross-Attention}: Attends to encoder outputs
-\end{enumerate}
-
-\begin{mathresult}{Causal Mask}
-\begin{equation}
-M_{ij} = \begin{cases}
-0 & \text{if } j \leq i \\
--\infty & \text{if } j > i
-\end{cases}
-\end{equation}
-Applied as: $\softmax\left(\frac{\mQ\mK^T}{\sqrt{d_k}} + \mathbf{M}\right)$
-\end{mathresult}
 
 \subsection{Pre-Norm vs Post-Norm}
 
-\textbf{Post-Norm (Original Transformer)}:
+\textbf{Post-Norm (original Transformer)}:
 \begin{equation}
 \mH' = \text{LayerNorm}(\mH + \text{SubLayer}(\mH))
 \end{equation}
 
-\textbf{Pre-Norm (Modern Standard)}:
+\textbf{Pre-Norm (modern standard)}:
 \begin{equation}
 \mH' = \mH + \text{SubLayer}(\text{LayerNorm}(\mH))
 \end{equation}
 
-\begin{table}[H]
-\centering
-\caption{Pre-Norm vs Post-Norm comparison}
-\begin{tabularx}{\textwidth}{lXX}
-\toprule
-\textbf{Aspect} & \textbf{Post-Norm} & \textbf{Pre-Norm} \\
-\midrule
-Gradient flow & Through LayerNorm & Direct residual path \\
-Training stability & Needs warmup & More stable \\
-Final performance & Slightly better (when stable) & Very close \\
-Modern usage & Rare & Standard (GPT, LLaMA, etc.) \\
-\bottomrule
-\end{tabularx}
-\end{table}
+Pre-norm trains stably without warmup and scales past 100 layers because the residual path is clean; post-norm can edge it out on final quality when it converges, but needs warmup and is rare in modern LLMs. The full trade-off---including DeepNet-style initialization and Gemma-2's sandwich norm---is worked in the interview question in Section~\ref{sec:attention_interview}, and the normalization mechanics themselves are Chapter~\ref{chap:activation_normalization}.
 
 \begin{keyinsight}[Why Pre-Norm Stabilizes Training]
 Pre-norm is more stable because the residual path doesn't pass through normalization:
@@ -348,82 +238,25 @@ The identity term $\mI$ ensures gradient always flows, preventing vanishing grad
 \label{sec:positional}
 %==============================================================================
 
-\subsection{Why Position Information is Needed}
+Self-attention is permutation equivariant (Section~\ref{sec:self_attention}), so position must be injected explicitly---otherwise ``The cat sat on the mat'' and ``mat the on sat cat The'' produce identical outputs and the model is a bag of tokens. The schemes differ in \textit{where} position enters: added to the token embedding (sinusoidal, learned absolute), added to the attention score (Shaw-style relative, ALiBi), or applied as a rotation to $\mQ$ and $\mK$ themselves (RoPE).
 
-Self-attention is \textbf{permutation equivariant}:
-\begin{equation}
-\text{SelfAttn}(\pi(\mX)) = \pi(\text{SelfAttn}(\mX))
-\end{equation}
+\begin{table}[H]
+\centering
+\caption{Positional encoding schemes. $L$ = maximum training length, $K$ = relative-distance clip, $d$ = model dimension, $h$ = number of heads.}
+\begin{tabularx}{\textwidth}{llXX}
+\toprule
+\textbf{Scheme} & \textbf{Extra params} & \textbf{Extrapolation} & \textbf{Where position enters / used in} \\
+\midrule
+Sinusoidal & none & Degrades empirically & Added to embeddings; original Transformer \\
+Learned absolute & $L \times d$ & None---hard ceiling at $L_{\max}$ & Added to embeddings; BERT, GPT-2, early GPT-3 \\
+Relative (Shaw) & $O(Kd)$ & To the clip distance & Added to scores (and optionally values); Shaw et al.\ (2018), with related schemes in Transformer-XL and T5 \\
+RoPE & none & Good, with base scaling & Rotation applied to Q and K; LLaMA, Mistral, Qwen, DeepSeek \\
+ALiBi & $h$ slopes & Strong & Linear distance penalty on scores; BLOOM, MPT \\
+\bottomrule
+\end{tabularx}
+\end{table}
 
-Without positional information, ``The cat sat on the mat'' and ``mat the on sat cat The'' produce the same output!
-
-\subsection{Sinusoidal Positional Encoding}
-
-\begin{mathresult}{Sinusoidal Encoding (Original Transformer)}
-\begin{align}
-PE_{(pos, 2i)} &= \sin\left(\frac{pos}{10000^{2i/d}}\right) \\
-PE_{(pos, 2i+1)} &= \cos\left(\frac{pos}{10000^{2i/d}}\right)
-\end{align}
-\end{mathresult}
-
-\textbf{Properties}:
-\begin{itemize}
-    \item Deterministic, no learned parameters
-    \item Each dimension has different frequency
-    \item Can extrapolate to longer sequences than seen in training
-\end{itemize}
-
-\textbf{Why it enables relative position}:
-For any fixed offset $k$:
-\begin{equation}
-PE_{pos+k} = f_k(PE_{pos})
-\end{equation}
-where $f_k$ is a linear transformation (rotation matrix). This allows the model to learn to attend to relative positions.
-
-\subsection{Learned Positional Embeddings}
-
-\textbf{Learned Positional Embedding.} Instead of using a fixed function of position, maintain a trainable embedding matrix $\mathbf{P} \in \R^{L_{\max} \times d_{\text{model}}}$ where each row corresponds to a position index. The position encoding for token at position $t$ is simply:
-
-\begin{equation}
-\mE_{pos} \in \R^{L_{max} \times d}, \quad \text{PE}(t) = \mathbf{P}[t, :]
-\end{equation}
-
-This embedding is added to the token embedding exactly as with sinusoidal encodings: $\vx_t = \text{TokenEmbed}(w_t) + \mathbf{P}[t, :]$. The matrix $\mathbf{P}$ is initialized randomly and learned end-to-end via backpropagation.
-
-\textbf{Key difference from sinusoidal}: Sinusoidal encodings have a built-in inductive bias for relative positions (the linear-transformation property between positions), while learned embeddings treat each position as an independent embedding with no structural relationship. This means learned PE must discover positional patterns purely from data.
-
-\textbf{Used in}: BERT (max 512), GPT-2 (max 1024), early GPT-3
-
-\begin{warningbox}
-Learned positional embeddings impose a hard sequence length ceiling at $L_{\max}$. At inference time, any position $t \geq L_{\max}$ has no trained embedding---the model either crashes or produces garbage. This is not a soft degradation; it is a cliff. This is the primary reason the field moved away from learned PE for generative models that need flexible context windows.
-\end{warningbox}
-
-\textbf{Positional Encoding Comparison} --- when each strategy fits:
-
-\begin{itemize}
-    \item \textbf{Sinusoidal (Vaswani et al., 2017).} Fixed, no learned parameters, theoretically extrapolates but empirically degrades. Useful as a simple baseline and in settings where you want deterministic encodings.
-    \item \textbf{Learned (BERT, GPT-2).} Slightly higher accuracy than sinusoidal within training lengths, but zero extrapolation ability. Suitable for fixed-length encoder tasks (classification, NLI) where $L_{\max}$ is known in advance.
-    \item \textbf{RoPE (Su et al., 2021).} Encodes relative position via rotation matrices applied to Q/K. Naturally captures relative distance, and extrapolates beyond training length via NTK-aware scaling or YaRN. Default choice for modern LLMs (LLaMA, Mistral, Qwen).
-    \item \textbf{ALiBi (Press et al., 2022).} Adds a static linear bias $-m \cdot |i - j|$ directly to attention scores (no change to embeddings). Zero extra parameters, strong extrapolation, but slightly less expressive than RoPE. Used in BLOOM and MPT.
-\end{itemize}
-
-\textbf{Why RoPE won.} Most modern autoregressive models need to (a) handle relative positions for generalization and (b) extrapolate to longer sequences at inference via techniques like NTK-aware scaling or dynamic NTK. Learned PE fails both requirements. Sinusoidal PE handles (a) in theory but degrades in practice. RoPE achieves both cleanly, which is why it became the de facto standard from LLaMA onward.
-
-\subsection{Relative Positional Encodings}
-
-\subsubsection{Shaw et al. Relative Attention}
-
-Add relative position embeddings to keys:
-\begin{equation}
-e_{ij} = \frac{(\vx_i \mW^Q)(\vx_j \mW^K + \va_{j-i}^K)^T}{\sqrt{d_k}}
-\end{equation}
-
-Optionally also to values:
-\begin{equation}
-\vz_i = \sum_j \alpha_{ij}(\vx_j \mW^V + \va_{j-i}^V)
-\end{equation}
-
-\textbf{Used in}: Transformer-XL, T5
+\textbf{Where the derivations live.} The sinusoidal linear-shift property, Shaw-style relative attention, ALiBi's slope construction, and the scheme-by-scheme trade-off discussion are canon in [NLP 5] and are not repeated here. This chapter carries only RoPE at working depth, because the systems material downstream depends on it: the context-extension toolbox in Chapter~\ref{chap:long_context_rag} (position interpolation, NTK-aware scaling, YaRN) manipulates its base frequency directly, MLA's decoupled key (Section~\ref{sec:mla}) exists because of how RoPE composes with cached K/V, and the 2024--26 architecture table turns on the same parameter.
 
 \subsection{Rotary Position Embedding (RoPE)}
 
@@ -432,76 +265,45 @@ Encode position by rotating query and key vectors:
 \begin{equation}
 f(\vx, m) = \mR_m \vx
 \end{equation}
-where $\mR_m$ is a rotation matrix dependent on position $m$.
+where $\mR_m$ is block-diagonal, rotating each dimension pair $(2i, 2i{+}1)$ by angle $m\theta_i$ with base frequencies
+\begin{equation}
+\theta_i = b^{-2i/d}, \qquad i = 0, \ldots, d/2 - 1,
+\end{equation}
+for a base $b$ ($b = 10{,}000$ in the original; $500\text{K--}1\text{M}$ in 2024--26 long-context models).
 \end{mathresult}
 
-For 2D subspaces:
+Written out over the 2D subspaces:
 \begin{equation}
 \mR_m = \begin{pmatrix}
-\cos(m\theta_1) & -\sin(m\theta_1) & & \\
-\sin(m\theta_1) & \cos(m\theta_1) & & \\
+\cos(m\theta_0) & -\sin(m\theta_0) & & \\
+\sin(m\theta_0) & \cos(m\theta_0) & & \\
 & & \ddots & \\
-& & & \cos(m\theta_{d/2}) & -\sin(m\theta_{d/2}) \\
-& & & \sin(m\theta_{d/2}) & \cos(m\theta_{d/2})
+& & & \cos(m\theta_{d/2-1}) & -\sin(m\theta_{d/2-1}) \\
+& & & \sin(m\theta_{d/2-1}) & \cos(m\theta_{d/2-1})
 \end{pmatrix}
 \end{equation}
 
-\textbf{Key property}: Relative position naturally encoded:
+\textbf{Why RoPE is ``relative in disguise''}: the rotations are applied to \textit{absolute} positions $m$ and $n$, one token at a time, but rotation matrices compose, so the score depends only on the offset:
 \begin{equation}
 (\mR_m \vq)^T (\mR_n \vk) = \vq^T \mR_m^T \mR_n \vk = \vq^T \mR_{n-m} \vk
 \end{equation}
+There is no relative-position lookup table and no term added to the score matrix---which is why RoPE composes with FlashAttention and with a KV cache unchanged: each key is rotated once, at its own position, \textit{before} it is written to the cache.
 
-\textbf{Used in}: LLaMA, Mistral, most modern open LLMs
+\textbf{The base $b$ is the knob.} Dimension pair $i$ rotates with wavelength $2\pi b^{2i/d}$: low-index pairs spin fast (fine, local resolution), high-index pairs spin slowly (coarse, global position). Two consequences drive everything downstream. (1) Beyond the trained length, the model meets rotation angles it never saw---the out-of-distribution failure that makes naive extrapolation break. (2) Every context-extension method is an intervention on this frequency ladder: position interpolation rescales positions uniformly, NTK-aware scaling and YaRN raise $b$ (and rescale non-uniformly) so that the slow, global bands stretch while the fast, local bands are preserved, and modern pretraining simply starts at $b = 500\text{K--}1\text{M}$ so 128K--1M contexts are resolvable by construction. The methods, their extension ratios, and their trade-offs are Chapter~\ref{chap:long_context_rag}.
+
+\textbf{Used in}: LLaMA, Mistral, Qwen, DeepSeek---essentially every modern open-weight LLM.
 
 \textbf{Advantages}:
 \begin{itemize}
-    \item No explicit position embeddings
-    \item Naturally encodes relative positions
-    \item Good extrapolation
-    \item Efficient implementation
+    \item Relative position for free, through an absolute mechanism
+    \item No learned position parameters and no $L_{\max}$ ceiling
+    \item Attention decays gently with distance (an implicit recency bias)
+    \item Cheap and cache-friendly: two multiply--adds per dimension pair, applied to Q and K only
 \end{itemize}
 
 \begin{warningbox}
 Positional encoding extrapolation is not free. A model trained with 4K context won't magically work at 32K just because it uses RoPE or ALiBi. You still need position interpolation, continued pre-training, or progressive extension to reliably handle longer contexts.
 \end{warningbox}
-
-\subsection{ALiBi (Attention with Linear Biases)}
-
-\begin{mathresult}{ALiBi}
-Add linear bias based on distance:
-\begin{equation}
-\text{softmax}\left(\frac{\vq_i^T \vk_j}{\sqrt{d_k}} - m \cdot |i - j|\right)
-\end{equation}
-where $m$ is a head-specific slope.
-\end{mathresult}
-
-\textbf{Properties}:
-\begin{itemize}
-    \item No position embeddings at all
-    \item Linear penalty for distance
-    \item Excellent length extrapolation
-    \item Different heads have different ``attention spans''
-\end{itemize}
-
-\textbf{Used in}: BLOOM, MPT
-
-\subsection{Positional Encoding Comparison}
-
-\begin{table}[H]
-\centering
-\caption{Positional encoding comparison}
-\begin{tabularx}{\textwidth}{lXXXX}
-\toprule
-\textbf{Encoding} & \textbf{Parameters} & \textbf{Extrapolation} & \textbf{Relative} & \textbf{Used In} \\
-\midrule
-Sinusoidal & None & Degrades empirically & Implicit & Original Transformer \\
-Learned & $L \times d$ & Poor & No & BERT, GPT-2 \\
-Relative (Shaw) & $O(Ld)$ & Moderate & Explicit & T5, XL \\
-RoPE & None & Good & Implicit & LLaMA, Mistral \\
-ALiBi & $h$ scalars & Excellent & Implicit & BLOOM, MPT \\
-\bottomrule
-\end{tabularx}
-\end{table}
 
 %==============================================================================
 \section{Efficient Attention Variants}
@@ -823,7 +625,7 @@ Vanilla FA parallelizes across batch, heads, and \textit{query blocks}---abundan
 \textbf{Component} & \textbf{GPT-2 (2019)} & \textbf{LLaMA (2023)} & \textbf{Modern (2024--26)} \\
 \midrule
 Normalization & LayerNorm & RMSNorm & RMSNorm; sandwich (pre+post) in Gemma \\
-Norm placement & Post-norm & Pre-norm & Pre-norm + QK-norm \\
+Norm placement & Pre-norm (moved from the 2017 Transformer's post-norm) & Pre-norm & Pre-norm + QK-norm \\
 Logit control & --- & --- & QK-norm; soft-capping (Gemma-2) \\
 Position encoding & Learned & RoPE (base 10K) & RoPE, base 500K--1M \\
 Activation & GELU & SwiGLU & SwiGLU (unchanged) \\
@@ -844,7 +646,7 @@ The LLaMA recipe (pre-norm RMSNorm, RoPE, SwiGLU, GQA, no biases) froze into the
     \item \textbf{QK-norm}: apply RMSNorm to queries and keys before the dot product, bounding attention logits by construction. Adopted by Qwen3, Gemma-3, and most 2025-era models as the fix for attention-logit growth that $1/\sqrt{d_k}$ scaling alone cannot prevent (Chapter~\ref{chap:activation_normalization} covers the normalization mechanics).
     \item \textbf{Logit soft-capping}: Gemma-2 instead bounded logits with $z \leftarrow c \cdot \tanh(z/c)$ ($c{=}50$ for attention, $30$ for the final logits). It worked but broke stock FlashAttention kernels; Gemma-3 dropped it in favor of QK-norm---a nice case study in a design choice being superseded within one generation.
     \item \textbf{Interleaved sliding-window/full attention}: rather than every layer paying full $O(n^2)$ attention and full KV cache, alternate cheap sliding-window layers with occasional full-attention layers. Gemma-2 alternated 1:1; Gemma-3 pushed to \textbf{5:1} (five 1K-window layers per full layer), cutting KV-cache memory several-fold with negligible perplexity cost. Mistral's rolling-buffer KV cache is the same idea operationally: a window-sized circular buffer per layer bounds cache growth.
-    \item \textbf{RoPE base scaling}: the RoPE base grew from 10K to \textbf{500K (Llama 3.1) and 1M+} so that rotation frequencies stay resolvable across 128K--1M contexts, combined with the context-extension toolbox of Section~\ref{sec:positional} (position interpolation, NTK-aware scaling, YaRN). Long context became a pretraining design parameter, not a fine-tuning afterthought.
+    \item \textbf{RoPE base scaling}: the RoPE base grew from 10K to \textbf{500K (Llama 3.1) and 1M+} so that rotation frequencies stay resolvable across 128K--1M contexts, combined with the context-extension toolbox (the base-frequency mechanism is Section~\ref{sec:positional}; position interpolation, NTK-aware scaling, and YaRN are Chapter~\ref{chap:long_context_rag}). Long context became a pretraining design parameter, not a fine-tuning afterthought.
     \item \textbf{Vocabulary growth}: LLaMA-2's 32K gave way to \textbf{128K (Llama 3) and 256K (Gemma)}. Bigger vocabularies spend parameters on the embedding table but buy shorter sequences ($\sim$15\% fewer tokens for the same text), which cuts $O(n^2)$ attention cost and improves multilingual coverage---reversing the earlier ``smaller vocab is better'' lesson.
     \item \textbf{Tied embeddings in small models}: at 1--4B scale the embedding table is a large fraction of all parameters (256K $\times$ 2304 $\approx$ 0.6B in Gemma-2 2B), so small models re-tie input and output embeddings; large models keep them untied where the table is a rounding error.
 \end{itemize}

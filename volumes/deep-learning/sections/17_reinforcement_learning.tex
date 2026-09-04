@@ -91,7 +91,7 @@ Classic examples & Atari (DQN), board games & Robotics, LLM alignment \\
 \label{sec:rlhf_pipeline}
 %==============================================================================
 
-RLHF (Reinforcement Learning from Human Feedback) is a three-stage process that transforms a pretrained LLM into an aligned assistant. Each stage builds on the previous one, and understanding \textit{why} each stage exists is more important than memorizing the math.
+RLHF (Reinforcement Learning from Human Feedback) turns a pretrained LLM into an aligned assistant in three stages. What follows is the \textit{RL} account of that pipeline---what each stage optimizes, and why the Stage 3 objective takes the shape it does. Running the pipeline is a separate craft: preference-data collection and annotator agreement, reward-model training recipes and evaluation, the staged post-training schedule used in 2026, and the training infrastructure it demands are canonical in \textbf{[NLP~8]}.
 
 \subsection{Pipeline Overview}
 
@@ -133,39 +133,20 @@ RLHF (Reinforcement Learning from Human Feedback) is a three-stage process that 
 \label{fig:rlhf_pipeline}
 \end{figure}
 
-\subsection{Stage 1: Supervised Fine-Tuning (SFT)}
+\subsection{Stages 1 and 2: SFT and the Reward Model}
 
-\textbf{What it is.} Fine-tune the pretrained base model on high-quality (instruction, response) pairs using standard cross-entropy loss. This turns a text-completion model into an instruction-following model.
+\textbf{Stage 1 (SFT).} Fine-tune the pretrained base on (instruction, response) pairs with cross-entropy loss on the response tokens. Its role in the RL story is narrow but essential: Stage 3 improves a policy by sampling from it, and a base model's samples are too rarely on-task for that loop to be efficient. The same checkpoint is then frozen as the reference $\pi_{\text{ref}}$. Token-level mechanics are in Section~\ref{sec:sft_mechanics}; data curation is [NLP~8].
 
-\textbf{Why it matters.} The base model can generate text, but it does not know it is supposed to \textit{answer questions}. SFT teaches the format---respond to queries, follow instructions, produce structured outputs. Without SFT, the RL stage has no reasonable starting policy to improve.
-
-\textbf{Key design decisions:}
-\begin{itemize}
-    \item \textbf{Data quality $>$ data quantity.} A few thousand expertly written examples often outperform millions of noisy ones (LIMA showed 1,000 carefully curated examples can produce a strong instruction-following model).
-    \item \textbf{Loss masking.} Only compute cross-entropy loss on the response tokens, not the instruction tokens. The model should learn to \textit{generate} good responses, not to predict the prompt.
-    \item \textbf{Chat template.} Use consistent formatting (e.g., ChatML, Llama-style \texttt{[INST]...[/INST]}) so the model learns role boundaries.
-\end{itemize}
-
-\textbf{Pitfalls.} Over-training on SFT data leads to a verbose, sycophantic model that sounds helpful but does not actually calibrate quality. SFT teaches format, not judgment---that is what the RL stage adds.
-
-\subsection{Stage 2: Reward Model Training}
-
-\textbf{What it is.} Train a separate model to predict which of two responses a human would prefer. Given a prompt $x$ and two candidate responses $y_w$ (preferred) and $y_l$ (dispreferred), the reward model $R_\phi$ should assign a higher scalar score to $y_w$.
+\textbf{Stage 2 (reward model).} Train $R_\phi$ to predict which of two responses a human prefers, by fitting the Bradley--Terry likelihood to the score difference:
 
 \begin{mathresult}{Bradley-Terry Preference Loss}
 \begin{equation}
 \loss_{\text{RM}} = -\E_{(x, y_w, y_l)}\left[\log \sigma\!\left(R_\phi(x, y_w) - R_\phi(x, y_l)\right)\right]
 \end{equation}
-This is simply binary cross-entropy on the preference pair, using the score difference as the logit.
+Binary cross-entropy with the score difference as the logit. Only \textit{differences} are identified, so the absolute scale of $R_\phi$ carries no meaning. The RM is typically initialized from the SFT checkpoint with the LM head replaced by a scalar head.
 \end{mathresult}
 
-\textbf{Architecture.} The reward model is typically initialized from the SFT model with the language modeling head replaced by a scalar output head. It shares the same tokenizer and context window.
-
-\textbf{Data.} Human annotators are shown a prompt and two (or more) model-generated responses. They rank them by preference. Common annotation guidelines cover helpfulness, truthfulness, and safety. Inter-annotator agreement is typically 70--80\%---the task is inherently noisy.
-
-\begin{warningbox}
-The reward model is only as good as its training distribution. If the RM was trained on responses from a 7B model but is later used to score responses from a 70B model, it may assign unreliable scores to outputs it has never seen. This distributional mismatch is a primary cause of reward hacking: the policy finds high-reward outputs that exploit blind spots in the RM rather than genuinely improving quality.
-\end{warningbox}
+What matters for the RL that follows is that $R_\phi$ is a learned, finite-data proxy, and Stage 3 applies optimization pressure directly to it---so its blind spots become the policy's behavior (Section~\ref{sec:reward_hacking}). Everything about \textit{building} a good one---annotation guidelines, inter-annotator agreement, listwise ranking, synthetic preference data, calibration, RM benchmarks---is [NLP~8].
 
 \subsection{Stage 3: PPO Fine-Tuning with KL Penalty}
 
@@ -178,6 +159,8 @@ The reward model is only as good as its training distribution. If the RM was tra
 where $\pi_{\text{ref}}$ is the frozen SFT model and $\beta$ controls the strength of the KL penalty.
 \end{mathresult}
 
+\textbf{Why an RL algorithm at all?} The reward arrives once per completed sequence and the expectation is taken over the policy's \textit{own} samples---there is no fixed target to regress onto, so the gradient is a policy gradient rather than a supervised one. PPO fills the slot for the stability reasons in Section~\ref{sec:rl_fundamentals}.
+
 \textbf{Why the KL penalty?} Without it, the policy would exploit the reward model: producing degenerate text that scores high on the (imperfect) RM but is actually nonsensical. The KL term anchors the policy near the SFT model, which we know produces coherent text. Note the direction: this is the \textit{reverse} KL, $\KL(\pi_\theta \,\|\, \pi_{\text{ref}})$, which is mode-seeking---it penalizes the policy for putting mass where the reference does not, so the policy stays inside high-probability regions of the reference rather than being forced to cover all of them (a standard follow-up probe). $\beta$ controls the exploration-exploitation tradeoff:
 \begin{itemize}
     \item \textbf{$\beta$ too high:} Policy barely moves from SFT model; reward gains are minimal.
@@ -185,24 +168,7 @@ where $\pi_{\text{ref}}$ is the frozen SFT model and $\beta$ controls the streng
     \item \textbf{Typical range:} $\beta \in [0.01, 0.2]$. Many implementations use adaptive $\beta$ that targets a specific KL budget.
 \end{itemize}
 
-\textbf{Models in memory during PPO training.} This is a frequent interview question. Four models must coexist during Stage 3:
-
-\begin{table}[H]
-\centering
-\caption{Models loaded during PPO-based RLHF training}
-\begin{tabularx}{\textwidth}{llX}
-\toprule
-\textbf{Model} & \textbf{Updated?} & \textbf{Purpose} \\
-\midrule
-Policy $\pi_\theta$ & Yes (PPO updates) & Generates responses; the model being optimized \\
-Reference $\pi_{\text{ref}}$ & No (frozen) & Computes KL penalty; anchors policy \\
-Reward model $R_\phi$ & No (frozen) & Scores generated responses \\
-Value function $V_\psi$ & Yes (critic updates) & Estimates baseline for advantage computation \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\textbf{Why this is expensive.} For a 7B policy model, you need $\sim$4 copies of a large model in memory simultaneously ($\sim$56GB in FP16 for parameters alone, plus activations). This is why RLHF is typically done on clusters, and why methods that reduce model count (like DPO) are attractive.
+\textbf{What sits in memory.} A frequent interview question: Stage 3 keeps \textit{four} models resident---policy $\pi_\theta$ (updated), frozen reference $\pi_{\text{ref}}$ (KL anchor), frozen reward model $R_\phi$ (scores samples), and value network $V_\psi$ (updated; advantage baseline). At 7B that is $\sim$56\,GB in FP16 for parameters alone, which is why every later method is partly a story about deleting entries from this list: DPO drops the RM and the critic, GRPO drops the critic. The cluster layout that makes it run is [NLP~8].
 
 %==============================================================================
 \section{DPO: Direct Preference Optimization}
@@ -267,11 +233,11 @@ Scaling to frontier & Used by OpenAI, Anthropic & Used by Meta (Llama 3), many o
 
 \subsection{DPO Variants}
 
-Several improvements to DPO have emerged:
+Each variant changes one term of the DPO loss to fix one weakness:
 
 \begin{table}[H]
 \centering
-\caption{DPO and its variants}
+\caption{DPO and its variants. Which variant to run, on what data, at which point in a post-training pipeline is recipe territory---[NLP~8].}
 \begin{tabularx}{\textwidth}{lXX}
 \toprule
 \textbf{Method} & \textbf{Key Modification} & \textbf{Why It Helps} \\
@@ -285,7 +251,7 @@ SimPO & Uses average log-prob instead of total & Length-normalized, more stable 
 \end{tabularx}
 \end{table}
 
-\textbf{Practical note.} DPO's main weakness is that it operates on a static dataset. If the preference data does not cover the policy's failure modes, DPO cannot improve on them. Iterative DPO (generate with current policy $\rightarrow$ collect preferences $\rightarrow$ retrain) partially addresses this but adds complexity.
+\textbf{Practical note.} All of them optimize a \textit{static} dataset: the gradient never sees a sample the current policy would produce, so failure modes absent from the preference data go unfixed. Iterative DPO (generate $\rightarrow$ collect preferences $\rightarrow$ retrain) partially closes that gap at the cost of an online loop---at which point the honest comparison is against GRPO (Section~\ref{sec:grpo_rlvr}).
 
 %==============================================================================
 \section{GRPO and RL with Verifiable Rewards}
