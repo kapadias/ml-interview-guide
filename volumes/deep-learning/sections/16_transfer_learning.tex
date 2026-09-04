@@ -890,25 +890,64 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 
 \badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
 
-\stronganswer The decision depends on four axes: data quantity, compute budget, quality requirements, and serving constraints. \textbf{Full fine-tuning}: use when you have $>$100K high-quality examples, multi-GPU infrastructure, and need maximum quality---for example, training a production model that justifies the cost. Achieves the best quality but requires 4--8$\times$ the memory of the model weights (optimizer states, gradients). \textbf{LoRA}: the default choice for most fine-tuning. Use with 1K--100K examples on a single GPU. Trains 0.1--1\% of parameters, achieves 95--99\% of full FT quality, and can merge adapters for zero inference overhead. The key advantage is multi-task serving: swap adapters without duplicating the base model. \textbf{QLoRA}: LoRA on a 4-bit quantized base model. Use when memory is the binding constraint---e.g., fine-tuning a 70B model on a single 24GB GPU. Buys a 3--4$\times$ memory reduction at a quality cost that is task- and configuration-dependent: with NF4, double quantization, and adapters on all linear layers, the QLoRA paper reports parity with 16-bit LoRA, while narrower adapter placement or harder tasks can show a few percent gap from quantization noise in the frozen base's forward pass. Benchmark against a 16-bit LoRA baseline rather than assuming a fixed penalty. \textbf{Prompt tuning}: trains only soft prompt embeddings ($<$0.01\% parameters). Use only for very large models ($>$10B) on simple tasks, or when you need hundreds of task-specific variants served from one base model with minimal per-task storage. Quality is significantly lower than LoRA for models under 10B.
+\stronganswer The decision depends on four axes: data quantity, compute budget, quality requirements, and serving constraints. \textbf{Full fine-tuning}: updates every parameter. Use when you have $>$100K high-quality examples, multi-GPU infrastructure, and need maximum quality---for example, a flagship production model that justifies the cost. Memory is the gate: a 7B model needs roughly 60\,GB in FP16 (and $\sim$120\,GB in FP32) for weights, gradients, and optimizer states, i.e.\ 4--8$\times$ the weights alone. Risk: catastrophic forgetting if not regularized or data-mixed. \textbf{LoRA}: the default choice. Use with 1K--100K examples on a single GPU (a 7B model fits in $\sim$18\,GB FP16). Trains 0.1--1\% of parameters, reaches 95--99\% of full-FT quality on most tasks, and merges for zero inference overhead. The killer feature is multi-task serving: swap adapters instead of duplicating the base model. \textbf{QLoRA}: LoRA over a 4-bit quantized base. Use when memory is the binding constraint---fine-tuning a 70B model on a single 24--80\,GB GPU. Buys a 3--4$\times$ memory reduction at a quality cost that is task- and configuration-dependent: with NF4, double quantization, and adapters on all linear layers, the QLoRA paper reports parity with 16-bit LoRA, while narrower adapter placement or harder tasks can show a few percent gap from quantization noise in the frozen base's forward pass. Benchmark against a 16-bit LoRA baseline rather than assuming a fixed penalty. \textbf{Prompt tuning}: trains only soft prompt embeddings ($<$0.01\% of parameters). The quality gap to full FT closes with model scale but stays significant below $\sim$10B, so use it for simple tasks on very large models, or when you need hundreds of task variants from one base with minimal per-task storage. Not suitable for real domain adaptation. \textbf{Decision rule}: default to LoRA; upgrade to full FT only when LoRA quality is \emph{measurably} insufficient on your task; drop to QLoRA when the model will not otherwise fit; reach for prompt tuning only for lightweight customization at extreme scale.
 
 \redflags
 \begin{itemize}
+    \item ``Always use full fine-tuning for best results'' without considering the cost--quality tradeoff
     \item Treating QLoRA as strictly better than LoRA (quality parity is configuration-dependent and must be verified per task)
+    \item Treating LoRA and full FT as equivalent in quality for all tasks, or not knowing prompt tuning's gap at small model scale
     \item Not mentioning the serving/deployment dimension
-    \item ``Always use full fine-tuning for best results'' without considering the cost-quality tradeoff
 \end{itemize}
 
-\interviewtest{Practical decision-making under constraints. Can you map business requirements to the right technical choice?}
+\interviewtest{Practical decision-making under constraints. Can you map business requirements---data volume, hardware, quality bar, and how the model will be served---to the right technical choice, rather than reciting the PEFT landscape?}
 
 \goodgreat
 \begin{itemize}
-    \item \badgeLfive{L5} Correct comparison on memory/quality axes, knows the basic tradeoffs
-    \item \badgeLsix{L6} Adds the serving dimension (adapter merging, multi-task), discusses data quantity thresholds, mentions when prompt tuning is actually viable
+    \item \badgeLfive{L5} Correct comparison on memory, quality, and parameter-count axes; knows the basic tradeoffs
+    \item \badgeLsix{L6} Adds the serving dimension (adapter merging, multi-task), discusses data-quantity thresholds, knows prompt tuning's scaling behavior and when it is actually viable
     \item \badgeLseven{L7} Considers the full lifecycle---training cost, serving cost, iteration speed, team capability---and gives a decision tree that accounts for organizational constraints
 \end{itemize}
 
-\followups{``What about adapter layers?'' ``When would you use DoRA or IA3?'' ``How do you decide LoRA rank?''}
+\followups{``What about adapter layers?'' ``When would you use DoRA or IA3?'' ``Does LoRA work for pre-training?'' ``How do you pick rank and $\alpha$ once you have chosen LoRA?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You have chosen LoRA to adapt a 7B instruction-tuned model to an internal support-and-policy domain: 20K curated examples, one 80\,GB GPU, and the adapter will be served alongside the general assistant. Pick rank, $\alpha$, and target modules, and defend the choices.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer I would start at $r = 16$, $\alpha = 32$, adapters on all linear projections ($\mW_q, \mW_k, \mW_v, \mW_o$ plus the FFN up/gate/down matrices), learning rate 2e-4, and treat all three as things I will move once I have a held-out curve---not as a recipe.
+
+\textbf{Rank is capacity, and capacity cuts both ways.} $r$ sets the dimension of the subspace the update can live in. The count $L \times M \times 2 \times d \times r$ (Section~\ref{sec:peft_advanced}) gives 16.8M trainable parameters for the four attention projections at $L = 32$, $d = 4096$, $r = 16$; adding the wider FFN matrices roughly doubles that to $\sim$40M, about 0.6\% of a 7B base. Too low and the bottleneck starves a task that genuinely needs new directions; too high and, with only 20K examples, the adapter has enough capacity to memorize the domain and to override base behavior---which is what ``LoRA caused catastrophic forgetting'' usually turns out to be. This task is domain \emph{adaptation}, not new-capability acquisition---the model already speaks the language and knows the format, it needs our policies and vocabulary---so the low-rank assumption holds and 16 is the right starting point. The empirical test is decisive and cheap: sweep $r \in \{8, 16, 32, 64\}$ on a fixed budget; if quality is flat from 8 to 64, rank was never the binding constraint and I keep the smallest, because smaller adapters are cheaper to store, serve, and swap.
+
+\textbf{$\alpha$ is not a second capacity knob---it is the scale on the update.} The adapter contributes $\frac{\alpha}{r}\mB\mA\vx$, so only the \emph{ratio} matters: $\alpha = r$ gives unit scale, $\alpha = 2r$ the common $2\times$ default. The practical consequence is that $\alpha$ and the learning rate are entangled---raising $\alpha$ at fixed $r$ is close to raising the effective LR on the adapter path---so I fix $\alpha/r$ and tune the learning rate, rather than tuning both. I would hold $\alpha/r = 2$ while chasing domain quality, and pull it toward $\alpha/r \le 1$ if general-capability evals start to slide, since the effective scale is the most direct lever on how hard the adapter overrides the frozen base. One rank-dependent trap: because vanilla LoRA divides by $r$ rather than $\sqrt{r}$, raising rank while holding $\alpha$ fixed \emph{shrinks} the effective update, so a naive $r = 64$ run can look no better than $r = 16$ for reasons that have nothing to do with capacity. If I go above $r \approx 64$ I enable rank-stabilized scaling ($\alpha/\sqrt{r}$) so the added capacity is actually usable.
+
+\textbf{Target modules move quality more than rank does.} Attention-only ($\mW_q, \mW_v$) is the cheapest configuration and a fine baseline, but the modern default is all linear layers including the FFN, which is where a good deal of factual and stylistic adaptation lives; the QLoRA ablations point the same way. Widening the target set is usually a better use of a fixed parameter budget than raising $r$ on a narrow set. If I also have to extend the tokenizer for domain vocabulary, the new embedding rows must be trainable alongside the adapter---LoRA on frozen embeddings cannot learn tokens the base has never seen.
+
+\textbf{When I would raise rank.} Large distribution shift---a new language, a genuinely unfamiliar modality of text, or behavior the base model does not have at all---breaks the low-rank assumption, and the answer there is $r = 64$+ with all-linear targets and rank-stabilized scaling, or full fine-tuning if that still underperforms. That is not this task.
+
+\textbf{How I would know I was wrong.} Train-loss plateau with validation still improving means underfitting: raise $r$ or widen targets. Validation improving while a general benchmark suite (MMLU, an instruction-following set, plus a held-out general chat slice) degrades means the adapter is overriding the base: lower $\alpha/r$, lower $r$, shorten training, or mix 10--20\% general data back in. Both curves flat across a rank sweep means the bottleneck is data quality or learning rate, not rank---which is the most common outcome and worth saying out loud.
+
+\redflags
+\begin{itemize}
+    \item Quotes a recipe ($r = 8$, $\alpha = 16$) with no reasoning about task difficulty, dataset size, or how it would be validated
+    \item Treats $\alpha$ as an independent capacity knob rather than the scale $\alpha/r$ on the update
+    \item ``Just use the highest rank you can afford''---ignores overfitting and forgetting at 20K examples, and ignores per-adapter storage and serving cost
+    \item Never mentions target-module choice, or assumes attention-only is the only option
+    \item No empirical plan: no rank sweep, no general-capability eval to catch the override failure mode
+\end{itemize}
+
+\interviewtest{Whether the candidate can turn PEFT hyperparameters into an argument about capacity, scale, and evidence. Rank and $\alpha$ are where interviewers find out whether someone has actually run fine-tuning jobs or only read about them---the tell is that a practitioner talks about sweeps and forgetting evals, not about defaults.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names sensible starting values, knows $\alpha/r$ is the scale, and knows rank trades capacity against overfitting
+    \item \badgeLsix{L6} Ties rank to task difficulty and dataset size, argues target-module choice over raw rank, proposes a rank sweep with a general-capability eval, and connects excessive $\alpha/r$ to the forgetting failure mode
+    \item \badgeLseven{L7} Knows the $\alpha/r$ versus $\alpha/\sqrt{r}$ rank-scaling issue and when it matters, discusses per-layer rank allocation (AdaLoRA) and low-rank quality fixes (DoRA), and prices the choice against fleet-level storage and serving cost when many adapters share one base
+\end{itemize}
+
+\followups{``You raised rank from 16 to 64 and nothing improved---what are the two explanations?'' (the $\alpha/r$ scaling cancels the added capacity; or rank was never the binding constraint) ``What changes if you have 500 examples instead of 20K?'' ``What changes if the base is 4-bit quantized?'' ``How would you pick rank if you have to ship 100 adapters on shared hardware?''}
 \end{interviewq}
 
 \begin{interviewq}
@@ -1065,32 +1104,6 @@ A production fine-tuning pipeline for domain adaptation involves more than calli
 \end{itemize}
 
 \followups{``How do you prevent catastrophic forgetting?'' ``How do you build a test set that represents production?'' ``What monitoring would you put in place to catch this earlier?''}
-\end{interviewq}
-
-\begin{interviewq}
-\textbf{Q: Compare LoRA, full fine-tuning, and prompt tuning. When would you use each?}
-
-\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
-
-\stronganswer \textbf{Full fine-tuning}: updates all parameters. Best quality but highest cost---a 7B model needs $\sim$120 GB (FP32) or $\sim$60 GB (FP16) for weights, gradients, and optimizer states. Use when: abundant data ($>$100K examples), quality is paramount, and you can afford multi-GPU training. Typical scenario: building a flagship production model. Risk: catastrophic forgetting if not carefully regularized. \textbf{LoRA}: trains 0.1--1\% of parameters via low-rank updates. Achieves 95--99\% of full FT quality on most tasks. Fits a 7B model on a single GPU ($\sim$18 GB in FP16). Use when: moderate data (1K--100K examples), single-GPU budget, or you need to serve multiple task-specific adapters from one base model. The killer feature is zero inference overhead after merging. \textbf{Prompt tuning}: trains only soft prompt embeddings ($<$0.01\% of parameters). Quality gap with full FT closes at model scale ($>$10B) but remains significant for smaller models. Use when: you need hundreds of task variants served from one base model with minimal per-task storage, or when the task is simple enough that a few soft tokens can steer behavior. Not suitable for complex domain adaptation. \textbf{Decision rule}: default to LoRA. Upgrade to full FT only if LoRA quality is measurably insufficient on your specific task. Use prompt tuning only for lightweight customization at extreme scale.
-
-\redflags
-\begin{itemize}
-    \item ``Always use full fine-tuning for best results'' without considering constraints
-    \item Not knowing that prompt tuning has a quality gap for smaller models
-    \item Treating LoRA and full FT as equivalent in quality for all tasks
-\end{itemize}
-
-\interviewtest{Understanding of the PEFT landscape and practical decision-making under real-world constraints.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} Correct comparison on memory, quality, and parameter count axes
-    \item \badgeLsix{L6} Adds serving dimension (adapter merging, multi-task), data quantity thresholds, knows prompt tuning scaling behavior
-    \item \badgeLseven{L7} Considers full lifecycle cost (training, serving, iteration speed, team expertise) and gives a decision tree for organizational contexts
-\end{itemize}
-
-\followups{``What about adapter layers vs LoRA?'' ``Does LoRA work for pre-training?'' ``How do you serve 100 different LoRA adapters efficiently?''}
 \end{interviewq}
 
 \begin{interviewq}

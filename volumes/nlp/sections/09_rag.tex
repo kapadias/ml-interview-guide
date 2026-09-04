@@ -8,14 +8,19 @@
 \label{chap:rag}
 
 \begin{tldr}
-RAG is the dominant paradigm for building knowledge-grounded LLM applications.
-This chapter covers the complete RAG architecture from query processing through
-retrieval (sparse, dense, hybrid) to generation, including chunking strategies,
-vector databases, re-ranking, and advanced patterns like HyDE and agentic RAG.
-RAG system design is one of the most common interview topics for applied ML
-roles---every FAANG company building LLM-powered products uses some form of
-retrieval augmentation, and interviewers expect candidates to reason about the
-full pipeline, not just the model.
+RAG is the dominant paradigm for building knowledge-grounded LLM applications,
+and this chapter is the program's canonical home for the RAG \emph{pipeline}:
+chunking, retrieval-paradigm selection, context assembly, grounded generation,
+the advanced patterns (HyDE, multi-hop, Self-RAG, agentic RAG, context
+compression, citation), RAG evaluation, and the failure taxonomy that tells you
+which layer broke.  The retrieval \emph{infrastructure} underneath it is
+Volume~III: lexical retrieval systems are [SR 2], vector-index internals and
+sizing are [SR 3], bi-encoders, rerankers and hybrid fusion are [SR 4], and
+production retrieval---freshness, serving, caching, monitoring, and RAG's
+retrieval stage---is [SR 8]; the long-context-versus-retrieval architectural
+decision is [DL 21].  RAG system design is one of the most common interview
+topics for applied ML roles, and interviewers expect candidates to reason about
+the full pipeline, not just the model.
 \end{tldr}
 
 \bigskip
@@ -162,169 +167,120 @@ gives LLMs access to organizational knowledge without retraining.
 
 
 % ============================================================================
-% SECTION 2: RETRIEVAL PARADIGMS
+% SECTION 2: RETRIEVAL PARADIGMS (pipeline-level; engines are canon in [SR 2]/[SR 3]/[SR 4])
 % ============================================================================
 \section{Retrieval Paradigms}
 \label{sec:retrieval-paradigms}
 
-The retrieval component is the backbone of any RAG system.  Choosing the right
-retrieval strategy---and understanding the tradeoffs---is one of the most
-important design decisions and a frequent interview topic.
+The retrieval component is the backbone of any RAG system, and the choice
+among retrieval paradigms is the first quality decision a pipeline builder
+makes: what the retriever can and cannot find bounds everything downstream,
+because a chunk that retrieval misses is a fact the generator simply does not have.
+
+\begin{keyinsight}[Where Retrieval Infrastructure Is Canon]
+This chapter is the canonical home for the RAG \emph{pipeline}: chunking,
+context assembly, generation grounding, the advanced patterns, the failure
+taxonomy, and RAG evaluation.  It is deliberately not the home for retrieval
+infrastructure.  Lexical retrieval as a system---BM25 parameter tuning, field
+weighting, inverted-index construction, top-$k$ pruning, learned sparse
+serving---is Volume~III, [SR 2].  Vector-index internals and sizing---HNSW,
+IVF, product quantization, DiskANN, and the recall--latency--memory
+triangle---are [SR 3].  Bi-encoder training recipes, rerankers, late
+interaction, hybrid fusion, and the one canonical multi-stage retrieval design
+question are [SR 4].  Index freshness, ANN serving, caching, retrieval
+monitoring, and RAG's retrieval stage as a production system are [SR 8].  What
+follows is what a RAG pipeline builder must be able to reason about when
+choosing a retriever; when an interviewer pushes into the index itself, that
+is Volume~III's material.
+\end{keyinsight}
 
 \subsection{Sparse Retrieval (BM25)}
 
-Sparse retrieval methods represent queries and documents as high-dimensional
-sparse vectors over the vocabulary, where most entries are zero.  The dominant
-method remains \textbf{BM25} (Robertson et al., 1994), which extends TF-IDF
-with term frequency saturation and document length normalization (see
-Chapter~\ref{chap:classical_foundations} for the full derivation).
+Sparse retrieval represents queries and documents as high-dimensional sparse
+vectors over the vocabulary and scores by term overlap.  The dominant method
+remains \textbf{BM25} (Robertson et al., 1994), which extends TF-IDF with term
+frequency saturation and document length normalization; the derivation is in
+Chapter~\ref{chap:classical_foundations}, and the systems view---parameter
+tuning, BM25F field weighting, index construction, and top-$k$ pruning---is
+[SR 2].
 
-\paragraph{How it works.}
-An \textbf{inverted index} maps each term in the vocabulary to the list of
-documents containing that term.  At query time, the system looks up each query
-term in the index, retrieves the posting lists, and scores documents using the
-BM25 formula.  Only documents sharing at least one term with the query receive
-a non-zero score.
-
-\paragraph{Strengths.}
-\begin{itemize}
-    \item \textbf{Exact lexical matching:} Handles entity names, product IDs,
-          technical jargon, and rare terms that dense models often miss.
-    \item \textbf{Efficiency:} Inverted index lookup is $O(1)$ per term
-          (scoring then costs time proportional to the length of each term's
-          posting list); no GPU required at query time.
-    \item \textbf{No training data needed:} Works out of the box on any corpus.
-    \item \textbf{Interpretable:} Scores decompose into per-term contributions.
-\end{itemize}
-
-\paragraph{Weaknesses.}
-\begin{itemize}
-    \item \textbf{Vocabulary mismatch:} ``automobile'' and ``car'' share no
-          terms, so BM25 scores zero despite identical meaning.
-    \item \textbf{No semantic understanding:} Cannot match paraphrases, handle
-          synonyms, or bridge conceptual gaps.
-    \item \textbf{Bag-of-words assumption:} Ignores word order and context.
-\end{itemize}
+What matters for a RAG pipeline is the \emph{shape of its competence}.  BM25
+matches exactly: entity names, product IDs, error codes, version strings, and
+rare technical jargon are found reliably, with no training data, no GPU at
+query time, and per-term interpretable scores.  It fails on vocabulary
+mismatch---``automobile'' and ``car'' share no terms, so a semantically
+perfect document scores zero---and it has no notion of paraphrase, word order,
+or context.  Because enterprise RAG corpora (documentation, tickets, code,
+contracts) are saturated with exactly the identifier-shaped tokens dense
+encoders blur, BM25 is rarely the wrong leg of a RAG retriever, and treating
+it as legacy technology is a reliable interview red flag.
 
 \subsection{Dense Retrieval (Bi-Encoder)}
 \label{sec:dense-retrieval}
 
-Dense retrieval maps queries and documents into a shared dense embedding space
-where semantic similarity is measured by vector distance.
-
-\paragraph{Architecture.}
-A \textbf{bi-encoder} uses two separate encoders (or a shared encoder) to
-independently encode the query and document into fixed-size vectors:
+Dense retrieval maps queries and documents into a shared embedding space where
+semantic similarity is vector similarity.  A \textbf{bi-encoder} encodes query
+and document \emph{independently}:
 \[
-    \vq = E_Q(\text{query}), \qquad \mathbf{d} = E_D(\text{document})
-\]
-Similarity is computed as cosine similarity or dot product:
-
-\begin{mathresult}{Bi-Encoder Similarity and Contrastive Loss}
-\[
+    \vq = E_Q(\text{query}), \qquad \mathbf{d} = E_D(\text{document}),
+    \qquad
     \text{sim}(\vq, \mathbf{d}) = \frac{\vq^\top \mathbf{d}}{\norm{\vq}\,\norm{\mathbf{d}}}
-    \qquad \text{or} \qquad
-    \text{sim}(\vq, \mathbf{d}) = \vq^\top \mathbf{d}
+    \;\;\text{or}\;\; \vq^\top \mathbf{d}.
 \]
-Training uses the \textbf{InfoNCE contrastive loss} over a batch of queries
-$\{q_i\}$ with their positive documents $\{d_i^+\}$:
+That independence is the whole architectural contract, and it is what makes
+RAG affordable: every document vector is computed once, offline, so the online
+cost is one query encode plus an index lookup.  Training uses a contrastive
+(InfoNCE) objective over in-batch and mined hard negatives---the objective,
+the negatives, and the geometry are Volume~I's metric-learning chapter
+[DL 7], and the retrieval-specific recipes (batch size, hard-negative mining
+schedules, distillation from cross-encoders) are [SR 4].
+
+\paragraph{What a pipeline builder actually chooses.}
+The decisions here are model, dimension, and versioning, not loss function.
+The usual menu is instruction-tuned open-weight embedders (E5, BGE, GTE) or
+API embedders (OpenAI, Cohere, Voyage), with DPR (Karpukhin et al., EMNLP
+2020) as the foundational open-domain-QA bi-encoder worth naming.  Three
+RAG-specific gotchas are worth stating in an interview: use the \emph{same}
+model and the \emph{same} prefix convention (``query:'' / ``passage:'') for
+indexing and querying, or retrieval degrades with no error surfacing anywhere;
+embedding dimension is a multiplier on index memory and on every future
+re-embedding pass, so choose it jointly with the index; and the embedding
+model is part of the index's identity, which makes an encoder upgrade a
+migration rather than a config change.
+
+\subsection{Learned Sparse and Late Interaction}
+
+\textbf{SPLADE} (Formal et al., SIGIR 2021) uses a language model's MLM head to
+produce learned \emph{sparse} representations---neural term expansion, so a
+document about ``automobile maintenance'' also carries weight on ``car,''
+``vehicle,'' and ``repair.''  It buys semantics while still serving from an
+inverted index, and it stays interpretable.  \textbf{ColBERT} (Khattab \&
+Zaharia, SIGIR 2020) keeps one embedding per \emph{token} and scores by summing
+each query token's maximum similarity over document tokens (MaxSim),
 \[
-    \loss = -\frac{1}{N}\sum_{i=1}^{N}
-    \log \frac{\exp\!\bigl(\text{sim}(q_i, d_i^+)/\tau\bigr)}
-    {\sum_{j=1}^{N} \exp\!\bigl(\text{sim}(q_i, d_j^+)/\tau\bigr)}
+    \text{score}(q, d) = \sum_{i=1}^{|q|} \max_{j \in \{1,\ldots,|d|\}} \vq_i^\top \mathbf{d}_j,
 \]
-where $\tau$ is a temperature hyperparameter and the denominator includes
-\textbf{in-batch negatives}---other queries' positives serve as negatives.
-\end{mathresult}
-
-\paragraph{Key models.}
-\begin{itemize}
-    \item \textbf{DPR} (Karpukhin et al., EMNLP 2020): Separate BERT encoders
-          for query and passage.  Trained with in-batch negatives plus one BM25
-          hard negative per query.  Foundational model for open-domain QA and RAG.
-    \item \textbf{E5} (Wang et al., 2022): Instruction-tuned embeddings with
-          ``query:'' and ``passage:'' prefixes.  Contrastive pretraining on
-          large paired datasets followed by fine-tuning.
-    \item \textbf{BGE} (Xiao et al., 2023): Similar instruction-tuned approach
-          with strong multilingual support.  Competitive across MTEB benchmarks.
-    \item \textbf{GTE} (Li et al., 2023): General Text Embeddings with
-          multi-stage training.  Strong out-of-box performance.
-    \item \textbf{API-based:} OpenAI Embeddings, Cohere Embed v3, Voyage AI---
-          production-ready, require no infrastructure, but introduce API
-          dependency and cost.
-\end{itemize}
-
-\paragraph{Training details that matter.}
-\begin{itemize}
-    \item \textbf{Hard negative mining:} In-batch negatives are easy.  Mining
-          hard negatives (documents that are similar but not relevant) using
-          BM25 or a cross-encoder dramatically improves retrieval quality.
-    \item \textbf{Batch size:} Larger batches provide more in-batch negatives,
-          improving contrastive learning.  Typical: 512--4096 pairs.
-    \item \textbf{Temperature $\tau$:} Lower temperature produces sharper
-          discrimination but can cause training instability.  Typical:
-          $\tau = 0.01$--$0.1$.
-\end{itemize}
-
-\subsection{Learned Sparse Retrieval (SPLADE)}
-
-\textbf{SPLADE} (Formal et al., SIGIR 2021) bridges the gap between sparse and
-dense retrieval.  It uses a pretrained language model's MLM head to produce
-\emph{learned sparse representations}: for each input token, the MLM head
-outputs a distribution over the full vocabulary, effectively performing
-\textbf{neural term expansion}.
-
-For example, a document about ``automobile maintenance'' might generate high
-weights for terms like ``car,'' ``vehicle,'' ``repair,'' and ``mechanic''---
-terms not in the original text but semantically relevant.
-
-\paragraph{Advantages.}
-\begin{itemize}
-    \item \textbf{Interpretable:} Output is a weighted bag-of-words; you can
-          inspect which terms were expanded.
-    \item \textbf{Efficient:} Uses inverted index infrastructure (no ANN).
-    \item \textbf{Semantic:} Captures synonyms and related terms via expansion.
-\end{itemize}
-
-\subsection{Late Interaction (ColBERT)}
-
-\textbf{ColBERT} (Khattab \& Zaharia, SIGIR 2020) introduces a middle ground
-between bi-encoders and cross-encoders: \textbf{late interaction}.
-
-\paragraph{How it works.}
-Both query and document are independently encoded into \emph{per-token}
-embeddings (not a single vector).  At scoring time, each query token's
-embedding computes its maximum similarity with any document token embedding,
-and these MaxSim scores are summed:
-\[
-    \text{score}(q, d) = \sum_{i=1}^{|q|}
-    \max_{j \in \{1,\ldots,|d|\}} \vq_i^\top \mathbf{d}_j
-\]
-
-\paragraph{Tradeoffs.}
-ColBERT achieves higher quality than bi-encoders because token-level matching
-captures fine-grained semantic alignment.  However, it requires storing
-per-token embeddings for every document, and the index-size penalty is
-\emph{compression-dependent}: stored uncompressed, per-token embeddings can be
-roughly two orders of magnitude larger than a single-vector bi-encoder index,
-while ColBERTv2's residual compression brings the overhead down to roughly
-$6$--$10\times$.  Quote the assumption along with the number.
+landing between bi-encoders and cross-encoders in both quality and cost.  Its
+price is storing per-token vectors, an index-size penalty that is
+\emph{compression-dependent}: roughly two orders of magnitude uncompressed,
+roughly $6$--$10\times$ with ColBERTv2's residual compression---quote the
+assumption along with the number.  Both are real options for a RAG retriever,
+and both are cheap to describe and expensive to operate; their serving
+stories---SPLADE's efficiency regularization on the inverted index, ColBERT's
+storage math and PLAID---are [SR 2] and [SR 4].
 
 \subsection{Cross-Encoder Re-Ranker}
 
-A \textbf{cross-encoder} takes the concatenated (query, document) pair as
-input to a single transformer, allowing full bidirectional attention between
-query and document tokens:
+A \textbf{cross-encoder} concatenates the (query, document) pair into a single
+transformer, so query and document tokens attend to one another:
 \[
-    \text{score}(q, d) = \text{Linear}\!\bigl(\text{BERT}(\texttt{[CLS]}\; q \;\texttt{[SEP]}\; d)\bigr)
+    \text{score}(q, d) = \text{Linear}\!\bigl(\text{BERT}(\texttt{[CLS]}\; q \;\texttt{[SEP]}\; d)\bigr).
 \]
-
-This produces the highest quality scores because the model can perform deep
-token-level interaction.  However, each (query, document) pair requires its
-own full transformer forward pass---$O(N)$ forward passes to score $N$
-candidate documents, with nothing precomputable offline.  This makes
-cross-encoders impractical for searching a full corpus but ideal for
-\emph{re-ranking} a small candidate set (Section~\ref{sec:reranking}).
+This is the highest-quality relevance signal available, and it is structurally
+incompatible with first-stage retrieval: nothing can be precomputed offline,
+so scoring $N$ candidates costs $N$ forward passes.  That is why it appears in
+a RAG pipeline only as a re-ranker over a small candidate set
+(Section~\ref{sec:reranking}).
 
 \subsection{Comparison of Retrieval Methods}
 
@@ -342,11 +298,22 @@ ColBERT (Late Inter.)  & Token-level MaxSim     & Very high & Moderate & Require
 Cross-Encoder        & Full attention over pair  & Highest  & Slow      & Required & DeBERTa-v3, BGE re-ranker \\
 \bottomrule
 \end{tabularx}
-\caption{Comparison of retrieval methods.  Quality and latency are relative
-within each category.  Cross-encoders are used only for re-ranking, not
-full-corpus retrieval.}
+\caption{Retrieval methods as a pipeline-level menu.  Quality and latency are
+relative within each category; cross-encoders are used only for re-ranking,
+not full-corpus retrieval.}
 \label{tab:retrieval-comparison}
 \end{table}
+
+\textbf{The default for RAG is hybrid.}  Lexical and dense retrieval fail on
+disjoint query populations---lexical on paraphrase and conceptual queries,
+dense on identifiers and near-identical strings---so running both and fusing
+their rankings is the production default rather than an optimization, and it
+is what a RAG design answer should open with.  Hybrid is not free: it doubles
+the operational surface (two indexes, two freshness pipelines, two failure
+domains), so it needs per-slice evaluation to justify itself.  The fusion
+mechanics---why raw score blending fails, reciprocal rank fusion and its
+constant, learned fusion---are canonical in [SR 4];
+Section~\ref{sec:reranking} keeps only what the pipeline stage costs.
 
 \begin{warningbox}
 A common interview mistake is proposing a cross-encoder for full-corpus
@@ -449,250 +416,146 @@ size and embedding model should all be treated as hyperparameters.
 
 
 % ============================================================================
-% SECTION 4: VECTOR DATABASES AND INDEXING
+% SECTION 4: VECTOR INDEXING FOR RAG (compressed; index internals are canon in [SR 3]/[SR 8])
 % ============================================================================
-\section{Vector Databases and Indexing}
+\section{Vector Indexing for RAG, in Brief}
 \label{sec:vector-db}
 
-Once chunks are embedded into dense vectors, they must be stored and searched
-efficiently.  Exact nearest neighbor search is $O(N \cdot d)$ per query (brute
-force), which is impractical for millions of chunks.  \textbf{Approximate
-Nearest Neighbor} (ANN) algorithms trade a small amount of recall for
-orders-of-magnitude speedup.
+Once chunks are embedded they must be searched.  Exact nearest-neighbor search
+costs $O(N \cdot d)$ per query---at tens of millions of chunks that is hundreds
+of gigabytes of memory traffic per query---so production RAG serves an
+\textbf{approximate nearest neighbor} (ANN) index that trades a few points of
+recall for two to three orders of magnitude in speed.  Index internals are
+Volume~III's subject; what a RAG pipeline builder has to hold is three
+consequences.
 
-\subsection{ANN Algorithms}
-
-\paragraph{HNSW (Hierarchical Navigable Small World).}
-The dominant ANN algorithm in production vector databases.  HNSW constructs a
-multi-layer graph where the top layers contain long-range connections (for
-fast navigation) and the bottom layers contain short-range connections (for
-precise search).  Search starts at the top layer and greedily navigates toward
-the query vector, descending to lower layers for refinement.
-
-\begin{figure}[H]
-\centering
-\begin{tikzpicture}[
-    node distance=0.6cm,
-    pt/.style={circle, draw=deepblue, fill=deepblue!20, minimum size=0.3cm,
-               inner sep=0pt, font=\tiny\sffamily},
-    qpt/.style={circle, draw=deepred, fill=deepred!30, minimum size=0.35cm,
-                inner sep=0pt, font=\tiny\sffamily\bfseries},
-    edge/.style={draw=deepblue!40, thick},
-    searchedge/.style={draw=deepred!70, very thick, -{Stealth[length=3pt]}},
-    layer/.style={font=\scriptsize\sffamily\bfseries, text=deepblue!70},
-    lbl/.style={font=\tiny\sffamily, text=gray!70}
-]
-
-% Layer 2 (top, sparse)
-\node[layer] at (-2.2, 3.0) {Layer 2};
-\node[pt] (a2) at (0, 3.0) {};
-\node[pt] (b2) at (2.5, 3.0) {};
-\node[pt] (c2) at (5.0, 3.0) {};
-\draw[edge] (a2) -- (b2);
-\draw[edge] (b2) -- (c2);
-
-% Layer 1 (mid, moderate)
-\node[layer] at (-2.2, 1.5) {Layer 1};
-\node[pt] (a1) at (0, 1.5) {};
-\node[pt] (b1) at (1.2, 1.5) {};
-\node[pt] (c1) at (2.5, 1.5) {};
-\node[pt] (d1) at (3.8, 1.5) {};
-\node[pt] (e1) at (5.0, 1.5) {};
-\draw[edge] (a1) -- (b1);
-\draw[edge] (b1) -- (c1);
-\draw[edge] (c1) -- (d1);
-\draw[edge] (d1) -- (e1);
-\draw[edge] (a1) -- (c1);
-\draw[edge] (c1) -- (e1);
-
-% Layer 0 (bottom, dense)
-\node[layer] at (-2.2, 0) {Layer 0};
-\node[pt] (a0) at (0, 0) {};
-\node[pt] (b0) at (0.7, 0) {};
-\node[pt] (c0) at (1.2, 0) {};
-\node[pt] (d0) at (1.9, 0) {};
-\node[pt] (e0) at (2.5, 0) {};
-\node[pt] (f0) at (3.2, 0) {};
-\node[pt] (g0) at (3.8, 0) {};
-\node[pt] (h0) at (4.4, 0) {};
-\node[pt] (i0) at (5.0, 0) {};
-\draw[edge] (a0) -- (b0); \draw[edge] (b0) -- (c0);
-\draw[edge] (c0) -- (d0); \draw[edge] (d0) -- (e0);
-\draw[edge] (e0) -- (f0); \draw[edge] (f0) -- (g0);
-\draw[edge] (g0) -- (h0); \draw[edge] (h0) -- (i0);
-\draw[edge] (a0) -- (d0); \draw[edge] (c0) -- (f0);
-\draw[edge] (e0) -- (h0); \draw[edge] (f0) -- (i0);
-
-% Query point
-\node[qpt] (q) at (3.5, -0.8) {q};
-\node[lbl, right=0.1cm of q] {query};
-
-% Search path
-\draw[searchedge] (a2) -- (b2);
-\draw[searchedge, deepblue!40] (a2) -- (a1);
-\draw[searchedge] (b2) -- (c1);
-\draw[searchedge, deepblue!40] (c1) -- (d1);
-\draw[searchedge] (d1) -- (g0);
-\draw[searchedge] (g0) -- (f0);
-
-% Vertical connections (showing hierarchy)
-\draw[gray!30, dashed] (a2) -- (a1);
-\draw[gray!30, dashed] (b2) -- (c1);
-\draw[gray!30, dashed] (c2) -- (e1);
-\draw[gray!30, dashed] (a1) -- (a0);
-\draw[gray!30, dashed] (c1) -- (e0);
-\draw[gray!30, dashed] (e1) -- (i0);
-\draw[gray!30, dashed] (b1) -- (c0);
-\draw[gray!30, dashed] (d1) -- (g0);
-
-\end{tikzpicture}
-\caption{HNSW index structure.  Upper layers have fewer nodes and long-range
-connections for coarse navigation; lower layers are dense for precise local
-search.  Search starts at the top and descends to the bottom, greedily moving
-toward the query.}
-\label{fig:hnsw}
-\end{figure}
-
-\textbf{Key properties:}
-\begin{itemize}
-    \item Search complexity: $O(\log N)$ on average.
-    \item Build time: $O(N \log N)$.
-    \item Memory: stores the full vectors plus the graph structure.
-    \item Recall@10 $> 95$\% is typical with proper tuning (ef\_construction,
-          M parameters).
-    \item Best quality/speed tradeoff for most production workloads.
-\end{itemize}
-
-\paragraph{IVF (Inverted File Index).}
-Cluster the vectors using k-means into $C$ clusters (Voronoi cells).
-At query time, find the $n_{\text{probe}}$ nearest cluster centroids, then
-search only within those clusters.  Faster than HNSW for very large corpora
-but lower recall at the same latency.
-
-\paragraph{Product Quantization (PQ).}
-Compress vectors by splitting each into subvectors and quantizing each
-subvector to the nearest centroid in a learned codebook.  Reduces memory by
-$4$--$32\times$ but introduces quantization error.  Often combined with IVF
-(IVF-PQ) for large-scale systems where memory is the primary constraint.
-
-\subsection{Vector Database Landscape}
+\paragraph{1.\ The index is a recall--latency--memory trade, and recall is the
+corner you will forget to measure.}
+No index family wins all three corners: exact search buys recall with latency
+or memory, graph indexes buy recall and speed with RAM, quantized cell indexes
+buy memory and speed with recall (usually clawed back by re-scoring survivors
+at full precision), and disk-resident graphs buy memory back with SSD latency.
+The RAG-specific hazard is that ANN recall loss is \emph{silent}: results still
+look plausible, and the only symptom is a generator answering from an
+incomplete evidence set---which then presents as a \emph{generation} problem
+and sends the team debugging the prompt.  Keep a golden query set with
+brute-force ground truth and recompute recall@$K$ on every reindex and every
+parameter change.
 
 \begin{table}[H]
 \centering
 \small
-\begin{tabularx}{\textwidth}{@{}l l l X@{}}
+\caption{ANN index families at a glance---the one-line version a pipeline
+design needs.  Graph construction, the $M$/\texttt{ef}/\texttt{nprobe}
+parameters, the quantization ladder, and worked sizing arithmetic are
+canonical in [SR 3].}
+\label{fig:hnsw}% label retained; the HNSW layer diagram and its mechanics are canon in [SR 3]
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
 \toprule
-\textbf{Database} & \textbf{Type} & \textbf{ANN} & \textbf{Notes} \\
+\textbf{Index} & \textbf{Mechanism} & \textbf{Reach for it when} \\
 \midrule
-Pinecone    & Managed cloud   & Proprietary   & Fully managed, serverless option \\
-Weaviate    & Open-source     & HNSW          & Hybrid search (dense + BM25), GraphQL API \\
-Milvus      & Open-source     & HNSW, IVF, PQ & Highly scalable, GPU support \\
-Qdrant      & Open-source     & HNSW          & Rust-based, fast, rich filtering \\
-Chroma      & Open-source     & HNSW          & Lightweight, good for prototyping \\
-pgvector    & PostgreSQL ext. & IVF, HNSW     & Familiar SQL interface, co-located with app data \\
-FAISS       & Library         & IVF, PQ, HNSW & Facebook's research library; not a database \\
+Flat (exact) & Full scan; recall $=1$ & The corpus is small, or exactness and constant churn matter more than latency \\
+HNSW & Multi-layer proximity graph, greedy descent from sparse upper layers & You want the best recall--QPS trade and can afford vectors $+$ graph resident in RAM \\
+IVF-PQ & $k$-means cells plus quantized codes; scan only \texttt{nprobe} cells & Memory or cost is binding; pair with exact re-scoring to recover the recall quantization gives up \\
+DiskANN & Graph on NVMe with quantized codes in RAM & The corpus is far larger than one node's RAM \\
 \bottomrule
 \end{tabularx}
-\caption{Vector database landscape.  Choice depends on scale, operational
-requirements, and existing infrastructure.}
-\label{tab:vector-dbs}
 \end{table}
 
-\subsection{Index Tradeoffs and Metadata Filtering}
+\paragraph{2.\ Filtering interacts with the index, and in RAG the filter is
+often a security control.}
+Enterprise RAG queries carry metadata predicates: date ranges, product
+versions, source systems, and above all access-control lists.
+\textbf{Post-filtering} (search, then discard non-matching candidates)
+preserves ANN quality, but its recall collapses arithmetically with
+selectivity---if 1\% of the corpus passes the filter, a top-100 ANN result set
+yields on the order of \emph{one} surviving candidate, and over-fetching to
+compensate blows the latency budget exactly when the filter is tightest.
+\textbf{Pre-filtering} (constrain the search itself) is mandatory for ACLs
+regardless of selectivity, because anything retrieved can leak into the
+generated answer---but selective pre-filters are precisely where ANN
+structures degrade.  The production resolutions---per-tenant partitions for
+coarse security boundaries, filter-aware traversal for fine-grained
+predicates, and routing highly selective filters to the lexical engine, which
+evaluates predicates natively---are [SR 8].
 
-Every ANN index involves a three-way tradeoff between \textbf{recall}
-(fraction of true nearest neighbors found), \textbf{latency} (query time),
-and \textbf{memory} (index size).  Increasing recall requires either more
-memory (storing the graph or more centroids) or more latency (exploring more
-candidates).
+\paragraph{3.\ Embeddings are versioned \emph{with} the index.}
+The query encoder, the document encoder, the chunking policy, and the index
+artifact are one unit.  Serving a query embedded by model $v2$ against an index
+built by model $v1$ raises no error and fires no alert---it just returns
+quietly wrong neighbors.  Ship encoder and index as one atomic artifact, make
+the serving path refuse mismatched manifests, and treat an embedder upgrade as
+a migration with a dual-serving window rather than a config edit.  The
+migration playbook, near-real-time freshness architecture, and the economics
+of re-embedding a large corpus are [SR 8].
 
-\paragraph{Metadata filtering.}
-Production RAG systems often need to filter results by metadata (e.g., date
-range, document type, access permissions).  Two strategies exist:
-
-\begin{itemize}
-    \item \textbf{Pre-filtering:} Apply metadata filters first to reduce the
-          candidate set, then run ANN search on the filtered subset.  Precise
-          but may reduce ANN quality if the filtered set is small.
-    \item \textbf{Post-filtering:} Run ANN search on the full index, then
-          filter results by metadata.  Guarantees ANN quality but may return
-          fewer than $k$ results after filtering.
-\end{itemize}
-
-Most production databases (Qdrant, Weaviate, Milvus) support efficient
-pre-filtering by combining metadata indices with the ANN structure.
+\begin{table}[H]
+\centering
+\small
+\caption{Choosing a vector store for RAG: the questions that actually decide
+it at pipeline-design time.}
+\label{tab:vector-dbs}% label retained; the vendor landscape table is canon in [SR 8]
+\begin{tabularx}{\textwidth}{@{}l X@{}}
+\toprule
+\textbf{Question to ask} & \textbf{Why it decides the choice} \\
+\midrule
+Does it do hybrid natively? & RAG's default retriever is lexical $+$ dense; no lexical leg means running and synchronizing a second system \\
+How good is filtered search? & ACL and metadata predicates are load-bearing (above), and filter-aware ANN quality varies widely across engines \\
+What is the update path? & Chunk-level indexes churn hard---one edited document invalidates all of its chunk vectors \\
+\bottomrule
+\end{tabularx}
+\end{table}
 
 
 % ============================================================================
-% SECTION 5: RE-RANKING
+% SECTION 5: RE-RANKING (pipeline role and cost; reranker mechanics are canon in [SR 4])
 % ============================================================================
 \section{Re-Ranking}
 \label{sec:reranking}
 
-The standard RAG pattern uses a two-stage retrieval pipeline:
-\textbf{retrieve many, re-rank to few.}  The first stage (bi-encoder or BM25)
-retrieves a broad candidate set (top-100 or top-200) cheaply; the second stage
-(cross-encoder or LLM) re-ranks these candidates to select the most relevant
-top-$k$ for the LLM context window.
+The standard RAG pattern is \textbf{retrieve many, re-rank to few}: a cheap
+first stage (hybrid BM25 $+$ bi-encoder) returns a broad candidate set
+(top-100 to top-200) tuned for \emph{recall}, and a second stage re-scores
+those candidates with a model that reads query and document together, tuned
+for \emph{precision at the top}.
 
-\subsection{Cross-Encoder Re-Rankers}
+\paragraph{Why the stage exists in a RAG pipeline specifically.}
+The generator receives $k \approx 5$--$20$ chunks and synthesizes from
+\emph{all} of them.  An irrelevant chunk is not skipped the way a person skips
+a bad search result---it is a distraction, and often a hallucination seed---so
+precision at small $k$ bounds answer faithfulness in a way it never bounds a
+page of ten blue links.  That is the whole argument for paying for a reranker:
+it is the cheapest place to convert first-stage recall into the small, clean
+context the generator actually consumes.  Two consequences follow.  The
+reranker's \emph{ordering} matters downstream, not just its selection, because
+of the lost-in-the-middle effect (Section~\ref{sec:rag-vs-ft}).  And no
+reranker can recover a document the first stage never retrieved---the recall
+ceiling---which is why the most common funnel misdiagnosis is tuning the
+reranker when the candidate set never contained the answer.
 
-A cross-encoder (Section~\ref{sec:retrieval-paradigms}) scores each
-(query, document) pair with full bidirectional attention.  Re-ranking 100
-candidates with a cross-encoder adds $\sim$200--500ms depending on model size
-and hardware, but substantially improves retrieval precision.
+\paragraph{What it costs.}
+A cross-encoder re-ranking 100 candidates adds roughly $200$--$500$\,ms for a
+BERT-base-class model, which is why production rerankers are small distilled
+models and why re-rank depth is a first-class budget knob rather than a
+constant.  LLM rerankers---pointwise scoring, pairwise comparison, or listwise
+ranking of the whole candidate list---buy quality on relevance judgments that
+cross-encoders struggle with, at roughly an order of magnitude more cost, so
+they are used at small candidate counts or offline.  Reranker model classes,
+latency by candidate count, score calibration, distilling a cross-encoder back
+into the bi-encoder, and how handoff depths are chosen from marginal-recall
+curves are canonical in [SR 4]; serving a reranker fleet economically is
+[SR 8].
 
-Popular re-ranker models: BGE-reranker, Cohere Rerank, cross-encoder/ms-marco
-models from Sentence-Transformers.
-
-\subsection{LLM-Based Re-Ranking}
-
-Increasingly, LLMs themselves are used as re-rankers.  Three paradigms exist:
-
-\begin{itemize}
-    \item \textbf{Pointwise:} Score each document independently (``Rate the
-          relevance of this document to the query on a scale of 1--10'').
-    \item \textbf{Pairwise:} Compare pairs of documents (``Which document is
-          more relevant to the query?'').
-    \item \textbf{Listwise:} Present the full candidate list and ask the LLM
-          to rank them (``Rank these documents by relevance'').
-\end{itemize}
-
-LLM re-ranking is expensive but can achieve very high quality.  It is most
-useful when the candidate set is small (10--20 documents) or when the domain
-requires complex relevance judgments that cross-encoders struggle with.
-
-\subsection{Hybrid Retrieval and Reciprocal Rank Fusion}
-
-The most robust production RAG systems combine multiple retrieval methods:
-typically BM25 (sparse) + bi-encoder (dense), then fuse the rankings.
-\textbf{Reciprocal Rank Fusion} (RRF) is the standard fusion method:
-
-\begin{mathresult}{Reciprocal Rank Fusion (RRF)}
-Given $m$ rankers, each producing a ranking over documents, the fused score for
-document $d$ is:
-\[
-    \text{RRF}(d) = \sum_{i=1}^{m} \frac{1}{k + \text{rank}_i(d)}
-\]
-where $k$ is a constant (typically $k = 60$) that mitigates the impact of high
-rankings from any single ranker, and $\text{rank}_i(d)$ is the rank of document
-$d$ in the $i$-th ranker's output.
-\end{mathresult}
-
-\paragraph{Why hybrid works.}
-BM25 excels at exact lexical matching (entity names, technical terms); dense
-retrieval excels at semantic matching (paraphrases, conceptual similarity).
-Their failure modes are largely complementary.  Hybrid retrieval with RRF
-consistently outperforms either method alone across diverse benchmarks (BEIR,
-MTEB).
-
-\subsection{Distillation: Best of Both Worlds}
-
-An advanced technique: use a high-quality cross-encoder to score a large set
-of (query, document) pairs, then train a bi-encoder to match these scores.
-The resulting bi-encoder inherits much of the cross-encoder's quality while
-retaining the bi-encoder's efficiency for online retrieval.  This is a common
-pattern at companies that can afford the offline computation.
+\paragraph{Fusion sits immediately before this stage.}
+Because the first stage is two retrievers, their rankings must be merged
+before re-ranking.  Blending raw scores fails---BM25 is unbounded above and
+query-length dependent while cosine concentrates in a narrow band, so no
+single blending weight means the same thing across queries---and the default
+is therefore rank-based reciprocal rank fusion with its standard constant
+($k \approx 60$), which is invariant to any monotone rescaling of either
+system's scores.  The failure analysis, the constant's tuning behavior, and
+learned fusion are [SR 4].  For the pipeline, the point is that fusion is a
+solved default you should ship, not a research problem you should solve.
 
 
 % ============================================================================
@@ -945,7 +808,12 @@ and interviewers expect you to articulate this decomposition.
 A common interview question asks when to use RAG versus fine-tuning versus
 simply stuffing all documents into a long context window.  These are not
 mutually exclusive---they can be combined---but understanding the tradeoffs
-is critical for system design.
+is critical for system design.  The view here is the pipeline builder's: given
+that you are shipping a RAG system, when is retrieval the wrong tool for a
+part of the problem?  The \emph{architectural} form of the same question---how
+context windows are actually extended, what long-context evaluation measures,
+and how the retrieval-versus-context frontier moves as windows grow---is
+Volume~I, [DL 21].
 
 \subsection{Decision Framework}
 
@@ -1084,8 +952,10 @@ and an LLM.''}
           offline/online split, evaluation strategy, and failure modes
     \item \badgeLseven{L7} Designs for multi-turn conversation (session context),
           discusses guardrails for hallucination, proposes an active learning loop
-          to improve retrieval from user feedback, and addresses scaling (sharding
-          the index, caching frequent queries)
+          that mines grounding signals (which retrieved chunks the answer actually
+          cited) back into retriever training, and addresses scaling---index
+          sharding, cache layers, and the freshness pipeline, whose design is
+          [SR 8]
 \end{itemize}
 
 \followups{How would you handle multi-turn conversations where context from
@@ -1121,7 +991,12 @@ is critical.  \textbf{When to use dense:} semantic search, FAQ matching, when
 queries and documents use different vocabulary.  \textbf{Combine them:} almost
 always in production.  Hybrid retrieval with RRF consistently outperforms
 either alone because their failure modes are complementary.  BM25 catches
-what dense misses (rare terms) and vice versa.
+what dense misses (rare terms) and vice versa.  If the interviewer pushes past
+this into the engines themselves---BM25 parameter tuning and inverted-index
+serving, or the fusion arithmetic and how the two legs are trained---that is
+[SR 2] and [SR 4].  What the RAG answer owes is the routing judgment above,
+plus the acknowledgement that hybrid doubles the operational surface (two
+indexes, two freshness pipelines) and therefore needs per-slice evaluation.
 
 \redflags
 \begin{itemize}
@@ -1480,7 +1355,12 @@ documents is $\sim$200--500ms, acceptable for most applications.
 
 \textbf{Distillation:} for even better bi-encoder performance, use the
 cross-encoder to score a large training set, then train the bi-encoder to
-approximate these scores.
+approximate these scores.  Choosing the handoff depth from marginal-recall
+curves, reranker latency by candidate count and model class, and the
+distillation recipes themselves are canonical in [SR 4]; the pipeline-level
+claim to defend here is that the expensive model must run on few candidates,
+so the first stage is evaluated on recall at its handoff depth, never on
+precision.
 
 \redflags
 \begin{itemize}
@@ -1593,16 +1473,20 @@ failure mode automatically?}
 \stronganswer
 At this scale, every component needs careful engineering.
 
-\textbf{Indexing:} 10M documents at 512 tokens/chunk, assume 5 chunks per
-document $=$ 50M chunks.  At 1024-dimensional embeddings in float32, that is
-$50\text{M} \times 1024 \times 4$ bytes $\approx 200$\,GB of vectors.  Use
-HNSW with scalar quantization (int8) to reduce to $\sim$50\,GB, fitting in
-memory on a single high-memory machine, or shard across multiple nodes.
+\textbf{Indexing:} the chunk multiplier is the number to say out loud, because
+it is the RAG-specific one: 10M documents at 512 tokens/chunk and 5 chunks per
+document is a \emph{50M-vector} index, not a 10M-vector index, and the same
+multiplier applies to every future re-embedding pass and to the churn from
+every edited document.  At 1024-d float32 that is $\sim$200\,GB of raw vectors,
+which int8 quantization cuts roughly $4\times$; sizing the index families
+against each other, and the sharding and replication arithmetic behind it, is
+[SR 3].
 
-\textbf{Retrieval at 1K QPS:} HNSW queries take $\sim$1--5ms each.
-A single machine can handle 200--1000 QPS depending on index size and parameters.
-For 1K QPS, deploy 2--4 retrieval replicas behind a load balancer.  BM25 via
-Elasticsearch scales horizontally with sharding.
+\textbf{Retrieval at 1K QPS:} a graph index answers in single-digit
+milliseconds, so retrieval is a replication problem---a few replicas behind a
+load balancer---rather than a modeling one, and the lexical leg scales
+horizontally by sharding.  Budget the two legs plus fusion as one stage;
+per-stage latency budgets, degradation ladders, and cache layers are [SR 8].
 
 \textbf{Re-ranking:} Work in (query, document) pairs: 1K QPS $\times$ 50
 candidates $=$ 50,000 pairs/second.  Scored sequentially ($\sim$200ms per
@@ -1670,18 +1554,26 @@ vector index across multiple machines?}
           BM25 (sparse, fast, lexical) $\to$ bi-encoder (dense, semantic) $\to$
           ColBERT (late interaction, high quality) $\to$ cross-encoder (highest
           quality, re-ranking only).  Production systems use hybrid retrieval
-          with RRF fusion.
+          with rank-based fusion.  Choosing among them is a RAG decision; the
+          engines, their training recipes, and the fusion arithmetic are
+          [SR 2] and [SR 4].
 
     \item \textbf{Chunking} is deceptively important: chunk size, overlap, and
           method should be treated as hyperparameters.  The parent-child
           pattern resolves the precision-context tradeoff.
 
-    \item \textbf{Vector databases} use ANN algorithms (HNSW, IVF, PQ) to
-          make dense retrieval practical at scale, with tradeoffs between
-          recall, latency, and memory.
+    \item \textbf{Vector indexing} is a recall--latency--memory trade whose
+          recall loss is silent, whose interaction with metadata and ACL
+          filtering is load-bearing, and whose artifact is versioned together
+          with the embedding model.  Those three facts are what a pipeline
+          builder owes; index internals and sizing are [SR 3], and freshness,
+          serving, and monitoring are [SR 8].
 
-    \item \textbf{Re-ranking} with cross-encoders or LLMs dramatically improves
-          precision.  The standard pattern is retrieve-many-then-re-rank-to-few.
+    \item \textbf{Re-ranking} with cross-encoders or LLMs converts first-stage
+          recall into the small, clean context the generator consumes---the
+          standard pattern is retrieve-many-then-re-rank-to-few.  Precision
+          at small $k$ bounds faithfulness, and the reranker's ordering---not
+          just its selection---is what the generator sees.
 
     \item \textbf{Advanced patterns}---HyDE, query decomposition, multi-hop
           retrieval, Self-RAG, agentic RAG, and context compression---address
@@ -1694,7 +1586,9 @@ vector index across multiple machines?}
     \item \textbf{RAG vs.\ fine-tuning vs.\ long context} are complementary
           tools: RAG for dynamic knowledge with attribution, fine-tuning for
           behavior change, long context for small-corpus analysis.  The most
-          common production pattern combines fine-tuning with RAG.
+          common production pattern combines fine-tuning with RAG; the
+          architectural form of the context-versus-retrieval decision is
+          [DL 21].
 \end{enumerate}
 
 \bigskip
