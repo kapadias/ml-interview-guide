@@ -2,5 +2,931 @@
 \label{chap:ml_coding_rounds}
 
 \begin{tldr}
-Placeholder --- this chapter is written in Phase C.
+The ML coding round is not LeetCode and it is not a systems interview: it asks whether you can turn a model you can describe into code that runs, under time pressure, without a framework doing the thinking for you. This chapter covers what the round actually scores, the habits that keep you moving (shape-first development, tiny-input tests, stability by reflex), and a worked canon of sixteen problems spanning all four volumes---attention and optimizers, tokenizers and sampling, BM25 and NDCG and ANN search, logistic regression and k-means and boosting---each with a reference implementation, the traps graders watch for, and a follow-up ladder. It closes with the debug-the-training-code variant and a practice protocol. Every listing in this chapter was executed before it was printed; runnable versions with tests live in \texttt{drills/}.
 \end{tldr}
+
+\section{What the Round Actually Is}
+\label{sec:coding_round_shape}
+
+Three formats dominate. \textbf{Implement from scratch}: ``write multi-head attention in numpy,'' ``code BPE,'' ``implement NDCG''---the most common, and the one this chapter's canon targets. \textbf{Debug broken training code}: you are handed a script that trains badly and asked to find the bugs (Section~\ref{sec:debug_round}); increasingly popular because it discriminates between people who have trained models and people who have read about training models. \textbf{Extend given code}: a working implementation plus ``now add grouped-query attention'' or ``add a KV cache''---which tests whether you can read unfamiliar code as fast as you write your own.
+
+What graders score, in the order they weight it:
+
+\begin{enumerate}
+    \item \textbf{Correctness.} Does it run, and does it produce right answers on a case they can check by hand? Nothing else compensates for a wrong softmax.
+    \item \textbf{Shape and dtype discipline.} Do you know what dimension everything is at every line, and does the code say so? Most failures in this round are shape failures.
+    \item \textbf{API fluency.} Do you reach for \texttt{np.einsum} or a triple loop; do you know \texttt{keepdims}, broadcasting rules, \texttt{argpartition}? Fluency reads as experience.
+    \item \textbf{Testing instinct.} Do you check your own work before being asked---rows summing to one, a mask actually masking, a gradient matching finite differences?
+    \item \textbf{Communication.} Do you say what you are about to do before doing it, so a stuck moment is a conversation rather than a silence?
+\end{enumerate}
+
+Speed matters less than candidates believe. Steady visible progress with a running partial solution beats a heroic sprint that ends in a broken 80-line function; interviewers are calibrated on the former. Budget 35--60 minutes, expect one core problem plus follow-ups, and assume a plain editor---no autocomplete, no LLM, and often no execution at all, which is precisely why the habits below matter.
+
+\begin{warningbox}
+\textbf{Know numpy cold.} Nearly every from-scratch prompt is answerable in numpy, and candidates who only know \texttt{torch.nn} stall the moment they cannot call a layer. You need: broadcasting and \texttt{keepdims}, \texttt{reshape}/\texttt{transpose} for head splitting, boolean masking and \texttt{np.where}, \texttt{argsort}/\texttt{argpartition}, \texttt{einsum} or confident \texttt{@} chaining, and stable \texttt{exp}/\texttt{log} patterns. If you use torch, know how to do these without autograd too---``I'd call \texttt{F.softmax}'' is not an implementation of softmax.
+\end{warningbox}
+
+\section{Strategy: The Habits That Carry the Round}
+\label{sec:coding_strategy}
+
+\textbf{Shapes first, code second.} Before writing a function body, write the shapes as comments---\texttt{Q: (B, H, T, dh)}, \texttt{scores: (B, H, T, T)}, \texttt{out: (B, T, D)}---and keep them updated. This is the single highest-return habit in the round: it prevents the transpose bugs that eat ten minutes, and it shows the interviewer your mental model even if you never finish. When a shape assertion would be cheap, write it: \texttt{assert scores.shape == (B, H, T, T)}.
+
+\textbf{Tiny inputs, immediately.} Construct a case small enough to verify by hand---batch 2, sequence 3, model dimension 4, two heads---and run against it as soon as any code exists. Real tests you can state out loud: attention rows sum to one; the causal mask leaves position $t$ with exactly $t+1$ nonzeros; a permutation of the input permutes the output; a zero learning rate leaves parameters unchanged; loss on a two-class balanced dataset starts near $\ln 2 \approx 0.693$.
+
+\textbf{Incremental verification over big-bang.} Write softmax, test it, then scores, test them, then the mask, then the heads. Candidates who type the whole function and then debug it spend the second half of the interview in a hole; candidates who assemble it in verified pieces are usually still moving at the buzzer.
+
+\textbf{Vectorize where it counts, loop where it does not.} A Python loop over layers, over heads on a whiteboard, or over training steps is fine and often clearer. A Python loop over the batch or over tokens inside an inner product is not---that is the one place where a loop reads as inexperience. Say the trade-off out loud: ``I'll loop over heads for clarity; the vectorized version reshapes to \texttt{(B, H, T, dh)} and batches the matmul.''
+
+\textbf{Numerical stability as reflex.} Subtract the max before \texttt{exp}. Work in log space for products of probabilities. Put \texttt{eps} inside the square root (\texttt{sqrt(var + eps)}), not outside. Use \texttt{log1p}/\texttt{expm1} at small magnitudes, and clip before \texttt{log}. Doing this unprompted is a strong signal; being asked ``what happens with large logits?'' and not knowing is a weak one.
+
+\textbf{Sixty seconds of clarifying questions.} Batched or single sequence? Causal or bidirectional? numpy or torch, and may I use autograd? Do you want the backward pass? Should this handle padding? Each answer can save ten minutes of wrong work, and asking shows seniority---but timebox it, because an interviewer who wanted a five-minute design discussion would have asked a design question.
+
+\begin{keyinsight}
+\textbf{The grader's checklist.} Most rubrics reduce to six checks: (1) does it run; (2) are the shapes right; (3) is the softmax numerically stable; (4) is the mask applied \emph{before} the softmax, not after; (5) did the candidate test anything without being told to; (6) can they state the complexity and the memory footprint. Internalize these and you will pass rounds where you did not finish the code---and fail none where you did.
+\end{keyinsight}
+
+\textbf{When you get stuck.} Say what you know and what you are choosing between, then take the simpler branch: ``I can't remember the exact LayerNorm backward; let me write the forward, define the intermediate values, and derive the three terms.'' Interviewers hint generously when they can see your reasoning and not at all when they cannot. Never silently rewrite from scratch---narrate the pivot and keep the working parts.
+
+\section{The Canon: Sixteen Problems}
+\label{sec:coding_canon}
+
+Each problem below is stated as it is actually asked, with a reference implementation, the traps that decide the grade, and a follow-up ladder. The implementations are deliberately compact---interview-length, not library-quality---and every one has been executed against the tests described in its answer.
+
+\subsection{Deep Learning Core}
+
+\begin{interviewq}
+\textbf{Q: Implement multi-head self-attention with a causal mask in numpy.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+This is the single most-asked ML coding problem at frontier labs. Start by fixing shapes out loud: input \texttt{(B, T, D)}, project to $Q, K, V$, split $D$ into \texttt{H} heads of size \texttt{dh = D // H}, transpose to \texttt{(B, H, T, dh)} so the matmul batches over heads, score with $QK^\top/\sqrt{d_h}$ to get \texttt{(B, H, T, T)}, mask, softmax over the last axis, weight $V$, then merge heads back to \texttt{(B, T, D)} and apply the output projection.
+
+Three details carry the grade. The scale is $\sqrt{d_h}$, the \emph{head} dimension, not $\sqrt{D}$---dot products of $d_h$-dimensional vectors have variance $d_h$ at unit-variance init, and dividing keeps the softmax out of its saturated regime. The mask is applied to the \emph{scores}, before the softmax, by setting masked entries to $-\infty$; zeroing probabilities after the softmax leaves the remaining ones un-normalized and is the classic wrong answer. And the softmax subtracts the row max before exponentiating, which is what keeps large logits from overflowing.
+
+Verify it in front of them: attention rows sum to one; the strictly-upper triangle of the attention matrix is exactly zero; row 0 is $[1, 0, \ldots, 0]$ because the first token can attend only to itself. Then state the cost---$O(T^2 d)$ time and $O(T^2)$ memory per head, which is the fact that motivates FlashAttention (Chapter~\ref{chap:attention_transformers}) and every efficient-attention variant.
+
+\redflags
+\begin{itemize}
+    \item Masking after the softmax, or masking with 0 instead of $-\infty$.
+    \item Scaling by $\sqrt{D}$ instead of $\sqrt{d_h}$, or omitting the scale entirely.
+    \item An unstable softmax with no max subtraction.
+    \item Reshaping heads without the transpose, silently mixing head and sequence dimensions---the bug that still produces plausible-looking output.
+    \item Looping over batch or over positions instead of batching the matmul.
+\end{itemize}
+
+\interviewtest{Whether the architecture you can draw is one you can also write. The head reshape-transpose and the mask-before-softmax ordering are where most candidates lose it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct single-head attention; needs a hint for the head reshape.
+    \item \badgeLsix{L6} Batched multi-head, stable softmax, self-tests the mask, states the complexity.
+    \item \badgeLseven{L7} Adds GQA by broadcasting fewer K/V heads, sketches the KV-cache change for inference, and explains why the $T^2$ matrix is never materialized in a fused kernel.
+\end{itemize}
+
+\followups{``Now add a KV cache for autoregressive decoding.'' ``Make it grouped-query.'' ``Derive the backward pass of the softmax.'' ``What changes for cross-attention?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Multi-head causal self-attention (verified: rows sum to 1, mask holds, row 0 is one-hot).}]
+def softmax(x, axis=-1):
+    x = x - np.max(x, axis=axis, keepdims=True)   # stability: never exp a big number
+    e = np.exp(x)
+    return e / np.sum(e, axis=axis, keepdims=True)
+
+def mha(X, Wq, Wk, Wv, Wo, n_heads, causal=True):
+    B, T, D = X.shape
+    H, dh = n_heads, D // n_heads
+    # (B,T,D) -> (B,T,H,dh) -> (B,H,T,dh) so the matmul batches over heads
+    Q = (X @ Wq).reshape(B, T, H, dh).transpose(0, 2, 1, 3)
+    K = (X @ Wk).reshape(B, T, H, dh).transpose(0, 2, 1, 3)
+    V = (X @ Wv).reshape(B, T, H, dh).transpose(0, 2, 1, 3)
+    scores = Q @ K.transpose(0, 1, 3, 2) / np.sqrt(dh)      # (B,H,T,T)
+    if causal:
+        mask = np.triu(np.ones((T, T), dtype=bool), k=1)    # k=1: keep the diagonal
+        scores = np.where(mask, -np.inf, scores)            # mask BEFORE softmax
+    A = softmax(scores, axis=-1)
+    ctx = (A @ V).transpose(0, 2, 1, 3).reshape(B, T, D)    # merge heads back
+    return ctx @ Wo, A
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement one AdamW update step in numpy.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Maintain two exponential moving averages: $m$ of the gradient and $v$ of its square, with decay rates $\beta_1 = 0.9$ and $\beta_2 = 0.999$. Both start at zero, which biases them toward zero early, so divide by $1 - \beta^t$ to correct---at $t=1$ this rescales $m$ by $1/(1-0.9) = 10$, recovering the raw gradient, which is why the first step has magnitude $\approx \eta$ regardless of gradient scale. Update with $\eta \, \hat m / (\sqrt{\hat v} + \epsilon)$.
+
+The ``W'' is the whole point: weight decay is applied \emph{directly to the parameters}, not added to the gradient. Adding $\lambda \theta$ to $g$ (classic Adam plus L2) means the decay term also passes through the adaptive denominator, so parameters with large historical gradients get decayed less---coupling regularization strength to gradient history, which is not what anyone wants. Decoupled decay makes the regularization uniform and is why AdamW generalizes better in practice.
+
+Sanity checks worth stating: at $t=1$ with no decay the update is $\eta \cdot g/(|g| + \epsilon) \approx \eta \cdot \mathrm{sign}(g)$---Adam's step size is scale-invariant, which is both its strength and the reason a bad learning rate is catastrophic regardless of loss scale. Memory is two extra copies of the parameters, which is the $2\times$ term in optimizer-state accounting (Chapter~\ref{chap:training_optimization}).
+
+\redflags
+\begin{itemize}
+    \item Adding weight decay to the gradient---that is Adam-with-L2, not AdamW.
+    \item Omitting bias correction, then wondering why the first steps are tiny.
+    \item Putting $\epsilon$ inside the square root ($\sqrt{\hat v + \epsilon}$ changes the semantics; the convention is $\sqrt{\hat v} + \epsilon$).
+    \item Using $t$ as the epoch rather than the global step count.
+\end{itemize}
+
+\interviewtest{Whether ``we use AdamW'' corresponds to knowledge of what it does. Bias correction and decoupled decay are the two discriminating details.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct moments and update rule.
+    \item \badgeLsix{L6} Correct decoupled decay and bias correction, explains the $t=1$ behavior.
+    \item \badgeLseven{L7} Discusses optimizer memory, why $\beta_2$ matters for stability at scale, and when to prefer alternatives (Chapter~\ref{chap:training_optimization}).
+\end{itemize}
+
+\followups{``How much memory does this cost for a 7B model?'' ``What breaks with $\beta_2 = 0.9$?'' ``Add gradient clipping.''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={AdamW step (verified: first step $\approx \eta\,\mathrm{sign}(g)$ plus decoupled decay).}]
+def adamw_step(p, g, m, v, t, lr=1e-3, b1=0.9, b2=0.999, eps=1e-8, wd=0.01):
+    m = b1 * m + (1 - b1) * g            # 1st moment
+    v = b2 * v + (1 - b2) * g ** 2       # 2nd moment
+    mhat = m / (1 - b1 ** t)             # bias correction: t is the GLOBAL step
+    vhat = v / (1 - b2 ** t)
+    p = p - lr * (mhat / (np.sqrt(vhat) + eps) + wd * p)   # decay on p, not on g
+    return p, m, v
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement LayerNorm forward and backward in numpy.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Forward is four lines: mean and variance over the feature axis (not the batch axis---that is BatchNorm), normalize with \texttt{sqrt(var + eps)}, then scale and shift by learned $\gamma, \beta$. Cache $\hat x$, the standard deviation, and $\gamma$ for the backward pass.
+
+Backward is the part that separates candidates, and the trick is to remember that $\mu$ and $\sigma$ both depend on every element of $x$, so the gradient has three terms rather than one. With $d\hat x = \mathrm{dout} \cdot \gamma$ and feature dimension $D$:
+\[
+dx = \frac{1}{\sigma}\left(d\hat x - \overline{d\hat x} - \hat x \cdot \overline{d\hat x \cdot \hat x}\right),
+\]
+where the bars are means over the feature axis. The three terms are exactly the direct path, the correction through $\mu$, and the correction through $\sigma$. The parameter gradients sum over all non-feature axes: $d\gamma = \sum \mathrm{dout} \cdot \hat x$, $d\beta = \sum \mathrm{dout}$.
+
+Say how you would check it, then do it: finite differences, $(f(x+\epsilon) - f(x-\epsilon))/2\epsilon$ against a random scalar projection of the output, agreeing to about $10^{-9}$. Offering a gradient check unprompted is one of the strongest signals available in this round.
+
+\redflags
+\begin{itemize}
+    \item Normalizing over the batch axis---that is BatchNorm, and it behaves differently at inference.
+    \item A one-term backward ($dx = d\hat x/\sigma$), which ignores that $\mu$ and $\sigma$ are functions of $x$.
+    \item \texttt{sqrt(var) + eps} instead of \texttt{sqrt(var + eps)}: with zero variance the former divides by $\epsilon$ and explodes.
+    \item Summing $d\gamma$ over the wrong axes.
+\end{itemize}
+
+\interviewtest{Whether you can differentiate through a normalization---the canonical ``do you understand backprop beyond calling .backward()'' probe.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct forward, backward with hints.
+    \item \badgeLsix{L6} Correct three-term backward, verifies numerically.
+    \item \badgeLseven{L7} Explains why RMSNorm drops the mean subtraction and what that buys, and where the normalization sits in pre-norm blocks (Chapter~\ref{chap:activation_normalization}).
+\end{itemize}
+
+\followups{``Now do RMSNorm.'' ``Why is LayerNorm preferred over BatchNorm in transformers?'' ``What is the cost of this op relative to the matmuls?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={LayerNorm forward/backward (verified against finite differences to $8\times10^{-10}$).}]
+def ln_forward(x, gamma, beta, eps=1e-5):
+    mu  = x.mean(-1, keepdims=True)
+    var = x.var(-1, keepdims=True)
+    xhat = (x - mu) / np.sqrt(var + eps)          # eps INSIDE the sqrt
+    return gamma * xhat + beta, (xhat, np.sqrt(var + eps), gamma)
+
+def ln_backward(dout, cache):
+    xhat, std, gamma = cache
+    axes = tuple(range(dout.ndim - 1))            # everything but the feature axis
+    dgamma = (dout * xhat).sum(axis=axes)
+    dbeta  = dout.sum(axis=axes)
+    dxhat  = dout * gamma
+    # three terms: direct, through the mean, through the variance
+    dx = (dxhat - dxhat.mean(-1, keepdims=True)
+          - xhat * (dxhat * xhat).mean(-1, keepdims=True)) / std
+    return dx, dgamma, dbeta
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Write a minimal training loop with gradient clipping in PyTorch.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The loop is short, and every line is a place people plant bugs. Set \texttt{model.train()} at the top of each epoch (and \texttt{model.eval()} plus \texttt{torch.no\_grad()} for validation)---dropout and BatchNorm behave differently, and forgetting this is the most common bug in the debug round. Call \texttt{opt.zero\_grad()} \emph{before} the forward pass, because PyTorch accumulates gradients by default; \texttt{set\_to\_none=True} is the modern default and slightly cheaper. Then forward, loss, \texttt{backward()}, clip, step.
+
+Clipping goes \emph{after} \texttt{backward()} and \emph{before} \texttt{step()}---that is the only window in which gradients exist and have not yet been applied. Use \texttt{clip\_grad\_norm\_}, which rescales the whole gradient vector if its global norm exceeds the threshold, preserving direction; \texttt{clip\_grad\_value\_} clips elementwise and distorts direction, which is why norm clipping is standard. A threshold of 1.0 is the usual starting point, and the returned pre-clip norm is worth logging: a spiking grad norm is the earliest visible symptom of the instabilities in Chapter~\ref{chap:training_optimization}.
+
+Track loss as a running sum weighted by batch size rather than a mean of means---unequal final batches otherwise bias the epoch average, which is the same subtlety that makes gradient accumulation with token-weighted losses non-trivial (Chapter~\ref{chap:loss_functions}). Use \texttt{loss.item()} so you do not retain the graph.
+
+\redflags
+\begin{itemize}
+    \item Missing \texttt{zero\_grad}, so gradients accumulate across batches and training silently degrades.
+    \item Clipping before \texttt{backward()} (no gradients yet) or after \texttt{step()} (too late).
+    \item Never setting train/eval mode.
+    \item Accumulating \texttt{loss} rather than \texttt{loss.item()}, holding the whole graph and leaking memory.
+\end{itemize}
+
+\interviewtest{Whether you have actually written training code. Every line here is muscle memory for someone who has, and a guess for someone who has not.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct loop with the right ordering.
+    \item \badgeLsix{L6} Adds mode switching, no\_grad validation, grad-norm logging, correct loss weighting.
+    \item \badgeLseven{L7} Extends to accumulation, mixed precision with a scaler, and checkpoint/resume semantics.
+\end{itemize}
+
+\followups{``Add gradient accumulation over 4 micro-batches.'' ``Add mixed precision.'' ``How would you resume from a checkpoint exactly?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Training loop (verified: loss falls 0.61 $\to$ 0.10 over six epochs).}]
+def train(model, loader, epochs, lr=1e-3, clip=1.0, device="cpu"):
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    lossf = nn.CrossEntropyLoss()
+    for ep in range(epochs):
+        model.train()                                   # dropout/BN in train mode
+        total, n = 0.0, 0
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad(set_to_none=True)             # BEFORE forward
+            loss = lossf(model(xb), yb)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), clip)  # after bwd, before step
+            opt.step()
+            total += loss.item() * len(xb); n += len(xb)   # weight by batch size
+        yield ep, total / n
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement 2-D convolution as a matrix multiply (im2col).}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+The insight is that convolution is a matmul in disguise: extract every $k_h \times k_w$ patch, flatten each into a row, stack them into a matrix of shape $(H_{out}W_{out}, k_hk_w)$, and multiply by the flattened kernel. That is exactly how cuDNN's non-Winograd path works and why convolutions ride the same tensor cores as everything else (Chapter~\ref{chap:gpu_fundamentals}).
+
+State the output size formula---$\lfloor (H - k_h + 2p)/s \rfloor + 1$---and the cost: im2col replicates each input element up to $k_hk_w$ times, so it trades memory for the ability to call a highly optimized GEMM. That memory blowup is the reason implicit-GEMM kernels exist, which tile the same computation without materializing the matrix.
+
+Verify against a direct double loop over output positions; they should agree exactly. Then extend verbally to channels: with $C_{in}$ input channels the patch row has length $C_{in}k_hk_w$, and with $C_{out}$ filters the kernel matrix is $(C_{in}k_hk_w, C_{out})$, so the whole layer is one GEMM.
+
+\redflags
+\begin{itemize}
+    \item Confusing convolution with cross-correlation without noting it (deep learning libraries implement cross-correlation and call it convolution---no kernel flip).
+    \item Getting the output-size formula wrong, or ignoring stride and padding.
+    \item Not seeing the memory cost of the replicated patches.
+\end{itemize}
+
+\interviewtest{Whether you can see the linear algebra under an operation you normally call as a layer.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Direct nested-loop convolution.
+    \item \badgeLsix{L6} Correct im2col with the GEMM framing and the memory trade-off.
+    \item \badgeLseven{L7} Extends to multi-channel/batched, mentions implicit GEMM and Winograd, connects to arithmetic intensity.
+\end{itemize}
+
+\followups{``Add channels and batching.'' ``What is the arithmetic intensity of this op?'' ``How does a depthwise convolution change the picture?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Conv2d via im2col (verified against a direct loop, exact match).}]
+def im2col(x, kh, kw, stride=1):
+    H, W = x.shape
+    oh, ow = (H - kh)//stride + 1, (W - kw)//stride + 1
+    cols = np.empty((oh*ow, kh*kw))
+    for i in range(oh):
+        for j in range(ow):
+            cols[i*ow + j] = x[i*stride:i*stride+kh, j*stride:j*stride+kw].ravel()
+    return cols, oh, ow
+
+def conv2d(x, kernel, stride=1):
+    cols, oh, ow = im2col(x, *kernel.shape, stride)
+    return (cols @ kernel.ravel()).reshape(oh, ow)   # one GEMM
+\end{lstlisting}
+
+\subsection{Language Modeling and Inference}
+
+\begin{interviewq}
+\textbf{Q: Implement BPE---train the merges on a corpus, then encode a word.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Training is a greedy loop. Represent each word as a tuple of characters plus an end-of-word marker (\texttt{</w>}), keep word counts rather than expanding the corpus, then repeat: count all adjacent symbol pairs weighted by word frequency, take the most frequent pair, merge it everywhere, record it. The merge list \emph{in order} is the model---encoding replays it.
+
+Encoding applies merges by \emph{rank}, not by scanning: split the word into characters, repeatedly find the adjacent pair with the lowest merge rank, and apply it, until no pair is in the merge table. Applying merges in left-to-right textual order instead of rank order is the classic bug and produces a different tokenization than training implied.
+
+Two details worth volunteering. Ties in the pair counts must be broken deterministically or the tokenizer is not reproducible---my version breaks ties on the pair itself. And the end-of-word marker is what lets the tokenizer distinguish word-final from word-internal subwords ($\texttt{est</w>}$ versus \texttt{est}), which matters for reconstructing text. Verify by checking that encoding an unseen word built from seen pieces (``lowest'' from ``low'' and ``est'') yields a small number of subwords rather than characters, and that concatenating the pieces reproduces the input.
+
+Mention the algorithmic caveat: the naive implementation is $O(\text{merges} \times \text{corpus})$; real trainers maintain incremental pair counts and an index from pairs to affected words. Full comparison with WordPiece and Unigram lives in [NLP 12].
+
+\redflags
+\begin{itemize}
+    \item Applying merges in scan order rather than by rank at encode time.
+    \item Losing the merge \emph{order}---a set of merges is not a BPE model.
+    \item Non-deterministic tie-breaking.
+    \item Expanding the corpus into a list of words instead of using counts (works, but shows no thought about scale).
+\end{itemize}
+
+\interviewtest{Whether you understand tokenizers as trained artifacts with a train/encode asymmetry, rather than as a preprocessing black box.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Working trainer and encoder on a toy corpus.
+    \item \badgeLsix{L6} Rank-based encoding, deterministic ties, end-of-word handling, complexity discussion.
+    \item \badgeLseven{L7} Contrasts with WordPiece's likelihood criterion and Unigram's pruning, and discusses vocabulary-size trade-offs and multilingual fertility.
+\end{itemize}
+
+\followups{``How would you make training scale to a large corpus?'' ``How does WordPiece differ?'' ``What breaks if you change the tokenizer but keep the model?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={BPE train + encode (verified: ``lowest'' encodes to the two subwords \texttt{low} and \texttt{est</w>}).}]
+def bpe_train(corpus, num_merges):                  # corpus: {word: count}
+    vocab = Counter({tuple(w) + ("</w>",): c for w, c in corpus.items()})
+    merges = []
+    for _ in range(num_merges):
+        pairs = Counter()
+        for sym, cnt in vocab.items():
+            for i in range(len(sym) - 1):
+                pairs[(sym[i], sym[i+1])] += cnt    # weight by word frequency
+        if not pairs: break
+        best = max(pairs.items(), key=lambda kv: (kv[1], kv[0]))[0]  # deterministic ties
+        merges.append(best)
+        new = Counter()
+        for sym, cnt in vocab.items():
+            i, out = 0, []
+            while i < len(sym):
+                if i < len(sym)-1 and (sym[i], sym[i+1]) == best:
+                    out.append(sym[i] + sym[i+1]); i += 2
+                else:
+                    out.append(sym[i]); i += 1
+            new[tuple(out)] += cnt
+        vocab = new
+    return merges                                   # ORDER is the model
+
+def bpe_encode(word, merges):
+    sym = list(word) + ["</w>"]
+    rank = {m: i for i, m in enumerate(merges)}
+    while True:
+        pairs = [(rank.get((sym[i], sym[i+1]), np.inf), i) for i in range(len(sym)-1)]
+        if not pairs: break
+        r, i = min(pairs)                           # lowest RANK, not leftmost
+        if r == np.inf: break
+        sym[i:i+2] = [sym[i] + sym[i+1]]
+    return sym
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement sampling from logits with temperature, top-$k$, and top-$p$.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Order matters and is the whole question. Divide logits by the temperature first (lower temperature sharpens; $T \to 0$ approaches greedy, $T > 1$ flattens). Then filter: top-$k$ keeps the $k$ largest logits, top-$p$ keeps the smallest prefix of the sorted distribution whose cumulative probability reaches $p$. Only \emph{after} filtering do you take the softmax and sample---renormalizing over the survivors is the point, and computing probabilities before masking and then sampling from an un-normalized vector is the standard bug.
+
+Set filtered logits to $-\infty$ rather than deleting entries, so indices still line up with the vocabulary. For top-$p$, always keep at least one token: use the strictly-less-than-$p$ cumulative test on the exclusive prefix sum (\texttt{cum - probs < p}), which retains the first token even when it alone exceeds $p$---otherwise a confident distribution can produce an empty candidate set and a crash.
+
+Verify: with $k=2$ exactly two probabilities are nonzero and they sum to 1; lowering temperature increases the top token's probability; top-$p$ at 0.7 on a peaked distribution keeps only the head. Mention min-$p$ as the 2024-era alternative that thresholds relative to the max probability and behaves better at high temperature (Chapter~\ref{chap:nlp_architectures}), and note that these are applied at every decoding step.
+
+\redflags
+\begin{itemize}
+    \item Softmaxing before filtering and never renormalizing.
+    \item Applying temperature to probabilities instead of logits.
+    \item Top-$p$ that can return an empty set.
+    \item Sorting the whole vocabulary when \texttt{argpartition} suffices for top-$k$ (fine in an interview, worth naming).
+\end{itemize}
+
+\interviewtest{Whether you know what the decoding parameters you tune every day actually do to the distribution, in the right order.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct temperature and top-$k$.
+    \item \badgeLsix{L6} Correct top-$p$ with the keep-one guard and renormalization after masking.
+    \item \badgeLseven{L7} Adds min-$p$, repetition penalties, and how these interact with structured decoding and speculative sampling.
+\end{itemize}
+
+\followups{``Add a repetition penalty.'' ``What is min-$p$ and why does it help at high temperature?'' ``How does this interact with a JSON grammar constraint?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Sampling with temperature/top-$k$/top-$p$ (verified: masked probs renormalize to 1).}]
+def sample_next(logits, temperature=1.0, top_k=None, top_p=None, rng=None):
+    logits = logits.astype(np.float64).copy()
+    if temperature != 1.0:
+        logits = logits / max(temperature, 1e-6)          # temperature on LOGITS
+    if top_k is not None:
+        kth = np.partition(logits, -top_k)[-top_k]
+        logits[logits < kth] = -np.inf
+    if top_p is not None:
+        order = np.argsort(-logits)
+        probs = softmax(logits[order])
+        cum = np.cumsum(probs)
+        keep = cum - probs < top_p                        # exclusive prefix: keeps token 0
+        logits[order[~keep]] = -np.inf
+    p = softmax(logits)                                   # renormalize AFTER masking
+    return int(rng.choice(len(p), p=p)), p
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement greedy decoding with a KV cache.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The observation that makes decoding tractable: in a causal model, the keys and values for tokens already generated never change, so recomputing them each step is pure waste. Cache them, and each new token costs one query against a growing cache---$O(T)$ per step instead of $O(T^2)$, turning the whole generation from cubic to quadratic in total.
+
+Structure it as prefill then decode. Prefill runs the prompt once and stores $K, V$ for every prompt position. Each decode step then: takes only the \emph{last} token's embedding, computes a single query vector, attends over the whole cache, picks the argmax, appends the new token's $K, V$ to the cache, and repeats. Only one query per step---computing queries for cached positions is the most common mistake here.
+
+The check to run out loud, and the one that convinces an interviewer, is equivalence: a cached decoder must produce token-for-token identical output to a naive implementation that recomputes everything each step. State the memory cost, since that is what the follow-up will be: $2 \times L \times H_{kv} \times d_h \times T$ times the dtype width, which is the arithmetic behind MQA/GQA/MLA and paged attention (Chapters~\ref{chap:attention_transformers} and~\ref{chap:inference_optimization}).
+
+\redflags
+\begin{itemize}
+    \item Recomputing $Q$ for all positions, which defeats the cache entirely.
+    \item Forgetting to append the newly sampled token's $K, V$, so the model cannot see what it just wrote.
+    \item Growing the cache by reallocating and copying every step instead of appending (fine in an interview, worth naming for production).
+    \item Not knowing the cache's memory footprint.
+\end{itemize}
+
+\interviewtest{Whether you understand why inference is memory-bandwidth-bound rather than compute-bound, from the code up.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct cached loop for one layer.
+    \item \badgeLsix{L6} Clean prefill/decode split, verifies equivalence against recomputation, states the memory formula.
+    \item \badgeLseven{L7} Extends to batched decoding with ragged lengths, discusses paged attention and prefix sharing, and connects to the roofline (Chapter~\ref{chap:gpu_fundamentals}).
+\end{itemize}
+
+\followups{``Now batch it with different sequence lengths.'' ``How much memory for 7B at 128K context?'' ``How would you add speculative decoding?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Greedy decode with a KV cache (verified: token-identical to full recomputation).}]
+def greedy_decode(prompt, Wq, Wk, Wv, Wemb, n_new):
+    D = Wq.shape[0]
+    toks = list(prompt)
+    K = [Wemb[t] @ Wk for t in toks]           # prefill: one pass over the prompt
+    V = [Wemb[t] @ Wv for t in toks]
+    for _ in range(n_new):
+        q = Wemb[toks[-1]] @ Wq                # ONE query: only the newest token
+        att = softmax(q @ np.stack(K).T / np.sqrt(D))
+        logits = Wemb @ (att @ np.stack(V))    # tied output embedding
+        nxt = int(logits.argmax())
+        toks.append(nxt)
+        K.append(Wemb[nxt] @ Wk)               # extend cache by one row
+        V.append(Wemb[nxt] @ Wv)
+    return toks
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement beam search with length normalization.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Maintain $B$ partial hypotheses, each with a cumulative \emph{log}-probability. At each step expand every beam by its top-$B$ continuations, pool all $B^2$ candidates, and keep the best $B$. Finished hypotheses (those emitting EOS) move to a completed list rather than continuing to be expanded, otherwise they crowd the beam.
+
+Two correctness details. Work in log space and \emph{add}---multiplying probabilities underflows within a few dozen tokens. And normalize by length before the final selection: raw log-probability is monotonically decreasing in length, so an unnormalized beam search systematically prefers short outputs, which in translation shows up as truncated sentences. The standard fix divides by $|y|^\alpha$ with $\alpha \approx 0.6$--$0.7$ (the GNMT convention).
+
+Worth saying: beam search maximizes sequence likelihood, which is the right objective for translation and summarization but produces bland, repetitive text for open-ended generation---the ``likelihood trap'' that is why sampling won for chat models. Verify by checking that the beam result's score is at least the greedy result's score, since greedy is beam search with $B=1$.
+
+\redflags
+\begin{itemize}
+    \item Multiplying probabilities instead of summing logs.
+    \item No length normalization, then not knowing why outputs are short.
+    \item Letting finished hypotheses keep expanding, or stopping the whole search at the first EOS.
+    \item Claiming larger beams are monotonically better---beyond a point they degrade quality on open-ended tasks.
+\end{itemize}
+
+\interviewtest{Whether you can manage a search frontier correctly and know what objective the search is actually optimizing.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct beam maintenance in log space.
+    \item \badgeLsix{L6} Adds length normalization and correct EOS handling, notes greedy as $B=1$.
+    \item \badgeLseven{L7} Discusses the likelihood trap, diverse beam search, and why chat models sample instead.
+\end{itemize}
+
+\followups{``Why does beam search hurt open-ended generation?'' ``Add coverage or repetition penalties.'' ``What is the memory cost with a KV cache per beam?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Beam search (verified: beam score $\ge$ greedy score).}]
+def beam_search(step_fn, start, beam=3, max_len=5, eos=0, alpha=0.7):
+    beams, done = [([start], 0.0)], []                  # (tokens, sum of log probs)
+    for _ in range(max_len):
+        cand = []
+        for toks, lp in beams:
+            logp = np.log(step_fn(toks) + 1e-12)        # log space: ADD, never multiply
+            for tok in np.argsort(-logp)[:beam]:
+                nxt = (toks + [int(tok)], lp + float(logp[tok]))
+                (done if tok == eos else cand).append(nxt)
+        if not cand: break
+        beams = sorted(cand, key=lambda x: x[1], reverse=True)[:beam]
+    done += beams
+    return max(done, key=lambda x: x[1] / (len(x[0]) ** alpha))   # length-normalized
+\end{lstlisting}
+
+\subsection{Search and Recommendation}
+
+\begin{interviewq}
+\textbf{Q: Build a toy inverted index and score queries with BM25.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Two pieces. The index maps each term to a postings list of \texttt{(doc\_id, term\_frequency)} pairs, built by tokenizing each document once and counting; store document lengths alongside, since BM25 needs them. Scoring iterates over \emph{query terms} (not documents), accumulating each term's contribution into a score dictionary---that term-at-a-time structure is exactly why retrieval cost scales with postings length rather than corpus size.
+
+The formula has two knobs and both should be explained while typing: $k_1$ controls term-frequency saturation---the contribution approaches $k_1 + 1$ asymptotically, so the tenth occurrence of a word adds far less than the second, unlike raw TF---and $b$ controls length normalization against the average document length, penalizing long documents that match by sheer size. Use the Lucene IDF form $\ln(1 + (N - df + 0.5)/(df + 0.5))$, which is always positive; the textbook Robertson-Sparck-Jones form goes negative for terms appearing in more than half the documents, which is a real bug in naive implementations.
+
+Test with a document that repeats a query term many times and is long: BM25 should rank it below a short, focused match, which is the behavior TF-IDF fails to produce. The derivation lives in [NLP 1] and the systems view in [SR 2].
+
+\redflags
+\begin{itemize}
+    \item Implementing raw TF-IDF and calling it BM25 (no saturation, no length normalization).
+    \item Using an IDF that can go negative without noticing.
+    \item Iterating over all documents per query instead of over postings.
+    \item Not storing document lengths, making $b$ inoperative.
+\end{itemize}
+
+\interviewtest{Whether ``we use BM25'' means you know what the formula does mechanically---saturation and length normalization are the two ideas.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Working index and scorer.
+    \item \badgeLsix{L6} Explains $k_1$/$b$ with the saturation curve, uses a safe IDF, notes the postings-driven cost.
+    \item \badgeLseven{L7} Sketches WAND/block-max pruning, field weighting (BM25F), and where hybrid retrieval fits ([SR 2], [SR 4]).
+\end{itemize}
+
+\followups{``How would you return the top-10 without scoring every posting?'' ``Add field weights.'' ``When does BM25 beat a dense retriever?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Inverted index + BM25 (verified: short focused doc outranks a long keyword-stuffed one).}]
+def build_index(docs):                                # docs: {doc_id: text}
+    index, dl = {}, {}
+    for did, text in docs.items():
+        toks = text.lower().split(); dl[did] = len(toks)
+        for term, tf in Counter(toks).items():
+            index.setdefault(term, []).append((did, tf))
+    return index, dl
+
+def bm25(query, index, dl, k1=1.5, b=0.75):
+    N = len(dl); avgdl = sum(dl.values()) / N
+    scores = Counter()
+    for term in query.lower().split():                # iterate QUERY terms
+        postings = index.get(term, [])
+        if not postings: continue
+        df = len(postings)
+        idf = np.log(1 + (N - df + 0.5) / (df + 0.5)) # Lucene form: always positive
+        for did, tf in postings:
+            denom = tf + k1 * (1 - b + b * dl[did] / avgdl)
+            scores[did] += idf * tf * (k1 + 1) / denom  # saturating in tf
+    return scores.most_common()
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement NDCG@k.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+DCG sums each result's gain divided by a positional discount; NDCG divides that by the DCG of the ideal ranking, putting it on $[0, 1]$ so scores are comparable across queries with different numbers of relevant documents.
+
+Two conventions decide correctness. The discount is $\log_2(i + 1)$ for one-indexed position $i$, so position 1 gets $\log_2 2 = 1$ (no discount) and position 2 gets $\log_2 3 \approx 1.585$---implementing it as $\log_2(i)$ divides by zero at the first position, the single most common bug. The gain is either linear ($rel_i$) or exponential ($2^{rel_i} - 1$); the exponential form is the industry default because it sharply rewards highly relevant results, and the two give materially different numbers on the same list---for $[3,2,3,0,1,2]$, exponential gain gives $0.9488$ while linear gives about $0.785$. State which you are using, because an interviewer checking against their own reference will otherwise think you are wrong.
+
+Handle the degenerate cases explicitly: if no document is relevant, IDCG is zero and NDCG should be defined as 0 rather than raising. Note that the ideal ranking is computed over the judged documents you have, so unjudged relevant documents silently inflate the score---the ``holes'' problem ([SR 7]).
+
+\redflags
+\begin{itemize}
+    \item $\log_2(i)$ instead of $\log_2(i+1)$---infinite first term.
+    \item Forgetting to truncate the \emph{ideal} list at $k$ as well.
+    \item No zero-IDCG guard.
+    \item Not stating the gain convention.
+\end{itemize}
+
+\interviewtest{Whether you can implement the metric your ranking work is evaluated on, including the two conventions that make numbers incomparable.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct DCG/NDCG with proper discount.
+    \item \badgeLsix{L6} Handles both gain conventions, truncation, and the zero case; knows why normalization matters across queries.
+    \item \badgeLseven{L7} Discusses judgment holes, ties, and when NDCG is the wrong metric (recall-oriented candidate generation, [SR 7]).
+\end{itemize}
+
+\followups{``Now MRR and MAP.'' ``What if relevance labels are missing for some results?'' ``How would you compute confidence intervals over queries?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={NDCG@k (verified: relevances 3,2,3,0,1,2 give 0.9488 with exponential gain).}]
+def dcg(rels, k):
+    rels = np.asarray(rels[:k], dtype=float)
+    disc = np.log2(np.arange(2, len(rels) + 2))   # position i -> log2(i+1), i one-indexed
+    return float(((2 ** rels - 1) / disc).sum())  # exponential gain (state the convention)
+
+def ndcg(rels, k):
+    idcg = dcg(sorted(rels, reverse=True), k)     # ideal list ALSO truncated at k
+    return dcg(rels, k) / idcg if idcg > 0 else 0.0
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement the in-batch softmax loss for a two-tower retrieval model.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The setup: a batch of $B$ (query, positive-item) pairs, each tower producing an embedding. Score all pairs into a $B \times B$ logit matrix; the diagonal holds the positives and every off-diagonal entry is a free negative---that reuse is why in-batch negatives are the default, and why batch size functions as a quality hyperparameter here rather than just a throughput knob. The loss is cross-entropy over each row with the diagonal as the label, which is InfoNCE.
+
+Two details to volunteer. The temperature divides the logits and controls how hard the loss pushes on near-misses; with L2-normalized embeddings, cosine similarities live in $[-1, 1]$ and a temperature around $0.05$ is typical, since without it the logits are too flat to learn from. And in-batch sampling is not uniform---popular items appear as negatives far more often, so the model learns to suppress them; the logQ correction subtracts $\log Q(j)$, the sampling probability, from each logit to debias it (Chapter~\ref{chap:recommendation}, [SR 6]).
+
+Compute the loss with a stable log-sum-exp rather than logging a sum of exponentials. Verify by checking that a perfectly aligned batch (positives identical to queries) gives near-zero loss while a random batch gives roughly $\ln B$, the uniform-guessing value---a check that catches both sign errors and axis errors.
+
+\redflags
+\begin{itemize}
+    \item Softmaxing over the wrong axis, so negatives come from the wrong tower.
+    \item No temperature, or a temperature applied after the softmax.
+    \item Treating false negatives (a duplicate of the positive elsewhere in the batch) as true negatives without mentioning the problem.
+    \item Unstable log-sum-exp.
+\end{itemize}
+
+\interviewtest{Whether you understand contrastive retrieval training as a classification problem over the batch, and know the sampling bias it introduces.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct matrix of scores and cross-entropy.
+    \item \badgeLsix{L6} Adds temperature, stability, and the false-negative caveat.
+    \item \badgeLseven{L7} Adds logQ correction, hard-negative mixing, and how the trained towers are served (ANN over the item tower, [SR 3]).
+\end{itemize}
+
+\followups{``Add the logQ correction.'' ``How would you mine hard negatives?'' ``What changes when serving---which tower runs at query time?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Two-tower in-batch softmax loss (verified: aligned $\approx 0$, random $\approx \ln B$).}]
+def two_tower_loss(U, V, temperature=0.05, logQ=None):
+    """U, V: (B, d) L2-normalized. Positives are the diagonal; the rest are negatives."""
+    logits = U @ V.T / temperature                  # (B, B)
+    if logQ is not None:
+        logits = logits - logQ                      # sampled-softmax bias correction
+    labels = np.arange(len(U))
+    mx = logits.max(1, keepdims=True)               # stable log-sum-exp
+    logZ = np.log(np.exp(logits - mx).sum(1)) + mx.squeeze(1)
+    return float(np.mean(logZ - logits[labels, labels]))
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement greedy graph search over a fixed HNSW-style neighbor graph.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Scope it honestly first---``I'll implement search over a given graph rather than the full insert-with-layers construction, which is a much longer problem''---then write beam search over the graph. Keep a min-heap frontier of candidates ordered by distance to the query, a max-heap of the best \texttt{ef} results found so far, and a visited set. Pop the closest unexplored candidate, evaluate its unvisited neighbors, and push any that improve on the current worst result. Stop when the closest remaining candidate is farther than the worst kept result---at that point no unexplored path can improve the answer, which is the termination condition that makes the search fast.
+
+The parameter to explain is \texttt{ef}: it is the beam width, and it is the recall-latency dial. Larger \texttt{ef} explores more of the graph, finds more true neighbors, and costs proportionally more distance computations; \texttt{ef} is set at query time independently of the index, which is why HNSW can trade recall for latency without rebuilding. Mention that the full algorithm runs this same routine on each layer of a hierarchy, using the result of the coarse layer as the entry point for the next.
+
+Verify against brute force on a small point set---the returned neighbors should match exactly at generous \texttt{ef}, and the exercise of watching recall fall as \texttt{ef} shrinks is the intuition the interviewer is after. Theory in [SR 3].
+
+\redflags
+\begin{itemize}
+    \item No visited set, so the search revisits nodes and may not terminate.
+    \item Terminating at the first local minimum without the frontier-versus-results comparison, which collapses recall.
+    \item Confusing the result heap's ordering with the candidate heap's (one wants nearest, the other farthest).
+    \item Claiming HNSW gives exact results.
+\end{itemize}
+
+\interviewtest{Whether ``we use HNSW'' corresponds to a mental model of graph traversal with a tunable beam, rather than a library call.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Plain greedy descent to a local minimum.
+    \item \badgeLsix{L6} Correct beam search with visited set and proper termination; explains \texttt{ef}.
+    \item \badgeLseven{L7} Describes layer construction and $M$, the delete/update problem, and when IVF-PQ or DiskANN is the better choice ([SR 3]).
+\end{itemize}
+
+\followups{``How does insertion build the graph?'' ``Why does deletion hurt?'' ``How would you cut memory 10x?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Greedy/beam search over a neighbor graph (verified: matches brute force at ef=6).}]
+def greedy_search(q, entry, graph, vectors, ef=4, k=2):
+    def dist(i): return float(np.linalg.norm(vectors[i] - q))
+    visited = {entry}
+    cand = [(dist(entry), entry)]            # min-heap: closest unexplored first
+    best = [(-dist(entry), entry)]           # max-heap: worst-of-the-best on top
+    while cand:
+        d, node = heapq.heappop(cand)
+        if -best[0][0] < d and len(best) >= ef:
+            break                            # frontier worse than results: done
+        for nb in graph[node]:
+            if nb in visited: continue
+            visited.add(nb); dn = dist(nb)
+            if len(best) < ef or dn < -best[0][0]:
+                heapq.heappush(cand, (dn, nb)); heapq.heappush(best, (-dn, nb))
+                if len(best) > ef: heapq.heappop(best)
+    return [i for _, i in sorted((-nd, i) for nd, i in best)][:k]
+\end{lstlisting}
+
+\subsection{Classical Machine Learning}
+
+\begin{interviewq}
+\textbf{Q: Implement logistic regression with SGD from scratch, deriving the gradient.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Derive before you type, because the derivation is the elegant part. With $z = w^\top x + b$, $p = \sigma(z)$, and log loss $L = -[y\log p + (1-y)\log(1-p)]$, the chain rule gives $\partial L/\partial p = (p - y)/(p(1-p))$ and $\sigma'(z) = p(1-p)$, so those cancel exactly: $\partial L/\partial z = p - y$. The gradient is therefore $(p - y)x$ for the weights and $(p - y)$ for the bias---the same clean form as linear regression with squared loss, which is not a coincidence but a property of matched link and loss in exponential families.
+
+Then the implementation notes that show experience. Shuffle each epoch (a fixed order induces correlated updates). Apply L2 to the weights but not the bias---penalizing the intercept shifts predictions toward $p = 0.5$ for no benefit. For numerical stability in a production version, compute the loss with \texttt{logaddexp} rather than logging $\sigma$ directly, since $\log \sigma(z)$ underflows for large negative $z$.
+
+Verify: on separable-ish synthetic data accuracy should be high (mine reaches 0.98), and the learned weight vector should be nearly collinear with the true one---note that the \emph{magnitude} grows without bound on separable data unless regularized, which is a nice thing to observe unprompted. Compare briefly to the batch/Newton alternative: IRLS converges in a handful of iterations for small $d$, while SGD is what scales.
+
+\redflags
+\begin{itemize}
+    \item Not being able to derive $p - y$, or deriving it with a sign error.
+    \item Regularizing the bias.
+    \item Never shuffling.
+    \item Computing $\log(\sigma(z))$ naively and being surprised by NaNs.
+\end{itemize}
+
+\interviewtest{Whether the most basic classifier in the field is something you can derive and implement, not just call. Interviewers use it as a floor check.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct gradient and working SGD loop.
+    \item \badgeLsix{L6} Adds shuffling, L2 excluding bias, stability, and the separable-data divergence observation.
+    \item \badgeLseven{L7} Contrasts with IRLS/L-BFGS, discusses calibration and class imbalance handling ([CML 1]).
+\end{itemize}
+
+\followups{``Extend to multiclass softmax.'' ``What happens on perfectly separable data?'' ``How would you calibrate the output probabilities?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Logistic regression via SGD (verified: 98\% accuracy, weights collinear with truth).}]
+def logreg_sgd(X, y, lr=0.1, epochs=200, l2=0.0, seed=0):
+    rs = np.random.default_rng(seed)
+    n, d = X.shape
+    w, b = np.zeros(d), 0.0
+    for _ in range(epochs):
+        for i in rs.permutation(n):                # shuffle every epoch
+            p = 1 / (1 + np.exp(-(X[i] @ w + b)))
+            g = p - y[i]                           # dL/dz for log loss: the whole trick
+            w -= lr * (g * X[i] + l2 * w)          # L2 on weights...
+            b -= lr * g                            # ...but NOT on the bias
+    return w, b
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement k-means with k-means++ initialization.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Lloyd's algorithm alternates two steps: assign each point to its nearest centroid, then move each centroid to the mean of its assigned points. Vectorize the assignment---compute the full $(n, k)$ distance matrix by broadcasting and take an \texttt{argmin}---rather than looping over points, and note you can skip the square root since \texttt{argmin} is unchanged by a monotone transform.
+
+Two things must be handled or the implementation is wrong in practice. \textbf{Empty clusters}: if no point is assigned to a centroid, the mean is undefined (\texttt{nan}) and the run silently corrupts; the standard repair is to reseed that centroid on the point currently farthest from any centroid. \textbf{Initialization}: uniformly random seeds routinely converge to bad local optima---I hit exactly that while testing this code, getting an inertia of 662 on three well-separated blobs where the right answer is about 25. k-means++ fixes it by choosing each new seed with probability proportional to squared distance from the nearest existing seed, spreading the initial centroids apart, and it comes with an $O(\log k)$ approximation guarantee.
+
+Converge on centroid movement below a tolerance rather than a fixed iteration count, and report inertia (within-cluster sum of squares). Note that inertia decreases monotonically in $k$, so it cannot select $k$ by itself---that is what the elbow heuristic, silhouette score, or a downstream task metric are for, and it is the natural follow-up.
+
+\redflags
+\begin{itemize}
+    \item No empty-cluster handling, producing \texttt{nan} centroids.
+    \item Purely random init with no acknowledgment of local optima or restarts.
+    \item A Python loop over points for assignment.
+    \item Claiming k-means finds the global optimum, or using inertia to choose $k$.
+\end{itemize}
+
+\interviewtest{Whether you know the failure modes of the simplest clustering algorithm---empty clusters and bad initialization are the two that bite in production.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct Lloyd iteration, vectorized.
+    \item \badgeLsix{L6} Adds k-means++, empty-cluster repair, convergence check, and the $k$-selection caveat.
+    \item \badgeLseven{L7} Discusses mini-batch k-means at scale, the spherical-cluster assumption versus GMMs, and when to use something else entirely ([CML 3]).
+\end{itemize}
+
+\followups{``How do you choose $k$?'' ``What if clusters are elongated?'' ``How would you scale to 100M points?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={k-means with k-means++ (verified: inertia 25.4 vs 662 from a bad random init).}]
+def kmeans(X, k, iters=50, seed=0):
+    rs = np.random.default_rng(seed)
+    C = [X[rs.integers(len(X))]]                                  # k-means++ seeding
+    for _ in range(k - 1):
+        d2 = ((X[:, None, :] - np.array(C)[None]) ** 2).sum(-1).min(1)
+        C.append(X[rs.choice(len(X), p=d2 / d2.sum())])           # far points favored
+    C = np.array(C)
+    for _ in range(iters):
+        d = ((X[:, None, :] - C[None, :, :]) ** 2).sum(-1)        # (n,k), vectorized
+        a = d.argmin(1)
+        newC = C.copy()
+        for j in range(k):
+            if (a == j).any():
+                newC[j] = X[a == j].mean(0)
+            else:
+                newC[j] = X[d.min(1).argmax()]                    # empty: reseed farthest
+        if np.allclose(newC, C): break
+        C = newC
+    return C, a, float(((X - C[a]) ** 2).sum())                   # centroids, labels, inertia
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement gradient boosting with decision stumps.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Boosting fits an additive model stagewise: initialize with a constant (the mean, which is the optimal constant under squared loss), then repeatedly compute the negative gradient of the loss with respect to the current predictions---for squared loss that is exactly the residual $y - F$---fit a weak learner to it, and add a shrunken version to the ensemble. Saying ``residuals are the negative gradient, which is why this generalizes to any differentiable loss'' is the sentence that distinguishes a real understanding from a memorized recipe.
+
+The stump finds the best axis-aligned split by sorting each feature and scanning candidate thresholds, choosing the split that minimizes the squared error of the two leaf means. That is $O(nd\log n)$ per tree; mention that histogram binning (LightGBM) replaces the scan with an $O(nd)$ pass over precomputed bins, which is the main reason it is fast ([CML 2]).
+
+The learning rate is doing real work: each tree is added scaled by $\eta \approx 0.1$, so the ensemble takes many small steps rather than a few greedy ones, and shrinkage plus more rounds reliably beats fewer, larger steps. State the classic trade-off---lower $\eta$ needs proportionally more trees---and that the number of rounds must be chosen by early stopping on a validation set, since training error decreases monotonically. Verify by checking the ensemble beats the constant baseline substantially (mine reaches MSE 0.059 against a baseline of 1.43 on a sine-plus-linear target).
+
+\redflags
+\begin{itemize}
+    \item Fitting the trees to the labels rather than to the residuals (that is bagging, not boosting).
+    \item No learning rate, or claiming $\eta = 1$ is fine.
+    \item Not knowing that residuals are a special case of the negative gradient, so unable to extend to log loss.
+    \item Choosing the number of rounds by training error.
+\end{itemize}
+
+\interviewtest{Whether you understand boosting as functional gradient descent rather than as a library with good defaults---the setup for every XGBoost follow-up.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Working residual-fitting loop with shrinkage.
+    \item \badgeLsix{L6} Frames it as gradient descent in function space, explains $\eta$/rounds and early stopping.
+    \item \badgeLseven{L7} Extends to log loss with second-order (Newton) steps, recovering the XGBoost leaf-weight formula ([CML 2]).
+\end{itemize}
+
+\followups{``Now do it for classification with log loss.'' ``Where does the second-order term come from in XGBoost?'' ``How does LightGBM make split finding fast?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Gradient boosting with stumps (verified: MSE 0.059 vs 1.43 baseline).}]
+def fit_stump(X, g):                      # best axis-aligned split on the residuals
+    best = (np.inf, 0, 0.0, 0.0, 0.0)
+    for f in range(X.shape[1]):
+        order = np.argsort(X[:, f]); xs, gs = X[order, f], g[order]
+        for i in range(1, len(xs)):
+            if xs[i] == xs[i-1]: continue
+            L, R = gs[:i], gs[i:]
+            sse = ((L - L.mean())**2).sum() + ((R - R.mean())**2).sum()
+            if sse < best[0]:
+                best = (sse, f, (xs[i] + xs[i-1]) / 2, L.mean(), R.mean())
+    _, f, thr, vl, vr = best
+    return f, thr, vl, vr
+
+def gbm_fit(X, y, n_rounds=60, lr=0.1):
+    F = np.full(len(y), y.mean())         # optimal constant under squared loss
+    trees = []
+    for _ in range(n_rounds):
+        resid = y - F                     # = negative gradient of squared loss
+        f, thr, vl, vr = fit_stump(X, resid)
+        F += lr * np.where(X[:, f] <= thr, vl, vr)   # shrinkage: many small steps
+        trees.append((f, thr, vl, vr))
+    return trees, y.mean()
+\end{lstlisting}
+
+\section{The Debug-the-Training-Code Round}
+\label{sec:debug_round}
+
+You are handed 40 lines of training code that runs but trains badly---loss plateaus, or diverges, or the validation number is suspiciously good---and asked to find the bugs. This format is spreading because it cannot be prepared for by memorizing implementations; it rewards having debugged your own training runs.
+
+\begin{keyinsight}
+\textbf{The planted-bug taxonomy.} Almost every planted bug is one of these eight, and they are worth being able to recite: (1) missing \texttt{optimizer.zero\_grad()}, so gradients accumulate across batches; (2) never calling \texttt{model.train()}/\texttt{model.eval()}, so dropout and BatchNorm behave wrongly at one end; (3) an off-by-one in the causal mask, letting the model see the token it predicts---or masking the diagonal and producing NaNs; (4) the wrong loss reduction, or a mean-of-means over unequal batches; (5) a learning rate one or two orders of magnitude too high; (6) data leakage in the split---a scaler fit before splitting, or shuffled time-series data; (7) a non-shuffled loader, so each batch is one class; (8) labels misaligned with inputs by one position, which trains a model to predict the current token instead of the next.
+\end{keyinsight}
+
+Work a fixed order rather than reading top to bottom, because the cheap checks eliminate the most probability mass per minute:
+
+\begin{enumerate}
+    \item \textbf{Look at the loss curve first} and classify the symptom. Flat at $\ln(\text{n\_classes})$ from step one means no learning signal reaches the parameters---suspect zero\_grad, a detached tensor, a frozen requires\_grad, or a learning rate of zero. Diverging to \texttt{inf}/\texttt{nan} means the learning rate, a bad mask producing an all-$-\infty$ softmax row, or a $\log(0)$. Descending then plateauing early suspects the schedule or capacity. Train loss falling while validation rises immediately is overfitting; validation \emph{better} than train usually means dropout is still on at eval---or leakage.
+    \item \textbf{Overfit a single batch.} The fastest decisive test in all of deep learning: take four examples and train until the loss is essentially zero. If a model cannot memorize four examples, the bug is in the optimization path, not the data or the hyperparameters, and you have cut the search space in half in thirty seconds.
+    \item \textbf{Check the training loop mechanics}---the seven lines around \texttt{zero\_grad}/\texttt{backward}/\texttt{step}, mode switching, and where the clipping sits.
+    \item \textbf{Check shapes and alignment}: print the shapes of inputs, labels, and logits; verify the input/label offset for a language model; verify the mask by looking at its first row.
+    \item \textbf{Check the data path}: shuffling, the split, whether any transform was fit on the full dataset, class balance in a batch.
+    \item \textbf{Check the metric} last. Validation numbers that are too good are usually leakage or a metric computed on the training set.
+\end{enumerate}
+
+Two of these are worth being able to demonstrate quantitatively, because interviewers ask ``how bad is it really?'' Removing \texttt{zero\_grad} on a small classifier leaves training visibly worse rather than catastrophic (in my test, final loss $0.24$ versus $0.19$ clean)---which is exactly why it survives in real codebases, sometimes for months. A learning rate of $5.0$ on the same model drives the loss to $73$, unmistakable. And a causal mask built with \texttt{np.triu(..., k=0)} instead of \texttt{k=1} masks the diagonal, leaving the first row entirely $-\infty$; the softmax of an all-$-\infty$ row is $0/0$, so the loss becomes \texttt{nan} on the very first step---a fast failure with a confusing message.
+
+\begin{warningbox}
+\textbf{Say the symptom-to-cause mapping out loud.} The grader is scoring your diagnostic order, not your reading speed. ``Loss is flat at 0.693, which is $\ln 2$, so the model is outputting a constant---that points at the gradient path rather than the data, so I'll check \texttt{zero\_grad} and \texttt{requires\_grad} before I look at the loader'' earns more than silently finding the bug in the same time.
+\end{warningbox}
+
+\section{A Practice Protocol}
+\label{sec:coding_practice}
+
+Reproduce the round, do not just read about it. Set a 45-minute timer, open a plain editor with no autocomplete and no assistant, and implement one canon problem end to end---including the tests. Then, and only then, run it and compare against the reference. The gap between ``I understand attention'' and ``I can write attention in 20 minutes without a reference'' is exactly what this round measures, and it closes only by doing it.
+
+A workable cadence for a two-week ramp: days 1--3, the deep-learning core (attention, AdamW, LayerNorm, the training loop) until attention is reliably under 20 minutes; days 4--6, the language-modeling set (BPE, sampling, KV cache); days 7--9, whichever track your loop targets---search/recsys (BM25, NDCG, two-tower, graph search) or classical (logistic regression, k-means, boosting); days 10--11, the debug round, using deliberately corrupted copies of your own working code; days 12--14, mixed random draws under time pressure, plus one mock with another person.
+
+Grade yourself against the rubric the interviewer uses, not against ``did it eventually work'': did it run; were shapes right first time; was the softmax stable; was the mask applied before the softmax; did you write a test unprompted; can you state the complexity and memory cost. Log which of the six you missed---the pattern is usually stable across problems and tells you what to drill.
+
+Two habits pay off disproportionately in mocks. Narrate continuously, because the round is graded partly on communication and because saying ``now I need the head dimension'' catches your own errors. And when the timer expires, finish the sentence rather than the function: ``I'd complete the merge-heads reshape here, then test that rows sum to one'' converts an unfinished solution into a demonstrated plan.
+
+Runnable versions of every listing in this chapter, with the tests described in each answer, live in \texttt{drills/} at the repository root; the debug-round exercises there ship as working scripts plus a bug-injection script, so you can practice the diagnosis rather than the typing.
