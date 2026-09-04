@@ -2,5 +2,1066 @@
 \label{chap:pretraining_at_scale}
 
 \begin{tldr}
-Placeholder --- this chapter is written in Phase C.
+This chapter covers the orchestration layer of a frontier pretraining run: how a corpus is built from Common Crawl and specialized sources, filtered, deduplicated, and decontaminated; how domain mixtures are set and staged across a run (main phase, mid-training/annealing, long-context extension); how synthetic data entered frontier recipes and where model collapse actually bites; and how the run itself is operated---in-flight evals, the small-scale ablation program that gates every decision, and data incident response. The scaling-law mathematics lives in Chapter~\ref{chap:learning_theory}, parallelism and stability in Chapter~\ref{chap:training_optimization}, GPU internals in Chapter~\ref{chap:gpu_fundamentals}, and the classical filtering machinery (fastText, KenLM, MinHash) in the NLP volume [NLP 1]; what this chapter owns is the recipe: what gets done, in what order, at what cost, and how each choice is validated before a nine-figure compute budget is committed. For 2026 Staff interviews, ``design the data pipeline for the next pretraining run'' is now as canonical as ``design a recommender system'' was a decade ago.
 \end{tldr}
+
+%==============================================================================
+\section{The Anatomy of a Frontier Pretraining Run}
+\label{sec:pretrain_lifecycle}
+%==============================================================================
+
+A frontier pretraining run is not a script that reads a dataset and minimizes a loss. It is a months-long program involving separate data, infrastructure, and evaluation workstreams, a large fraction of a company's total compute, and a decision process closer to a spacecraft launch than to a research experiment. Interviewers ask about it end-to-end because the end-to-end view is exactly what distinguishes a candidate who has read the papers from one who could own a workstream.
+
+\begin{keyinsight}[The Pretraining Lifecycle]
+Every modern run follows the same skeleton, and being able to draw it is the price of admission:
+\begin{enumerate}
+    \item \textbf{Corpus construction}: acquire raw pools---web crawls, code, math, licensed and synthetic sources (Section~\ref{sec:pretrain_corpus}).
+    \item \textbf{Filter $\rightarrow$ dedup $\rightarrow$ decontaminate}: a cascade of quality filters, then deduplication, then benchmark decontamination---in that order (Sections~\ref{sec:pretrain_filtering}--\ref{sec:pretrain_dedup}).
+    \item \textbf{Mixture design}: set sampling weights over domains, validated by proxy-scale ablations (Section~\ref{sec:pretrain_mixtures}).
+    \item \textbf{Tokenize}: freeze the tokenizer, tokenize and shard the corpus, fix the data order (Section~\ref{sec:pretrain_tokenizer}).
+    \item \textbf{Main run}: the bulk of compute on the broad mixture, with staged data changes planned in advance.
+    \item \textbf{Mid-training / anneal}: during learning-rate decay, upsample the highest-quality and eval-adjacent data.
+    \item \textbf{Long-context extension}: a short late stage extending the context window on long-document data (pointer: Chapter~\ref{chap:long_context_rag}).
+    \item \textbf{Base-model evals}: few-shot suites, per-domain held-out perplexity, contamination audits (Chapter~\ref{chap:evaluation_metrics}).
+    \item \textbf{Hand-off to post-training}: SFT and preference/RL optimization (Chapters~\ref{chap:transfer_learning} and~\ref{chap:reinforcement_learning}).
+\end{enumerate}
+\end{keyinsight}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  stage/.style={draw=deepblue, fill=lightblue, rounded corners, align=center, font=\scriptsize\sffamily, minimum height=9mm, minimum width=21mm, inner sep=3pt},
+  runstage/.style={draw=deepgreen, fill=lightgreen, rounded corners, align=center, font=\scriptsize\sffamily, minimum height=9mm, minimum width=21mm, inner sep=3pt},
+  arrow/.style={->, thick, deepblue}
+]
+\node[stage] (corpus) {Raw pools\\ CC, code, math};
+\node[stage, right=5mm of corpus] (filter) {Extraction +\\ filter cascade};
+\node[stage, right=5mm of filter] (dedup) {Dedup, then\\ decontaminate};
+\node[stage, right=5mm of dedup] (mix) {Mixture\\ design};
+\node[stage, right=5mm of mix] (tok) {Tokenize,\\ shard, freeze};
+\node[runstage, below=9mm of tok] (main) {Main run\\ ($\sim$90\% of tokens)};
+\node[runstage, left=5mm of main] (anneal) {Mid-training\\ / anneal};
+\node[runstage, left=5mm of anneal] (long) {Long-context\\ extension};
+\node[runstage, left=5mm of long] (evals) {Base-model\\ evals};
+\node[runstage, left=5mm of evals] (post) {Post-training\\ hand-off};
+\draw[arrow] (corpus) -- (filter);
+\draw[arrow] (filter) -- (dedup);
+\draw[arrow] (dedup) -- (mix);
+\draw[arrow] (mix) -- (tok);
+\draw[arrow] (tok) -- (main);
+\draw[arrow] (main) -- (anneal);
+\draw[arrow] (anneal) -- (long);
+\draw[arrow] (long) -- (evals);
+\draw[arrow] (evals) -- (post);
+\end{tikzpicture}
+\caption{The pretraining lifecycle. Blue stages are the data pipeline (this chapter's Sections~\ref{sec:pretrain_corpus}--\ref{sec:pretrain_mixtures} and \ref{sec:pretrain_tokenizer}); green stages are the run itself (Section~\ref{sec:pretrain_runmech}), ending in the hand-off to Chapters~\ref{chap:transfer_learning} and~\ref{chap:reinforcement_learning}.}
+\label{fig:pretrain_lifecycle}
+\end{figure}
+
+\subsection{A Reference Run on Paper}
+
+Interviewers reward candidates who can put concrete numbers on the lifecycle, and the Llama 3 405B report is the most complete public anchor---worth carrying as one coherent set rather than as isolated trivia:
+
+\begin{table}[H]
+\centering
+\small
+\caption{A frontier run's stages, anchored to public Llama 3 405B numbers}
+\label{tab:pretrain_reference_run}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Stage} & \textbf{What happens} \\
+\midrule
+Planning \& ablations (months) & Scaling study fixes $N \approx 405$B, $D \approx 15.6$T---far past $D \approx 20N$, an inference-economics choice; the data recipe is frozen with ablation evidence behind each ingredient \\
+Main phase ($\sim$14.5T tokens, 8K context) & Broad mixture: $\sim$50\% general knowledge, 25\% math and reasoning, 17\% code, 8\% multilingual; batch-size and LR staging per Chapter~\ref{chap:training_optimization} \\
+Mid-run mixture adjustments & Newer crawl data added late to advance the knowledge cutoff; subsets that underperform in-flight evals down-weighted \\
+Long-context extension ($\sim$800B tokens) & Context grown 8K $\rightarrow$ 128K in six stages with long documents upsampled (Section~\ref{sec:pretrain_mixtures}) \\
+Final anneal (last 40M tokens) & LR annealed to zero while the highest-quality sources are upsampled; checkpoint (Polyak) averaging produces the release candidate \\
+Base evals \& hand-off (weeks) & Few-shot suites, contamination audit, then SFT and preference/RL post-training (Chapters~\ref{chap:transfer_learning}, \ref{chap:reinforcement_learning}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The envelope arithmetic that goes with the table: $C \approx 6ND = 6 \times 4.05 \times 10^{11} \times 1.56 \times 10^{13} \approx 3.8 \times 10^{25}$ FLOPs. On 16{,}384 H100s at $\sim$40\% MFU ($\sim$990 TFLOPS dense BF16 each), the cluster sustains $16{,}384 \times 9.9 \times 10^{14} \times 0.4 \approx 6.5 \times 10^{18}$ FLOP/s, so the run takes $\sim 5.8 \times 10^{6}$ seconds---\textbf{roughly two months of wall-clock}---before counting interruptions and restarts (Chapter~\ref{chap:training_optimization}, fault tolerance). Dividing instead by the $6N \approx 2.4 \times 10^{12}$ FLOPs each token costs gives the consumption rate: $\sim$2.7M tokens per second, around a quarter-trillion tokens per day. Those two months are the window in which every data mistake in this chapter either was or was not caught in advance; at a very rough \$2/GPU-hour, the run itself prices at $\sim$\$50M of compute, which is why the surrounding process looks like capital allocation rather than experimentation.
+
+\subsection{The Org Reality}
+
+The lifecycle is executed by an organization, and Staff-level interviews probe whether you understand that organization:
+
+\begin{itemize}
+    \item \textbf{The data team} owns sourcing, filtering, dedup, decontamination, mixtures, and synthetic generation. Its unit of work is the \textit{ablation}: a small pretraining run testing one data change against a fixed eval suite. Mature teams run these on a continuous cadence---an ``ablation factory'' consuming a few percent of the fleet year-round, so that when the flagship run is planned, every ingredient has an evidence trail.
+    \item \textbf{The pretraining/infra team} owns parallelism, throughput, numerics, checkpointing, and stability---the canon of Chapters~\ref{chap:training_optimization} and~\ref{chap:gpu_fundamentals}. The interface between the two teams is precise: tokenized, shuffled, versioned shards with a deterministic data order.
+    \item \textbf{The eval team} owns the metric suite the other two optimize against, plus private held-out benchmarks that never touch the internet (Chapter~\ref{chap:evaluation_metrics}).
+    \item \textbf{The run room}: once the flagship launches, it is operated like a production service---dashboards (loss, per-domain held-out loss, gradient norm, MFU, interruption counts), an on-call rotation, a run logbook (the OPT-175B logbook made this culture public), and an incident process. Data changes mid-run go through the same review discipline as code changes to a live service.
+    \item \textbf{Go/no-go discipline}: before the fleet is committed, a launch review checks the scaling-law fit and its confidence band (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:scaling_fitting}), the frozen data recipe and its ablation evidence, contamination audit results, and the stability plan. Changing the recipe after the freeze requires incident-level justification.
+\end{itemize}
+
+\subsection{What This Chapter Owns---and What It Points To}
+
+Pretraining touches half the book. To avoid re-deriving canon, this chapter deliberately stays at the recipe level and points elsewhere for machinery:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Division of labor: where the canonical treatment of each pretraining topic lives}
+\label{tab:pretrain_ownership}
+\begin{tabularx}{\textwidth}{Xl}
+\toprule
+\textbf{Topic} & \textbf{Canonical home} \\
+\midrule
+Scaling-law fitting, Chinchilla, data-constrained scaling, test-time compute & Ch.~\ref{chap:learning_theory} (\S\ref{sec:scaling_fitting}--\S\ref{sec:third_axis}) \\
+Optimizers, muP, parallelism, loss spikes, fault tolerance & Ch.~\ref{chap:training_optimization} \\
+GPU/interconnect internals, MFU accounting & Ch.~\ref{chap:gpu_fundamentals} \\
+Contamination detection, benchmark error bars, eval protocols & Ch.~\ref{chap:evaluation_metrics} (\S\ref{sec:contamination}); [NLP 10] \\
+Classical filter machinery: fastText, KenLM, MinHash/LSH mechanics & [NLP 1] \\
+Tokenizer algorithms: BPE, unigram, SentencePiece internals & [NLP 12] \\
+Pretraining objectives (CLM/MLM), architecture families & Ch.~\ref{chap:self_supervised}; [NLP 6] \\
+Post-training: SFT, RLHF, RLVR & Ch.~\ref{chap:transfer_learning}, Ch.~\ref{chap:reinforcement_learning} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+One orientation number before the details: a Chinchilla-style budget allocates about 20 tokens per parameter ($D \approx 20N$), but production models are deliberately over-trained far past that for inference economics---Llama 3 trained 8B and 405B models alike on roughly 15T tokens. At $C \approx 6ND$, a 400B-parameter model on 15T tokens is $\sim 4 \times 10^{25}$ FLOPs---months on a 16K-GPU cluster. Every section below exists because when a single run costs that much, \textit{data decisions are capital allocation decisions}.
+
+%==============================================================================
+\section{Corpus Construction}
+\label{sec:pretrain_corpus}
+%==============================================================================
+
+\subsection{The Common Crawl Reality}
+
+Nearly every open pretraining corpus, and a large share of proprietary ones, starts from \textbf{Common Crawl} (CC): a nonprofit that has crawled the web since 2008 and publishes snapshots (roughly monthly in recent years; 100+ crawls total), each containing on the order of billions of pages. Three file formats matter:
+
+\begin{itemize}
+    \item \textbf{WARC}: the raw crawl---full HTTP responses including HTML. Everything is recoverable from WARC; everything downstream is a lossy view of it.
+    \item \textbf{WAT}: metadata (links, headers).
+    \item \textbf{WET}: CC's own plain-text extraction of each page. Convenient---and the biggest known quality trap in the pipeline.
+\end{itemize}
+
+Scale intuitions worth having: a single recent snapshot holds a few billion pages; English is the largest language at very roughly 40--45\% of documents; and successive snapshots overlap heavily (the same popular pages are re-crawled every month), which is why deduplication policy interacts with snapshot count (Section~\ref{sec:pretrain_dedup}). CC is also a \textit{sample} of the web, not the web: crawl politeness rules, robots.txt, paywalls, and JavaScript-rendered content all shape what is present, and anything behind a login or an API never was.
+
+\textbf{Extraction quality dominates.} WET files retain enormous amounts of boilerplate: navigation menus, cookie banners, footers, repeated headers, ad text. Early corpora (C4, CCNet-lineage datasets) built on WET and then tried to filter the noise out. The modern lesson, established by RefinedWeb and then quantified by FineWeb's ablations, is to discard WET and re-extract main content from the raw WARC HTML with a trafilatura-class extractor (boilerplate-aware DOM pruning). In FineWeb's controlled comparisons, switching the \textit{extractor} improved downstream model quality by more than most individual \textit{filtering} steps applied on top of WET text. Extraction is upstream of filtering, and errors there are unrecoverable later: no heuristic can restore a paragraph the extractor dropped, and no classifier reliably unlearns a cookie banner that appears in half the corpus. Extraction is also domain-sensitive: math-heavy pages need LaTeX and MathML preserved (OpenWebMath's main contribution is extraction, not filtering), code blocks need indentation intact, and tables need a linearization policy---each a place where a generic extractor silently destroys the highest-value content.
+
+\begin{keyinsight}[The Pipeline Is Only as Good as Its First Lossy Step]
+Candidates fixate on filtering and dedup because those have named papers. But the ordering of leverage in a web pipeline is: \textbf{extraction} $>$ \textbf{filtering} $>$ \textbf{dedup tuning}. If asked to improve a web corpus, saying ``re-extract from WARC with a modern extractor and ablate extractors like any other pipeline stage'' signals practitioner knowledge that ``add a quality classifier'' does not.
+\end{keyinsight}
+
+\subsection{Beyond the Crawl: Code, Math, Papers, and PDFs}
+
+Web text is the volume play; the capability-dense pools are acquired separately, each with its own pipeline quirks:
+
+\begin{itemize}
+    \item \textbf{Code} comes from repository archives, not crawls: The Stack lineage (GitHub, then the Software Heritage archive for v2) with license filtering and author opt-out honored at ingestion. Code pipelines have their own dedup problem---forks and vendored dependencies duplicate at the \textit{repository} level, not just the file level---and their own quality signals (stars are weak; syntax validity, import resolvability, and repo-level structure are stronger).
+    \item \textbf{Math} is scarce and extraction-bound: OpenWebMath's 14.7B tokens exist because someone built a LaTeX-preserving extractor; FineMath adds the classifier-scoring pattern. The scarcity of this pool relative to its mixture demand is the single biggest driver of synthetic math budgets (Section~\ref{sec:pretrain_synthetic}).
+    \item \textbf{Academic papers and books} arrive as PDFs, which until recently were effectively locked: heuristic PDF-to-text tools mangle equations, tables, and multi-column layouts. VLM-based OCR pipelines (olmOCR-class, 2025) changed the economics, opening one of the last large untapped high-quality pools---at a real inference cost per page, which is itself a data-budget line item now.
+    \item \textbf{Licensed and proprietary data}: news archives, book corpora, and domain data acquired by contract. Beyond quality, this is a compliance and moat play (next subsection).
+\end{itemize}
+
+\subsection{The Open Corpus Landscape (with Honest Sizes)}
+
+Interviewers probe corpus literacy with sizes, because sizes encode the design trade-offs. Two honesty caveats before the table: token counts depend on the tokenizer (FineWeb's 15T is measured in GPT-2 tokens), and ``size'' can mean a raw pool, a filtered release, or the tokens actually trained on---which differ by orders of magnitude.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Major open pretraining corpora, c.~2026. Sizes are the released/filtered figures unless noted.}
+\label{tab:pretrain_corpora}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Corpus} & \textbf{Size} & \textbf{What it is / why it matters} \\
+\midrule
+C4 (2019) & $\sim$175B tokens & WET + heuristic rules (terminal punctuation, blocklists). The baseline everyone ablates against. \\
+The Pile (2020) & 825GB ($\sim$300B tokens) & First curated multi-domain mixture (22 sources); the testbed for DoReMi-style mixture work. \\
+RefinedWeb (2023) & 600B released (of a $\sim$5T pipeline) & Web-only, WARC re-extraction + aggressive dedup; showed filtered web alone can match curated mixtures (Falcon). \\
+RedPajama v1 / V2 (2023) & 1.2T / 30T & v1: open Llama-recipe reproduction. V2: lightly filtered CC pool over 84 snapshots shipped \textit{with precomputed quality signals}, so filtering thresholds become the user's experiment. \\
+Dolma (2024) & 3T tokens & AI2's fully documented corpus behind OLMo; the reference for pipeline transparency. \\
+FineWeb (2024) & 15T tokens & 96 CC snapshots, trafilatura extraction, per-snapshot MinHash dedup; every pipeline decision published with ablations. \\
+FineWeb-Edu (2024) & 1.3T tokens & FineWeb scored by a classifier distilled from LLM ``educational value'' labels; large MMLU/ARC gains at equal compute. \\
+DCLM-Pool / DCLM-baseline (2024) & 240T / 3.8T & A frozen raw pool plus a benchmark: fixed training code and evals, competing \textit{data recipes}. The winning filter was a simple fastText classifier ([NLP 1]). \\
+Nemotron-CC (2024) & 6.3T (4.4T real + 1.9T synthetic) & CC refined with classifier ensembles plus large-scale rephrasing of low-quality documents. \\
+\midrule
+The Stack v1 (2022) & 6.4TB ($\sim$200B tokens) & Permissively licensed GitHub code; opt-out honored. \\
+The Stack v2 (2024) & 67.5TB ($\sim$900B unique tokens) & Built on the Software Heritage archive, 600+ languages; StarCoder2 trained 3.3--4.3T tokens on it (multiple epochs). \\
+\midrule
+OpenWebMath (2023) & 14.7B tokens & Math-heavy web pages with LaTeX preserved through extraction---extraction, again, is the hard part. \\
+FineMath (2024) & 34B tokens (FineMath-3+) & Classifier-scored math from CC; the FineWeb-Edu pattern applied to math. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Read the table column-wise and the field's trajectory is visible: sizes of \textit{pools} exploded (240T) while sizes of \textit{what you would actually train on} converged to the 3--15T range---the usable, deduplicated, quality-filtered web is far smaller than the raw web, which is why data-constrained scaling (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:data_constrained}) went from a theoretical concern to the central planning constraint.
+
+Two structural facts about web corpora that recipes must handle explicitly. First, \textbf{domain concentration}: raw crawls are dominated by a heavy head of hosts, and naive sampling lets a handful of mega-domains (patent databases, e-commerce templates, scraped-content farms) claim outsized shares---C4's patent-office skew is the classic example. Production pipelines apply per-domain caps or sub-linear domain sampling so no host dominates. Second, \textbf{accounting honesty}: when auditing any corpus---including your own---ask the data-card questions that actually determine comparability: extracted from WARC or WET, and with what tool? Deduplicated at what granularity and scope? Filter positives drawn from what distribution? Token counts in whose tokenizer? Decontaminated against which benchmark list, dated when? Two ``15T-token web corpora'' with different answers to these five questions are different objects, and most public corpus comparisons that look contradictory stop being contradictory once the answers are put side by side.
+
+\subsection{Licensing, Robots, and the Shrinking Commons}
+
+One paragraph of compliance reality, because interviewers increasingly ask: the raw web is not a free-for-all. Robots.txt opt-outs aimed specifically at AI crawlers expanded sharply after 2023---audits (Longpre et al., 2024) found that within about a year, restrictions appeared on roughly a quarter of tokens from the highest-quality web sources in common corpora. Code corpora filter by license and honor opt-outs (The Stack); books and news increasingly arrive via litigation-shaped licensing deals rather than crawling. The practical consequences for a data lead: crawl-date matters (older snapshots predate opt-outs, raising policy questions), provenance tracking is now a pipeline requirement, and licensed or synthetic data is partly a \textit{compliance} strategy, not just a quality one.
+
+\subsection{Multilingual Coverage Decisions}
+
+Language coverage is a run-level product decision made before filtering starts, because the pipeline forks on it: language identification routes documents into per-language pipelines with per-language filters and reference corpora ([NLP 1] owns the machinery). The recipe-level questions are:
+
+\begin{itemize}
+    \item \textbf{Which languages, at what weight?} English dominates filtered CC; multilingual pools like mC4 and CulturaX ($\sim$6.3T tokens across 167 languages) exist, but per-language quality varies wildly. Llama 3 allocated $\sim$8\% of tokens to non-English; models with multilingual mandates (Qwen, Gemma, Aya-lineage work) go far higher.
+    \item \textbf{The trade}: at fixed compute, tokens spent on language $\ell$ mostly buy capability in $\ell$ (plus some transfer); English-heavy mixtures win English benchmarks. This is a product decision wearing a data-mixture costume---get the target market question answered before tuning weights.
+    \item \textbf{Tokenizer coupling}: multilingual capability is capped by tokenizer coverage---a vocabulary that fragments a script into bytes taxes that language's effective context and per-token compute (Section~\ref{sec:pretrain_tokenizer}).
+    \item \textbf{Low-resource reality}: below some size, a language's web presence is too small and too noisy to filter with classifier confidence; the practical options are curated/translated data, synthetic augmentation, or accepting transfer from related languages.
+\end{itemize}
+
+%==============================================================================
+\section{Quality Filtering at the Recipe Level}
+\label{sec:pretrain_filtering}
+%==============================================================================
+
+The classical machinery---fastText classifiers, KenLM perplexity models, and their throughput arithmetic---is [NLP 1]'s territory. This section owns the questions above the machinery: what order the filters run in, what ``quality'' operationally means, and how filtering goes wrong.
+
+\subsection{The Filter Cascade and Its Ordering}
+
+Every production pipeline is a cascade ordered \textbf{cheapest-first}, so each stage shrinks the corpus before the next, more expensive one runs:
+
+\begin{enumerate}
+    \item \textbf{URL and domain rules}: blocklists (adult/spam/SEO farms), allowlists for known-good domains. Near-zero cost, rejects a large fraction of raw crawl.
+    \item \textbf{Extraction} (previous section) and \textbf{language ID}: route documents into per-language pipelines.
+    \item \textbf{Document heuristics}: C4/Gopher-style rules---length bounds, symbol-to-word and repetition ratios, terminal-punctuation fraction, boilerplate line rules. Cheap, interpretable, embarrassingly parallel.
+    \item \textbf{Model-based filters}: KenLM perplexity buckets and/or trained quality classifiers---still CPU-scale, but now the dominant pipeline cost.
+    \item \textbf{Deduplication, then decontamination} (Section~\ref{sec:pretrain_dedup})---decontamination runs last so no duplicate of a contaminated document survives.
+\end{enumerate}
+
+\textbf{What the heuristics actually are.} It helps to have three concrete rule families memorized, because ``document heuristics'' sounds vaguer than it is:
+\begin{itemize}
+    \item \textbf{C4-style line rules}: keep only lines ending in terminal punctuation; drop pages with fewer than three sentences, pages containing ``lorem ipsum'' or curly braces (a JavaScript tell in prose), and pages hitting a bad-words list. Brutal and lossy---these rules alone discard code and dialogue---which is why C4 is the ablation baseline, not the modern recipe.
+    \item \textbf{Gopher-style document statistics}: word-count bounds ($\sim$50 to $\sim$100K words), mean word length within 3--10 characters, bounded symbol-to-word and hash/ellipsis ratios, a cap on the fraction of bullet-point or all-caps lines, and a minimal stop-word requirement (a document containing none of the most common function words is rarely prose). These survive nearly unchanged in FineWeb and its descendants.
+    \item \textbf{Repetition rules}: maximum fractions of duplicated lines, paragraphs, and top n-grams \textit{within} a document---catching the SEO-spam pattern of one sentence repeated five hundred times, which document-level dedup will not see.
+\end{itemize}
+Every threshold above is a hyperparameter someone once ablated on English web text---which is exactly why they cannot be copied blindly to code, math, or other languages (a symbol-ratio rule deletes mathematics; a stop-word rule deletes Chinese unless re-derived per language).
+
+The cost logic that dictates this ordering is worth stating in interview form: a fastText-class scorer handles hundreds of thousands of documents per second per CPU core, so scoring a 100T-token pool is a modest CPU-cluster job; pushing the same pool through even a 1B-parameter neural scorer costs FLOPs comparable to a visible fraction of pretraining itself. LLMs therefore appear in pipelines only as \textit{annotators} of small seed sets, never as corpus-scale scorers ([NLP 1] works this arithmetic).
+
+To make the funnel concrete, the published end-to-end survival rates:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Representative pipeline funnels: how much survives}
+\label{tab:pretrain_funnel}
+\begin{tabularx}{\textwidth}{lllX}
+\toprule
+\textbf{Pipeline} & \textbf{In} & \textbf{Out} & \textbf{Survival} \\
+\midrule
+DCLM-baseline & 240T-token pool & 3.8T & $\sim$1.6\%---heuristics and dedup do most of the volume reduction; the fastText top-10\% cut does the final quality selection \\
+FineWeb & 96 CC snapshots & 15T & mid-single-digit \% of raw crawl text---the ``keep more, filter softer'' point on the curve \\
+FineWeb-Edu & 15T (FineWeb) & 1.3T & $\sim$9\% of an already-filtered corpus---aggressive classifier thresholding for knowledge-benchmark gains \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The funnel numbers frame every filtering debate: at 1--2\% survival, the corpus is defined by the rejection rules, and a threshold moved by a few percent swings tens of trillions of tokens---so ``where do we sit between DCLM-aggressive and FineWeb-permissive'' is a named, ablated decision in any serious recipe, not an emergent property of accumulated scripts.
+
+\subsection{Model-Based Filtering: The Annotate-Then-Distill Pattern}
+
+Three generations of model-based filtering, each one still in production somewhere:
+
+\begin{itemize}
+    \item \textbf{Perplexity filtering} (CCNet lineage): score documents with a Kneser-Ney 5-gram model trained on a clean reference corpus (Wikipedia); drop or downweight the high-perplexity tail. Cheap and effective against gibberish---but it encodes a bias: it keeps text that \textit{resembles the reference}, so a Wikipedia-referenced filter systematically disfavors dialogue, forums, and informal registers.
+    \item \textbf{Discriminative classifiers} (GPT-3-era to DCLM): train a fastText classifier with positives from a chosen ``good'' distribution and negatives from raw crawl; keep the top-scoring fraction. DCLM's central finding was that this simplest approach---positives from instruction-style data (OpenHermes-2.5) and high-quality Reddit ELI5 answers, keep the top $\sim$10\%---beat substantially fancier schemes under a fixed-compute, fixed-eval benchmark.
+    \item \textbf{LLM-annotated seed sets $\rightarrow$ distilled scorers} (FineWeb-Edu pattern): use a strong LLM to grade a few hundred thousand documents on an explicit rubric (``educational value,'' 0--5), train a small classifier on those labels, score the entire corpus with the small model, threshold. FineWeb-Edu (score $\geq 3$) cut 15T tokens to 1.3T and delivered large knowledge-benchmark gains at equal compute. The LLM's judgment is bought once, at annotation time; the corpus pays only linear-model prices.
+\end{itemize}
+
+The pattern to name in interviews: \textbf{expensive judgment on thousands of documents, cheap inference on billions}. Every modern filter is some instantiation of it, and the design choices are (a) what distribution or rubric defines the positive class, and (b) what keep-fraction survives---both of which are hyperparameters to be ablated, not asserted.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Three generations of model-based quality filtering}
+\label{tab:pretrain_filter_generations}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+ & \textbf{Perplexity (CCNet)} & \textbf{Discriminative (DCLM)} & \textbf{Annotate-then-distill (FineWeb-Edu)} \\
+\midrule
+Scorer & KenLM 5-gram vs.\ reference corpus & fastText, curated positives vs.\ crawl negatives & Small classifier on LLM-graded rubric labels \\
+Labels needed & None (corpus statistics) & A positive corpus & $10^5$--$10^6$ LLM annotations, bought once \\
+Encoded bias & ``Looks like the reference'' (Wikipedia-ish) & ``Looks like the positive class'' (instruction-shaped) & ``Scores high on the rubric'' (explicit, auditable) \\
+Where it wins & Gibberish/spam rejection; low-resource languages & Best DCLM result; simplest to run at 100T scale & Largest knowledge-benchmark gains per token kept \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The rubric column is the quiet advance: earlier filters encoded their bias implicitly in a reference corpus or seed set, while the annotate-then-distill pattern states it in a prompt that can be reviewed, debated, and versioned. The bias does not go away---``educational value'' is a choice with consequences (Section on over-filtering below)---but it becomes a legible design artifact instead of an accident of which corpus was lying around.
+
+Two refinements now standard in production variants of the pattern. First, \textbf{ensembles over single scorers}: Nemotron-CC combines multiple quality classifiers and buckets documents by agreement, because any single classifier's blind spots become corpus-wide biases at trillion-token scale. Second, \textbf{bucketing over binary dropping}: instead of a hard keep/drop threshold, documents are binned by score and the bins become \textit{mixture components} with their own sampling weights (high-quality bins upsampled, low bins downsampled or reserved for early training). This converts an irreversible filtering decision into a tunable mixture decision---and lets the anneal stage (Section~\ref{sec:pretrain_mixtures}) draw specifically from the top bins without re-running the pipeline.
+
+\subsection{What ``Quality'' Means Operationally}
+
+``High-quality data'' is the most abused phrase in the field. The operational definition used by serious teams:
+
+\begin{keyinsight}[Quality Is an Ablation Result, Not an Aesthetic]
+A filter is ``good'' if and only if models pretrained on its output, at matched compute, outperform models trained on its input (or on a competing filter's output) on a pre-registered eval suite. DCLM institutionalized this: frozen pool, frozen training code, frozen evals---the \textit{filter} is the experimental variable. Judging data by reading samples of it is how teams convince themselves to keep beautiful, useless text and drop ugly, informative text. The definition has a known circularity---``quality'' inherits the biases of the eval suite---which is managed, not eliminated: keep the suite broad (knowledge, reasoning, code, multiple languages), audit what the filter removes by domain, and treat surprising eval-suite wins with the same suspicion as surprising losses.
+\end{keyinsight}
+
+\textbf{What such an ablation concretely looks like.} Suppose the question is the classifier keep-fraction: top 5\%, 10\%, 20\%, or 40\%? Build the four candidate corpora; train an identical $\sim$1B-parameter proxy on $\sim$30B tokens of each ($6ND \approx 1.8 \times 10^{20}$ FLOPs per run---all four together are well under a thousandth of a flagship budget); two seeds each if the expected effect is small; evaluate every run on the same centered multi-task average plus per-domain held-out perplexities. The decision rule is written \textit{before} the runs: e.g., ``adopt the most aggressive threshold whose per-domain perplexity regressions stay within $x$\% while the centered accuracy improves by $\ge y$.'' The cost asymmetry is the entire argument for this discipline: the ablation costs a rounding error; shipping the wrong threshold costs a percentage of a nine-figure run.
+
+\subsection{Over-Filtering: The Failure Mode of Success}
+
+\begin{warningbox}
+Filtering is an optimization against a proxy, and pushed hard enough it Goodharts like any other. The documented failure modes:
+\begin{itemize}
+    \item \textbf{Diversity loss}: an ``educational'' classifier pushed to high thresholds converges on encyclopedic exposition---and strips dialogue, narrative, informal register, and format diversity that general capability (and post-training robustness) depend on. Benchmark suites over-indexed on knowledge QA will not show the damage; held-out per-domain perplexities will.
+    \item \textbf{Domain skew}: web-quality classifiers score code, math notation, tables, and non-English text as ``low quality'' because they resemble the negative class. Production pipelines route these domains around the web filter entirely---filtering is per-domain, never global.
+    \item \textbf{Selection toward the seed set}: a classifier whose positives are instruction-formatted text upweights instruction-\textit{shaped} web text, quietly pre-baking format biases into the base model.
+    \item \textbf{Compounding cascades}: each stage's false-negative bias multiplies through the pipeline; by the end, a 1--2\% survival rate (240T $\rightarrow$ 3.8T in DCLM) means the corpus is \textit{mostly defined by what was removed}. Soft-weighting (downsampling low-scoring buckets rather than hard-dropping them) is the standard hedge, retaining tail mass at reduced rates.
+\end{itemize}
+\end{warningbox}
+
+%==============================================================================
+\section{Deduplication and Decontamination}
+\label{sec:pretrain_dedup}
+%==============================================================================
+
+\subsection{Why Dedup Improves Models: The Evidence}
+
+Web crawls are massively duplicated---mirrors, syndication, boilerplate, scraped re-posts---and the case for removing duplicates is quantitative, not hygienic:
+
+\begin{itemize}
+    \item \textbf{Memorization}: Lee et al.\ (2022) showed models trained on deduplicated C4 emit memorized training text about $10\times$ less often, while matching or improving validation perplexity---sometimes with fewer steps, since compute is not spent re-reading the same page.
+    \item \textbf{Disproportionate damage from repeats}: Hernandez et al.\ (2022) found repetition damages far beyond its token share---repeating just 0.1\% of the data 100 times degraded an 800M-parameter model to the performance of a model \textit{half its size}, with the mechanistic signature that repeated data damages generalization structures (e.g., induction heads) rather than merely wasting the repeated tokens' worth of compute.
+    \item \textbf{Contamination amplification}: a benchmark answer duplicated 10,000 times across the crawl is 10,000 chances to memorize it; dedup is the first line of decontamination defense.
+\end{itemize}
+
+At the recipe level, three tiers with rising cost: \textbf{exact} dedup (document hashing), \textbf{near-duplicate} dedup (MinHash over n-gram shingles with LSH banding, Jaccard threshold $\approx 0.8$), and \textbf{substring} dedup (suffix arrays, catching repeated passages inside otherwise-distinct documents). The MinHash/LSH mathematics and parameter choices are canonical in [NLP 1]; the run-level decisions are the threshold, the scope (within-snapshot vs.\ global), and---critically---how much dedup is too much.
+
+\textbf{Scope decisions that only show up in production:}
+\begin{itemize}
+    \item \textbf{Within-source vs.\ cross-source}: dedup is usually run within each source first (web against web, code against code); cross-source dedup is a separate, gentler pass, because legitimate overlap (a paper quoted in a textbook, a README mirroring documentation) is not crawl spam and aggressive cross-source removal strips exactly the multiply-attested content you want.
+    \item \textbf{Code needs repository-level dedup}: forks, vendored dependencies, and template scaffolding duplicate at repo granularity; file-level MinHash alone leaves millions of near-identical files from forked projects. The Stack lineage dedups across forks explicitly.
+    \item \textbf{Boilerplate vs.\ document duplication}: a licensing header appearing in $10^7$ files is a \textit{substring} problem (suffix-array or line-frequency treatment), invisible to document-level signatures.
+    \item \textbf{Semantic dedup}: embedding-cluster methods (SemDeDup-class) catch templated content that shares meaning but few shingles---used sparingly, since ``semantically similar'' shades into ``about the same topic,'' and removing topical neighborhoods is over-dedup by construction.
+\end{itemize}
+
+\subsection{Over-Deduplication Harm}
+
+Dedup is not monotonically good, and the best-documented counterexample is FineWeb's: deduplicating \textit{globally} across all 96 CC snapshots removed enormous volumes but produced \textit{worse} models than deduplicating each snapshot independently. The mechanism: global dedup preferentially deletes content that persists across snapshots---and persistence correlates with quality (the pages that survive years on the web are disproportionately the good ones), while ephemeral spam is snapshot-unique and survives the global pass untouched. Aggressive dedup had inverted the filter.
+
+Two more reasons restraint wins. First, repetition of high-quality data is not a bug at all within limits: the data-constrained scaling results (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:data_constrained}) show up to $\sim$4 epochs of reuse is nearly free---so the goal is \textit{controlled} repetition set by mixture weights, not zero repetition. Second, natural duplication carries signal: a document mirrored on many reputable sites earned that distribution. The crime dedup should target is \textit{unintentional, uncontrolled} repetition---especially of junk---not repetition per se.
+
+\subsection{Decontamination}
+
+Decontamination removes training documents that overlap evaluation sets, and it is where data pipelines meet scientific integrity. The standard recipe: after dedup, scan the corpus for long n-gram collisions against every benchmark the model will report---GPT-3 used 13-gram overlap; 50-character substring sampling is a common variant---and drop or flag the hits. Re-run whenever a benchmark is added; order matters (dedup first, or a duplicate of a removed contaminated page slips back in).
+
+\textbf{The blind spots, honestly.} N-gram matching is a string-level test, and everything semantic escapes it:
+\begin{itemize}
+    \item \textbf{Paraphrase}: a GSM8K problem re-worded in a tutorial shares no 13-gram with the original.
+    \item \textbf{Translation}: benchmark items translated into another language match nothing.
+    \item \textbf{Contamination-in-the-wild}: benchmarks leak because train and test are drawn from the same internet---test sets re-posted on GitHub and forums, solutions in blog posts, benchmark-formatted synthetic data circulating in open datasets. Any benchmark released before the crawl date should be \textit{presumed present} unless actively filtered---and the filter is best-effort.
+    \item \textbf{Format-level contamination}: annealing on benchmark-\textit{shaped} data (Section~\ref{sec:pretrain_mixtures}) raises scores without containing a single test item---contamination of the distribution rather than the instances.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Contamination pathways and the defense that actually addresses each}
+\label{tab:pretrain_contamination}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Pathway} & \textbf{How it enters} & \textbf{Working defense} \\
+\midrule
+Verbatim test items & Crawled copies of test sets, GitHub mirrors & N-gram / substring scans (this section); dedup first \\
+Paraphrase and translation & Tutorials, forums, localized reposts & Embedding-similarity scans (costly, partial); perturbation probes on the eval side \\
+Format shaping & Eval-adjacent QA data, especially in the anneal & Anneal-hardest decontamination; judge on private + temporal-holdout evals \\
+Synthetic-generator leakage & The generator has memorized public benchmarks and re-emits them & Decontaminate synthetic output like crawl (Section~\ref{sec:pretrain_synthetic}) \\
+Late-run refresh & Newer crawl snapshots added mid-run carry newer leaks & Re-scan every data addition against the current benchmark list \\
+Post-training injection & Benchmark-formatted SFT/preference data & Same scans on post-training corpora (Chapter~\ref{chap:transfer_learning}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+The honest position, which strong candidates state unprompted: decontamination reduces contamination, it does not certify absence. Detection-side defenses---canary strings, temporal holdouts, perplexity probes, private eval suites---are the complementary half, covered in Chapter~\ref{chap:evaluation_metrics} (Section~\ref{sec:contamination}) and [NLP 10]. A lab's real protection is not the 13-gram scan; it is evals the internet has never seen.
+
+\textbf{The deliverable is an audit, not a certificate.} A mature decontamination process produces an artifact: per-benchmark match rates in the corpus, counts of removed documents by source, the residual overlap after removal (sampling-based), and the list of benchmarks that were \textit{not} scanned against. That artifact travels with the model card and determines which reported scores deserve asterisks. Its most useful property is longitudinal: a benchmark whose in-corpus match rate jumps between crawl snapshots has started leaking, and its public scores---everyone's, not just yours---are inflating from that date forward.
+
+%==============================================================================
+\section{Data Mixtures and Curricula}
+\label{sec:pretrain_mixtures}
+%==============================================================================
+
+\subsection{Setting Domain Weights}
+
+A ``mixture'' is a set of sampling weights over sources---web, code, math, academic, multilingual, synthetic---and it is the highest-leverage handful of numbers in the recipe. A public reference point: Llama 3's final mix was roughly 50\% general knowledge, 25\% math and reasoning, 17\% code, and 8\% multilingual---note how far the code+math share (42\%) sits above their share of the raw web, a deliberate bet that these domains transfer to general reasoning. How labs actually arrive at such numbers:
+
+\begin{enumerate}
+    \item \textbf{Small-proxy grid ablations} (the workhorse): train proxy models (100M--3B) at fixed compute on candidate mixtures; evaluate on the pre-registered suite; pick winners and refine. Robust and legible; costs one run per candidate, so the grid is coarse.
+    \item \textbf{Regression-based extrapolation}: train many cheap runs on \textit{randomized} mixtures, fit a regression from mixture weights to downstream performance, and optimize the fitted surface (RegMix and the ``data mixing laws'' line of work). Turns mixture search from grid enumeration into model-based optimization; inherits all the extrapolation caveats of scaling-law fitting (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:scaling_fitting}).
+    \item \textbf{DoReMi} (one paragraph, as promised): train a small proxy (280M) with group-DRO against a reference model of the same size, upweighting domains where the proxy's \textit{excess loss} over the reference is largest---domains that are learnable but not yet learned. The resulting weights, transferred to a 30$\times$ larger model on The Pile, reached the baseline's accuracy $2.6\times$ faster. The caveats are the interesting part: weights are tuned through a proxy objective (excess loss, not your eval suite), and the transfer of optimal weights across scale is assumed, not guaranteed---which is the next subsection.
+\end{enumerate}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Mixture-setting methods compared}
+\label{tab:pretrain_mixture_methods}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Method} & \textbf{Cost} & \textbf{Strength} & \textbf{Weakness} \\
+\midrule
+Heuristic priors + reference mixes & Free & Encodes accumulated field knowledge; sane starting point & No evidence for \textit{your} corpus, evals, or budget \\
+Proxy grid ablations & One proxy run per candidate & Direct measurement on your eval suite; legible to reviewers & Coarse grid; expensive to explore interactions \\
+Regression on randomized mixtures (RegMix-class) & Many tiny runs, then free optimization & Explores the simplex efficiently; captures interactions & Extrapolates a fitted surface; proxy-scale only \\
+DoReMi (DRO proxy reweighting) & Two small models, one reweighting run & Automated; no eval-suite engineering needed & Optimizes excess loss, not your actual targets; proxy-to-flagship transfer assumed \\
+Anneal-based evaluation & $\sim$0.1--1\% of a flagship run & Tests data at scale, on the real model lineage & Only available once you have a big checkpoint; measures late-training value, not main-phase value \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{The supply constraint.} Mixture weights are not free variables: weight $\times$ total budget must be compatible with each domain's \textit{unique-token supply} and an epoch cap.
+
+\begin{mathresult}{Mixture Feasibility: The Epoch Equation}
+For domain $d$ with mixture weight $w_d$, total token budget $D$, and unique-token supply $U_d$, the implied epoch count is
+\begin{equation}
+\text{epochs}_d = \frac{w_d \, D}{U_d}, \qquad \text{feasible only if } \text{epochs}_d \lesssim E_{\max},
+\end{equation}
+with $E_{\max} \approx 4$ for near-free repetition and $\approx 16$ as the practical wall (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:data_constrained}). Equivalently, supply caps the weight: $w_d \leq E_{\max} U_d / D$. \textbf{Worked example}: a 30T-token run assigning $w = 25\%$ to a math pool of $U = 100$B unique tokens implies $0.25 \times 30\text{T} / 100\text{B} = 75$ epochs---deep into the worthless-repetition regime. Even at $E_{\max} = 16$, the feasible math weight is $16 \times 100\text{B}/30\text{T} \approx 5\%$; the remaining 20 points of desired weight must come from new supply (better extraction, PDFs, synthetic) or not at all.
+\end{mathresult}
+
+Real mixtures are therefore solved as a constrained problem---desired weights, clipped per domain by the epoch equation---and this constraint, more than any optimizer, is what pushes labs toward synthetic math and code (Section~\ref{sec:pretrain_synthetic}).
+
+\textbf{Within-run ordering.} Within each stage, data is shuffled approximately IID---strong ordering effects are a stability and forgetting hazard, and a shuffle bug that serves one source in contiguous blocks is a classic data incident (Section~\ref{sec:pretrain_runmech}). The deliberate exceptions are stage-level, not document-level: recency staging (adding newer crawl snapshots late in the run advances the knowledge cutoff---Llama 3 did exactly this), quality staging (the anneal, below), and context staging (long-context extension). ``Curriculum learning'' in the classic easy-to-hard sense has repeatedly underperformed its intuition at LLM scale; what survives of the idea in production is exactly these three coarse stages.
+
+\subsection{The Mixture-as-Hyperparameter Problem}
+
+The uncomfortable truth about every method above: the optimal mixture is a \textit{hyperparameter that shifts with scale and token budget}, and it is tuned at scales orders of magnitude below where it is deployed. A mixture tuned on 1B-parameter proxies at 20 tokens/parameter is being trusted at 400B parameters and 40 tokens/parameter---but capability composition changes with scale (small proxies barely benefit from hard math; large models do), multi-epoch effects kick in at different points per domain, and eval-suite sensitivity changes as scores move off floor. Mitigations, none complete: validate the chosen mixture at two proxy scales and check the \textit{ranking} of candidate mixtures is stable (rank stability across scale is the actual assumption being leaned on); re-tune the mixture for the anneal stage where signal is cheaper (below); and monitor per-domain held-out loss during the flagship run so a mixture pathology is at least visible early.
+
+\subsection{Staged Training: Mid-Training and the Anneal}
+
+Modern runs are not one IID phase; they are staged, and the vocabulary has stabilized enough to be interview material:
+
+\begin{itemize}
+    \item \textbf{Main phase}: the bulk of tokens on the broad mixture at high learning rate. The priority is coverage and diversity---this is where the model buys its knowledge.
+    \item \textbf{Mid-training / anneal}: as the LR decays, shift the mixture toward the highest-quality data---curated code and math, textbook-like text, sometimes instruction-formatted data. The empirical basis: Llama 3 reported that annealing on small amounts of high-quality code and math data boosts key benchmarks, and annealed its LR to zero over the final tokens while upsampling top sources; MiniCPM's warmup-stable-decay (WSD) schedule made the stage explicit---a long constant-LR plateau, then a short sharp decay during which the high-quality data enters; OLMo 2's ``mid-training'' mix is the open replication. The mechanistic intuition: late, low-LR updates are the ones the final weights actually retain in detail, so the data seen during decay gets outsized influence on final behavior---spend your best tokens there.
+    \item \textbf{Anneal-as-evaluator}: the same mechanism doubles as a measurement instrument. Rather than pretraining a proxy from scratch to test a candidate dataset, anneal a mid-run checkpoint of an existing large model on a mixture containing the candidate (Llama 3 used $\sim$40B-token anneals) and read the benchmark delta. This tests data \textit{at scale} for roughly 0.1--1\% of a run's cost, and has become a standard tool in the ablation program (Section~\ref{sec:pretrain_runmech}).
+\end{itemize}
+
+\begin{warningbox}
+The anneal has a built-in contamination tension. The data that most reliably moves benchmarks during annealing is data that most resembles the benchmarks---``eval-adjacent'' QA-formatted text---and upweighting it shades continuously from legitimate curriculum into distribution-level contamination that inflates scores without adding capability (Section~\ref{sec:pretrain_dedup}). The discipline that keeps the stage honest: decontaminate the anneal mixture \textit{hardest} (it is small, so aggressive scanning is cheap), evaluate anneal decisions on private and temporal-holdout evals rather than only public suites, and treat a benchmark gain unaccompanied by held-out-domain perplexity gains as a red flag, not a win.
+\end{warningbox}
+
+Two consequences of the staged view worth stating explicitly. First, \textbf{WSD turns anneal ablations into branches}: from one shared constant-LR plateau checkpoint, a team can run many short decay branches---each a complete ``end of training'' under a different anneal mixture---for the cost of the decay segment alone. This is the cheap experimental machinery behind the anneal-as-evaluator pattern, and a large part of why WSD-family schedules spread beyond the papers that introduced them. Second, \textbf{the base/post-training boundary is blurring}: once instruction-formatted and reasoning-trace data appears in the anneal, the ``base model'' handed to post-training is already partially shaped for it, and the clean pretraining-then-alignment story of Chapter~\ref{chap:transfer_learning} becomes a division of engineering labor rather than a fact about the model. Interviewers increasingly probe whether you know that frontier ``base'' checkpoints are staged artifacts, not raw web predictors.
+
+\subsection{The Long-Context Extension Stage}
+
+Context extension is a late, short stage, not a property of the main run: attention cost during the main phase and the scarcity of genuinely long documents both argue for training most tokens at moderate context. The recipe shape (Llama 3 as the public example): after the main phase, increase context in stages---8K to 128K over six steps, $\sim$800B tokens---while upsampling long documents (books, code repositories, long-form web) and adjusting positional encodings (RoPE base scaling). The mechanics of position extrapolation, and the long-context vs.\ RAG decision, are Chapter~\ref{chap:long_context_rag}'s territory; the run-level facts to carry into interviews are that extension is cheap relative to the main run ($\sim$5\% of tokens), that it is gated on long-context evals (not just perplexity, which long-range recall barely moves), and that it precedes the final anneal/hand-off in most recipes.
+
+The stage has its own data problem, which is why it belongs in this chapter at all: genuinely long documents are scarce and unrepresentative---books, filings, and large code repositories are a very different distribution from filtered web---so upsampling ``whatever is long'' silently shifts the domain mixture during exactly the stage that shapes final behavior. The recipe-level mitigations: cap the domain shift explicitly (hold the domain mixture roughly fixed and vary only the \textit{length} distribution within domains), synthesize length where nature does not supply it (concatenating related documents, repository-level code assembly with cross-file structure preserved), and keep cross-document attention masking on so that packed filler does not masquerade as long-range dependency (Section~\ref{sec:pretrain_runmech}).
+
+\subsection{Continued Pretraining and Learning-Rate Re-Warming}
+
+Runs also get \textit{extended}: knowledge refreshes on newer crawls, domain adaptation (a code- or bio-specialized continuation), or stretching a checkpoint with newly available data. The naive approach---resume at the tiny final LR---underfits the new data; resuming at a high LR without care causes a transient loss spike on the old distribution and real forgetting. The now-standard recipe (Ibrahim et al., 2024): \textbf{re-warm} the LR back up, \textbf{re-decay} it over the continuation, and \textbf{replay} a small fraction of the original mixture to anchor old capabilities---together these approximately match the loss of a hypothetical from-scratch run on the union of the data, at a fraction of the cost. The transient spike on re-warming is expected and recovers; budget for it and do not panic-rollback. Fine-tuning-scale versions of the same forgetting problem, and its post-training incarnations, live in Chapter~\ref{chap:transfer_learning}.
+
+%==============================================================================
+\section{Synthetic Data}
+\label{sec:pretrain_synthetic}
+%==============================================================================
+
+\subsection{The Generation Patterns}
+
+``Synthetic data'' in pretraining means several distinct recipes with different risk profiles:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Synthetic pretraining data patterns, c.~2026}
+\label{tab:pretrain_synthetic}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Pattern} & \textbf{Mechanism and exemplars} & \textbf{Primary risk} \\
+\midrule
+Textbook generation & Prompt a strong model to write educational content on a curriculum of topics/seeds: the phi series (``Textbooks Are All You Need''), Cosmopedia (25B tokens, open reproduction) & Diversity collapse; generator's blind spots inherited at scale; eval-format leakage \\
+Rephrasing / augmentation & Rewrite \textit{existing} documents into cleaner styles (Wikipedia-like, QA): WRAP; Nemotron-CC's 1.9T rephrased tokens & Mildest---content is anchored to real text; risk is style homogenization and amplified extractor errors \\
+Verifier-filtered math/code & Generate problems/solutions/programs, keep only what passes an external check: unit-test execution, answer verification, compilers, provers & Verifier weaknesses become the selection target (test-hacking analog, cf.\ Chapter~\ref{chap:reinforcement_learning}); difficulty distribution skews easy \\
+Task-formatted extraction & Derive QA pairs, summaries, or exercises from real documents & Format-level benchmark contamination if shapes mimic eval suites \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The rephrasing pattern deserves emphasis because it is the quiet workhorse: it converts \textit{marginal} real data (badly extracted, boilerplate-ridden, stylistically poor) into usable tokens rather than conjuring content---WRAP showed mixing rephrased web with raw web substantially accelerates pretraining at matched compute, and Nemotron-CC ran the recipe at trillion-token scale. It sidesteps most collapse concerns because the information content is grounded in the source document; the model supplies style, not facts.
+
+\textbf{Diversity is engineered at the prompt, not hoped for at the output.} The failure mode of naive generation is a million samples of the same five essays; production pipelines attack it on the input side: explicit topic curricula (Cosmopedia organizes tens of millions of prompts across a curated topic hierarchy), seed-document conditioning (every generation grounded in a distinct real document, as in rephrasing), style and audience axes varied systematically, and persona conditioning (the Persona Hub line of work scales this to enormous synthetic ``author'' populations). The output-side check---distributional diversity monitoring---then verifies the input-side engineering worked, rather than substituting for it.
+
+\subsection{Verifier-Filtered Math and Code}
+
+The pattern with the strongest 2026 momentum deserves its own mechanics sketch, because it is where synthetic pretraining data and the RLVR world (Chapter~\ref{chap:reinforcement_learning}) meet:
+
+\begin{itemize}
+    \item \textbf{Code}: generate a function (or mutate a real one), generate tests for it (or take real tests), execute in a sandbox, and keep only samples where the program runs and passes. Variants generate problem statements first and solutions second, or translate real code across languages with round-trip execution checks. The sandbox is the ground truth; the generator only proposes.
+    \item \textbf{Math}: generate problem variants and step-by-step solutions; keep solutions whose final answer matches a known target, survives a symbolic checker, or---when no ground truth exists---agrees under self-consistency (majority vote across independent samples, a weaker but usable proxy). Formal-proof pipelines go further: a proof checker gives a perfect verifier, at the cost of restricted domain.
+    \item \textbf{The shared structure}: sample broadly, filter externally, train on survivors. This is offline rejection sampling---the pretraining-side cousin of the RS+SFT stage in post-training pipelines---and its value is bounded by the verifier exactly as RLVR's is: lenient checkers admit wrong-but-well-formatted solutions, weak test suites admit special-cased code, and the difficulty distribution drifts easy because hard samples rarely survive filtering. Production pipelines therefore track survival rate by difficulty band and backfill hard bands deliberately.
+\end{itemize}
+
+\subsection{Model Collapse, Honestly}
+
+The model-collapse literature (Shumailov et al., Nature 2024) shows that training generation $n{+}1$ on generation $n$'s outputs, \textit{recursively and with replacement of the real data}, collapses the distribution: tails vanish first, diversity shrinks, and later generations degenerate. It is a real phenomenon with a precise scope, and the Staff-level answer states the scope rather than the slogan:
+
+\begin{keyinsight}[When Collapse Bites---and When It Does Not]
+Collapse requires a \textbf{closed loop}: synthetic data \textit{replaces} real data across generations, with \textbf{no external selection signal}. Break either condition and the mathematics changes. (1) \textbf{Accumulation}: if real data is retained and synthetic \textit{added} (the realistic regime---nobody deletes their corpus), follow-up work (Gerstgrasser et al., 2024) shows error stays bounded rather than diverging. (2) \textbf{External signal}: a verifier (execution, answer checking, proof checking) or even a strong filter injects information the generator did not have, converting ``model imitating itself'' into ``model distilling verified search''---this is why math and code led the synthetic wave, and why verifier-filtered synthetic pipelines are conceptually closer to RLVR (Chapter~\ref{chap:reinforcement_learning}) than to naive self-training. The practical residual risks are subtler: diversity narrowing (measure type-token and topic distributions, not just evals), inherited generator biases, and the uncontrolled version of the loop---AI-generated text already in the web crawl, at an unknown and growing fraction, which pipelines now try to detect and downweight like any other quality signal.
+\end{keyinsight}
+
+\subsection{The 2026 Status}
+
+The direction of travel is unambiguous: the synthetic fraction of frontier recipes is rising. The public anchor is phi-4---9.8T training tokens with roughly 40\% synthetic, plus 15\% rephrased web, and web+targeted sources for the rest---explicitly arguing synthetic data is no longer a cheap substitute for real data but, for reasoning-shaped capabilities, sometimes preferable to it. Nemotron-CC ships 1.9T synthetic tokens inside a 6.3T corpus; Qwen3's reported 36T-token corpus leans on synthetic math and code; systematic trillion-token-scale studies of \textit{how} to generate (rephrasing styles, generator size, seed selection---the BeyondWeb line of work) replaced the early anecdotes. Frontier labs disclose less, but the data-constrained arithmetic (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:data_constrained}) explains the incentive: unique web text is capped, epochs saturate at $\sim$16, and compute keeps growing---synthetic generation is the mechanism that converts surplus \textit{inference} compute plus verifiers into additional \textit{training} tokens.
+
+The guardrails that make a rising fraction defensible, stated as a checklist because interviewers ask for one:
+\begin{itemize}
+    \item \textbf{Provenance-tag every synthetic token} (generator, prompt template, seed document, verifier verdict), so fractions are auditable and any pattern can be dialed back without rebuilding the corpus.
+    \item \textbf{Decontaminate synthetic output exactly like crawl}: the generator has seen every public benchmark; its outputs are a contamination vector, not a clean room.
+    \item \textbf{Monitor diversity distributionally} (lexical statistics, topic coverage, embedding dispersion against the real-data baseline)---evals are the last place narrowing shows up.
+    \item \textbf{Keep fresh non-synthetic data flowing} (new crawls, licensed sources), which keeps the system in the accumulation regime where the collapse results do not apply.
+\end{itemize}
+
+The honest framing for interviews: synthetic data is a compute-for-data exchange whose rate is set by the quality of your verifiers and the diversity of your seeding---not free tokens, and not poison; an engineering trade with knobs.
+
+%==============================================================================
+\section{Run Mechanics}
+\label{sec:pretrain_runmech}
+%==============================================================================
+
+\subsection{Evaluation During Training}
+
+A flagship run is monitored on three tiers, in increasing cost and decreasing frequency:
+
+\begin{enumerate}
+    \item \textbf{Continuous}: training loss, plus \textbf{per-domain held-out loss} on fixed frozen shards (one per major source). Per-domain curves are the underrated tool: a mixture bug, a bad shard, or a filter regression shows up as one domain's curve bending while the aggregate loss looks fine. Optimizer-side telemetry (gradient norms, logit maxima) is Chapter~\ref{chap:training_optimization}'s canon.
+    \item \textbf{Checkpoint cadence} (order of every 50--100B tokens): a few-shot benchmark suite---the usual suspects are knowledge and commonsense sets (MMLU, ARC, HellaSwag), math (GSM8K), and code (HumanEval-class), but the design principle matters more than the roster. Design for \textit{signal at partial capability}: prefer likelihood-based multiple-choice scoring over generative evaluation (generation is noisy and parser-dependent early), aggregate many small tasks into a centered average (the DCLM-core pattern) rather than trusting any single benchmark, and normalize against chance so movement off the floor is visible.
+    \item \textbf{Milestone}: full generative evals, long-context probes, contamination audits, and comparison against the scaling-law prediction band from the planning fit.
+\end{enumerate}
+
+\textbf{When in-loop evals mislead.} Three standard traps. \textit{Variance}: a 1--2 point wiggle on a small benchmark at checkpoint granularity is noise (Chapter~\ref{chap:evaluation_metrics} covers benchmark error bars); react to trends over several checkpoints, not deltas between two. \textit{Emergence and metric cliffs}: capabilities scored by exact-match metrics can sit at floor for most of the run and jump late (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:emergent})---the absence of mid-run benchmark movement is weak evidence about the final model, which is precisely why smooth proxies (likelihood-based scores, per-domain loss) carry the in-loop burden. \textit{Contamination inflation}: a benchmark moving suspiciously early or fast is as likely a leak as a capability; the audit trail, not the celebration, is the correct response.
+
+\subsection{Feeding the Run: Data Logistics}
+
+The reference-run arithmetic (Section~\ref{sec:pretrain_lifecycle}) put consumption at $\sim$2.7M tokens per second. As raw bandwidth that is trivial---a few tens of MB/s of token IDs---so the data loader is never a throughput problem; it is a \textit{correctness and determinism} problem, and its design choices are recipe-level:
+
+\begin{itemize}
+    \item \textbf{Tokenize offline, once.} The corpus is tokenized and written as fixed-width token-ID shards (memory-mappable, with an index) before the run; shard metadata carries the tokenizer version. Tokenizing on the fly wastes CPU at best and, worse, makes the data stream dependent on library versions that will change during a months-long run.
+    \item \textbf{Packing and document masking.} Documents are concatenated and cut into fixed-length training sequences (padding wastes compute). The subtle choice is attention across document boundaries within a packed sequence: masking it off (as Llama 3 does) costs a little implementation complexity and matters increasingly at long context, where unmasked packing teaches the model to attend across unrelated documents.
+    \item \textbf{Shuffle at two levels.} A global document-level shuffle before sharding (so no shard is a topical block), then randomized shard interleaving at read time. The failure mode---a ``shuffle'' that is local but not global, serving one crawl or source in contiguous multi-billion-token blocks---is a classic data incident and a known cause of loss oscillations and forgetting artifacts.
+    \item \textbf{Determinism and addressability} (the property everything in the next subsections leans on): given a step number, the consumed token ranges must be reconstructable, and the loader must support resume-at-step and skip-range operations exactly.
+\end{itemize}
+
+\subsection{The Ablation Program and the Go/No-Go Discipline}
+
+Everything in this chapter---extractors, filters, dedup scope, mixture weights, synthetic fractions, tokenizer---enters the flagship recipe through the same gate: a small-scale ablation with pre-registered evals. The program has a hierarchy of instruments:
+
+\begin{itemize}
+    \item \textbf{From-scratch proxy runs} ($\sim$0.1--1\% of flagship compute each): the default instrument for filter and mixture comparisons. Design discipline is the scaling-study discipline---fixed tokenizer, fixed evals, completed LR schedules, matched compute; Chapter~\ref{chap:learning_theory}'s 1\%-budget scaling-study question is the canonical treatment and the same methodology governs here.
+    \item \textbf{Anneal-based evaluations} (Section~\ref{sec:pretrain_mixtures}): candidate data annealed into a mid-run checkpoint of the previous flagship---the instrument of choice when the effect only expresses at scale.
+    \item \textbf{The scaling fit itself}: the run's predicted loss with a confidence band, validated on a held-out compute tier.
+\end{itemize}
+
+The discipline around the instruments is what interviewers probe at L7: one variable per ablation; pre-registered success criteria (no post-hoc metric shopping); seed repeats for anything within noise; a written evidence trail per recipe ingredient; and a hard \textbf{data freeze} before launch, after which the recipe changes only through the incident process.
+
+\textbf{The launch review itself} is a checklist meeting, and being able to recite the checklist is a strong interview signal:
+\begin{enumerate}
+    \item \textbf{Scaling prediction}: fitted $L(N, D)$ with a confidence band, validated on a held-out compute tier; the run's target loss is written down before step one (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:scaling_fitting}).
+    \item \textbf{Recipe ledger}: every ingredient (extractor, each filter threshold, dedup scope, mixture weights, synthetic fractions, tokenizer) mapped to its ablation evidence; unresolved items either closed or explicitly risk-accepted.
+    \item \textbf{Supply arithmetic}: the epoch equation checked per domain; no silent 30-epoch domains.
+    \item \textbf{Contamination audit}: scan results per benchmark, plus the anneal mixture's stricter audit.
+    \item \textbf{Determinism verification}: resume-at-step and skip-range actually exercised in a drill, not assumed; shard checksums in place.
+    \item \textbf{Stability and fault plan}: monitoring, checkpoint cadence, spike protocol, on-call rotation---Chapter~\ref{chap:training_optimization}'s canon, reviewed jointly.
+    \item \textbf{Stop conditions}: pre-agreed criteria for pausing or killing the run (sustained divergence from the prediction band, incident classes that trigger rewind), so the 3am decision was made in daylight.
+\end{enumerate}
+This sounds bureaucratic until you price a wrong mixture at a nine-figure run's cost; then it sounds like the minimum.
+
+\subsection{Data Incident Response}
+
+Mid-run, something in the data will go wrong: a corrupted shard (truncated files, encoding garbage), a pipeline bug (mis-tokenized region, a shuffle that silently failed and serves a source in giant contiguous blocks), a spam subdomain that slipped the filters, or a benchmark leak discovered after launch. The response playbook:
+
+\begin{enumerate}
+    \item \textbf{Attribute before acting.} A loss anomaly has two very different causes, and Chapter~\ref{chap:training_optimization} (Section~\ref{subsec:stability_at_scale}) owns one of them: PaLM-style spikes are \textit{state--data interactions}---replaying the same batches from a different optimizer state does not reproduce them---and their remedy is rewind-and-skip. A \textit{data incident} is the other case: the anomaly follows the data. The test is the same in both directions: replay the suspect batch window from a different checkpoint (and, to rule out silent hardware corruption, on different nodes---Section~\ref{subsec:fault_tolerance}). Reproduces across states and hardware $\Rightarrow$ the data is bad; inspect the actual documents.
+    \item \textbf{Contain}: \textbf{skip-and-note}---advance the loader past the affected region, log the exact token range, continue. This is the default: cheap, preserves schedule, and a bounded skipped region is a rounding error against the budget. The alternative, \textbf{rewind-and-retrain} (restore a pre-incident checkpoint, fix the pipeline, re-run), is reserved for systematic problems where a large token volume was wrong---a mis-tokenized source, a contamination event, a mixture misconfiguration---because it burns real calendar and compute.
+    \item \textbf{Postmortem and gate}: every incident adds an upstream check---shard checksums at write and read time, tokenizer-version stamps in shard metadata, distributional monitors (per-shard mean loss vs.\ source baseline) that catch the next bad shard before the run does.
+\end{enumerate}
+
+\begin{keyinsight}[Determinism Is the Data Team's Observability]
+The entire playbook rests on one infrastructure property: the data order must be \textbf{deterministic and addressable}---``exactly which tokens did steps 214,000--214,400 consume?'' must have an answer, and the loader must support resume-with-skip at that granularity. Teams discover this requirement during their first incident, at maximum possible cost. Stated in an interview, it is one sentence that signals you have operated a run rather than read about one.
+\end{keyinsight}
+
+%==============================================================================
+\section{Tokenizer Decisions at the Run Level}
+\label{sec:pretrain_tokenizer}
+%==============================================================================
+
+Tokenizer algorithms (BPE, unigram/SentencePiece mechanics) are [NLP 12]'s territory. The run-level decisions are: vocabulary size, whether to retrain or reuse, and coverage policies---all frozen earlier than any other choice, because every downstream artifact (shards, ablations, scaling fits) is denominated in the tokenizer's units.
+
+\textbf{Vocabulary size} trades compression against compute:
+\begin{itemize}
+    \item \textbf{Compression}: a larger vocabulary means fewer tokens per byte of text---more content per context window and more corpus consumed per training FLOP. Gains are largest for multilingual and code text, which small English-centric vocabularies fragment badly.
+    \item \textbf{Compute and memory}: embedding plus unembedding cost $2Vd$ parameters---at $V = 128$K and $d = 8192$, over 2B parameters---and the output projection's per-token FLOPs scale with $V$. For small models this is decisive (a 256K vocabulary can be a large fraction of a 2B model's parameters); at frontier scale it amortizes, which is why production vocabularies grew from 32K (Llama 2) to 128K (Llama 3) to $\sim$200K (GPT-4o's \texttt{o200k\_base}) and 256K (Gemma). GPT-2's 50,257-token byte-level BPE remains the historical reference point.
+    \item \textbf{Fertility}: measure tokens-per-word per language. A language at fertility 3--4$\times$ English pays proportionally more per sentence in context, latency, and serving cost, and effectively receives less compute per unit of meaning at a fixed byte-level mixture. Fertility tables across the target languages belong in the vocab-size decision memo.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Production vocabulary sizes as a design trajectory}
+\label{tab:pretrain_vocabs}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Tokenizer} & \textbf{Vocab} & \textbf{Design note} \\
+\midrule
+GPT-2 & 50,257 & Byte-level BPE; the historical reference point \\
+Llama 2 & 32K & SentencePiece BPE with byte fallback; English-centric, high multilingual fertility \\
+Llama 3 & 128K & The 4$\times$ jump bought most of its compression on non-English and code \\
+GPT-4o (\texttt{o200k\_base}) & $\sim$200K & Multilingual fertility as an explicit serving-cost lever \\
+Gemma & 256K & Large vocab on small models---a deliberate bet that compression beats the parameter share \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Retrain vs.\ reuse.} Training a tokenizer is computationally trivial; the lock-in is everything denominated in it. Retrain when the corpus composition has shifted enough that compression on target domains is poor (multilingual expansion, heavy code); reuse when continuing pretraining from an existing checkpoint (embeddings are tied to token identities), or when ecosystem compatibility matters---speculative decoding drafts and distillation pairs want shared vocabularies (Chapter~\ref{chap:inference_optimization}). And because per-token loss is not comparable across tokenizers, cross-tokenizer comparisons must be made in bits-per-byte; quoting per-token perplexity across different vocabularies is a classic interview trap.
+
+\textbf{Coverage policies.} Byte fallback (bytes as guaranteed base symbols) eliminates \texttt{UNK} entirely---unseen scripts degrade gracefully into high-fertility byte sequences instead of failing. Digit handling is a small choice with visible arithmetic consequences (single-digit splitting vs.\ 1--3-digit groups changes how numbers compose); code needs whitespace/indentation merges to keep Python from paying one token per indent space.
+
+\begin{keyinsight}[The Tokenizer Silently Reweights the Mixture]
+Mixture weights are set in tokens, but value arrives in bytes of content. A tokenizer that compresses English at 4 bytes/token and a low-resource script at 1.3 bytes/token makes each English token carry $3\times$ the content---so at equal token weights, English receives far more effective data. Changing the tokenizer therefore \textit{changes the mixture} without touching a single sampling weight, which is (with the scaling-fit dependence) the deepest reason the tokenizer freezes first and retraining it mid-program is treated as a recipe reset.
+\end{keyinsight}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:pretrain_interview}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q: Walk me through what happens between ``we have a Common Crawl snapshot'' and the first training step.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+In pipeline order, with the purpose of each stage:
+
+\textbf{1. Extraction.} Start from WARC (raw HTML), not the convenience WET text---re-extract main content with a trafilatura-class extractor. This is the highest-leverage stage: boilerplate that survives extraction poisons everything downstream, and FineWeb's ablations showed the extractor choice matters more than most filtering steps.
+
+\textbf{2. Language ID}, routing documents into per-language pipelines with per-language filters.
+
+\textbf{3. Heuristic filtering}: URL/domain blocklists, then C4/Gopher-style document rules---length and word-length bounds, symbol and repetition ratios, stop-word checks. Cheap, interpretable, removes the bulk of obvious junk.
+
+\textbf{4. Model-based quality filtering}: KenLM perplexity buckets and/or a fastText-class classifier trained with LLM-annotated or curated positives (DCLM/FineWeb-Edu pattern). Always CPU-scale scoring; the LLM only ever labels the small seed set ([NLP 1]).
+
+\textbf{5. Deduplication}: exact (hashing), then near-dup (MinHash/LSH), scoped per snapshot rather than globally.
+
+\textbf{6. Decontamination}: n-gram overlap scans against every benchmark to be reported---after dedup, so no duplicate of a contaminated page survives.
+
+\textbf{7. Mixture assembly}: sampling weights over the filtered sources (web/code/math/multilingual), validated by proxy-run ablations.
+
+\textbf{8. Tokenize and shard}: freeze the tokenizer, tokenize offline, write fixed-width token shards with checksums and version stamps, globally shuffle, fix the deterministic data order.
+
+\textbf{9. Launch gate}: scaling-fit prediction in hand, ablation evidence for each recipe choice, contamination audit complete---then the first step runs.
+
+The one-line summary interviewers want: cheap filters first so expensive ones are affordable, dedup before decontamination, quality defined by ablation, and everything frozen and versioned before the fleet spins up.
+
+\redflags
+\begin{itemize}
+    \item Starting at ``download a dataset from Hugging Face''---no awareness of what is inside the corpus or how it got there.
+    \item Wrong ordering: decontamination before dedup, or expensive model filters before cheap heuristics.
+    \item No extraction stage at all (assuming CC is already ``text'').
+    \item Describing filtering as manual/aesthetic curation rather than ablation-validated thresholds.
+\end{itemize}
+
+\interviewtest{Basic fluency with the production pipeline---this is the warm-up question whose answer determines whether the interview proceeds to design depth or stays remedial.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct stages in correct order with a reason for each.
+    \item \badgeLsix{L6} Adds the cost logic, the WARC-vs-WET extraction insight, per-snapshot dedup scope, and the determinism requirement at sharding.
+    \item \badgeLseven{L7} Frames each stage's thresholds as ablated hyperparameters, names the funnel numbers (240T $\rightarrow$ 3.8T; 96 snapshots $\rightarrow$ 15T), and connects the pipeline to the launch-gate discipline.
+\end{itemize}
+
+\followups{``Why is WET a trap?'' (Boilerplate survives CC's extraction; re-extraction from WARC beats filtering-after-the-fact.) ``Where would an LLM appear in this pipeline?'' (Annotating classifier seed sets only---never scoring the corpus.) ``What breaks if you skip dedup?'' (Memorization, wasted compute, amplified contamination---see the dedup question below.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: You own data for the next frontier pretraining run. Design the pipeline and the ablation program.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Frame it as three deliverables---a corpus, a recipe, and an evidence trail---under two hard constraints: the token budget from the scaling plan, and unique-token supply per domain.
+
+\textbf{1. Targets and constraints first.} From the compute budget and the scaling fit (Chapter~\ref{chap:learning_theory}): token budget $D$ (say 30T for an over-trained production model), context plan, language and capability targets. Immediately check supply: per domain, unique tokens available vs.\ implied epochs at candidate weights---anything above $\sim$4 epochs needs justification, anything near 16 is a design error (Section~\ref{sec:data_constrained}). This arithmetic determines the synthetic budget before any quality argument does.
+
+\textbf{2. Sourcing.} Web (CC re-extracted from WARC with a modern extractor---extraction is the highest-leverage stage), code (Stack-v2-class, license-filtered), math (OpenWebMath/FineMath-class plus verifier-filtered synthetic), multilingual per the product mandate, licensed sources, and rephrased/synthetic tokens to close the supply gap.
+
+\textbf{3. Processing recipe} (cheapest-first cascade): URL rules $\rightarrow$ extraction $\rightarrow$ LID $\rightarrow$ heuristics $\rightarrow$ model-based quality filters (annotate-then-distill pattern) $\rightarrow$ per-snapshot near-dedup $\rightarrow$ decontamination last, re-run per new benchmark. Per-domain filter routes (web filters never touch code). Soft-weighting over hard drops for the quality tail. The classical machinery and its cost arithmetic are the [NLP 1] design; at this altitude the decisions are thresholds, keep-fractions, and dedup scope---all ablated, none asserted.
+
+\textbf{4. Mixture and staging.} Initial weights from priors and reference points; refined by proxy-grid or regression-based mixture search; supply-clipped. Staging plan written before launch: main phase on the broad mix, mid-training anneal upsampling the best data (decontaminated hardest), long-context extension ($\sim$5\% of tokens), final anneal.
+
+\textbf{5. The ablation program} (the part that separates L7 answers): a standing fleet fraction ($\sim$2--5\%) running (a) from-scratch proxy runs for filters and mixtures---one variable at a time, fixed tokenizer and evals, completed LR schedules, seed repeats; (b) anneal-based data evaluations on the previous flagship's checkpoints for at-scale effects at $\sim$0.1--1\% cost; (c) the scaling study validating $N$, $D$, and predicted loss with a confidence band (the design is Chapter~\ref{chap:learning_theory}'s 1\%-budget question). Every recipe ingredient carries its ablation ticket; pre-registered evals prevent metric shopping.
+
+\textbf{6. Operations.} Data freeze before launch; deterministic, addressable data order with shard checksums; per-domain held-out loss dashboards; incident playbook (attribute $\rightarrow$ skip-and-note vs.\ rewind $\rightarrow$ postmortem gate); contamination audit as a launch gate and a standing process.
+
+\textbf{7. Timeline shape} (offer it unprompted---it shows you have lived this): at $T{-}12$ to $T{-}6$ months the ablation factory settles extractor, filters, and dedup scope while crawl acquisition and licensing run; $T{-}6$ to $T{-}3$: mixture search, synthetic generation at volume, tokenizer freeze, then corpus tokenization and sharding; $T{-}3$ to $T{-}1$: scaling study on the frozen recipe, anneal-based validations, contamination audit, launch review; $T{-}0$: freeze, drill the resume/skip machinery, launch. The anneal mixture stays amendable longest---it is small and enters last---which is where late-breaking data wins are banked.
+
+\redflags
+\begin{itemize}
+    \item Jumping straight to filtering exotica with no token-budget or supply arithmetic---the recipe must be solvable before it is optimizable.
+    \item Proposing to score the corpus with an LLM (cost arithmetic fails by orders of magnitude; LLMs annotate seed sets).
+    \item No ablation methodology---``we'll use high-quality data'' with no definition of quality as an ablation result.
+    \item Treating dedup and decontamination as the same step, or running decontamination before dedup.
+    \item No mention of the data freeze, determinism, or any operational discipline---the run is treated as a script, not a program.
+\end{itemize}
+
+\interviewtest{Whether you can own the whole orchestration layer: budget arithmetic, sourcing, recipe design, and---the real differentiator---the experimental program and operational discipline that make each choice defensible. The classical-ML internals get one sentence and a pointer; spending ten minutes on MinHash bands here is an altitude error.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the pipeline stages in the right order with the right tools.
+    \item \badgeLsix{L6} Adds the cost logic (cheapest-first, annotate-then-distill), supply/epoch arithmetic, mixture ablations, and staged training.
+    \item \badgeLseven{L7} Runs the whole thing as a program: standing ablation fleet with pre-registered evals, anneal-based data evaluation, scaling-fit validation with uncertainty, data freeze and incident discipline, contamination as a standing audit---plus the honest limits (mixture transfer across scale, decontamination blind spots).
+\end{itemize}
+
+\followups{``Walk me through the classical filtering stage in detail''---hand off to the [NLP 1] design: fastText/KenLM scoring, MinHash/LSH dedup, and the CPU-throughput arithmetic. ``Your 1\%-scale ablations disagree with the anneal-based evaluation---which do you trust?'' (The anneal, for at-scale effects; but check format-level contamination first.) ``What breaks if the tokenizer changes after the ablation program starts?'' (Everything denominated in tokens: scaling fits, mixture weights, all ablation baselines.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: How would you decide the code:web:math mixture for a pretraining run?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Anchor with a public reference, then describe the method that would move you off it. Llama 3 landed at roughly 50\% general knowledge, 25\% math/reasoning, 17\% code, 8\% multilingual---code+math at $\sim$42\%, wildly above their raw-web share, reflecting the (ablation-supported) belief that both transfer to general reasoning.
+
+\textbf{Method:} (1) \textbf{Feasibility first}: per-domain unique-token supply $\times$ epoch caps ($\sim$4 free, $\sim$16 wall---Chapter~\ref{chap:learning_theory}, Section~\ref{sec:data_constrained}) bounds each weight. High-quality math is the scarcest pool---often the binding constraint and the reason for synthetic math budgets. (2) \textbf{Search}: proxy runs at fixed compute over a mixture grid, or cheaper, many randomized-mixture small runs with a regression from weights to the eval suite (RegMix-style); DoReMi-class proxy reweighting if you want an automated first cut. (3) \textbf{Validate the ranking at two proxy scales}---the mixture optimum is scale-dependent; what you actually rely on is rank stability of candidates across scale. (4) \textbf{Exploit staging}: the marginal math/code token is worth more in the anneal than in the main phase, so part of the ``mixture'' question is \textit{when}, not just \textit{how much}---putting extra weight in mid-training gets benchmark leverage at lower diversity cost. (5) \textbf{Instrument}: per-domain held-out loss during the run so a mis-weighting is visible early.
+
+\textbf{Trade-offs to name}: more code/math buys reasoning and tool-use downstream at the cost of breadth of world knowledge and some natural-language fluency at fixed compute; the eval suite defines the exchange rate, so a suite over-indexed on GSM8K-style tasks will happily push you into over-weighting math---which is a Goodhart risk, not a discovery.
+
+\redflags
+\begin{itemize}
+    \item Quoting a ratio as a universal constant with no method for deriving or updating it.
+    \item Ignoring supply: proposing 25\% math without asking whether that many unique math tokens exist.
+    \item No scale-transfer caveat---tuning at 100M and trusting at 400B without validating rank stability.
+    \item Optimizing per-domain \textit{loss} rather than downstream evals (domain losses are not comparable across domains; low code loss can mean boilerplate, not capability).
+\end{itemize}
+
+\interviewtest{Whether ``set a hyperparameter nobody can grid-search at full scale'' triggers an experimental design (proxies, regression, rank-stability validation, staging) rather than a memorized ratio.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows mixtures are ablated on proxy runs and cites a reference mix.
+    \item \badgeLsix{L6} Adds supply/epoch arithmetic, regression-based search, staging (main vs.\ anneal), and per-domain monitoring.
+    \item \badgeLseven{L7} Names the mixture-as-hyperparameter problem explicitly, designs for rank stability across scales, prices the synthetic budget off the supply gap, and flags the eval-suite Goodhart loop in mixture optimization.
+\end{itemize}
+
+\followups{``You run out of unique math tokens---what now?'' (Epochs to $\sim$4, then verifier-filtered synthetic; not 40 epochs.) ``Does code data help non-code tasks?'' (Widely replicated in ablations at moderate weights---one reason code exceeds its web share; cite it as ablation-supported, not folklore.) ``How does the answer change for a 1B edge model vs.\ a frontier model?'' (Different eval targets, different optimal mix---and the 1B model can actually be tuned near its deployment scale.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: After a data-pipeline change, training loss improved---but downstream evals got worse. Diagnose.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+Lead with the headline principle: \textbf{training loss is measured on the data distribution, and the change moved the distribution---the yardstick changed along with the model.} Lower loss on easier data is not a better model. Then enumerate mechanisms, most likely first:
+
+\textbf{H1: The data got easier to predict.} More templated, repetitive, or homogeneous text (e.g., a filter that upweights clean encyclopedic prose, or a dedup regression letting near-duplicates through) lowers loss without adding capability. \textit{Check}: evaluate old and new models on the \textit{same frozen held-out shards} (and in bits-per-byte if anything touched tokenization). If the new model is not better on the fixed yardstick, the ``loss improvement'' was an artifact.
+
+\textbf{H2: Over-filtering cost diversity.} The change filtered harder and stripped domains the evals need (dialogue, code, tail knowledge). \textit{Check}: per-domain held-out perplexities---look for domains that got \textit{worse}; diff what the new filter removes by domain and sample the rejects.
+
+\textbf{H3: Over-dedup removed high-value content} (the FineWeb global-dedup failure: persistence correlates with quality). \textit{Check}: dedup removal rates by source; whether the removed mass skews toward known-good domains.
+
+\textbf{H4: The old number was inflated.} If the change improved \textit{decontamination}, downstream ``got worse'' because the previous scores were partly memorization. This is the trap answer that separates candidates: check contamination audit deltas before declaring a regression.
+
+\textbf{H5: Noise.} Small benchmarks at proxy scale move 1--2 points between seeds (Chapter~\ref{chap:evaluation_metrics}); confirm with seed repeats before diagnosing anything.
+
+\textbf{Process fix}: this incident is only diagnosable because evals ran against frozen held-out sets and the change shipped as an isolated ablation; if multiple pipeline changes shipped together, bisect them---and institute one-variable-per-ablation going forward.
+
+\redflags
+\begin{itemize}
+    \item Treating training loss as a model-quality metric comparable across different training data.
+    \item Jumping to ``the evals are wrong'' or ``add more data'' without the fixed-yardstick check.
+    \item Missing H4---the possibility that the regression is the honest number.
+    \item No mention of per-domain decomposition (the single aggregate loss curve hides every mechanism above).
+\end{itemize}
+
+\interviewtest{Whether you understand that loss is data-conditional, and whether your debugging instinct is to re-establish a fixed measurement basis before theorizing. H4 tests intellectual honesty about evaluation.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the yardstick principle and proposes the frozen held-out comparison.
+    \item \badgeLsix{L6} Enumerates the mechanisms with a concrete check for each, in plausibility order, including the contamination-improvement case.
+    \item \badgeLseven{L7} Adds the process layer: one-variable ablations, bisection, per-domain dashboards as standing infrastructure, bits-per-byte for cross-tokenizer safety---and the organizational point that ``loss went down'' should never headline a data-change review.
+\end{itemize}
+
+\followups{``Held-out loss also improved, but evals still dropped---now what?'' (Distribution of the held-out set drifted with the pipeline---it must be frozen from \textit{before} the change; or the evals measure capabilities the loss is insensitive to---check format/diversity effects.) ``How would you catch this pre-launch?'' (The ablation gate with pre-registered evals is precisely this catch.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: Why does deduplication improve language models, and what goes wrong if you deduplicate too aggressively?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{Why it helps}, with the evidence: (1) \textit{Memorization}: Lee et al.\ (2022)---training on deduplicated data cuts verbatim regurgitation $\sim$10$\times$ at equal-or-better perplexity. (2) \textit{Disproportionate damage}: Hernandez et al.\ (2022)---repeating 0.1\% of data 100$\times$ degraded an 800M model to the performance of one half its size; repetition harms generalization machinery, it does not merely waste the repeated tokens. (3) \textit{Compute}: duplicated tokens buy nothing the first copy did not. (4) \textit{Contamination amplification}: dedup removes thousands of copies of leaked benchmark text before decontamination mops up the rest.
+
+\textbf{Over-dedup harm}: the FineWeb result---global dedup across all crawl snapshots produced \textit{worse} models than per-snapshot dedup, because content persisting across snapshots is disproportionately \textit{good} (quality correlates with persistence), while snapshot-unique spam survived. And zero repetition is not even the goal: up to $\sim$4 epochs of reuse of good data is nearly free (Chapter~\ref{chap:learning_theory}, Section~\ref{sec:data_constrained}), so the aim is \textit{controlled} repetition via mixture weights rather than uncontrolled repetition via crawl accidents. Recipe levels: exact (hashing), near-dup (MinHash/LSH over shingles, Jaccard $\approx 0.8$), substring (suffix arrays)---mechanics in [NLP 1].
+
+\redflags
+\begin{itemize}
+    \item ``Duplicates just waste compute''---misses the disproportionate-damage and memorization evidence.
+    \item Believing more dedup is monotonically better; not knowing any over-dedup result.
+    \item Only knowing exact-match dedup.
+\end{itemize}
+
+\interviewtest{Whether you know the quantitative evidence rather than the vibe, and whether you can argue \textit{both} directions of the dial---the mark of someone who has tuned it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Cites memorization plus compute waste and names near-dedup.
+    \item \badgeLsix{L6} Cites both key results with magnitudes, explains the persistence-quality mechanism behind over-dedup harm, and connects to the epoch-repetition results.
+    \item \badgeLseven{L7} Frames dedup as one knob in a repetition-control system (dedup scope $\times$ mixture epochs), and knows when deliberate upsampling of high-quality data is the right kind of ``duplication.''
+\end{itemize}
+
+\followups{``How do you choose the Jaccard threshold?'' (Ablate it---and see [NLP 1] for the MinHash/LSH parameter mechanics.) ``Would you dedup within a curated book corpus?'' (Exact dups yes; near-dup thresholds loosen---editions and quotations are not crawl spam.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: Design the benchmark decontamination strategy for a pretraining run. What does n-gram overlap miss, and what do you do about it?}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{The string-matching core}: after dedup (never before---duplicates of contaminated pages re-enter otherwise), scan the corpus for collisions against every benchmark that will be reported: 13-gram overlap (the GPT-3 convention) or sampled $\sim$50-character substrings; remove or flag hits; version the benchmark list and re-run the scan when it grows. Decontaminate the \textit{anneal mixture hardest}---it is small, cheap to scan aggressively, and its data has outsized influence on final behavior.
+
+\textbf{What it misses}: paraphrases (a re-worded GSM8K item shares no 13-gram), translations, format-level contamination (benchmark-\textit{shaped} training data that lifts scores without containing test items), and contamination-in-the-wild---test sets reposted on GitHub, solutions in tutorials---which is why anything published before the crawl date is presumed present until filtered, and imperfectly after.
+
+\textbf{The complementary defenses} (detection-side, Chapter~\ref{chap:evaluation_metrics}, Section~\ref{sec:contamination}; [NLP 10]): canary-string checks, temporal holdouts (post-cutoff problem sets---the strongest practical detector), perplexity/perturbation probes on test items, and above all \textit{private evals that never touch the internet}, with the public--private gap monitored as a standing contamination alarm. The honest deliverable to leadership is not ``the corpus is clean''; it is a contamination audit: match rates per benchmark, removal counts, and the caveats.
+
+\redflags
+\begin{itemize}
+    \item Claiming n-gram decontamination guarantees clean evals.
+    \item Running decontamination before dedup, or once rather than per-benchmark-addition.
+    \item No mention of private or temporal-holdout evals---string matching presented as the whole strategy.
+\end{itemize}
+
+\interviewtest{Whether you treat decontamination as a best-effort filter inside a larger integrity system, and can say plainly what cannot be guaranteed.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the n-gram scan, the ordering after dedup, and at least one blind spot.
+    \item \badgeLsix{L6} Full blind-spot list including format-level contamination, the anneal-hardest policy, and the detection-side complements.
+    \item \badgeLseven{L7} Frames it as an audit-and-alarm system (public--private gap, temporal holdouts as ground truth), and connects the anneal tension: the same eval-adjacent data that legitimately helps is the data most likely to be contamination-by-distribution.
+\end{itemize}
+
+\followups{``A hot benchmark turns out to be 40\% contaminated mid-run---what do you do?'' (Report with flagged items excluded; add to the scan; the training already happened---rewind only if the leak is systematic; this is exactly why private evals carry launch decisions.) ``How would you detect paraphrase contamination?'' (Embedding-similarity scans at higher cost; perturbation probes on the eval side.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: What is mid-training (annealing), why does everyone do it now, and what is the catch?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{What}: a late pretraining stage, coinciding with learning-rate decay, in which the mixture shifts toward the highest-quality data---curated code and math, textbook-like text, sometimes instruction-formatted data. Made explicit by WSD-style schedules (long constant-LR plateau, short sharp decay carrying the good data), used by Llama 3 (upsampled top sources while annealing LR to zero) and replicated openly by OLMo 2's mid-training mix.
+
+\textbf{Why}: late low-LR updates are what the final weights retain in fine detail, so a token seen during decay has outsized influence on final behavior---the same scarce high-quality tokens buy more there than diluted through the main phase. Empirically, Llama 3 reported that annealing on small amounts of high-quality code/math data boosts key benchmarks. A second, underrated payoff: \textbf{anneal-as-evaluator}---annealing a mid-run checkpoint on a candidate dataset ($\sim$tens of billions of tokens) measures that data's value \textit{at scale} for $\sim$0.1--1\% of a run's cost, which is how mature data teams evaluate at-scale-only effects.
+
+\textbf{The catch}: the data that moves benchmarks most during annealing is the data that most resembles benchmarks. Upweighting eval-adjacent QA-formatted text shades continuously from curriculum into distribution-level contamination---score inflation via format matching rather than capability. The honest discipline: decontaminate the anneal mix hardest, judge anneal decisions on private and temporal-holdout evals, and distrust benchmark gains that arrive without held-out-domain perplexity gains.
+
+\redflags
+\begin{itemize}
+    \item Describing pretraining as one homogeneous IID phase (a pre-2023 mental model).
+    \item ``Save the best data for the end'' with no mechanism (LR-decay retention) or evidence.
+    \item Presenting anneal gains as pure wins with no contamination tension.
+\end{itemize}
+
+\interviewtest{Currency with the modern staged recipe, plus whether you spot unprompted that the stage's power and its integrity risk are the same phenomenon.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Describes the stage and the quality-upsampling idea.
+    \item \badgeLsix{L6} Adds the LR-retention mechanism, WSD, concrete recipes (Llama 3, OLMo 2), and the contamination tension.
+    \item \badgeLseven{L7} Adds anneal-as-evaluator as an experimental instrument, the private-eval discipline that keeps the stage honest, and placement relative to long-context extension and post-training hand-off.
+\end{itemize}
+
+\followups{``Why not train on the best data the whole time?'' (Supply: there isn't 15T tokens of it---the anneal concentrates a scarce resource where retention is highest.) ``How does WSD make ablations cheaper?'' (Branch anneals off one shared plateau checkpoint instead of full reruns.) ``Is instruction data in the anneal just early SFT?'' (Functionally adjacent---which is why the base/post-training boundary is blurring; Chapter~\ref{chap:transfer_learning}.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: Your data lead proposes raising the synthetic fraction of the next run from 10\% to 40\%. How do you evaluate the proposal?}
+
+\badgeLseven{L7} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+Structure: what the tokens are for, which generation pattern, what guards against the known failure modes, and what evidence gates each step up.
+
+\textbf{1. Why these tokens?} The legitimate driver is supply arithmetic: if the unique-data budget caps out (epoch limits, Chapter~\ref{chap:learning_theory}, Section~\ref{sec:data_constrained}), synthetic is the mechanism that converts inference compute plus verifiers into training tokens. If instead the pitch is ``synthetic is cleaner,'' demand the ablation.
+
+\textbf{2. Which pattern?---the risk profile differs by an order of magnitude.} Rephrasing of real documents (WRAP/Nemotron-CC-style) is anchored to real content and is the safest large-scale lever. Verifier-filtered math/code inherits external ground truth from execution or checkers---the verifier injects information the generator lacked, which is what breaks the self-imitation loop. From-scratch textbook generation (phi-style) is the strongest capability-per-token claim and the highest diversity risk. A 40\% fraction should be a portfolio weighted toward the anchored patterns, not one pattern scaled 4$\times$.
+
+\textbf{3. Model collapse, scoped honestly.} Collapse (Shumailov et al.)\ requires a closed loop: synthetic \textit{replacing} real data across generations without external selection. The proposal keeps the real corpus (accumulation regime---bounded error, Gerstgrasser et al.)\ and uses verifiers/filters (external signal), so the classical collapse scenario does not apply. The \textit{residual} risks do: diversity narrowing (monitor lexical/topical diversity of the blend, not just evals), inherited generator biases and blind spots, format-level eval inflation (synthetic QA that mimics benchmark shapes), and AI text already in the web crawl compounding the effective fraction beyond the nominal 40\%.
+
+\textbf{4. Evidence gates.} Ablate at 10/20/30/40\% with fixed evals including private and temporal holdouts; decontaminate synthetic output against eval suites exactly as if it were crawl (the generator has seen the benchmarks); anneal-based evaluation for at-scale effects; provenance-tag every synthetic token so the fraction is auditable and reversible. Precedent that 40\% is not reckless: phi-4 trained at $\sim$40\% synthetic of 9.8T tokens by design---but with heavy verifier and curation infrastructure, which is the actual thing being approved here.
+
+\redflags
+\begin{itemize}
+    \item ``Model collapse means never train on model outputs''---misstates the literature's scope (replacement loops, no selection).
+    \item The mirror error: no residual-risk story---diversity, generator bias, format inflation go unmentioned.
+    \item Evaluating synthetic data only on benchmark movement (the metric it is best at gaming).
+    \item No provenance tracking---an irreversible, unauditable mixture change.
+\end{itemize}
+
+\interviewtest{Whether you can hold both truths---synthetic data is now load-bearing in frontier recipes \textit{and} its failure modes are real---and turn that into gates and instrumentation rather than a yes/no verdict.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the patterns and the collapse concern.
+    \item \badgeLsix{L6} Scopes collapse correctly (replacement vs.\ accumulation, verifiers as external signal), differentiates patterns by risk, proposes the ablation ladder.
+    \item \badgeLseven{L7} Adds the supply-arithmetic motivation, the compute-for-data framing (rate set by verifier quality), format-level inflation and web-already-contaminated effects, provenance/reversibility, and the phi-4 precedent with its infrastructure caveat.
+\end{itemize}
+
+\followups{``How would you detect diversity narrowing before it hits evals?'' (Distributional monitors on the blend: type-token statistics, topic coverage, embedding dispersion vs.\ the real-data baseline.) ``Does synthetic data change the scaling fit?'' (Different effective exponents---refit on the actual blend; Chapter~\ref{chap:learning_theory}.) ``Where does this meet RLVR?'' (Verifier-filtered generation is offline distillation of verified search---the pretraining-side cousin of Chapter~\ref{chap:reinforcement_learning}'s rejection-sampling pipelines.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: You are choosing between a 32K, 128K, and 256K vocabulary for a new model family. What changes, and when would you retrain vs.\ reuse a tokenizer?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{The trade}: vocabulary size buys compression at the price of parameters and per-token compute. Embedding + unembedding cost $2Vd$: at $d = 8192$, going 32K $\rightarrow$ 256K adds $\sim$3.7B parameters, and the output projection's FLOPs scale with $V$. For a 2B model that is decisive (the vocab can be a large fraction of all parameters); for a 400B model it amortizes---which is why production vocabularies grew 32K (Llama 2) $\rightarrow$ 128K (Llama 3) $\rightarrow$ $\sim$200K (\texttt{o200k\_base}) / 256K (Gemma). Compression compounds: fewer tokens per byte means more content per context window, lower serving cost per document, and more corpus per training FLOP---the gains concentrated in multilingual and code text that small English-centric vocabularies fragment. The multilingual lens is \textbf{fertility} (tokens/word per language): a language at 3$\times$ English fertility pays 3$\times$ per sentence in context and latency, so the vocab decision should ship with a fertility table over target languages, not just an aggregate compression number.
+
+\textbf{Retrain vs.\ reuse}: training the tokenizer is trivial; the lock-in is downstream. Retrain when corpus composition shifted materially (multilingual expansion, code-heavy target) or target-domain compression is poor. Reuse when continuing pretraining from an existing checkpoint (embeddings are bound to token identities), or for ecosystem compatibility---speculative-decoding drafts and distillation pairs want shared vocabularies (Chapter~\ref{chap:inference_optimization}). Two more run-level facts: per-token loss is not comparable across tokenizers (compare bits-per-byte); and byte fallback should be non-negotiable---no \texttt{UNK}, unseen scripts degrade to high-fertility bytes instead of failing. Digit-splitting policy is the small choice with visible arithmetic consequences. Algorithms themselves---BPE vs.\ unigram, training mechanics---are [NLP 12].
+
+\redflags
+\begin{itemize}
+    \item Discussing vocab size only as memory, missing the compression side (or vice versa).
+    \item No model-size dependence---recommending 256K for a 1B model without noticing the parameter share.
+    \item Comparing perplexities across different tokenizers.
+    \item Missing the mixture interaction: tokenizer compression differentials silently reweight effective per-language compute.
+\end{itemize}
+
+\interviewtest{Whether you reason about the tokenizer as a run-level economic decision---compression vs.\ compute, frozen-first lock-in---rather than an NLP preprocessing detail.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the compression-vs-parameters trade and the $2Vd$ arithmetic.
+    \item \badgeLsix{L6} Adds fertility and multilingual coverage, model-size dependence, retrain-vs-reuse criteria, bits-per-byte comparability.
+    \item \badgeLseven{L7} Adds the silent-mixture-reweighting insight, the ablation/scaling-fit lock-in (tokenizer freezes first; retraining mid-program is a recipe reset), and ecosystem coupling (speculative decoding, distillation).
+\end{itemize}
+
+\followups{``Your 256K vocab improved compression 15\% but small-model evals dropped---why?'' (Parameter share and per-token softmax cost at small $d$; rare-token embeddings undertrained.) ``How do you extend a vocabulary without retraining from scratch?'' (Append tokens, initialize new embeddings from subword compositions, continue training---standard for language expansion; details [NLP 12].)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: Design the in-flight evaluation for a three-month pretraining run. When do in-loop evals mislead?}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+\textbf{Three tiers.} (1) \textit{Continuous}: training loss plus per-domain held-out loss on frozen shards---the highest-signal early-warning instrument, since mixture bugs and bad shards bend one domain's curve while the aggregate hides it; optimizer telemetry (grad norms, logit maxima) per Chapter~\ref{chap:training_optimization}. (2) \textit{Every checkpoint} ($\sim$50--100B tokens): a few-shot suite engineered for signal at partial capability---likelihood-based multiple-choice scoring rather than generative parsing, many small tasks aggregated into a centered average (DCLM-core pattern), chance-normalized. (3) \textit{Milestones}: full generative evals, long-context probes, contamination audits, and comparison against the scaling fit's predicted-loss band---the run's primary ``is this working'' instrument, since loss is the quantity the plan actually predicted (Chapter~\ref{chap:learning_theory}).
+
+\textbf{When in-loop evals mislead}: (a) \textit{Variance}---small benchmarks wiggle 1--2 points between checkpoints; act on multi-checkpoint trends, and know your suite's noise floor from seed studies (Chapter~\ref{chap:evaluation_metrics}). (b) \textit{Emergence/metric cliffs}---exact-match metrics sit at floor most of the run and jump late (Section~\ref{sec:emergent}); a flat benchmark mid-run is weak evidence, which is why smooth likelihood-based proxies carry the in-loop burden. (c) \textit{Contamination}---a benchmark rising suspiciously early or fast warrants an audit before a celebration. (d) \textit{Proxy fixation}---the mid-run suite is chosen for signal, not importance; do not let ``moves the in-loop suite'' become the de facto definition of model quality (that is the ablation program's carefully broader job).
+
+\redflags
+\begin{itemize}
+    \item ``Watch the loss''---no held-out decomposition, no benchmark tiering, no cost awareness.
+    \item Generative evals with brittle parsers as the primary mid-run signal.
+    \item Reacting to single-checkpoint benchmark deltas; no noise-floor concept.
+    \item Not comparing against the scaling-fit prediction---the one pre-registered quantitative expectation the run has.
+\end{itemize}
+
+\interviewtest{Instrumentation judgment: choosing metrics by signal-to-noise at partial capability and by cost tier, and knowing the specific ways mid-run numbers lie.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes loss plus periodic benchmarks.
+    \item \badgeLsix{L6} Tiered design with per-domain held-out shards, likelihood-based scoring, aggregation for noise, and the misleading cases.
+    \item \badgeLseven{L7} Anchors the run to the scaling-fit prediction band, names proxy fixation as an organizational failure mode, and specifies noise floors from seed studies before the run starts.
+\end{itemize}
+
+\followups{``MMLU is flat at 25\% halfway through---abort?'' (No---likely below the metric cliff; check per-domain loss and the loss-vs-prediction band instead.) ``Loss tracks the prediction but the suite lags a comparable run---what do you check?'' (Tokenizer/eval-harness comparability first, then mixture differences---the comparable run's suite may also have been contaminated.)}
+\end{interviewq}
+
+\medskip
+
+\begin{interviewq}
+\textbf{Q: At 40\% through a flagship run, held-out code loss jumps and stays elevated. Walk me through the response.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqlow}
+
+\stronganswer
+A \textit{persistent} single-domain shift points at data or pipeline, not optimizer state---but attribution comes first, because the two have opposite remedies.
+
+\textbf{1. Attribute.} Identify the token ranges consumed around the inflection (this requires the deterministic, addressable data order---if you cannot answer ``which shards did step $k$ read,'' that is the real incident). Replay the suspect window from an earlier checkpoint and on different nodes: an anomaly that \textit{follows the data} across optimizer states and hardware is a data incident; one that does not is a state--data interaction or silent hardware corruption---rewind-and-skip / quarantine territory, per Chapter~\ref{chap:training_optimization} (Sections~\ref{subsec:stability_at_scale}, \ref{subsec:fault_tolerance}).
+
+\textbf{2. Inspect.} Pull the actual documents from the implicated shards: corrupted/truncated files, encoding garbage, a mis-tokenized region (tokenizer-version mismatch in shard metadata), a failed shuffle serving one source in a contiguous block, or a genuinely bad upstream drop (a code-crawl refresh that ingested minified/obfuscated bulk).
+
+\textbf{3. Contain.} Default: \textbf{skip-and-note}---advance past the affected range, log it exactly, continue; a bounded bad region is a rounding error at flagship scale. Escalate to \textbf{rewind-and-retrain} only for systematic problems (a whole source mis-tokenized for the last 2T tokens, a contamination event): restore pre-incident checkpoint, fix, re-run. The deciding variables: volume of affected tokens, whether damage is behavioral (contamination, format artifacts) vs.\ merely wasteful, and calendar cost.
+
+\textbf{4. Prevent.} Postmortem gates: shard checksums at write and read, tokenizer-version stamps, per-shard mean-loss monitors against source baselines, staging validation for data refreshes landing mid-run.
+
+\redflags
+\begin{itemize}
+    \item Restarting the run reflexively---or pushing through without attribution.
+    \item No replay test; conflating this with PaLM-style transient spikes (those recover and do not persist as a single-domain plateau shift).
+    \item No awareness that data-order determinism is what makes any of this debuggable.
+\end{itemize}
+
+\interviewtest{Operational judgment under real stakes: attribute-then-contain discipline, the cheap default vs.\ the expensive escalation, and the infrastructure prerequisites you either built in advance or wish you had.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Suspects data, proposes inspecting recent batches and skipping.
+    \item \badgeLsix{L6} Runs the replay-attribution test, distinguishes data incidents from state--data spikes and SDC, and reasons about skip vs.\ rewind explicitly.
+    \item \badgeLseven{L7} Leads with the determinism prerequisite, prices the containment options, adds the postmortem-gate loop, and knows which failure classes justify rewind (behavioral damage, not wasted tokens).
+\end{itemize}
+
+\followups{``The bad region turns out to be 8\% of all tokens so far---skip or rewind?'' (Depends on damage type: garbage that merely wasted compute---keep going, adjust budget; contamination or format poisoning---rewind, because it changes behavior, not just efficiency.) ``How would your monitors catch this within an hour next time?'' (Per-shard loss deltas against source baselines, alerting before the held-out curve moves.)}
+\end{interviewq}
+
+\bigskip
+
+\subsection*{Numbers Worth Memorizing}
+
+The chapter's load-bearing figures in one place---these are the numbers interviewers probe, and the ones this chapter's claims stand on:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Pretraining-at-scale cheat sheet}
+\label{tab:pretrain_cheatsheet}
+\begin{tabularx}{\textwidth}{lX}
+\toprule
+\textbf{Fact} & \textbf{Number(s)} \\
+\midrule
+Chinchilla-optimal ratio & $D \approx 20N$; production models over-train far past it (Llama 3: 8B--405B all on $\sim$15T tokens) \\
+Flagship envelope & Llama 3 405B: $15.6$T tokens, $C \approx 6ND \approx 3.8\times10^{25}$ FLOPs, $\sim$2 months on 16K H100s at $\sim$40\% MFU, $\sim$2.7M tokens/s \\
+Reference mixture & Llama 3: $\sim$50\% general / 25\% math+reasoning / 17\% code / 8\% multilingual \\
+Web corpus scale & FineWeb 15T (96 snapshots); FineWeb-Edu 1.3T; DCLM: 240T pool $\rightarrow$ 3.8T baseline ($\sim$1.6\% survival); RedPajama-V2 30T; Nemotron-CC 6.3T (1.9T synthetic) \\
+Code / math pools & Stack v2: 67.5TB, $\sim$900B unique tokens (StarCoder2: 3.3--4.3T trained); OpenWebMath 14.7B; FineMath-3+ 34B \\
+Dedup evidence & Lee et al.\ 2022: $\sim$10$\times$ less memorization at equal-or-better perplexity; Hernandez et al.\ 2022: 0.1\% repeated 100$\times$ $\Rightarrow$ 800M model performs like 400M \\
+Repetition budget & $\sim$4 epochs nearly free; $\sim$16 the practical wall (data-constrained scaling, Ch.~\ref{chap:learning_theory}) \\
+Decontamination & 13-gram overlap (GPT-3 convention) or $\sim$50-char substrings; blind to paraphrase and translation \\
+Anneal & Llama 3: LR $\rightarrow 0$ over final 40M tokens, top-quality data upsampled; $\sim$40B-token anneals as data evaluators \\
+Long-context stage & 8K $\rightarrow$ 128K in six stages, $\sim$800B tokens ($\sim$5\% of the run) \\
+Synthetic status & phi-4: 9.8T tokens, $\sim$40\% synthetic; DoReMi: $2.6\times$ speedup from proxy-derived weights \\
+Vocabularies & GPT-2 50,257; Llama 2 32K $\rightarrow$ Llama 3 128K $\rightarrow$ \texttt{o200k\_base} $\sim$200K / Gemma 256K; embedding+unembedding $= 2Vd$ params \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[Chapter Summary: The Recipe Is the Product]
+Frontier pretraining is decided less by architecture than by an orchestration layer that never appears in the model card: extraction before filtering, annotate-then-distill filters validated by ablation rather than aesthetics, dedup and decontamination with their limits stated honestly, mixtures solved under supply constraints and re-tuned for the anneal, synthetic data as verifier-priced compute-for-data exchange, and a run operated with launch-review discipline---deterministic data order, pre-registered evals, incident playbooks. Interviewers at frontier labs staff these exact workstreams; the candidate who can walk the lifecycle end-to-end, put a number and a citation on each claim, and point to where each deep-dive lives (Chapters~\ref{chap:learning_theory}, \ref{chap:training_optimization}, \ref{chap:evaluation_metrics}; [NLP 1], [NLP 12]) is interviewing at the altitude the role requires.
+\end{keyinsight}

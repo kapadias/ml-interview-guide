@@ -2,5 +2,703 @@
 \label{chap:gpu_fundamentals}
 
 \begin{tldr}
-Placeholder --- this chapter is written in Phase C.
+Everything in this chapter serves one skill: reasoning quantitatively about why a workload is slow. A GPU is a throughput machine---hundreds of streaming multiprocessors running tens of thousands of threads---whose peak compute (H100: 989 TFLOP/s dense BF16, $\sim$1979 TFLOP/s dense FP8) is only reachable through tensor cores fed by a steep memory hierarchy (registers $\to$ 228~KB/SM shared memory $\to$ 50~MB L2 $\to$ 80~GB HBM3 at $\sim$3.35~TB/s). The roofline model reduces ``why is this slow'' to one number: arithmetic intensity versus the H100 ridge point of $\sim$300 FLOP/byte. Large GEMMs sit far above it (compute-bound); elementwise ops, normalizations, and batch-1 decode sit far below (bandwidth-bound). Matmuls are fast because tiling gives $O(\text{tile})$ data reuse per byte; kernel fusion and FlashAttention are fast because they delete HBM round trips, not FLOPs; multi-GPU scaling is governed by ring all-reduce's $2(N-1)/N$ bandwidth factor and by which link (NVLink $\sim$900~GB/s aggregate vs.\ InfiniBand $\sim$400~Gb/s per NIC) each parallelism dimension crosses. Profiling closes the loop: trace gaps mean CPU/launch overhead, big kernels get a roofline check, and MFU is the honest end-to-end score. Parallelism strategy and MFU targets are canon in Chapter~\ref{chap:training_optimization}; serving arithmetic in Chapter~\ref{chap:inference_optimization}; FlashAttention's algorithm in Chapter~\ref{chap:attention_transformers}---this chapter owns the hardware mental model underneath all three.
 \end{tldr}
+
+%==============================================================================
+\section{GPU Architecture for ML Engineers}
+\label{sec:gpu_arch}
+%==============================================================================
+
+You do not need to write CUDA to reason about GPUs, but you do need a mechanical model of what the silicon actually does. This section builds that model with real numbers, because interview answers without numbers are vibes.
+
+\subsection{SMs, Warps, and SIMT}
+
+A modern datacenter GPU is a grid of \textbf{streaming multiprocessors (SMs)}---132 of them on an H100 SXM. Each SM contains vector ALUs (``CUDA cores''), four \textbf{tensor cores}, a large register file, and a slab of fast on-chip memory. A kernel launch creates a grid of \textbf{thread blocks}; each block is assigned to one SM and stays there until it finishes, and the hardware time-slices many blocks' threads onto the SM's execution units. Threads are scheduled in \textbf{warps} of 32 that execute in lockstep---a single instruction operating on 32 lanes of data (SIMT: single instruction, multiple threads). An SM can hold up to 64 resident warps (2{,}048 threads); it hides memory latency not with big caches and speculation like a CPU, but by \textit{switching warps}: while one warp waits $\sim$500+ cycles for an HBM load, the scheduler issues instructions from others. Throughput machines hide latency with parallelism---which is why ``keep enough independent work in flight'' recurs in every section of this chapter.
+
+\textbf{Divergence, in one paragraph.} Because a warp executes one instruction for 32 threads, an \texttt{if} whose condition differs within the warp forces the hardware to execute \textit{both} paths with complementary lanes masked off---worst case, a 32-way divergent branch runs at $1/32$ of throughput. In dense deep learning kernels this rarely matters: matmuls, normalizations, and attention have uniform control flow, and the standard trick of replacing branches with arithmetic masks (compute both, multiply by 0/1) is exactly how masked attention and dropout are implemented. Divergence resurfaces when you hand-write kernels with data-dependent branching---top-$k$ selection, sparse gather/scatter, MoE token routing---and is one reason those ops are memory-shuffling exercises rather than FLOP showcases.
+
+\textbf{The life of an op.} It helps to know what happens between \texttt{y = torch.nn.functional.linear(x, W)} and the silicon. Eager PyTorch dispatches the Python call to an ATen operator ($\sim$microseconds of CPU work: dtype/device dispatch, autograd bookkeeping, output allocation); the operator calls into a library (cuBLAS here), whose heuristics pick a pre-compiled kernel for the shape/dtype/layout; the CPU enqueues the kernel onto a stream via \texttt{cudaLaunchKernel} and returns \textit{immediately}---GPU execution is asynchronous; the GPU's scheduler eventually dispatches the kernel's blocks onto SMs in waves. Every performance topic in this chapter lives at one of these stages: dispatch cost (kernel launch overhead, CUDA graphs), kernel selection (shape hygiene, library fast paths), and on-SM execution (tiling, occupancy, the roofline). Compiled paths (\texttt{torch.compile}, Chapter~\ref{chap:training_optimization}) shorten the front of this pipeline and generate fused kernels for the middle---the physics of the back end never changes.
+
+\subsection{Tensor Cores}
+
+Tensor cores are fixed-function matrix-multiply--accumulate units: one instruction computes a small dense matrix product $\mathbf{D} = \mathbf{A}\mathbf{B} + \mathbf{C}$ on a hardware-defined tile. At the PTX level the Hopper BF16 primitive is an $m{\times}n{\times}k = 16{\times}8{\times}16$ fragment per warp instruction; Hopper adds \textbf{warpgroup MMA (WGMMA)} instructions in which 4 warps (128 threads) cooperatively compute $64{\times}n{\times}16$ tiles asynchronously, sourcing operands directly from shared memory. Two consequences matter to you:
+
+\begin{enumerate}
+    \item \textbf{They only accelerate matmul-shaped work.} The H100's 989 TFLOP/s of BF16 lives entirely in the tensor cores. The vector path---which executes everything else: softmax exponentials, LayerNorm reductions, residual adds, RoPE rotations---peaks at $\sim$67 TFLOP/s FP32, roughly $15\times$ slower. ``Non-matmul FLOPs are an order of magnitude more expensive'' is a load-bearing fact for FlashAttention-2's design and for why fusing elementwise chains matters so much.
+    \item \textbf{Shapes must feed the tile.} Tensor cores consume operands in fixed fragments with 128-bit-aligned loads, so cuBLAS's fast paths want dimensions divisible by 8 for FP16/BF16 (16 for FP8/INT8), and kernels tile outputs in blocks like $128\times128$ or $128\times256$. Dimensions that violate alignment fall off the fast path entirely; dimensions that are merely awkward multiples waste work through padding and wave quantization (Section~\ref{sec:gpu_matmul}).
+\end{enumerate}
+
+\subsection{The Memory Hierarchy, with Real Numbers}
+
+The defining fact of GPU performance is that compute capability has scaled far faster than memory bandwidth. An H100 can execute roughly 295 BF16 FLOPs in the time it takes to fetch one byte from HBM. Every level of the hierarchy exists to keep the tensor cores from starving:
+
+\begin{table}[H]
+\centering
+\small
+\caption{H100 SXM memory hierarchy (per-SM figures $\times$132 SMs where noted)}
+\label{tab:gpu_mem_hierarchy}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{2.7cm}>{\raggedright\arraybackslash}p{2.9cm}>{\raggedright\arraybackslash}p{3.4cm}X}
+\toprule
+\textbf{Level} & \textbf{Size} & \textbf{Speed (approx.)} & \textbf{What lives there} \\
+\midrule
+Registers & 256 KB/SM ($\sim$33 MB total) & operand-rate, $\sim$1 cycle & Accumulators of the current tile; per-thread scalars \\
+Shared memory / L1 & up to 228 KB/SM ($\sim$30 MB total) & tens of TB/s aggregate, $\sim$30 cycles & Staged input tiles shared by a block; FlashAttention's ``SRAM'' \\
+L2 cache & 50 MB, chip-wide & several $\times$ HBM bandwidth, $\sim$200+ cycles & Hot weights/activations reused across blocks \\
+HBM3 (``GPU memory'') & 80 GB & $\sim$3.35 TB/s, $\sim$500--700 cycles & Weights, KV cache, activations \\
+Peer GPU via NVLink 4 & 8 GPUs/node & $\sim$450 GB/s per direction ($\sim$900 GB/s aggregate) & TP/EP collectives (Section~\ref{sec:multi_gpu_comm}) \\
+Host DRAM via PCIe Gen5 x16 & TB-scale & $\sim$64 GB/s per direction & Dataloader batches, checkpoints, offloaded state \\
+Remote node via InfiniBand NDR & cluster-scale & 400 Gb/s $\approx$ 50 GB/s per NIC (8 NICs/node) & DP/PP traffic, storage \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Each step down is roughly an order of magnitude larger and an order of magnitude slower. The entire discipline of GPU optimization is arranging computation so that data is touched at the highest possible level of this pyramid as many times as possible per HBM byte---which is exactly the reuse arithmetic of Section~\ref{sec:gpu_matmul}.
+
+\begin{keyinsight}[FLOPs Are Cheap; Bytes Are Expensive]
+On an H100, one byte of HBM traffic ``costs'' $\sim$295 BF16 FLOPs of forgone compute. Any operation doing fewer FLOPs per byte than that is bandwidth-bound, and for it the tensor cores may as well not exist. This single ratio explains why fusion beats micro-optimizing arithmetic, why FlashAttention recomputes instead of storing, why decode throughput is a weight-reading problem, and why quantization speeds up inference even when the arithmetic stays in higher precision. When you don't know why something is slow, your first move is to count bytes, not FLOPs.
+\end{keyinsight}
+
+\subsection{The H100 Anchor Table}
+
+Memorize one column of numbers well rather than five badly. The H100 SXM is the 2024--26 workhorse and the reference machine for every estimate in this book:
+
+\begin{table}[H]
+\centering
+\small
+\caption{H100 SXM5 anchor numbers (dense $=$ no 2:4 sparsity)}
+\label{tab:h100_anchor}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Quantity} & \textbf{Value} & \textbf{Comment} \\
+\midrule
+SMs / tensor cores & 132 / 528 & 4 tensor cores per SM \\
+BF16 / FP16 tensor, dense & 989 TFLOP/s & \textit{The} training number; 1{,}979 for BF16 is the 2:4-sparsity marketing figure \\
+FP8 tensor, dense & $\sim$1{,}979 TFLOP/s & $2\times$ BF16; FP32 accumulation \\
+INT8 tensor, dense & $\sim$1{,}979 TOPS & Integer path, INT32 accumulation \\
+TF32 tensor, dense & $\sim$494 TFLOP/s & What ``FP32 matmul'' actually runs as, when enabled \\
+FP32 vector (CUDA cores) & $\sim$67 TFLOP/s & Everything that is not a matmul \\
+HBM3 capacity / bandwidth & 80 GB / $\sim$3.35 TB/s & The denominator of every decode estimate \\
+L2 / shared memory per SM & 50 MB / 228 KB & FlashAttention's working set lives in the latter \\
+NVLink 4 (per GPU) & $\sim$900 GB/s aggregate & $\sim$450 GB/s each direction; all-to-all via NVSwitch within a node \\
+PCIe Gen5 x16 & $\sim$64 GB/s per direction & $\sim$50$\times$ slower than HBM---never put it in an inner loop \\
+InfiniBand NDR (per NIC) & 400 Gb/s $\approx$ 50 GB/s & DGX H100: one NIC per GPU, 8 per node \\
+Ridge point, BF16 & $\sim$295 FLOP/byte & $989 \times 10^{12} / (3.35 \times 10^{12})$; Section~\ref{sec:roofline} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+For contrast, the A100 SXM: 312 TFLOP/s dense BF16, 80 GB HBM2e at $\sim$2.0 TB/s, NVLink 3 at 600 GB/s aggregate, ridge $\sim$155 FLOP/byte. Knowing both lets you translate any published A100-era result into H100 expectations.
+
+\textbf{Blackwell in one paragraph (coarse, deliberately approximate).} The B200 generation scales the same design: $\sim$192 GB of HBM3e at roughly 8 TB/s per GPU, dense throughput of very roughly 2.2 PFLOP/s BF16 and 4.5 PFLOP/s FP8, a new hardware FP4 path at roughly $2\times$ FP8 ($\sim$9 PFLOP/s class, using microscaled block formats), and NVLink 5 at $\sim$1.8 TB/s aggregate per GPU. GB200 pairs two B200s with a Grace CPU; the NVL72 rack joins 72 GPUs into a \textit{single} NVLink domain, which materially changes multi-GPU placement math (Section~\ref{sec:multi_gpu_comm}). Note what did \textit{not} change: the compute-to-bandwidth ratio ($\sim$2{,}200/8 $\approx$ 275 FLOP/byte BF16) stays close to Hopper's ridge, so operations that are bandwidth-bound today remain bandwidth-bound---faster, but not reclassified. Treat all Blackwell figures as ``$\pm$20\% and SKU-dependent'' in an interview; the reasoning transfers even where the digits drift.
+
+%==============================================================================
+\section{The Roofline Model}
+\label{sec:roofline}
+%==============================================================================
+
+The roofline model is the single highest-leverage tool in this chapter: a one-line calculation that classifies any kernel as compute-bound or bandwidth-bound and bounds its best-case runtime.
+
+\subsection{Arithmetic Intensity}
+
+For a kernel, define \textbf{arithmetic intensity} (AI) as useful FLOPs divided by bytes moved to and from HBM:
+\begin{equation}
+\text{AI} = \frac{\text{FLOPs}}{\text{bytes of HBM traffic}} \quad \left[\frac{\text{FLOP}}{\text{byte}}\right].
+\end{equation}
+Count \textit{HBM} traffic, not total memory instructions---data reused out of shared memory or L2 is precisely what raises AI. The kernel needs time at least $\text{FLOPs}/P$ for compute (peak $P$ FLOP/s) and at least $\text{bytes}/B$ for memory (bandwidth $B$ bytes/s); since a well-pipelined kernel overlaps the two, the bound is their max, not their sum.
+
+\begin{mathresult}{The Roofline Bound and the H100 Ridge Point}
+A kernel with arithmetic intensity $\text{AI}$ on hardware with peak compute $P$ (FLOP/s) and memory bandwidth $B$ (bytes/s) has attainable throughput
+\begin{equation}
+\text{FLOP/s}_{\text{attainable}} = \min\left(P,\; B \times \text{AI}\right),
+\end{equation}
+equivalently, runtime $\geq \max\left(\text{FLOPs}/P,\; \text{bytes}/B\right)$. The \textbf{ridge point} $\text{AI}^{*} = P/B$ separates the regimes:
+\begin{equation}
+\text{AI}^{*}_{\text{H100, BF16}} = \frac{989 \times 10^{12}\ \text{FLOP/s}}{3.35 \times 10^{12}\ \text{B/s}} \approx 295\ \text{FLOP/byte} \qquad (\text{FP8: } \approx 590).
+\end{equation}
+Below $\text{AI}^{*}$ the kernel is \textbf{bandwidth-bound}: runtime $=$ bytes$/B$, and adding FLOPs is free. Above it the kernel is \textbf{compute-bound}: runtime $=$ FLOPs$/P$, and reducing bytes further buys nothing. The two optimization playbooks are disjoint---classify first, optimize second.
+\end{mathresult}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{loglogaxis}[
+    width=0.95\textwidth, height=8.2cm,
+    xlabel={Arithmetic intensity (FLOP per byte of HBM traffic)},
+    ylabel={Attainable TFLOP/s},
+    xmin=0.1, xmax=20000, ymin=0.2, ymax=8000,
+    grid=major, grid style={gray!20},
+    legend pos=south east, legend cell align=left,
+    legend style={font=\scriptsize, draw=gray!40},
+    tick label style={font=\scriptsize},
+    label style={font=\small}
+]
+\addplot[deepred, thick, domain=0.1:295, samples=2] {3.35*x};
+\addlegendentry{Memory roof: $3.35\ \text{TB/s} \times \text{AI}$}
+\addplot[deepblue, very thick, domain=295:20000, samples=2] {989};
+\addlegendentry{BF16 dense roof: 989 TFLOP/s}
+\addplot[deepblue, thick, dashed, domain=591:20000, samples=2] {1979};
+\addlegendentry{FP8 dense roof: 1979 TFLOP/s}
+\addplot[gray, dotted, thick] coordinates {(295,0.2) (295,989)};
+\addplot[only marks, mark=*, deepgreen, mark size=2.2pt] coordinates {(0.167,0.56) (1,3.35) (8,26.8) (1365,989)};
+\node[anchor=west, font=\scriptsize, deepgreen!60!black] at (axis cs:0.167,0.56) {\ elementwise add ($\approx 0.17$)};
+\node[anchor=west, font=\scriptsize, deepgreen!60!black] at (axis cs:1,3.35) {\ LayerNorm; batch-1 decode GEMV ($\approx 1$)};
+\node[anchor=west, font=\scriptsize, deepgreen!60!black] at (axis cs:8,26.8) {\ small-batch GEMM ($\text{AI} \approx B$)};
+\node[anchor=east, font=\scriptsize, deepgreen!60!black] at (axis cs:1365,700) {$4096^3$ GEMM ($\approx 1365$)\ };
+\node[anchor=west, font=\scriptsize, rotate=90, gray] at (axis cs:240,0.5) {ridge $\approx 295$};
+\end{loglogaxis}
+\end{tikzpicture}
+\caption{H100 roofline (log--log). An op's arithmetic intensity fixes its ceiling: everything left of the ridge is a bandwidth problem no tensor core can fix; everything right of it is a compute problem no bandwidth can fix. Lowering precision doubles the compute roof but also doubles per-element AI (half the bytes), moving points up and to the right.}
+\label{fig:roofline}
+\end{figure}
+
+\subsection{Worked Classifications}
+
+\textbf{Large GEMM: compute-bound.} Multiplying $M{\times}K$ by $K{\times}N$ does $2MNK$ FLOPs over $2(MK + KN + MN)$ BF16 bytes (assuming ideal caching). For $M{=}N{=}K{=}4096$: $\text{AI} = 4096/3 \approx 1365 \gg 295$. This is the op the GPU was built for; a good kernel sustains 70--80\%+ of peak. \textit{The entire game of Section~\ref{sec:gpu_matmul} is achieving that ideal-caching byte count in practice.}
+
+\textbf{Elementwise op: hopelessly bandwidth-bound.} $\vz = \vx + \vy$ in BF16 reads 4 bytes and writes 2 per element for 1 FLOP: $\text{AI} = 1/6 \approx 0.17$. Attainable: $3.35\ \text{TB/s} \times 0.17 \approx 0.6$ TFLOP/s---0.06\% of peak, \textit{and that is optimal}. A GELU, a residual add, a dropout mask: all the same. The only lever is touching HBM fewer times, i.e., fusion (Section~\ref{sec:kernel_fusion}).
+
+\textbf{LayerNorm/RMSNorm/softmax: bandwidth-bound.} A handful of FLOPs per element (mean, variance, normalize, scale) against a read and a write: $\text{AI} \approx 1$--$2$. Runtime is just $2 \times \text{tensor bytes} / 3.35\ \text{TB/s}$; a ``faster normalization kernel'' can only win by fusing neighbors into the same pass.
+
+\textbf{Batch-1 decode GEMV: bandwidth-bound.} Multiplying a $d{\times}d$ weight matrix by one activation vector does $2d^2$ FLOPs while reading $2d^2$ weight bytes: $\text{AI} \approx 1$. Per-token decode latency is therefore \textit{weight bytes} $/$ \textit{bandwidth}---the foundational identity of serving arithmetic. Batching $B$ requests reuses each weight tile $B$ times, so $\text{AI} \approx B$: against the peak-number roofline the crossover is $B \approx 300$; with realistic ($\sim$50\%) GEMM efficiency at these shapes it lands near $B \approx 150$, which is exactly the crossover Chapter~\ref{chap:inference_optimization} derives in its 70B serving arithmetic.
+
+\textbf{Attention: prefill vs.\ decode.} Prefill attention is matmul-shaped ($n \times n$ score and value products, with FlashAttention keeping intermediates on-chip), with effective AI in the hundreds: compute-bound. Decode attention reads the whole KV cache to produce one token's output---a stream of bytes each used once, $\text{AI} = O(1)$: bandwidth-bound, and at long context the KV read rivals the weight read (Flash-Decoding's split-KV parallelism, Section~\ref{sec:flash_decoding}, exists to at least read those bytes with the whole chip). The serving-side implications---why prefill and decode want different batching, hardware, and possibly disaggregation---are canon in Chapter~\ref{chap:inference_optimization}, Section~\ref{sec:prefill_decode}; the roofline is \textit{why} that split exists.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Roofline crib sheet: the classifications worth having memorized (H100 BF16, ridge $\approx$ 295)}
+\label{tab:roofline_crib}
+\begin{tabularx}{\textwidth}{lllX}
+\toprule
+\textbf{Op} & \textbf{AI (FLOP/byte)} & \textbf{Regime} & \textbf{Lever that actually helps} \\
+\midrule
+Elementwise add / GELU / residual & $\sim$0.2 & Bandwidth & Fusion into neighbors \\
+LayerNorm / RMSNorm / softmax & $\sim$1--2 & Bandwidth & Fusion; fewer passes \\
+Batch-1 decode GEMV & $\sim$1 & Bandwidth & Batching; quantization; speculative decoding \\
+Batch-$B$ decode GEMM & $\sim B$ & Crossover $\sim$150--300 & Raise $B$ until compute-bound \\
+Decode attention (KV read) & $O(1)$ & Bandwidth & GQA/MLA, KV quantization, split-KV \\
+Prefill attention (FlashAttention) & hundreds & Compute & Kernel quality; FP8 \\
+Large training GEMM ($4096^3$) & $\sim$1365 & Compute & Shape hygiene; lower precision \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}
+The roofline is a bound, not a prediction. A kernel can sit far below its roof for reasons the model does not see: launch overhead on tiny tensors, low occupancy failing to cover latency, uncoalesced access patterns inflating actual bytes moved, wave quantization at the tail. Roofline tells you which resource \textit{would} limit a good kernel; profiling (Section~\ref{sec:gpu_profiling}) tells you whether you have a good kernel. Quoting attainable numbers as achieved numbers is a classic interview red flag.
+\end{warningbox}
+
+%==============================================================================
+\section{Why Matmuls Are Fast: Tiling and Its Failure Modes}
+\label{sec:gpu_matmul}
+%==============================================================================
+
+The GEMM's AI of $\sim n/3$ is a property of the \textit{math}, not of any particular kernel: each of the $2n^2$ input elements participates in $n$ multiply--adds, so $O(n)$ reuse per element is available. A naive triple loop that fetches operands from HBM for every multiply achieves $\text{AI} \approx 0.25$ and runs three orders of magnitude below peak. The whole craft of GEMM kernels is \textit{realizing} the available reuse inside the memory hierarchy.
+
+\subsection{Tiling: Turning Available Reuse into Achieved Reuse}
+
+\begin{mathresult}{Data Reuse of a Tiled Matmul}
+Partition the output into $b \times b$ tiles. To compute one output tile, stream matching $b \times b$ tiles of $\mathbf{A}$ and $\mathbf{B}$ through shared memory: each pair of loaded tiles ($2b^2$ elements, $4b^2$ BF16 bytes) fuels a $b \times b \times b$ tile-product ($2b^3$ FLOPs). Arithmetic intensity of the streaming loop:
+\begin{equation}
+\text{AI}_{\text{tiled}} = \frac{2b^3}{4b^2\ \text{bytes}} = \frac{b}{2}\ \text{FLOP/byte}.
+\end{equation}
+Every byte staged into shared memory is reused $b$ times---reuse is $O(b)$, linear in tile size. To clear the H100 ridge ($\approx$295) the tiling must deliver $b/2 \gtrsim 295$, i.e., an effective $b \sim 600$. Real kernels get there hierarchically: $\sim$128--256-element tiles in shared memory ($2 \times 128 \times 256 \times 2$ B $= 128$ KB, fitting the 228 KB/SM budget), sub-tiles held in registers, and L2 catching reuse \textit{across} blocks (neighboring blocks read the same rows of $\mathbf{A}$ and columns of $\mathbf{B}$). The levels multiply: register reuse $\times$ shared-memory reuse $\times$ L2 reuse is what actually lifts achieved AI above the ridge.
+\end{mathresult}
+
+This is the template for every fast kernel on a GPU, not just GEMM: \textbf{stage a tile into fast memory, do as much work as possible on it, write results once}. FlashAttention (Section~\ref{sec:kernel_fusion}) is this exact pattern applied to attention. On Hopper the staging itself is hardware-assisted: the \textbf{TMA} (Tensor Memory Accelerator) performs asynchronous bulk tile copies from HBM to shared memory while the tensor cores work on the previous tile---a producer/consumer pipeline that keeps both the memory system and the MMA units saturated (the machinery FlashAttention-3 exploits; Chapter~\ref{chap:attention_transformers}).
+
+\subsection{Shape Hygiene: Why Divisible-by-8 (and -64) Matters}
+
+Tensor cores and their data paths impose alignment: the BF16/FP16 fast paths want every GEMM dimension---especially $K$ and the leading (stride) dimension---divisible by 8, so 16-byte vectorized loads land aligned and fragments fill exactly (FP8/INT8: divisible by 16). Violate it and cuBLAS falls back to a padded or non-tensor-core kernel; a hidden size of 4100 instead of 4096 can roughly halve matmul throughput for a 0.1\% parameter increase. Beyond mere alignment, dimensions that are multiples of the \textit{tile} (64--256) avoid ragged edge-tiles doing masked, partially wasted work.
+
+The canonical demonstration is vocabulary padding: GPT-2's vocab is 50{,}257 (an alignment nuisance); padding the embedding/unembedding dimension to 50{,}304 ($= 64 \times 786$) costs 47 dead rows and bought nanoGPT roughly 25\% training throughput---a famous one-line change. Modern configs bake this in: hidden sizes, FFN widths, and vocab sizes are chosen as multiples of 64 or 128 from the start.
+
+\subsection{Wave Quantization: The 257th Tile}
+
+Thread blocks are scheduled in \textbf{waves}: if a GEMM produces $T$ output tiles and the GPU co-schedules $W$ tile-blocks at a time, runtime is $\lceil T/W \rceil$ wave-times---a ceiling function, with cliffs.
+
+\textbf{Worked example (stylized).} Take a GPU that runs $W = 128$ tile-blocks concurrently, one per SM, and a GEMM tiled into $128\times128$ output tiles. An output of $2048 \times 2048$ is $16 \times 16 = 256$ tiles: exactly two full waves, every SM busy to the end. Now grow one dimension by a single tile row: the \textbf{257th tile} runs as a \textit{third wave} in which 1 SM works and 127 idle---runtime jumps from 2 to 3 wave-times, a $+50\%$ latency cliff purchased with $+0.4\%$ more FLOPs. On a real H100 the constants differ (132 SMs, often 1--2 blocks resident per SM, and cuBLAS heuristics re-tile to rebalance), but the phenomenon is identical: plots of GEMM throughput versus dimension are sawtooths, and the last partial wave can be nearly free capacity. Mitigations: pick dimensions that are friendly multiples (the padding rule again), let the library autotune tile shapes, and for chronically awkward shapes use \textbf{split-K/Stream-K}-style kernels that divide the reduction dimension across SMs to fill the tail wave.
+
+\subsection{When GEMMs Go Bandwidth-Bound}
+
+A matmul is only compute-bound if \textit{all three} dimensions are large. Collapse any one and AI collapses with it:
+\begin{itemize}
+    \item \textbf{Skinny activations (small $M$).} $M$ $=$ batch $\times$ tokens. At decode, $M$ $=$ concurrent requests: an $M{=}8$, $K{=}N{=}8192$ GEMM has $\text{AI} \approx 8$---a weight-streaming op at $\sim$3\% of peak. This is the hardware content of ``decode is bandwidth-bound.''
+    \item \textbf{Thin reductions (small $K$ or $N$).} LoRA's $d \times r$ factors with $r{=}16$: AI is bounded by $\sim r$; such GEMMs live on the memory roof no matter how large $d$ is.
+    \item \textbf{Per-expert fragments.} MoE routing splits one big GEMM into many small ones ($M_{\text{expert}}$ $=$ tokens routed to that expert); at low batch, experts individually fall below the ridge even though the dense equivalent would not---one reason MoE decode economics are subtle (Chapter~\ref{chap:efficient_architectures}).
+\end{itemize}
+The classification question ``compute- or bandwidth-bound?'' is therefore really ``what is the \textit{smallest} dimension of the matmul?''---a one-line habit worth internalizing before any estimation interview.
+
+%==============================================================================
+\section{Kernel Fusion: Deleting HBM Round Trips}
+\label{sec:kernel_fusion}
+%==============================================================================
+
+\subsection{Why Small Ops Are Dominated by Overhead}
+
+An unfused model executes as a long sequence of kernels, and between consecutive kernels two taxes accrue:
+
+\textbf{Tax 1: launch overhead.} Each kernel launch costs $\sim$3--5 $\mu$s of CUDA-side latency, and an eager-mode PyTorch operator costs $\sim$10--30 $\mu$s of CPU dispatch (Python, autograd bookkeeping, allocator) before the launch even happens. Compare kernel runtimes: an elementwise add over a $4096 \times 4096$ BF16 tensor moves $\sim$100 MB and runs $\sim$30 $\mu$s---barely above its own overhead. Shrink to decode-sized tensors (one token, $d = 8192$: tens of KB) and the kernel runs $\sim$2 $\mu$s under a 10--30 $\mu$s tax: the GPU idles most of the time and the workload is \textit{CPU-bound}---visible in a profile as a sparse trace with gaps between slivers (Section~\ref{sec:gpu_profiling}). CUDA graphs attack this tax directly (Section~\ref{sec:gpu_occupancy}).
+
+\textbf{Tax 2: HBM round trips.} Each kernel reads its inputs from HBM and writes its outputs back. A chain of $k$ elementwise ops over the same tensor moves $\sim 2k \times$ the tensor's bytes when one pass would do. Since these ops sit at $\text{AI} \ll 295$, the round trips \textit{are} the runtime.
+
+\textbf{Worked arithmetic.} Take the FFN up-projection's output during training: $4096$ tokens $\times$ $d_{\text{ff}} = 14{,}336$, BF16 $\approx$ 117 MB. Unfused bias-add then GELU: the bias kernel reads 117 MB and writes 117 MB; the GELU kernel does the same---468 MB of extra traffic, $\approx 140\ \mu$s at 3.35 TB/s, \textit{per layer per direction}, for work whose FLOPs are worth $\approx 1\ \mu$s of tensor-core time. Fused into the GEMM epilogue, the extra traffic is zero: the values pass through registers on their way out. Multiply by dozens of such chains per layer and this is how eager, unfused models lose 20--40\% of a training step to plumbing---the source of \texttt{torch.compile}'s typical 10--30\% speedup on top of a FlashAttention baseline (Chapter~\ref{chap:training_optimization}).
+
+\textbf{Fusion} merges the chain into one kernel: intermediate values stay in registers, HBM is touched once on the way in and once on the way out, and $k{-}1$ launches disappear. Standard instances:
+\begin{itemize}
+    \item \textbf{Epilogue fusion:} bias add, GELU/SiLU, residual add, even dequantization folded into the tail of the preceding GEMM (cuBLAS epilogues, CUTLASS, Triton)---the intermediate activation never exists in HBM.
+    \item \textbf{Fused normalizations:} RMSNorm $+$ residual $+$ the following cast in one pass over the tensor.
+    \item \textbf{Fused optimizers:} AdamW as one (or a few) kernels sweeping all parameters via multi-tensor apply, instead of $\sim$10 tiny kernels per tensor per step---pure launch-tax removal at the scale of thousands of tensors (optimizer mechanics: Chapter~\ref{chap:training_optimization}).
+    \item \textbf{Fused linear + cross-entropy:} the LM head's $B \times T \times V$ logits tensor is the largest single activation in training; fused/chunked kernels (Liger, Cut Cross-Entropy) compute the loss without ever materializing it, collapsing $O(BTV)$ memory to $O(BT)$---the full memory arithmetic is in Chapter~\ref{chap:loss_functions}'s logits-memory discussion (chunked cross-entropy), and it is a fusion win as much as a memory win.
+\end{itemize}
+Most of this is automated now: \texttt{torch.compile}'s Inductor backend exists principally to find and generate exactly these fusions (canon in Chapter~\ref{chap:training_optimization}, including when it breaks); you hand-write a fusion only when the compiler cannot see it (Section~\ref{sec:kernels_2026}).
+
+\subsection{FlashAttention as the Canonical Fusion, Seen from the Hardware}
+
+Chapter~\ref{chap:attention_transformers} owns the algorithm (tiling, online softmax, the FA-2/FA-3 evolution). Here is the same object viewed purely as a hardware transaction.
+
+Standard attention is three kernels with two giant intermediates: $\mathbf{S} = \mathbf{Q}\mathbf{K}^\top$ written to HBM ($n^2$ scores per head---at $n = 8$K, 128 MB in BF16 \textit{per head}), read back by softmax, $\mathbf{P}$ written again, read again by $\mathbf{P}\mathbf{V}$. The matmuls are fine; the $O(n^2)$ HBM round trips between them put the overall op far below the ridge.
+
+FlashAttention is the tiling template of Section~\ref{sec:gpu_matmul} plus one algorithmic unlock: a block of $\mathbf{Q}$ stays resident in shared memory and registers while tiles of $\mathbf{K}, \mathbf{V}$ stream through, and the \textbf{online softmax} (a running max and running denominator, updated per tile) removes the need to see a full row of scores before normalizing---which is precisely what made the fusion invisible to a compiler. $\mathbf{S}$ and $\mathbf{P}$ simply never exist in HBM. The backward pass \textbf{recomputes} score tiles from $\mathbf{Q}, \mathbf{K}$ on the fly rather than reading stored ones: $O(n^2)$ extra FLOPs in exchange for $O(n^2)$ avoided bytes---and since pre-fusion attention sat on the memory roof, those FLOPs are paid out of idle tensor-core capacity. \textbf{Trading recompute for bandwidth is profitable whenever you are left of the ridge}; it is the same logic as activation checkpointing (Chapter~\ref{chap:training_optimization}), applied at kernel scale. Effective AI rises from $O(1)$ to $O(\text{block size})$, moving attention from the memory roof to the compute roof---after which the FFN, not attention, is typically the next bottleneck.
+
+\begin{keyinsight}[The Three Ways to Make a Bandwidth-Bound Op Faster]
+There is no fourth: (1) \textbf{move fewer bytes} (fusion, recompute-instead-of-store, quantization, KV-cache compression); (2) \textbf{reuse each byte more} (batching, tiling---i.e., raise arithmetic intensity); (3) \textbf{buy more bandwidth} (HBM3e, more GPUs so the same bytes stream in parallel). Every memory-flavored optimization in this book---from speculative decoding's ``verify many tokens per weight-read'' to GQA's smaller KV cache---is one of these three in costume. Naming which one a technique is, is a reliable way to sound like you understand it.
+\end{keyinsight}
+
+%==============================================================================
+\section{Occupancy, CUDA Graphs, and Streams}
+\label{sec:gpu_occupancy}
+%==============================================================================
+
+\subsection{Occupancy in One Honest Page}
+
+\textbf{Occupancy} is resident warps per SM divided by the maximum (64). It is limited by whichever per-block resource runs out first: the register file (64K $\times$ 32-bit registers per SM: a kernel using 128 registers/thread with 256-thread blocks fits $65{,}536/(128 \times 256) = 2$ blocks $=$ 512 threads $=$ 25\% occupancy), shared memory (a block asking for 114 KB fits twice in 228 KB), or block slots (max 32 blocks/SM). The scheduler hides latency by switching among resident warps, so occupancy is a proxy for \textit{latency-hiding capacity}.
+
+The honest part: \textbf{high occupancy is not the goal; hidden latency is}. By Little's law, sustaining bandwidth $B$ against latency $L$ requires $B \times L$ bytes in flight: at 3.35 TB/s and $\sim$600 ns of HBM latency that is $\sim$2 MB outstanding chip-wide, $\sim$15 KB per SM---over a hundred 128-byte lines that must be requested \textit{before} the first one lands. There are two currencies for keeping that many requests airborne: many warps (occupancy) or more independent work per thread (instruction-level parallelism, bigger register tiles, asynchronous bulk copies). Peak-performance GEMMs deliberately run \textit{low} occupancy---one or two fat blocks per SM hoarding the register file for large accumulator tiles, using asynchronous copies (TMA) and software pipelining to keep the tensor cores fed; Volkov's classic ``better performance at lower occupancy'' result is standard practice in every CUTLASS kernel. Conversely, a memory-streaming kernel with little work per element genuinely needs many warps in flight to saturate 3.35 TB/s. So treat low occupancy in a profiler as a \textit{hypothesis generator}, not a defect: ask what the kernel is bound by first; ``raise occupancy'' is only the fix when the SM is idle \textit{and} uncovered memory latency is why.
+
+\subsection{CUDA Graphs: Amortizing the Launch Tax}
+
+A transformer decode step is hundreds of kernels (per layer: norms, QKV projection, attention, output projection, the FFN pair, residuals), each individually tiny at small batch. At $\sim$10--30 $\mu$s of CPU cost per eager launch, the CPU cannot issue work as fast as the GPU retires it; the trace shows gaps and per-token latency inflates well beyond the roofline number. \textbf{CUDA graphs} capture the entire step's kernel DAG once---kernels, arguments, dependencies---and replay it with a single launch, collapsing hundreds of dispatches into one and cutting the CPU out of the inner loop. This is why serving engines (vLLM and peers) capture graphs per padded batch-size bucket and replay them during decode, and why \texttt{torch.compile}'s reduce-overhead mode wraps compiled regions in graphs. The constraints follow directly from ``replaying a recording'': shapes, memory addresses, and control flow must be static across replays---hence bucketing to fixed batch sizes, pre-allocated static buffers, and no data-dependent CPU branching inside the captured region. Training uses graphs less: big-batch kernels are long enough that the launch tax is already amortized.
+
+\subsection{Streams and Overlap}
+
+A \textbf{stream} is an ordered queue of GPU work; different streams may execute concurrently. Three overlaps matter in practice: (1) \textbf{copy/compute}---dataloaders prefetch the next batch host-to-device (pinned memory, separate stream) under the current step's compute, which is why the input pipeline should never appear on the critical path of a healthy trace; (2) \textbf{communication/compute}---NCCL collectives run on their own streams so DDP/FSDP can all-reduce or reduce-scatter gradient buckets \textit{while} backward still computes earlier layers' gradients (Chapter~\ref{chap:training_optimization}); a ``communication-bound'' run is often really a ``communication-not-overlapped'' run; (3) \textbf{compute/compute}---rarer, e.g., overlapping one micro-batch's attention with another's FFN in pipelined serving. The classic pitfall is accidental serialization: a synchronizing call (\texttt{.item()}, \texttt{.cpu()}, an unpinned copy) or an op dropped onto the default stream inserts a barrier that quietly flattens all this concurrency---one of the first things to look for in a trace (Section~\ref{sec:gpu_profiling}).
+
+%==============================================================================
+\section{Writing Kernels in 2026}
+\label{sec:kernels_2026}
+%==============================================================================
+
+\subsection{Triton's Block-Level Model, in One Page}
+
+Triton is the default tool when an ML engineer writes a kernel by hand. Its core abstraction: \textbf{you program at the tile level, not the thread level}. A Triton program describes what one \textit{block} of the launch grid does---load a tile with \texttt{tl.load} (with a boundary mask), compute on it as whole-tile tensor operations (\texttt{tl.dot} hits the tensor cores), store with \texttt{tl.store}---and the compiler decides everything a CUDA programmer sweats over inside the block: mapping tile elements to threads and warps, staging through shared memory, avoiding bank conflicts, vectorizing and coalescing loads, allocating registers, and software-pipelining the tile loop (\texttt{num\_stages} and \texttt{num\_warps} as tunable knobs, usually autotuned over a small config grid). What it deliberately does \textit{not} abstract is the memory hierarchy itself: you still choose tile sizes, you still reason with the roofline, and a Triton kernel with bad tiling is exactly as slow as the equivalent bad CUDA.
+
+\textbf{When you would actually write one.} Not for GEMM, norms, or standard attention---libraries and \texttt{torch.compile} (which itself \textit{generates} Triton; canon in Chapter~\ref{chap:training_optimization}) already cover those. You drop to Triton for a fusion the compiler cannot produce because it needs an algorithmic identity or nonstandard structure: a fused linear-plus-cross-entropy that never materializes logits (the Liger-style kernels of Chapter~\ref{chap:loss_functions}), an attention variant with exotic masking/gating/sparsity that breaks the FlashAttention pattern, dequantization fused into a GEMM epilogue for a new weight format, or a fused sampling/routing op. The economics: a competent engineer gets within 1.5--2$\times$ of expert CUDA in days instead of weeks, and for \textit{bandwidth-bound} fusions---where the win is deleting HBM trips, not exquisite MMA scheduling---Triton typically reaches parity. The residual gap lives at the bleeding edge (fine-grained warp specialization, TMA choreography, FP8/FP4 pipelines on the newest silicon), where hand-tuned kernels still lead.
+
+\textbf{The rest of the stack, one line each.} \textbf{CUTLASS}: NVIDIA's open C++ template library of GEMM and attention building blocks---cuBLAS-class performance as composable source, for when you need a custom mainloop or epilogue, and the substrate under much of FlashAttention-3. \textbf{cuBLAS/cuDNN}: NVIDIA's closed, heuristic-tuned libraries for GEMM and conv/attention---the default fast path, which you fall off of only knowingly.
+
+%==============================================================================
+\section{Multi-GPU Communication}
+\label{sec:multi_gpu_comm}
+%==============================================================================
+
+Parallelism strategies (what to shard and why) are canon in Chapter~\ref{chap:training_optimization}; serving-side placement in Chapter~\ref{chap:inference_optimization}. This section owns the layer beneath both: what the collectives cost and which wires they run on.
+
+\subsection{NCCL Collectives and Their Price}
+
+\begin{table}[H]
+\centering
+\small
+\caption{The collectives that matter, with per-GPU traffic for payload $S$ bytes on $N$ GPUs}
+\label{tab:nccl_collectives}
+\begin{tabularx}{\textwidth}{llX}
+\toprule
+\textbf{Collective} & \textbf{Per-GPU bytes (bandwidth-optimal)} & \textbf{Where it appears} \\
+\midrule
+All-reduce & $2S(N-1)/N \approx 2S$ & DDP gradient sync; TP activation sums (2 per layer) \\
+Reduce-scatter & $S(N-1)/N \approx S$ & FSDP/ZeRO gradient sharding; the first half of all-reduce \\
+All-gather & $S(N-1)/N \approx S$ & FSDP/ZeRO parameter gathering; the second half \\
+Broadcast & $\approx S$ & Weight sync to rollout engines; checkpoint fan-out \\
+All-to-all & $S(N-1)/N \approx S$, each GPU exchanging \textit{distinct} shards & MoE expert dispatch/combine (Chapter~\ref{chap:efficient_architectures}); DeepSpeed-Ulysses context parallelism \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{mathresult}{Ring All-Reduce: the $2(N-1)/N$ Factor}
+Ring all-reduce runs in two phases over a logical ring of $N$ GPUs. \textbf{Reduce-scatter}: split the payload into $N$ chunks; in each of $N-1$ steps every GPU sends one chunk ($S/N$ bytes) to its neighbor and adds what it receives---after which each GPU holds one fully reduced chunk. \textbf{All-gather}: $N-1$ more steps circulate the reduced chunks. Total per-GPU traffic (each direction):
+\begin{equation}
+\text{bytes sent} = 2(N-1)\cdot\frac{S}{N} = \frac{2(N-1)}{N}\,S \xrightarrow{\;N \to \infty\;} 2S,
+\end{equation}
+so with per-GPU link bandwidth $B$ and per-step latency $\alpha$,
+\begin{equation}
+T_{\text{ring}} \approx \frac{2(N-1)}{N}\cdot\frac{S}{B} \;+\; 2(N-1)\,\alpha.
+\end{equation}
+Two readings, both interview gold: (1) the \textbf{bandwidth term is independent of $N$}---each GPU sends at most $2S$ no matter how many peers, which is why data parallelism scales; (2) the \textbf{latency term is linear in $N$}---at 1{,}024 GPUs and $\alpha \approx 5$--$10\ \mu$s, a ring pays $\sim$10--20 ms \textit{regardless of message size}, which is why small collectives at scale switch to trees.
+\end{mathresult}
+
+\textbf{Worked example: syncing a 70B model's gradients.} BF16 gradients: $S = 140$ GB. \textit{Intra-node, 8$\times$H100 over NVLink:} $B \approx 450$ GB/s per direction; $T \approx 1.75 \times 140/450 \approx 0.54$ s at peak---call it $\sim$0.7 s at realistic ($\sim$80\%) NCCL efficiency. That is enormous next to a $\sim$1 s step, tolerable only because DDP overlaps it bucket-by-bucket under the backward pass; the honest metric is \textit{exposed} (non-overlapped) communication time. \textit{Naive flat ring across 64 GPUs (8 nodes) with one 50 GB/s NIC each:} $T \approx 1.97 \times 140/50 \approx 5.5$ s---catastrophic. The fix is \textbf{hierarchical reduction} (HSDP-style; Chapter~\ref{chap:training_optimization}): reduce-scatter within each node on NVLink, all-reduce only the $1/8$-sized shards across nodes ($\approx 1.97 \times 17.5/50 \approx 0.7$ s), then all-gather back on NVLink. Same result, $8\times$ less inter-node traffic---the fabric hierarchy used as a bandwidth concentrator. Gradient compression and less-frequent sync attack the same term from the algorithm side.
+
+\textbf{When does overlap actually hide it?} Overlap is not free magic; it has a feasibility condition: exposed time is $\max(0,\ T_{\text{comm}} - T_{\text{overlappable compute}})$, where the overlappable window is essentially the backward pass (gradients become ready layer by layer and their buckets can fly while earlier layers still compute). If syncing costs $\sim$0.7 s, the backward pass must be at least that long---and here per-GPU batch size enters: compute per step grows linearly with local batch while the gradient payload is \textit{fixed} at one model's worth, so shrinking the per-GPU batch (scaling out at constant global batch) shrinks the window under a constant cost until DP goes communication-bound. This is the fabric-level reason ``more GPUs'' stops helping before the arithmetic says it should, why gradient accumulation (fewer syncs per unit compute) trades latency for exposure, and one of the reasons MFU degrades with scale (Chapter~\ref{chap:training_optimization}).
+
+\textbf{Tree vs.\ ring.} NCCL's double binary trees replace the $O(N)$ latency chain with $O(\log N)$ depth while sustaining near-full bandwidth for the reduce-plus-broadcast pattern; NCCL auto-selects by message size and scale. Heuristic: big messages (gradient buckets) $\to$ ring, bandwidth-optimal; small messages (batch-1 TP activations, control-plane syncs) at large $N$ $\to$ tree, latency-optimal. Chapter~\ref{chap:inference_optimization}'s observation that batch-1 TP all-reduces are latency-dominated ($\sim$10 $\mu$s on NVLink regardless of the few KB moved) is the same $\alpha$-versus-$S/B$ split at serving time.
+
+\textbf{All-to-all.} MoE's expert parallelism sends each token's hidden state to the GPUs owning its routed experts and back---two all-to-alls per MoE layer, traffic $\propto \text{tokens} \times k \times d_{\text{model}}$, and unlike TP's all-reduces it routinely crosses node boundaries (EP mechanics: Chapters~\ref{chap:efficient_architectures} and \ref{chap:training_optimization}). All-to-all is also unforgiving of imbalance: the collective completes when the most-loaded link finishes, so a hot expert becomes a straggler for the whole layer. This is why DeepSeek-V3-style node-limited routing exists (bound the number of nodes a token may touch; Chapter~\ref{chap:efficient_architectures}) and why EP degree is chosen jointly with the fabric.
+
+\subsection{Topology: Which Wire Does Each Dimension Cross?}
+
+A DGX H100 node is 8 GPUs, all-to-all connected at $\sim$900 GB/s aggregate each via NVSwitch, with one 400 Gb/s ($\sim$50 GB/s) InfiniBand NIC per GPU for the outside world---a $\sim$9$\times$ bandwidth cliff plus a latency step at the node boundary. Topology-aware placement is just sorting parallelism dimensions by communication intensity and paying the cliff with the cheapest one:
+
+\begin{table}[H]
+\centering
+\small
+\caption{Communication intensity dictates placement (strategy canon: Chapters~\ref{chap:training_optimization} and \ref{chap:inference_optimization})}
+\label{tab:topology_placement}
+\begin{tabularx}{\textwidth}{lXl}
+\toprule
+\textbf{Dimension} & \textbf{Traffic pattern} & \textbf{Fabric} \\
+\midrule
+Tensor parallel & All-reduce of activations, \textit{every layer}; latency-sensitive, unoverlappable & NVLink (intra-node) \\
+Expert parallel & All-to-all per MoE layer; imbalance-sensitive & NVLink; node-limited if it must cross \\
+Pipeline parallel & Point-to-point activations at stage boundaries only & Inter-node OK \\
+Data parallel / FSDP & Largest volume but once per step and overlappable & Inter-node, hierarchical \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Clusters are built so this sorting works: \textbf{rail-optimized} InfiniBand fabrics wire NIC $i$ of every node to the same leaf switch (``rail''), so same-rank traffic avoids the spine, and \textbf{GPUDirect RDMA} lets NICs read HBM directly, bypassing host memory. Get placement wrong---say, TP spanning two nodes---and every layer's all-reduce pays NIC latency and bandwidth hundreds of times per step; Chapter~\ref{chap:inference_optimization} quantifies the same mistake at serving time ($\sim$2--4 ms of pure communication latency per decoded token). The Blackwell-era wrinkle: an NVL72 rack makes 72 GPUs one NVLink domain, so ``TP/EP must fit in 8'' relaxes to ``must fit in 72''---the cliff moves rather than disappears, and the sorting logic is unchanged.
+
+%==============================================================================
+\section{Profiling Methodology}
+\label{sec:gpu_profiling}
+%==============================================================================
+
+Everything so far predicts performance; profiling is how you find out what actually happened. The Staff-level habit is a fixed loop---\textbf{measure $\to$ classify the bottleneck $\to$ apply the matching playbook $\to$ re-measure}---never optimizing on speculation.
+
+\subsection{Reading a torch.profiler Trace}
+
+\begin{lstlisting}[language=Python]
+with torch.profiler.profile(
+    activities=[torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA],
+    schedule=torch.profiler.schedule(wait=1, warmup=3, active=5),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler("./trace"),
+    profile_memory=True, with_stack=True,
+) as prof:
+    for step, batch in enumerate(loader):
+        train_step(batch)
+        prof.step()
+\end{lstlisting}
+
+Open the trace (Perfetto/Chrome) and read the GPU row first. There are only a few shapes, and each maps to a playbook:
+\begin{itemize}
+    \item \textbf{Gaps between kernels} $\Rightarrow$ the GPU is waiting. Wide, regular gaps under a busy CPU row: eager-mode launch overhead or Python/dataloader work on the critical path---fuse, \texttt{torch.compile}, CUDA graphs, more dataloader workers. A gap at the same point each step aligned with a \texttt{cudaStreamSynchronize}: a hidden sync (\texttt{.item()} on the loss, per-step metrics, \texttt{.cpu()}).
+    \item \textbf{A few fat kernels dominating} $\Rightarrow$ the GPU is busy; roofline-check the top kernels. A GEMM at 60--80\% of peak is healthy---move on. An elementwise or norm kernel high on the list is a fusion opportunity. A GEMM far below peak: check shapes (alignment, skinny dims, wave quantization).
+    \item \textbf{NCCL kernels exposed} (not overlapped with compute) $\Rightarrow$ communication on the critical path: check bucket sizes, overlap configuration, topology placement, stragglers.
+    \item \textbf{Memcpy HtoD inside the step} $\Rightarrow$ input pipeline not prefetched or not pinned.
+\end{itemize}
+
+\textbf{Nsight, one paragraph.} \texttt{torch.profiler} sees the framework's view; \textbf{Nsight Systems} sees the whole machine---every CPU thread, CUDA API call, NCCL operation, NVTX range---and is the tool when the question is ``why is the GPU idle'' at system scale (per-rank timelines expose stragglers). \textbf{Nsight Compute} goes inside a single kernel: achieved FLOP/s and DRAM throughput, occupancy and its limiting resource, and a built-in roofline chart that places the kernel on Figure~\ref{fig:roofline} for you. Escalate in that order: framework trace $\to$ system timeline $\to$ single-kernel autopsy.
+
+\textbf{Memory profiling.} Start with \texttt{torch.cuda.memory\_summary()} for the headline numbers; for the allocation timeline, record memory history (\texttt{\_record\_memory\_history()}) and open the snapshot in the memory visualizer. Two patterns to recognize: (1) \textbf{fragmentation}---\textit{reserved} far above \textit{allocated}, OOMs despite apparent headroom, caused by varying shapes churning the caching allocator; fixes are shape bucketing/padding and \texttt{expandable\_segments:True}; (2) \textbf{activation spikes}---a sawtooth peaking early in backward, or one giant short-lived allocation at the loss layer (the $B \times T \times V$ logits tensor; Chapter~\ref{chap:loss_functions}); fixes are checkpointing, chunked/fused cross-entropy, micro-batching. Full memory-component accounting is in Chapter~\ref{chap:training_optimization}.
+
+\begin{keyinsight}[The ``GPU at 20\% Utilization'' Diagnostic Ladder]
+Work down; each rung has a cheap discriminating test. (0) \textbf{Distrust the metric}: \texttt{nvidia-smi} ``utilization'' is the fraction of time \textit{any} kernel is resident---one tiny kernel per interval reads as 100\%. Check power draw/SM activity or a trace before believing any number. (1) \textbf{Data loading}: does throughput jump with synthetic, pre-loaded batches? If yes: more workers, pinned memory + prefetch, pre-tokenized/cached data, faster storage. (2) \textbf{CPU-bound launches}: trace shows sliver kernels with gaps and a saturated Python thread. Fix: \texttt{torch.compile}, fused ops, CUDA graphs, remove per-step host work. (3) \textbf{Small batch / small kernels}: kernels run back-to-back but each is too small to fill 132 SMs. Fix: bigger true batch or sequence packing (gradient accumulation fixes memory, \textit{not} per-kernel parallelism). (4) \textbf{Sync points}: recurring \texttt{cudaStreamSynchronize} aligned with the gaps---\texttt{.item()}, metrics, dynamic control flow. Fix: async/periodic logging, keep decisions on-device. (5) \textbf{Communication stalls}: exposed NCCL time; per-rank timelines disagree (straggler) or traffic crosses the wrong fabric. Fix: overlap, hierarchical collectives, placement, quarantine slow nodes. Only after the ladder is clean does kernel-level tuning (Sections~\ref{sec:gpu_matmul}--\ref{sec:gpu_occupancy}) become the bottleneck.
+\end{keyinsight}
+
+\subsection{MFU: The End-to-End Score}
+
+Model FLOPs Utilization is the honest summary statistic: the fraction of the cluster's peak FLOP/s doing \textit{model-defined} work,
+\begin{equation}
+\text{MFU} = \frac{\text{tokens/s} \times 6P}{N_{\text{GPU}} \times \text{peak FLOP/s}},
+\end{equation}
+using the $6P$ FLOPs-per-token rule for dense transformers (Chapter~\ref{chap:training_optimization}). \textbf{Worked example:} an 8B dense model on 64 H100s measures 520K tokens/s. Achieved: $5.2\times10^{5} \times 6 \times 8\times10^{9} = 2.50 \times 10^{16}$ FLOP/s. Peak: $64 \times 989 \times 10^{12} = 6.33 \times 10^{16}$ FLOP/s. $\text{MFU} \approx 39\%$---respectable, with room. Two conventions to state before quoting numbers: MFU counts only the $6P$ (recomputation from checkpointing counts in \textit{HFU} but not MFU, so heavy recompute lowers MFU at constant hardware busyness); and FP8 runs are reported against the FP8 peak or as BF16-equivalent---say which. Frontier targets and their scale-dependence are canon in Chapter~\ref{chap:training_optimization}: roughly 40--55\% on H100-class hardware for well-optimized dense pretraining, degrading as parallelism degree and cluster size grow.
+
+%==============================================================================
+\section{Precision Formats on the Hardware}
+\label{sec:gpu_precision}
+%==============================================================================
+
+Format semantics, loss scaling, and training recipes are canon in Chapter~\ref{chap:training_optimization} (mixed precision); inference quantization (GPTQ/AWQ/FP8/FP4 deployment) in Chapter~\ref{chap:inference_optimization}. What belongs \textit{here} is the hardware contract: each halving of operand width doubles tensor-core throughput and halves the bytes per element---raising the compute roof \textit{and} moving the op rightward in arithmetic intensity simultaneously, which is why quantization helps even purely bandwidth-bound decode.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Tensor-core formats on H100 SXM (dense figures; 2:4 structured sparsity doubles each)}
+\label{tab:precision_hw}
+\begin{tabularx}{\textwidth}{lllcX}
+\toprule
+\textbf{Format} & \textbf{Peak (dense)} & \textbf{vs.\ BF16} & \textbf{Acc.} & \textbf{Hardware notes} \\
+\midrule
+TF32 & $\sim$494 TFLOP/s & $0.5\times$ & FP32 & 10-bit mantissa; what opted-in ``FP32'' matmuls actually run as \\
+FP16 & 989 TFLOP/s & $1\times$ & FP32 & Same speed as BF16; narrow range needs loss scaling \\
+BF16 & 989 TFLOP/s & $1\times$ & FP32 & Training default: FP32's exponent range, no loss scaling \\
+FP8 & $\sim$1{,}979 TFLOP/s & $2\times$ & FP32 & E4M3/E5M2, Hopper+; needs per-tensor or per-block scaling; FA-3 attention, DeepSeek-V3-style training \\
+INT8 & $\sim$1{,}979 TOPS & $2\times$ & INT32 & Integer path; weight/activation quant serving \\
+FP4 & --- (B200 only) & $\sim$4$\times$ & FP32 & Blackwell adds it at $\sim$2$\times$ FP8 peak; microscaled block formats (NVFP4/MXFP4); inference-first \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Three hardware facts worth volunteering unprompted. \textbf{Accumulation is wider than the operands}: H100 tensor cores multiply in the narrow format but accumulate partial sums in FP32 (INT32 for integer paths), which is why an FP8 GEMM does not compound rounding error across a $K = 8192$ reduction---and why ``FP8 training'' really means FP8 \textit{matmul operands} inside an FP32-accumulate, higher-precision-master-weight recipe. \textbf{The sparsity asterisk}: the doubled ``peak'' figures (e.g., 1{,}979 for BF16) require 2:4 structured sparsity---two zeros in every four weights, compiled into sparse tensor-core instructions; dense workloads, i.e., nearly all LLM work in practice, get the dense column, and quoting the sparse figure for a dense workload is a red flag this book enforces everywhere. \textbf{Narrow formats raise the ridge}: FP8's ridge is $\sim$590 FLOP/byte, so an op that barely cleared the BF16 ridge can land back on the memory roof after quantizing only its compute---halve the bytes too, or the speedup evaporates.
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:gpu_interview}
+%==============================================================================
+
+\begin{interviewq}
+\textbf{Q: Walk me through the GPU memory hierarchy. Why does it, rather than FLOPs, dominate ML performance thinking?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer Five levels, each roughly an order of magnitude bigger and slower (H100 numbers): registers (256 KB/SM, operand-speed) $\to$ shared memory/L1 (up to 228 KB/SM, tens of TB/s aggregate) $\to$ L2 (50 MB, chip-wide) $\to$ HBM3 (80 GB at $\sim$3.35 TB/s) $\to$ off-chip (NVLink $\sim$450 GB/s per direction to peer GPUs, PCIe $\sim$64 GB/s to host, $\sim$50 GB/s InfiniBand to other nodes). The reason it dominates: compute outgrew bandwidth. An H100 executes $\sim$295 BF16 FLOPs in the time one HBM byte arrives, so any op doing fewer FLOPs per byte is limited by the memory system---and most non-matmul ops do 100--1000$\times$ fewer. Fast kernels are therefore data-movement schedules: stage a tile high in the hierarchy, extract all its reuse, write once. Most named optimizations---FlashAttention, kernel fusion, KV-cache compression, quantization---are memory-traffic optimizations wearing different hats.
+
+\redflags
+\begin{itemize}
+    \item Describing the hierarchy with no numbers---the levels only mean something through their ratios.
+    \item ``More FLOPS $=$ faster model''---ignores that most ops in a transformer step are nowhere near the compute roof.
+    \item Confusing shared memory (on-chip, per-SM, program-managed) with ``GPU memory'' (HBM).
+\end{itemize}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the levels and the HBM bandwidth number; states that elementwise ops are bandwidth-bound.
+    \item \badgeLsix{L6} Quantifies the $\sim$295 FLOP/byte ratio, connects it to the roofline, and tells the tiling-for-reuse story.
+    \item \badgeLseven{L7} Extends the hierarchy off-chip (NVLink/PCIe/InfiniBand as ``level five'') and uses one mental model---bytes per FLOP per wire---to reason about kernels and cluster topology alike.
+\end{itemize}
+
+\followups{``Where does the KV cache live, and what does that imply per decode step?'' ``Why does L2 matter for GEMM performance?'' ``What changes on B200?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why do tensor cores only accelerate matrix multiplication? What does that imply for how you design models and kernels?}
+
+\badgeLfive{L5} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer Because matmul is the one primitive with enough \textit{regular data reuse} to justify fixed-function silicon. A tensor core computes a whole small tile-product $\mathbf{D} = \mathbf{A}\mathbf{B} + \mathbf{C}$ as one operation (a $16{\times}8{\times}16$ fragment per warp instruction in BF16; $64$-wide warpgroup MMAs on Hopper): $O(b^3)$ multiply--adds against $O(b^2)$ operands, fixed dataflow, no per-FLOP instruction fetch/decode, accumulators hard-wired to the multiplier array. General-purpose units cannot amortize control overhead like that for irregular code---which is why the vector path peaks at $\sim$67 TFLOP/s FP32 while the tensor path hits 989 TFLOP/s BF16, a $\sim$15$\times$ gap. Implications: (1) architectures keep their FLOPs matmul-shaped (transformers are matmul factories by construction; the softmax/norm glue is the expensive-per-FLOP part, a key motivation in FlashAttention-2 for minimizing non-matmul work); (2) shapes must feed the tiles---dimensions divisible by 8 (BF16) or 16 (FP8), padded vocabularies, tile-friendly hidden sizes; (3) the way to ``accelerate everything else'' is fusing it into matmul epilogues, since standalone elementwise ops cannot touch tensor cores at all.
+
+\redflags
+\begin{itemize}
+    \item ``Tensor cores are just more CUDA cores''---they are a different execution path operating on matrix fragments.
+    \item Not knowing that operands are low-precision while accumulation is FP32.
+    \item Unable to explain \textit{why} shape constraints exist (fragment sizes, 128-bit aligned loads).
+\end{itemize}
+
+\interviewtest{Do you understand hardware specialization as an amortization argument---reuse per operand and control overhead per FLOP---or do you just know the marketing name?}
+
+\followups{``Why are convolutions also tensor-core friendly?'' (im2col/implicit GEMM.) ``Your profiler shows a matmul not using tensor cores---name three causes.'' (Misaligned/odd dimensions, unsupported dtype combination, shapes too small so the library picked a vector kernel.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: I give you an op---say, a LayerNorm over a $[16{,}384 \times 8{,}192]$ BF16 tensor, or a $4096^3$ GEMM. Is it compute-bound or bandwidth-bound on an H100? Show your method.}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
+
+\stronganswer Method: count FLOPs, count HBM bytes, take the ratio, compare to the ridge $\approx 989/3.35 \approx 295$ FLOP/byte; runtime bound is $\max(\text{FLOPs}/989\text{T},\ \text{bytes}/3.35\text{T})$. \textbf{LayerNorm:} $1.34\times10^{8}$ elements at $\sim$5--10 FLOPs each ($\sim$$10^{9}$ FLOPs); bytes $\approx$ read $+$ write $= 2 \times 2.7\times10^{8} \approx 5.4\times10^{8}$. AI $\approx 2 \ll 295$: bandwidth-bound; time $\approx 5.4\times10^{8}/3.35\times10^{12} \approx 160\ \mu$s, and no kernel cleverness beats that without fusing neighbors. \textbf{GEMM:} $2 \times 4096^3 \approx 1.4\times10^{11}$ FLOPs over $\sim$$10^{8}$ bytes: AI $\approx 1365 \gg 295$, compute-bound; $\gtrsim$140 $\mu$s at peak, realistically $\sim$0.2 ms at 70--80\% efficiency. The expert reflexes: for matmuls, AI is governed by the \textit{smallest} dimension (a batch-8 decode GEMM has AI $\approx 8$---bandwidth-bound despite being ``a matmul''); count \textit{HBM} bytes, not instruction-level loads (cached reuse is the whole point); and precision moves both axes---FP8 doubles the roof but halves the bytes, raising the ridge to $\sim$590.
+
+\redflags
+\begin{itemize}
+    \item Not knowing the anchor numbers (989 TFLOP/s dense BF16, $\sim$3.35 TB/s)---the method dies without them.
+    \item Quoting 1{,}979 TFLOP/s as dense BF16 peak (that is the 2:4-sparsity figure; the legitimate $\sim$1{,}979 is FP8 dense).
+    \item Classifying ``matmul $\Rightarrow$ compute-bound'' without checking the smallest dimension.
+    \item Adding compute and memory time instead of taking the max.
+\end{itemize}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the two regimes and classifies the easy cases correctly.
+    \item \badgeLsix{L6} Computes AI cleanly, states the ridge, gives runtime bounds in microseconds, avoids the skinny-GEMM trap.
+    \item \badgeLseven{L7} Adds the honesty caveats: roofline is attainable-not-achieved, launch overhead and wave quantization at small sizes, L2 reuse blurring the byte count, and how fusion changes the classification.
+\end{itemize}
+
+\followups{``Same LayerNorm fused with the residual add---what changes?'' ``At what batch size does a $d{=}8192$ decode GEMM cross over?'' (AI $\approx B$: $\sim$300 against peak, $\sim$150 at realistic GEMM efficiency---matching the serving math of Chapter~\ref{chap:inference_optimization}.) ``Is attention prefill compute- or bandwidth-bound? Decode?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your training job shows the GPU at 20\% utilization. Diagnose it.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer First, distrust the metric: \texttt{nvidia-smi} utilization is the fraction of time \textit{any} kernel is resident---one tiny kernel per sampling interval reads as busy---so it neither proves nor localizes anything. Get a \texttt{torch.profiler} or Nsight trace and walk the ladder in order of prior probability, each rung with a cheap discriminating test. \textbf{(1) Data loading}: swap in synthetic pre-loaded batches; if step time collapses, it is the input pipeline (workers, pinned memory + async prefetch, pre-tokenization, storage throughput). \textbf{(2) CPU-bound launches}: the trace shows sliver kernels separated by gaps with a saturated Python thread---eager dispatch ($\sim$10--30 $\mu$s/op) exceeds kernel runtimes; fix with \texttt{torch.compile}, fused ops, CUDA graphs. \textbf{(3) Batch or kernels too small}: kernels run back-to-back but cannot fill 132 SMs; raise the true batch size or pack sequences (gradient accumulation fixes memory, \textit{not} per-kernel parallelism). \textbf{(4) Sync points}: recurring \texttt{cudaStreamSynchronize} aligned with the gaps---\texttt{.item()} on the loss every step, metrics, \texttt{.cpu()} calls; make logging asynchronous and periodic. \textbf{(5) Communication}: exposed NCCL kernels, or per-rank timelines that disagree---missing overlap, wrong topology placement (TP across nodes), or a straggler node to quarantine. Close by naming the real target: healthy LLM pretraining sits around 40--55\% \textit{MFU} (Chapter~\ref{chap:training_optimization}); utilization percent is not the metric, achieved FLOP/s is.
+
+\redflags
+\begin{itemize}
+    \item Jumping to kernel optimization or ``get faster GPUs'' before ruling out the input pipeline---the most common real cause.
+    \item Taking \texttt{nvidia-smi} utilization at face value, or optimizing it instead of MFU/tokens-per-second.
+    \item Listing causes with no discriminating experiments to separate them.
+    \item Believing gradient accumulation increases per-kernel parallelism.
+\end{itemize}
+
+\interviewtest{Debugging discipline on systems: an ordered hypothesis ladder with cheap tests per rung, correct use of profiling tools, and a quantitative definition of ``fixed.''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names data loading and small batches; reaches for a profiler.
+    \item \badgeLsix{L6} Runs the full ladder with per-rung tests, reads trace shapes correctly, debunks the utilization metric.
+    \item \badgeLseven{L7} Adds the distributed rungs (stragglers, exposed collectives, per-rank variance), quantifies the launch-overhead arithmetic, and frames the end state as an MFU number.
+\end{itemize}
+
+\followups{``Utilization is 95\% but MFU is 15\%---now what?'' (Busy with tiny/inefficient kernels: fusion and shape work.) ``How do you find one straggler among 512 GPUs?'' ``Which of these fixes does \texttt{torch.compile} subsume, and which not?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Kernel fusion doesn't reduce FLOPs. Why does it make models faster---and when does it stop helping? Use FlashAttention as your example.}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer Because for ops left of the ridge, runtime is bytes, not FLOPs. Unfused, every op in a chain reads its input from HBM and writes its output back---$k$ chained elementwise ops move $\sim 2k\times$ the tensor's bytes---plus $\sim$10--30 $\mu$s of launch/dispatch tax per op, which for small tensors exceeds the kernel runtime outright. Fusion keeps intermediates in registers: one read, one write, one launch. FlashAttention is the canonical case: standard attention writes the $n^2$ score matrix to HBM, reads it back for softmax, writes the probabilities, reads them again for $\mathbf{P}\mathbf{V}$; the fused kernel streams $\mathbf{K}/\mathbf{V}$ tiles past SRAM-resident $\mathbf{Q}$ blocks, the online softmax removes the need to see a full row before normalizing (the algorithmic unlock no compiler could find), and the backward \textit{recomputes} score tiles instead of reading stored ones---spending idle-anyway FLOPs to delete $O(n^2)$ bytes. Effective AI rises from $O(1)$ to $O(\text{block size})$: memory roof to compute roof. When fusion stops helping: once the region is compute-bound, deleted bytes buy nothing (fusing two large GEMMs is pointless---each already saturates the tensor cores, and merging them can wreck both kernels' tiling); when the fused kernel's register/shared-memory appetite cuts occupancy below its latency-hiding needs; and when a downstream consumer forces the intermediate to be materialized anyway.
+
+\redflags
+\begin{itemize}
+    \item ``FlashAttention approximates attention''---it is exact; the savings are I/O, not math.
+    \item Explaining fusion only as launch-overhead removal---for large tensors the HBM round trips dominate.
+    \item ``Fuse everything''---no articulation of the compute-bound limit.
+\end{itemize}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explains saved memory round trips and launch overhead.
+    \item \badgeLsix{L6} Does the $2k\times$ traffic arithmetic, explains online softmax as the enabling identity, frames recompute-for-bandwidth as rational left of the ridge.
+    \item \badgeLseven{L7} Draws the boundary between what \texttt{torch.compile} fuses automatically and what needs a hand-written kernel (algorithmic identities---e.g., fused linear$+$CE never materializing logits), and connects the same trade to activation checkpointing at graph scale.
+\end{itemize}
+
+\followups{``Why couldn't a compiler have discovered FlashAttention?'' ``What does fusing dequantization into a GEMM epilogue buy?'' ``When would you \textit{un}fuse?'' (Debugging numerics; an intermediate needed elsewhere.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: How long does it take to all-reduce the gradients of a 70B-parameter model across 8 GPUs? Derive it.}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
+
+\stronganswer Ring all-reduce $=$ reduce-scatter $+$ all-gather: $N-1$ steps each, moving $S/N$ bytes per step per GPU, so each GPU sends $\frac{2(N-1)}{N} S$---the key factor, approaching $2S$ as $N$ grows, which is why data parallelism's bandwidth cost is independent of GPU count. Numbers: BF16 gradients give $S = 140$ GB; $N = 8$ makes the factor 1.75; NVLink 4 gives $\sim$450 GB/s per direction per GPU. $T \approx 1.75 \times 140/450 \approx 0.54$ s at peak, $\sim$0.7 s at realistic NCCL efficiency. That is huge relative to a step, which is why DDP overlaps bucketed all-reduces under backward---the honest metric is \textit{exposed} (non-overlapped) communication, near zero in a healthy run. Then volunteer the extensions: cross-node, one 50 GB/s NIC per GPU makes a flat 64-GPU ring $\sim$5.5 s, so real systems reduce hierarchically---NVLink reduce-scatter within nodes, inter-node all-reduce on $1/8$-size shards ($\sim$0.7 s), NVLink all-gather; and the latency term $2(N-1)\alpha$ grows linearly in $N$, so small messages at large $N$ switch to NCCL's $O(\log N)$ double binary trees.
+
+\redflags
+\begin{itemize}
+    \item Missing the $2\times$ (counting only reduce-scatter), or silently using FP32 gradient bytes in a BF16-gradient setup.
+    \item Treating 900 GB/s as unidirectional NVLink bandwidth---it is the aggregate of both directions.
+    \item No mention of overlap---raw collective time on the critical path is the naive model.
+    \item Believing per-GPU all-reduce cost grows with $N$ (the bandwidth term is $N$-independent; only the latency term grows).
+\end{itemize}
+
+\interviewtest{Can you derive a collective's cost from first principles and connect it to why HSDP, bucketing, and overlap exist---rather than saying ``NCCL handles it''?}
+
+\followups{``Now 512 GPUs across 64 nodes---what changes?'' ``Where do reduce-scatter and all-gather appear as explicit patterns?'' (FSDP/ZeRO; Chapter~\ref{chap:training_optimization}.) ``Why is MoE's all-to-all more topology-sensitive than this all-reduce?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: A teammate changed the hidden size from 4096 to 4100 ``to add a few features,'' and training throughput dropped 35\%. What happened?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqlow}
+
+\stronganswer Two stacked shape-hygiene failures. First, \textbf{alignment}: 4100 is not divisible by 8, so BF16 GEMMs fall off cuBLAS's tensor-core fast path---fragments no longer fill cleanly and 16-byte vectorized loads land misaligned; the library selects padded or partially vectorized kernels, easily 1.5--2$\times$ slower on the dominant matmuls. Second, \textbf{tile economics}: kernels tile outputs in 64--256-wide blocks, so a dimension just past a tile boundary adds a ragged edge-tile of mostly masked work, and wave quantization can add a nearly idle final wave (the stylized cliff: 256 tiles fill two exact waves on a 128-slot GPU; the 257th tile starts a third wave at $<$1\% useful occupancy---$+50\%$ latency for $+0.4\%$ FLOPs). Diagnosis: profile before/after---the same GEMMs got longer, or their kernel names changed to non-tensor-core variants. Fix: keep dimensions multiples of 64/128 and put the extra capacity elsewhere, or pad---the canonical example being GPT-2's vocab, 50{,}257 $\to$ 50{,}304, worth roughly 25\% step throughput in nanoGPT for 47 dead rows.
+
+\redflags
+\begin{itemize}
+    \item ``0.1\% more FLOPs, so throughput should be flat''---kernel selection is discrete, not smooth.
+    \item Unable to name either mechanism (alignment fast paths; wave quantization).
+\end{itemize}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Knows the divisible-by-8/64 rule of thumb and the padding fix.
+    \item \badgeLsix{L6} Explains both mechanisms and how to confirm each in a profile.
+    \item \badgeLseven{L7} Adds the systemic view: shape constraints propagate (TP divides dimensions by the parallel degree---$4100/8$ is not even integral; vocab and FFN widths chosen for tiles at design time; split-K/Stream-K as the kernel-side mitigation for shapes you cannot change).
+\end{itemize}
+
+\followups{``Why do serving engines pad batch sizes to fixed buckets?'' (Stable kernel selection $+$ CUDA-graph capture.) ``Sequence length is dynamic---how do you keep GEMMs well-shaped?'' (Packing and bucketing.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What problem do CUDA graphs solve, and what constraints do they impose? Where do they matter most in an LLM system?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqlow}
+
+\stronganswer They amortize the CPU launch tax. A transformer decode step is hundreds of kernels; at small batch each runs a few microseconds while eager dispatch costs $\sim$10--30 $\mu$s---the CPU becomes the bottleneck and the GPU idles between slivers. A CUDA graph records the step's entire kernel DAG once and replays it as a single launch: hundreds of dispatches become one, and the CPU leaves the inner loop. The costs follow from ``replaying a recording'': static shapes, memory addresses, and control flow---hence serving engines capture one graph per padded batch-size bucket into pre-allocated static buffers, and data-dependent CPU branching must live outside the captured region. Where it matters: decode loops above all (vLLM-class engines; \texttt{torch.compile}'s reduce-overhead mode), much less in big-batch training, where kernels are long enough to bury the tax. Complementary with fusion, not redundant: fusion shrinks the kernel count; graphs make launching whatever remains nearly free.
+
+\redflags
+\begin{itemize}
+    \item ``CUDA graphs make kernels faster''---kernel time is unchanged; only inter-kernel overhead disappears.
+    \item Not connecting graphs to the decode use case, or to why serving engines bucket batch sizes.
+\end{itemize}
+
+\interviewtest{Do you understand the CPU side of GPU execution---that dispatch is a real, exhaustible resource---and when amortizing it matters?}
+
+\followups{``Why does dynamic batch size complicate capture, and how do engines cope?'' ``Why does prefill rarely use graphs?'' (Long kernels, variable lengths.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Estimate the maximum tokens/second for a 70B dense model on 8$\times$H100---for training, and for inference.}
+
+\badgeLseven{L7} \quad \badgetype{Estimation} \quad \badgefreq{\freqhigh}
+
+\stronganswer \textbf{Training.} FLOPs per token $\approx 6P = 4.2\times10^{11}$. Peak: $8 \times 989 \approx 7.9$ PFLOP/s. At a well-optimized 40--50\% MFU (Chapter~\ref{chap:training_optimization}): $\sim$3.2--4.0 PFLOP/s effective $\Rightarrow$ \textbf{$\sim$7{,}500--9{,}500 tokens/s} ($\sim$8.5K at 45\%). Then the Staff caveat: 8$\times$H100 is 640 GB, but 70B full training state is $\sim$1.1 TB before activations ($\sim$16 bytes/param for BF16 weights $+$ FP32 master $+$ Adam moments; Chapter~\ref{chap:training_optimization}), so full fine-tuning at this scale needs ZeRO-3 with recompute and offload (which erodes MFU) or a different recipe (LoRA/QLoRA, 8-bit optimizer)---give the throughput as arithmetic, then flag feasibility. \textbf{Inference---two regimes.} \textit{Batch 1 (latency-bound):} decode reads all weights per token: 140 GB across 8 GPUs $=$ 17.5 GB/GPU at $\sim$3.35 TB/s $\approx$ 5.2 ms, plus $2 \times 80$ latency-dominated TP all-reduces $\approx$ 1.6 ms $\Rightarrow$ 6--7 ms/token, i.e., \textbf{$\sim$140--170 tokens/s roofline}; production stacks observe $\sim$50--90 with scheduling and sampling overhead. \textit{Large batch (throughput-bound):} weights are read once per step regardless of batch, AI grows $\approx B$, and the system turns compute-bound near $B \approx 150$ at realistic GEMM efficiency; beyond it, throughput $\approx$ effective FLOP/s $\div$ $2P$ per token $\Rightarrow$ \textbf{$\sim$15{,}000--25{,}000 output tokens/s} aggregate---all consistent with Chapter~\ref{chap:inference_optimization}'s serving arithmetic. Sanity cross-check: training and large-batch inference land within a small factor of each other, as they must---both are compute-bound matmul factories, and training pays $3\times$ the FLOPs per token ($6P$ vs.\ $2P$).
+
+\redflags
+\begin{itemize}
+    \item One inference number with no batch-size regime split---the single most common failure.
+    \item Using 1{,}979 TFLOP/s as dense BF16 peak, or assuming 100\% MFU.
+    \item No memory-feasibility check on the training side.
+    \item Forgetting that at long context the KV-cache read joins the weight read in the bandwidth bill, eroding the batch-1 number.
+\end{itemize}
+
+\interviewtest{Fluency across the whole stack---$6P$/$2P$ rules, anchor hardware numbers, roofline regimes, MFU realism, communication overhead---and whether your training and inference estimates are mutually consistent.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Training via $6P$ $+$ MFU; knows decode is bandwidth-bound.
+    \item \badgeLsix{L6} Both inference regimes with the crossover batch, TP all-reduce latency, and the memory-feasibility flag.
+    \item \badgeLseven{L7} Cross-checks the estimates against each other, quotes the production-vs-roofline gap ($\sim$2$\times$ at batch 1), and extends: what FP8 does to each number, what 32K context does to decode, what B200's $\sim$2.4$\times$ bandwidth does to batch-1 latency.
+\end{itemize}
+
+\followups{``Which numbers change if it is a $\sim$8$\times$22B MoE instead?'' ``Add a 32K prompt---new TTFT and decode rate?'' ``Why do training MFU and decode-GEMM efficiency differ?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your 512-GPU pretraining run reports 25\% MFU. Walk me through how you find the missing performance.}
+
+\badgeLseven{L7} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer First bound the problem: 25\% against a 40--55\% target (Chapter~\ref{chap:training_optimization}) means $\sim$1.6--2$\times$ is on the table---worth serious engineering at 512-GPU cost. The highest-information experiment comes first: \textbf{measure the single-node ceiling} by running the identical per-GPU workload on one node. If it hits, say, 45\%, the gap is distributed (communication, stragglers, input); if it is already 28\%, the gap is local (kernels, launches, memory policy)---and you fix local first because it replicates 512 times. \textbf{Local pass} (trace a few ranks): kernel-time histogram---GEMM share vs.\ elementwise share (fusion debt; \texttt{torch.compile} status; FlashAttention in place?); gaps (dispatch overhead, hidden syncs); recompute policy (checkpointing everything burns FLOPs MFU does not credit---use selective recompute); shape hygiene on the top GEMMs. \textbf{Distributed pass}: exposed NCCL time per rank (overlap config, bucket sizes); per-rank step-time variance---synchronous training runs at the \textit{slowest} rank, so one throttling GPU taxes all 512 (find and quarantine it); topology audit (TP inside nodes? hierarchical DP? EP all-to-all crossing spines?); pipeline-bubble fraction if PP is in play. \textbf{Step-structure pass}: dataloader stalls at step boundaries; checkpoint/eval pauses badly amortized. Fix in order of measured exposed time, re-measure MFU after each change, and stop when marginal engineering time exceeds the GPU-hours it buys.
+
+\redflags
+\begin{itemize}
+    \item No experiment separating local from distributed causes before diving in.
+    \item Treating MFU as purely a kernel problem---ignoring stragglers, exposed communication, and recompute accounting.
+    \item Missing that synchronous collectives make the slowest rank everyone's speed.
+\end{itemize}
+
+\interviewtest{Staff-level systems debugging: decomposing a global metric into locality classes with one cheap experiment, then spending effort proportional to measured exposure---plus fluency in what MFU does and does not count.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Structured trace reading with the correct playbook per symptom.
+    \item \badgeLseven{L7} The bisection experiment first; quantifies the straggler tax and the recompute/MFU accounting; frames stopping criteria in dollars; knows what ``done'' looks like (40--55\%, degrading with parallel degree and scale).
+\end{itemize}
+
+\followups{``MFU is 45\% on 64 GPUs but 30\% on 512 with the same per-GPU batch---most likely causes?'' ``How do you detect a straggler without tracing all ranks?'' (Per-rank step-time and collective-wait metrics.) ``When is 30\% actually fine?'' (High parallel degrees, MoE, very long context.)}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You have 8 nodes of 8$\times$H100. Map tensor, pipeline, data, and expert parallelism onto this cluster's fabric, justifying the mapping from link characteristics---then tell me what changes on a GB200 NVL72.}
+
+\badgeLseven{L7} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
+
+\stronganswer Start from the fabric, not the strategies: inside a node, NVSwitch gives every GPU $\sim$900 GB/s aggregate ($\sim$450 GB/s per direction) at microsecond-class latency; between nodes, one 400 Gb/s NIC per GPU gives $\sim$50 GB/s---a $\sim$9$\times$ bandwidth cliff plus a latency step. Now sort parallelism dimensions by communication intensity and pay the cliff with the cheapest one. \textbf{TP} all-reduces activations twice per layer, latency-sensitive and unoverlappable $\Rightarrow$ NVLink only, degree $\leq 8$ here. \textbf{EP} all-to-alls every MoE layer and is straggler-sensitive $\Rightarrow$ intra-node if possible, node-limited routing if not (Chapter~\ref{chap:efficient_architectures}). \textbf{PP} sends activations point-to-point at stage boundaries only $\Rightarrow$ happily inter-node. \textbf{DP/FSDP} moves the most bytes but once per step and overlappable $\Rightarrow$ inter-node, with hierarchical collectives (intra-node reduce-scatter, shard-sized inter-node all-reduce). Name the failure mode: TP spanning nodes puts $2L$ latency-dominated collectives per micro-batch on a 10--20 $\mu$s fabric---milliseconds of pure latency per step, and the serving version of the same mistake is quantified in Chapter~\ref{chap:inference_optimization}. Mention rail-optimized IB (NIC $i$ of every node on one leaf switch, so same-rank traffic avoids the spine) and GPUDirect RDMA. \textbf{NVL72}: 72 GPUs become one NVLink domain at $\sim$1.8 TB/s each---the cliff moves from 8 to 72, so previously forbidden degrees become natural (wide-EP MoE serving with experts spread one-per-GPU; TP of 16--32 for very large dense models), the DP hierarchy re-centers on the rack, and the scarce resource becomes rack-to-rack bandwidth. The sorting principle survives; only the constants move.
+
+\redflags
+\begin{itemize}
+    \item Reciting ``TP intra-node, DP inter-node'' as a memorized rule with no per-link, per-collective-frequency justification.
+    \item Ranking dimensions by data volume instead of frequency $\times$ latency-sensitivity $\times$ overlappability---DP moves the most bytes yet tolerates the slow fabric best.
+    \item Not knowing the order-of-magnitude NVLink-vs-NIC gap.
+\end{itemize}
+
+\interviewtest{Whether you own the fabric-level model underneath the parallelism recipes: collectives per layer vs.\ per step, latency vs.\ bandwidth domination, and whether a topology change (NVL72) makes you re-derive the recipe rather than break it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLsix{L6} Correct mapping with the bandwidth numbers and the TP-across-nodes failure mode.
+    \item \badgeLseven{L7} Adds rail optimization, the straggler-sensitivity of all-to-all, the hierarchical-DP arithmetic ($8\times$ inter-node traffic reduction), and re-derives the design for NVL72 from first principles.
+\end{itemize}
+
+\followups{``Where does context parallelism sit in this sorting?'' (Ring attention overlaps its ring transfers with blockwise compute; Chapter~\ref{chap:training_optimization}.) ``MoE decode latency is spiky under EP---what fabric-level causes do you check?'' ``How does disaggregated prefill/decode change what the network carries?'' (Bulk KV-cache transfers; Chapter~\ref{chap:inference_optimization}.)}
+\end{interviewq}

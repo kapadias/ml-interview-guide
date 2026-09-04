@@ -2,5 +2,1121 @@
 \label{chap:agents_tool_use}
 
 \begin{tldr}
-Placeholder --- this chapter is written in Phase C.
+An agent is a model in a loop: the model reads its context, chooses an action (usually a tool call), the environment executes it, and the observation is appended to the context for the next iteration. That one sentence hides every hard problem in the field. This chapter covers what actually distinguishes an agent from a workflow with LLM steps; the loop in depth---action-space design, termination, budgets, code execution as the universal tool, and what MCP standardizes; planning and search over action sequences (honestly: production agents are mostly linear with retries); memory and context management over long trajectories; orchestration patterns (orchestrator--workers, critics, and the evidence that more agents is often worse); computer use and why it trails API-based agents; reliability engineering---the compounding-error arithmetic ($0.98^{50} \approx 36\%$) that makes per-step reliability the dominant design constraint; agent evaluation methodology (task success vs.\ trajectory quality, pass@$k$ vs.\ pass\textasciicircum{}$k$, environment design, cost-adjusted comparison); and agent economics. For a Staff-level loop in 2026 this is the highest-leverage chapter in the volume: ``design an agent for X'' and ``your agent is unreliable---fix it'' are now standard system-design prompts, and the differentiator is engineering judgment about reliability and evaluation, not familiarity with frameworks.
 \end{tldr}
+
+\textit{Canon boundaries: this chapter owns agent architectures, orchestration, reliability, and evaluation methodology. The tool-calling \textbf{formats}---JSON-Schema definitions, the generate--execute--observe round trip, parallel calls, constrained decoding, error-as-observation conventions, and how tool use is trained into models---are covered in [NLP~7] and assumed here. Agentic \textbf{safety}---indirect prompt injection, the lethal trifecta, sandboxing, human-approval gates as a security control---is canonical in Section~\ref{sec:agentic_safety}. RL training of agentic policies is Chapter~\ref{chap:reinforcement_learning}; the benchmark catalog (SWE-bench, $\tau$-bench, OSWorld mechanics) is [NLP~10]; eval statistics (estimators, error bars) are Chapter~\ref{chap:evaluation_metrics}.}
+
+%==============================================================================
+\section{What Makes Something an Agent}
+\label{sec:agent_definition}
+%==============================================================================
+
+\subsection{The Loop}
+
+Strip away the framework marketing and every LLM agent is the same control flow:
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    box/.style={rectangle, rounded corners, draw=deepblue, fill=lightblue, thick, minimum width=3.0cm, minimum height=1.0cm, align=center, font=\small},
+    envbox/.style={rectangle, rounded corners, draw=deepgreen, fill=lightgreen, thick, minimum width=3.0cm, minimum height=1.0cm, align=center, font=\small},
+    stopbox/.style={rectangle, rounded corners, draw=gray, fill=lightgray, thick, minimum width=2.2cm, minimum height=0.9cm, align=center, font=\small},
+    arrow/.style={->, >=stealth, thick}
+]
+\node[box] (context) {Context\\ \scriptsize system prompt + tools + trajectory};
+\node[box, right=2.0cm of context] (model) {Model\\ \scriptsize (policy)};
+\node[box, right=2.0cm of model] (action) {Action\\ \scriptsize tool call or final answer};
+\node[envbox, below=1.4cm of action] (env) {Environment\\ \scriptsize executes the call};
+\node[box, below=1.4cm of context] (obs) {Observation\\ \scriptsize tool result / error};
+\node[stopbox, right=1.2cm of action] (stop) {Terminate};
+\draw[arrow] (context) -- (model);
+\draw[arrow] (model) -- (action);
+\draw[arrow] (action) -- node[right, font=\scriptsize]{tool call} (env);
+\draw[arrow] (env) -- (obs);
+\draw[arrow] (obs) -- node[left, font=\scriptsize]{append} (context);
+\draw[arrow] (action) -- node[above, font=\scriptsize]{answer} (stop);
+\end{tikzpicture}
+\caption{The agent loop. The model is stateless; all state lives in the context (and in the environment). Each iteration re-submits the full trajectory---which is why prefix caching (Section~\ref{sec:prefix_caching}) and context management (Section~\ref{sec:agent_memory}) are first-order concerns.}
+\label{fig:agent_loop}
+\end{figure}
+
+Three properties of this loop drive everything else in the chapter:
+
+\begin{itemize}
+    \item \textbf{The model decides the control flow.} In a pipeline, an engineer wrote the sequence of steps; in an agent, the model chooses the next action based on what it has observed. This is the actual definition worth defending in an interview: \textit{an agent is a system where the LLM dynamically directs its own process and tool usage}---as opposed to a workflow, where LLM calls are orchestrated through code paths fixed at design time.
+    \item \textbf{The model is stateless; the trajectory is the state.} Every iteration replays the entire history through the model. Memory, cost, and latency are all consequences of this replay.
+    \item \textbf{Errors feed back.} A wrong action produces an observation, and the model can notice and correct---or not notice and compound. Whether your loop recovers from or amplifies errors is the difference between a product and a demo (Section~\ref{sec:agent_reliability}).
+\end{itemize}
+
+\textbf{How we got here, in one paragraph.} ReAct (2022) showed the loop works with prompting alone; the 2023 AutoGPT wave showed what unbounded autonomy without verification looks like (viral demos, negligible completion rates---the cautionary tale worth citing by name); 2023--24 industrialized the substrate (native function calling, tool-trained models); late 2024--25 added computer use, MCP, and---decisively---RL training on verifiable agentic tasks, which moved much of the orchestration intelligence into the model and made coding agents the first category with durable product--market fit. By 2026 the frontier question is no longer ``can a model drive a loop'' but the subjects of this chapter's second half: reliability, evaluation, and unit economics.
+
+\subsection{Levels of Agency}
+
+``Agent'' covers a spectrum, and precision about where a system sits on it is a cheap credibility signal. A useful three-level taxonomy (essentially the workflow/agent distinction popularized by Anthropic's 2024 ``Building Effective Agents'' guidance, with the autonomous tier split out):
+
+\begin{table}[H]
+\centering
+\caption{Levels of agency}
+\label{tab:agency_levels}
+\begin{tabularx}{\textwidth}{p{3.2cm}XX}
+\toprule
+\textbf{Level} & \textbf{Who controls the flow} & \textbf{Examples / properties} \\
+\midrule
+Workflow with LLM steps & Code. Fixed DAG; LLM calls fill in slots (classify, extract, draft, route) & Prompt chaining, routing, parallel map-reduce over documents. Predictable cost/latency, unit-testable per step, easiest to debug \\
+Tool-loop agent & Model, within one loop. Chooses which tools to call and when to stop; horizon of a single task & Coding assistants, support agents, research agents. Cost/latency variable; reliability dominated by per-step error compounding \\
+Autonomous multi-step & Model, across subgoals. Decomposes an open-ended goal, maintains plans and memory across many loops, possibly spawns sub-agents & Long-horizon engineering tasks, multi-hour computer-use sessions. Hardest to evaluate; failure modes include goal drift and runaway cost \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The levels are not a maturity ladder---they are a menu, and the right choice is the \textit{lowest} level that solves the task. Most production ``agent'' successes in 2024--2026 are level one or two; level three is where demos live and reliability goes to die. The engineering consequences of the choice are concrete enough to tabulate:
+
+\begin{table}[H]
+\centering
+\caption{Engineering properties: static pipeline vs.\ agent loop}
+\label{tab:pipeline_vs_agent}
+\begin{tabularx}{\textwidth}{p{2.6cm}XX}
+\toprule
+\textbf{Property} & \textbf{Pipeline with LLM steps} & \textbf{Agent loop} \\
+\midrule
+Cost per task & Fixed: $N$ calls, bounded context & Variable; input replay grows quadratically with steps (Section~\ref{sec:agent_economics}) \\
+Latency & Predictable; parallelizable by design & Variable and sequential by default; p95 dominated by wandering trajectories \\
+Debugging & Failure localizes to a stage with fixed inputs; reproducible & Failure is a point in trajectory space; every run takes a different path \\
+Testing & Unit tests per stage & Eval suites over environments; statistical, not exact (Section~\ref{sec:agent_eval}) \\
+Reliability & Errors contained by stage contracts & Errors compound across steps ($p^n$, Section~\ref{sec:agent_reliability}) \\
+Change management & Diff and A/B one stage & Any prompt/tool change shifts whole-trajectory behavior; needs regression evals \\
+Right when & Steps are known before seeing the input & Steps depend on what the environment reveals \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[When NOT to Build an Agent]
+If the task decomposes \textit{statically}---you can write down the steps before seeing the input, and the steps do not change based on intermediate results---a deterministic pipeline with LLM steps beats an agent on every axis that matters in production:
+\begin{itemize}
+    \item \textbf{Cost and latency}: a pipeline runs exactly $N$ model calls with bounded context; an agent runs a variable number of calls over a growing trajectory. For a fixed task, the agent pays for re-deciding, at every step, what the pipeline decided once at design time.
+    \item \textbf{Debuggability}: a pipeline failure localizes to a step with fixed inputs---you can unit-test it. An agent failure is a point in a combinatorially large trajectory space; every run takes a different path.
+    \item \textbf{Reliability}: each dynamic decision is a new opportunity to be wrong, and per-step errors compound (Section~\ref{sec:agent_reliability}). Removing a decision from the model is the cheapest reliability improvement available.
+\end{itemize}
+Reach for an agent only when the task structure is genuinely input-dependent: the number and identity of the steps cannot be known in advance (debugging code, open-ended research, multi-turn support with an unpredictable user). The strong interview answer states the decision rule, not a preference: \textit{agency should be spent where the environment's response actually changes what to do next, and nowhere else}. ``We built an agent'' is an engineering cost to be justified, not an achievement.
+\end{keyinsight}
+
+Orthogonal to the architecture levels is the \textbf{autonomy ladder} a deployed agent climbs as trust accumulates: \textit{suggest} (agent proposes, human executes) $\rightarrow$ \textit{act with approval} (agent executes after per-action confirmation) $\rightarrow$ \textit{act and report} (agent executes autonomously within a scope, human reviews after the fact) $\rightarrow$ \textit{act silently} (background automation). Products should launch low on the ladder and promote \textit{per action class}, backed by measured reliability---the merge stays gated long after the read-only analysis runs free. The ladder is also the honest answer to ``when is it safe to remove the human'': when the measured failure rate times the blast radius of that action class is a cost you can eat (gating mechanics: Section~\ref{sec:agentic_safety}; the reliability measurements: Section~\ref{sec:agent_eval}).
+
+%==============================================================================
+\section{The Agent Loop in Depth}
+\label{sec:agent_loop}
+%==============================================================================
+
+\subsection{From ReAct to Native Tool Loops}
+
+\textbf{ReAct} (Yao et al., 2022) is the lineage ancestor: interleave free-text \textit{reasoning} (``thought'') with \textit{actions} against an environment, feeding each observation back before the next thought. At the time this was pure prompt engineering---few-shot exemplars of Thought/Action/Observation triples, with the runtime parsing actions out of generated text. Its result---that reasoning-before-acting beats acting alone, and that acting (retrieving evidence) grounds reasoning---still holds; everything since is industrialization of the same loop.
+
+\begin{lstlisting}
+# ReAct (2022): everything is text the harness must parse
+Thought: I need the current stock level before promising a date.
+Action: lookup_inventory[SKU-4411]
+Observation: {"sku": "SKU-4411", "on_hand": 0, "restock": "09-04"}
+Thought: Out of stock until Sept 4; I should offer the ETA.
+
+# Native tool loop (2024+): typed messages, structured stop
+assistant: [tool_use] lookup_inventory({"sku": "SKU-4411"})
+user:      [tool_result] {"on_hand": 0, "restock": "09-04"}
+assistant: "That item is back in stock September 4 --- ..."
+\end{lstlisting}
+
+The industrialized form replaced fragile text parsing with \textbf{native function calling}: tools declared as JSON-Schema, calls emitted as structured blocks with a distinguished stop reason, results returned as typed observation messages---all trained into the model via SFT on tool-use trajectories and, increasingly, RL on multi-step tasks with verifiable end states (formats and training: [NLP~7]). Two consequences matter architecturally. First, the ``thought'' half of ReAct migrated into the model: reasoning models interleave private chain-of-thought with tool calls natively, so the scaffold no longer prompts for deliberation---it budgets for it (Section~\ref{sec:reasoning_ttc}). Second, because \textit{when to call, retry, and stop} is now trained behavior (largely via RL on agentic tasks, Chapter~\ref{chap:reinforcement_learning}), scaffold cleverness matters less than it did in 2023--24: modern frontier models do more of the orchestration internally, and thick frameworks increasingly fight the model rather than help it.
+
+\subsection{Action-Space Design}
+
+The tools you expose \textit{are} the agent's action space, and action-space design is the highest-leverage, least-glamorous part of building an agent.
+
+\textbf{Few good tools beat many overlapping ones.} Tool selection is a classification problem the model solves in-context on every step, and its accuracy degrades as the number of tools grows and their boundaries blur---overlapping tools (\texttt{search\_tickets} vs.\ \texttt{query\_tickets} vs.\ \texttt{find\_ticket\_by\_field}) force the model to make a distinction that the tool authors themselves could not make cleanly. Symptoms of an overgrown action space: wrong-tool calls, dithering between near-equivalent tools, and prompt bloat (every schema is context on every step, whether used or not). The fixes are an editor's, not a modeler's: merge overlapping tools, delete rarely-used ones, replace families of narrow tools with one parameterized tool, and namespace what remains. A useful heuristic from practice: if a competent new engineer could not decide which tool to use from the descriptions alone, neither can the model.
+
+\textbf{Tool descriptions are the real interface.} The model never sees your implementation---only the name, description, and parameter schema. Description text is therefore load-bearing prompt engineering: it must say what the tool does, when to use it (and when \textit{not} to), what the arguments mean, and what the output looks like, including failure shapes. Most ``the agent uses tools wrong'' bugs are description bugs, and the error taxonomy of a failing agent (Section~\ref{sec:agent_eval}) routinely assigns a plurality of failures to tool-interface confusion rather than model incapacity. Treat tool definitions as versioned, tested artifacts: when a trajectory shows tool misuse, the fix is usually a sentence in a description, and it should land with a regression test.
+
+\textbf{Return values are prompt engineering too.} Observations enter the context verbatim. A tool that dumps 40KB of raw JSON taxes every subsequent step; a tool that returns a concise, model-readable summary with an option to page into detail keeps the trajectory lean. Error returns deserve the same care---``\texttt{Error: invalid ID}'' teaches nothing; ``\texttt{Error: ticket ID must look like TKT-12345; you passed 12345}'' lets the model self-correct in one step ([NLP~7] covers the error-as-observation convention).
+
+\textbf{Worked micro-example.} A before/after that generalizes:
+
+\begin{lstlisting}
+# Before: three overlapping, underspecified tools
+search_tickets(query)       "Search tickets."
+query_tickets(filter)       "Query the ticket database."
+get_ticket_info(id)         "Get info for a ticket."
+
+# After: one tool with a sharp contract
+find_tickets(query, status=None, max_results=10)
+  "Full-text search over support tickets. Returns id, title,
+   status, last_update for up to max_results matches, newest
+   first. Use before creating a ticket, to avoid duplicates.
+   For a single known ID, pass the ID as the query.
+   Errors: INVALID_STATUS (message lists allowed values)."
+\end{lstlisting}
+
+The merged tool deletes a three-way classification the model was getting wrong; the description now says when to use it and what comes back; the error contract makes self-correction a one-step affair. Edits of this class are routinely worth more task success than a model upgrade---and they are free.
+
+\subsection{Termination and Budgets}
+
+An agent needs to stop, and each way of stopping should be designed rather than inherited:
+
+\begin{itemize}
+    \item \textbf{Model-declared completion}: the model responds without a tool call (or calls an explicit \texttt{finish}/\texttt{submit} tool). Cheap, but unverified---models declare victory prematurely, and a \texttt{submit}-style tool lets you attach a checklist or verification requirement to the declaration.
+    \item \textbf{Verified completion}: termination requires an environment-checked predicate---tests pass, the record exists, the diff applies. The strongest form; use it whenever the task admits a checkable end state, because it converts ``the model thinks it is done'' into ``the task is done.''
+    \item \textbf{Budget exhaustion}: hard caps on steps, tokens, dollars, and wall-clock, enforced by the harness, not requested in the prompt. A prompt that says ``use at most 20 steps'' is a suggestion; a loop counter is a guarantee. On exhaustion, fail gracefully: return partial work and state, not an exception (Section~\ref{sec:agent_reliability}).
+    \item \textbf{Stuck detection}: terminate or escalate on loop signatures---the same tool called with the same arguments repeatedly, oscillation between two states, or $N$ consecutive tool errors. Without this, a confused agent converts its remaining budget into an identical error message, at your expense.
+\end{itemize}
+
+\subsection{The Harness: The Non-Model Half of the Loop}
+
+The loop's non-model half---the \textit{harness} (or scaffold)---is ordinary software with a precise job list, and naming its components crisply is a cheap credibility win in system-design rounds:
+
+\begin{itemize}
+    \item \textbf{Executor}: runs tool calls with timeouts (and sandboxing for anything that executes code or touches untrusted content; Section~\ref{sec:agentic_safety}), and serializes results back into observation messages.
+    \item \textbf{Validator}: checks arguments against schemas \textit{before} execution and returns violations as observations; runs postcondition checks after consequential steps (Section~\ref{sec:agent_reliability}).
+    \item \textbf{Budget enforcer}: counts steps, tokens, dollars, wall-clock; terminates or escalates on exhaustion---enforced here, never delegated to the prompt.
+    \item \textbf{Context manager}: assembles each step's input---system prompt, tool schemas, trajectory, compaction, retrieved memory (Section~\ref{sec:agent_memory})---laid out stable-prefix-first so caching works (Section~\ref{sec:prefix_caching}).
+    \item \textbf{Trajectory store}: structured logs, checkpoints, replay (Section~\ref{sec:agent_reliability}).
+    \item \textbf{Approval surface}: routes gated actions to a human with the concrete action rendered for inspection (Section~\ref{sec:agentic_safety}).
+\end{itemize}
+
+On build-vs-buy: the 2023-era heavyweight agent frameworks lost ground to thin, transparent harnesses precisely because every abstraction between you and the context window becomes a debugging liability---when the product-defining question is ``what tokens went in and what came out,'' owning that path outweighs borrowed graph plumbing. Frameworks earn their keep for commodity concerns (provider abstraction, telemetry, retries), not for hiding the loop.
+
+The division of labor between the trained policy and the harness is worth stating explicitly, because interviews probe it from both sides (``why do you still need a scaffold if the model is RL-trained on agentic tasks?''):
+
+\begin{table}[H]
+\centering
+\caption{What the model learned vs.\ what the harness must still guarantee}
+\label{tab:model_vs_harness}
+\begin{tabularx}{\textwidth}{XX}
+\toprule
+\textbf{Trained into the model (probabilistic)} & \textbf{Owned by the harness (guaranteed)} \\
+\midrule
+When to call a tool, which tool, argument construction & Schema validation before execution; sandboxing of execution \\
+When to retry, when to stop, when to ask & Hard budgets (steps/tokens/\$/time); stuck detection; termination \\
+Interleaved reasoning and self-correction & Verification against the environment; postcondition checks \\
+Decomposition and plan revision & Checkpointing, resumption, rollback; trajectory logging \\
+Recovering from error observations & Idempotency of side effects; approval gates on irreversible actions \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+RL training (Chapter~\ref{chap:reinforcement_learning}) keeps moving rows upward---models retry and stop far more sensibly than in 2023---but the right column never migrates: anything that must hold with probability 1.0 cannot be delegated to a sampled policy. The harness is where guarantees live.
+
+\subsection{Code Execution as the Universal Tool}
+
+A single tool---\textit{run code in a sandbox}---subsumes a surprising fraction of bespoke tool catalogs, and ``write code that calls APIs'' often beats exposing each API as its own tool (the CodeAct line of work, Wang et al., 2024, made this concrete: an agent acting through executable Python outperforms the same model acting through JSON tool calls on multi-step benchmarks). The mechanism is worth spelling out:
+
+\begin{itemize}
+    \item \textbf{Composition in one step.} Code expresses loops, conditionals, and data flow, so ``fetch all 50 pages, filter, aggregate, save a CSV'' is \textit{one} agent step instead of 50 loop iterations---50 fewer chances to err and 50 fewer context replays.
+    \item \textbf{Intermediate results stay out of the context.} A 10MB API response lives in an interpreter variable; only the two-line summary the model prints enters the trajectory. With bespoke tools, every intermediate result round-trips through the context window. (This is also the architectural idea behind running MCP tools \textit{from code}: load tool definitions on demand and process data in the execution environment, which can shrink tool-heavy contexts by orders of magnitude.)
+    \item \textbf{Leverage of pretraining.} Models have seen vastly more Python calling \texttt{requests} and \texttt{pandas} than any bespoke tool schema; the action space with the best prior is code.
+    \item \textbf{Verifiability.} Code either runs or throws; its effects can be asserted. That gives the loop a free per-step verifier (Section~\ref{sec:agent_reliability}).
+\end{itemize}
+
+The costs: a sandbox is mandatory (arbitrary code execution is the sharpest edge in the threat model---isolation, egress control, and credential scoping are canonical in Section~\ref{sec:agentic_safety}), latency per step rises, and debugging shifts from ``inspect tool calls'' to ``read the agent's code.'' The design rule of thumb: expose narrow, schema-validated tools for consequential side effects (send, pay, delete---things you want to gate and audit one at a time) and a code sandbox for read-heavy computation and glue.
+
+\subsection{MCP: Standardizing the Tool Ecosystem}
+
+The \textbf{Model Context Protocol} (Anthropic, late 2024; adopted across major vendors through 2025) standardizes how applications discover and invoke tools: tool servers expose tools, resources, and prompt templates over a common client--server protocol, and any MCP client can connect, list the tools, and inject their schemas into a model's context. The wire-level mechanics are [NLP~7] material; what matters here is what it changes architecturally---and what it does not.
+
+\textbf{What changes.} Integration effort drops from $N \times M$ bespoke connectors to $N + M$ protocol implementations, which converts tool integration from an engineering project into a configuration choice and creates an \textit{ecosystem}: thousands of third-party servers your agent can attach at runtime, tools discovered dynamically rather than compiled in. Two architectural consequences follow:
+
+\begin{itemize}
+    \item \textbf{Action-space discipline stops being enforced by effort.} When adding 40 tools is one config line, the ``few good tools'' principle must be enforced deliberately: tool filtering and per-task allowlists, on-demand loading of tool definitions (search over tools, or code-execution wrappers that import them as needed), and ongoing curation---rather than dumping every schema into every context.
+    \item \textbf{The trust boundary moves.} A third-party tool server ships text (descriptions, results) straight into your model's context, making it an injection and supply-chain surface---provenance, least privilege, and the layered controls of Section~\ref{sec:agentic_safety} apply to tool servers exactly as to retrieved web content.
+\end{itemize}
+
+\textbf{What does not change.} From the model's point of view, nothing: schemas in, structured calls out. MCP standardizes plumbing; it does not make tool selection more accurate, descriptions better written, or loops more reliable. In an interview, ``we'll use MCP'' answers the integration question only---every question in the rest of this chapter survives it.
+
+%==============================================================================
+\section{Planning}
+\label{sec:agent_planning}
+%==============================================================================
+
+\subsection{Decompose-then-Execute vs.\ Interleaved Replanning}
+
+Two poles define the design space:
+
+\textbf{Plan-then-execute}: one (often stronger) model call decomposes the goal into an explicit step list; execution then works through the steps. Pros: the plan is inspectable and approvable \textit{before} anything runs (a natural human gate), subtasks can be dispatched in parallel or to cheaper models, and cost is more predictable. Cons: plans go stale on contact with the environment---step 4 discovers that the API the plan assumed does not exist---so pure feed-forward planning only fits environments you can characterize up front.
+
+\textbf{Interleaved (ReAct-style) replanning}: no persistent plan; each step decides the next action from the full trajectory. Maximally adaptive, but drifts on long horizons---without an explicit goal representation, agents forget constraints, repeat work, and mistake local progress for global progress.
+
+Production practice converged on the hybrid: \textbf{plan as a revisable artifact}. The agent writes an explicit plan (a to-do list, a markdown file---Claude Code's plan mode and to-do tracking are the visible examples), executes interleaved, checks items off, and \textit{revises the plan} when observations invalidate it---replanning as a deliberate, visible event rather than an implicit drift. The artifact earns its keep three ways: it is a commitment device against goal drift (re-reading the plan re-anchors each step---the ``recitation'' pattern, where the agent rewrites its plan into recent context, exploits the model's recency attention bias deliberately); it is a communication surface for humans (approve/edit the plan, watch progress); and it is a checkpoint for resumption (Section~\ref{sec:agent_reliability}).
+
+Revision needs \textit{triggers}, or the plan fossilizes: a verification failure on the current step, an observation that contradicts a plan assumption (the API does not exist, the file is already migrated), a budget reforecast (three steps consumed half the budget), or a user interrupt. Each trigger should produce an explicit plan diff in the trajectory---revisions you can see are revisions you can debug.
+
+\begin{table}[H]
+\centering
+\caption{Planning regimes}
+\label{tab:planning_regimes}
+\begin{tabularx}{\textwidth}{p{3.0cm}XX}
+\toprule
+\textbf{Regime} & \textbf{Strengths} & \textbf{Weaknesses / failure modes} \\
+\midrule
+Plan-then-execute & Inspectable and approvable up front; parallel dispatch; cheaper executor models per step; predictable cost & Plans go stale on contact with the environment; feed-forward only fits well-characterized tasks \\
+Interleaved (ReAct-style) & Maximally adaptive; no stale-plan problem & Goal drift on long horizons; repeated work; local progress mistaken for global progress \\
+Plan as revisable artifact (production default) & Anchors against drift (recitation); human-visible progress; checkpoint for resumption; revision is explicit and loggable & Plan maintenance overhead; a wrong-but-plausible plan can over-anchor; revision requires designed triggers \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Search over Action Sequences---Honestly}
+
+Since a step's value is uncertain, one can search: sample multiple candidate actions or trajectories, evaluate, keep the best. Tree-of-Thoughts and MCTS-style agent search (e.g., LATS) do exactly this, and the honest summary for an interview has three parts.
+
+\textbf{Where search genuinely helps.} Search needs two things from the domain: a way to \textit{evaluate} partial progress (a verifier, tests, a score) and a way to \textit{branch} cheaply (reset or fork the environment state). Code with test suites, math with checkers, games, and SQL-against-a-snapshot qualify; that is where ToT/MCTS results are real. Best-of-$n$ over \textit{whole} trajectories with a final verifier---sample $k$ attempts, keep the one that passes---is the degenerate but most-used form of search, and it is exactly the pass@$k$ protocol (Section~\ref{sec:pass_at_k}).
+
+\textbf{Where it does not.} Most production environments break both requirements: real side effects cannot be forked (you cannot ``explore the branch'' where you sent the email), and there is no mid-trajectory value function worth trusting. Search multiplies cost and latency by the branching factor, which agent economics (Section~\ref{sec:agent_economics}) rarely forgives.
+
+\textbf{Current practice.} Production agents in 2026 are overwhelmingly \textit{linear with retries}: one trajectory, per-step verification where possible, resample-on-failure, occasionally best-of-$n$ where a cheap verifier exists. Meanwhile the search moved \textit{inside the model}: reasoning models trained with RL on verifiable rewards explore, backtrack, and self-correct within their chain of thought, so buying more test-time compute on a single trajectory has largely displaced explicit tree search over scaffold state (Section~\ref{sec:reasoning_ttc}; the training recipe is Chapter~\ref{chap:reinforcement_learning}). Claiming that frontier agents plan via explicit MCTS is a dated take interviewers will flag.
+
+\textbf{Budgeting thought, not just steps.} With reasoning models the harness gains a second dial: how much thinking to allow per step. The pragmatic allocation mirrors model routing---spend extended thinking where decisions branch (initial planning, plan revision after a surprise, diagnosis after a failed verification) and run mechanical steps at low or no thinking budget, since a step that copies a value into a tool call gains nothing from a thousand tokens of deliberation. Thinking tokens are output tokens---the expensive kind---so per-step thinking budgets are simultaneously a quality and a cost decision (serving implications: Section~\ref{sec:serving_reasoning}).
+
+%==============================================================================
+\section{Memory and State}
+\label{sec:agent_memory}
+%==============================================================================
+
+\subsection{The Context Window as Working Memory}
+
+Everything the agent knows at step $t$ is what fits in its context: system prompt, tool schemas, and the trajectory so far. Long tasks therefore hit a wall---not only the hard token limit, but the soft degradation before it: retrieval quality over the middle of a long context decays, attention to early constraints weakens, and cost per step grows with everything ever observed (Section~\ref{sec:long_context} covers the underlying long-context behavior). Managing this---\textit{context engineering}, the discipline of deciding what deserves to be in the window at each step---is working-memory management, and it has three levers: compaction, externalization, and isolation (isolation via sub-agents is Section~\ref{sec:agent_orchestration}).
+
+\textbf{Budget the window explicitly.} A 200K window disappears fast in practice: 3--5K of system prompt, 5--15K of tool schemas (more with MCP servers attached), and a trajectory growing 1--3K tokens per step puts a 50-step task past 100K before it reads a single large file---and quality degrades before the hard limit as the middle of the context stops being reliably attended to. Production harnesses therefore track context occupancy as a first-class metric and trigger compaction at a threshold (say 70--80\% full), rather than discovering the limit as an API error mid-task.
+
+\subsection{Compaction and Its Failure Modes}
+
+\textbf{Compaction} replaces older trajectory segments with a model-written summary, freeing the window while preserving---supposedly---what matters. It is the workhorse (every long-running coding agent does it), and its failure modes are predictable enough to design against:
+
+\begin{itemize}
+    \item \textbf{Lost constraints.} The user said ``never touch the production config'' at turn 3; the summary at turn 60 preserves the narrative (``investigated config handling'') and drops the prohibition. The agent then violates, with perfect confidence, a constraint it no longer knows exists. Constraints, decisions, and invariants are precisely the low-token-count, high-consequence content that generic summarization deprioritizes.
+    \item \textbf{Lost specifics.} Exact identifiers---file paths, ticket IDs, error strings, flag values---get paraphrased into uselessness (``updated the relevant config value'').
+    \item \textbf{Irreversibility and drift.} Compaction is lossy and compounds: a summary of a summary of a summary. An error in an early summary becomes unquestionable ground truth for the rest of the task.
+\end{itemize}
+
+Mitigations, in the order to reach for them: \textbf{structured compaction} (a fixed template with pinned sections---goal, hard constraints, decisions made, open items, key identifiers---rather than free-form summarization; the constraint list is copied forward verbatim, never re-summarized); \textbf{keep the recent tail verbatim} and compact only the older middle; \textbf{externalize before compacting}---write durable state to files or a store, so compaction discards only what can be re-read. Concretely, a structured compaction block looks like:
+
+\begin{lstlisting}
+## COMPACTED HISTORY (steps 1-42)
+GOAL: migrate payments-service to billing-api v3
+HARD CONSTRAINTS (verbatim, never re-summarize):
+ - NEVER modify configs under deploy/prod/
+ - keep public API of PaymentClient unchanged
+DECISIONS: retry logic moved to middleware (step 17);
+  dropped plan to fork client lib (step 29, too invasive)
+OPEN: 3 failing tests in test_refunds.py; TODO update docs
+KEY IDS: branch=migr-v3-4411, PR #8812, flaky test=test_eu_vat
+\end{lstlisting}
+
+Free-form summarization of the same 42 steps produces a paragraph of narrative---and it is precisely the two constraint lines that it drops first.
+
+\subsection{External Memory}
+
+The context window is RAM; anything that must survive should live outside it and be paged back in on demand:
+
+\begin{itemize}
+    \item \textbf{Scratchpads and files.} The simplest and most robust external memory is the file system: the agent writes notes, plans, and intermediate artifacts to files and re-reads them when needed. Files are durable, inspectable, diffable, and shared naturally with sub-agents and humans; for coding agents the repository itself is the memory. This should be the default answer before anything fancier.
+    \item \textbf{Vector stores / retrieval.} When the external corpus is large (past tickets, org documentation, prior trajectories), retrieval brings back relevant slices per step---RAG serving as agent memory. The retrieval machinery itself (chunking, hybrid search, reranking) is canonical in [NLP~9] and Chapter~\ref{chap:long_context_rag}; the agent-specific twist is that the agent \textit{chooses} when to query, making retrieval a tool rather than a fixed pipeline stage (agentic retrieval, Section~\ref{sec:modern_rag}).
+    \item \textbf{Structured state.} Task queues, databases, and typed checkpoints---when state must be transactionally correct (what has been done, what remains), a database row beats prose in a context window.
+\end{itemize}
+
+\textbf{Cross-session memory} in one paragraph: persistent memory across tasks (user preferences, learned facts about a codebase, ``what went wrong last time'') is typically a curated store---explicit memory files or a retrieval index---written by the agent at session end or edited by the user, and injected or retrieved at session start. It compounds usefulness but also compounds two risks: stale or wrong memories silently poisoning every future session (memory needs provenance and an eviction/correction path), and memory as an injection-persistence vector---content the agent read once can write itself into all future contexts (Section~\ref{sec:agentic_safety}).
+
+\begin{table}[H]
+\centering
+\caption{The agent memory hierarchy}
+\label{tab:agent_memory_hierarchy}
+\begin{tabularx}{\textwidth}{p{2.9cm}p{3.3cm}X}
+\toprule
+\textbf{Layer} & \textbf{Systems analog} & \textbf{Properties and failure modes} \\
+\midrule
+Context window & RAM / working memory & Fast, expensive, volatile; degrades before it overflows; replayed (and billed) every step \\
+Compacted summary & Cache of evicted state & Lossy and irreversible; loses constraints and specifics unless structured; drifts when re-summarized \\
+Files / scratchpads & Disk & Durable, inspectable, diffable; the default external store; the agent must remember to read them back \\
+Retrieval index & Content-addressable store & Scales to large corpora; paged in per step; quality bounded by the retrieval stack ([NLP~9], Chapter~\ref{chap:long_context_rag}) \\
+Structured state (DB, queue) & Transactional store & Correct-by-construction task state; no ambiguity about what is done \\
+Cross-session memory & Long-term profile & Compounds usefulness; risks staleness-poisoning and injection persistence (Section~\ref{sec:agentic_safety}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Orchestration Patterns}
+\label{sec:agent_orchestration}
+%==============================================================================
+
+\subsection{Orchestrator--Workers (Sub-agents)}
+
+The dominant multi-agent pattern that actually earns its complexity: a lead agent decomposes the task and dispatches sub-agents, each running its own loop in its own \textit{fresh context}, returning only a distilled result.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    obox/.style={rectangle, rounded corners, draw=deepblue, fill=lightblue, thick, minimum width=4.2cm, minimum height=1.0cm, align=center, font=\small},
+    wbox/.style={rectangle, rounded corners, draw=deepgreen, fill=lightgreen, thick, minimum width=2.9cm, minimum height=1.0cm, align=center, font=\small},
+    arrow/.style={->, >=stealth, thick},
+    backarrow/.style={->, >=stealth, thick, dashed, color=deepgreen}
+]
+\node[obox] (orch) {Orchestrator\\ \scriptsize plans, dispatches, synthesizes};
+\node[wbox, below left=1.5cm and 2.6cm of orch.south] (w1) {Worker 1\\ \scriptsize fresh context};
+\node[wbox, below=1.5cm of orch.south] (w2) {Worker 2\\ \scriptsize fresh context};
+\node[wbox, below right=1.5cm and 2.6cm of orch.south] (w3) {Worker 3\\ \scriptsize fresh context};
+\draw[arrow] (orch.south) to[bend right=18] node[above left, font=\scriptsize]{brief} (w1.north);
+\draw[arrow] (orch.south) to[bend right=10] (w2.north west);
+\draw[arrow] (orch.south) to[bend left=18] node[above right, font=\scriptsize]{brief} (w3.north);
+\draw[backarrow] (w1.north east) to[bend right=10] (orch.south west);
+\draw[backarrow] (w2.north east) to[bend right=10] node[right, font=\scriptsize, color=deepgreen]{distilled result} (orch.south east);
+\draw[backarrow] (w3.north west) to[bend right=18] (orch.south east);
+\end{tikzpicture}
+\caption{Orchestrator--workers. Each worker's exploration (potentially 100K+ tokens) stays in its own context; only briefs go down and distilled results come back. The briefs are lossy natural-language interfaces---what they omit, workers invent.}
+\label{fig:orchestrator_workers}
+\end{figure}
+
+Two distinct benefits, often conflated:
+
+\begin{itemize}
+    \item \textbf{Context isolation.} The worker's 100K tokens of exploration (file dumps, search results, dead ends) never enter the orchestrator's context---only the 1--2K-token conclusion does. This is the memory-management lever of Section~\ref{sec:agent_memory} implemented with process structure, and it is valuable even for \textit{sequential} sub-tasks.
+    \item \textbf{Parallel fan-out.} Independent sub-tasks run concurrently, converting latency from a sum to a max.
+\end{itemize}
+
+\textbf{Worked trade-off arithmetic.} Task: analyze 8 independent modules of a repository and synthesize a report. Assume each module requires reading $\sim$20K tokens and producing a 2K-token analysis; base context (system + tools) 5K.
+
+\begin{itemize}
+    \item \textbf{Single agent, one trajectory.} The trajectory accumulates: step $i$'s input is roughly $5\text{K} + i \cdot 22\text{K}$. Total input over 8 steps $\approx 8 \times 5\text{K} + 22\text{K} \times (1 + 2 + \cdots + 8) = 40\text{K} + 22\text{K} \times 36 \approx 830\text{K}$ tokens; latency is 8 sequential steps; by module 8 the context holds $\sim$180K tokens of mostly-irrelevant earlier modules (with the attention-quality cost that implies); one hard failure mid-run leaves a poisoned trajectory.
+    \item \textbf{Orchestrator + 8 workers.} Each worker: $5\text{K} + 20\text{K}$ in, 2K out $\Rightarrow$ $8 \times 25\text{K} = 200\text{K}$ input. Orchestrator: plan + read 8 summaries + synthesize $\approx$ 30K. Total $\approx$ 230K input tokens---\textit{less} than the single agent, because isolation removed the quadratic accumulation---at 1 parallel step of latency instead of 8, and a failed worker is retried alone without contaminating anything.
+\end{itemize}
+
+\textbf{The brief is the interface---write it like one.} An orchestrator's dispatch message is a lossy serialization of everything the worker needs, and most orchestrator--worker failures are brief failures. A good brief is \textit{self-contained} (the worker sees nothing else: objective, inputs, constraints copied verbatim, output contract), \textit{verifiable} (the worker can check its own success before reporting), and \textit{sized} (one coherent sub-goal; a brief that needs mid-flight clarification should have been two briefs or none). Treat brief templates like API schemas: versioned, tested with regression cases, and tightened whenever a worker's failure traces to an omission.
+
+The arithmetic flips when sub-tasks are \textit{dependent}: if each module's analysis needs the previous analyses, workers must receive that shared state in every brief (token duplication across $k$ workers), or serialize (no latency win), and inconsistencies between workers' assumptions become a new error class. Prefix caching also narrows the single-agent cost penalty specifically (the accumulated trajectory is a cached prefix billed at $\sim$10\%; Section~\ref{sec:prefix_caching})---though it does nothing for the attention-quality or error-isolation arguments. Hence the honest rule: \textbf{fan out when sub-tasks are independent, read-heavy, and compressible} (their value to the parent is much smaller than their working set); stay single-threaded when state is entangled. Anthropic's published multi-agent research system is the canonical positive example---breadth-first research questions, orchestrator plus parallel search workers, a large quality win over a single agent on that workload---and the same report is candid that the system consumed roughly 15$\times$ the tokens of a chat interaction, which only certain tasks justify.
+
+\subsection{Critic and Reviewer Patterns}
+
+A second loop instance---same or different model---reviews the first's output before it ships: code review on a generated diff, a checker over a research summary, an adversarial red-team pass over a plan.
+
+\begin{itemize}
+    \item \textbf{Why it works when it works.} Generation and verification are different tasks, and a reviewer with a \textit{clean context} evaluates the artifact on its merits, free of the generator's accumulated rationalizations. Self-review inside one context is measurably weaker---the model grades its own homework with its own assumptions still in the window.
+    \item \textbf{Where it earns the most.} Verification cheaper than generation, and errors consequential. The critic is also the natural mounting point for non-model checks (linters, tests, policy engines), so a production ``critic'' is really a stack of deterministic verifiers with an LLM at the top for what only judgment can catch.
+    \item \textbf{What it costs.} One more full pass per artifact plus a reject--retry loop whose termination you must bound---an unbounded generator--critic argument is a money fire with two participants.
+    \item \textbf{Design stance.} The critic \textit{rejects with an actionable reason}; it does not fix. Fixing belongs to the generator with the critique appended---which keeps roles clean, failures attributable, and the critic's standards from drifting toward whatever is easiest to patch.
+\end{itemize}
+
+\subsection{Multi-Agent, Honestly}
+
+The 2023--24 wave of role-played agent societies (planner/researcher/coder/tester personas debating in a group chat) mostly did not survive contact with evaluation, and a Staff-level answer should say so plainly:
+
+\begin{table}[H]
+\centering
+\caption{Orchestration patterns: what each buys and what it costs}
+\label{tab:orchestration_patterns}
+\begin{tabularx}{\textwidth}{p{3.0cm}XX}
+\toprule
+\textbf{Pattern} & \textbf{Earns its cost when} & \textbf{Characteristic failures} \\
+\midrule
+Single agent, one loop & The default: entangled state, moderate horizons & Context bloat on long tasks; no parallelism \\
+Orchestrator--workers & Sub-tasks independent, read-heavy, compressible; latency matters & Bad briefs (workers invent missing context); duplicated shared state; orchestrator bottleneck \\
+Critic / reviewer & Verification cheaper than generation; errors costly; clean-context judgment needed & Rubber-stamping by a weak critic; unbounded reject--retry loops \\
+Pipeline of specialists & Stages genuinely differ (tools, models); flow is static & This is a workflow wearing an agent costume---often correctly so \\
+Debate / ensemble voting & Answers verifiable-ish; disagreement signals error & Cost multiplies by $n$; correlated errors defeat voting; largely displaced by test-time compute (Section~\ref{sec:reasoning_ttc}) \\
+Role-play society & Rarely---the burden of proof sits here & Inter-agent misalignment; token burn; theater over architecture \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}
+More agents is not more intelligence. Empirically, multi-agent systems built from the same base model frequently \textit{underperform} a well-scaffolded single agent on the same tasks: the MAST study (Cemri et al., 2025), analyzing thousands of trajectories across popular multi-agent frameworks, found high failure rates dominated not by model incapacity but by \textit{system} design---specification failures, inter-agent misalignment (agents acting on inconsistent assumptions), and weak verification. Every agent boundary is a lossy, natural-language interface: state must be serialized into a brief, and whatever the brief omits, the receiving agent invents. Communication overhead grows with the number of edges, token cost grows a large multiple over single-agent, and debugging becomes distributed-systems archaeology. The burden of proof is on the extra agent: role separation earns its place for \textbf{context isolation} (sub-agents shielding a parent from token bloat), \textbf{genuinely parallel independent work}, and \textbf{adversarial or clean-context review} (critics)---not for anthropomorphic org charts. ``Which failure class does this boundary remove, and which does it add?'' is the question that separates architecture from theater.
+\end{warningbox}
+
+%==============================================================================
+\section{Computer Use}
+\label{sec:computer_use}
+%==============================================================================
+
+\textbf{The loop.} Computer-use agents (Anthropic's computer use, late 2024; OpenAI's Operator-class agents, 2025) close the agent loop over a GUI: observation is a \textit{screenshot} (sometimes plus an accessibility tree), and actions are primitive input events---click at coordinates, type, scroll, key-press. It is the same loop as Figure~\ref{fig:agent_loop} with the universal but lowest-level action space: anything a human can do with a screen, in principle; no API required from the target application.
+
+\textbf{Why it trails API-based agents.} The gap is structural, not just model maturity:
+
+\begin{itemize}
+    \item \textbf{Error compounding over many low-level steps.} One API call---\texttt{book\_flight(...)}---becomes dozens of clicks, keystrokes, and page loads. Per-action reliability is also \textit{lower} (grounding errors, mis-clicks, UI state surprises), and Section~\ref{sec:agent_reliability}'s arithmetic is merciless: many more steps at lower per-step reliability multiplies out to far lower task success. The API agent's chief advantage is that an atomic, schema-validated call collapses fifty failure opportunities into one.
+    \item \textbf{Grounding and click precision.} The model must map intent (``the Submit button'') to pixel coordinates on a rendered screen; small targets, dense UIs, dropdowns, and scrolled-out-of-view elements make this a genuine vision problem. Accessibility-tree grounding (act on the DOM/AX tree, when available) is more reliable than pixels but is not universally available---which is much of why browser agents lead desktop agents.
+    \item \textbf{Latency and cost per step.} Every step prefills a fresh screenshot (image tokens) and waits for real UI settling; seconds per action, minutes per task, with none of the batching or prefix-reuse economics of text loops.
+    \item \textbf{No schema to validate against.} An API call can be checked before execution; a click cannot---the ``schema'' is whatever the UI happens to render, and injection can arrive through the pixels themselves (Section~\ref{sec:agentic_safety} covers the widened threat model and its controls).
+\end{itemize}
+
+\textbf{The arithmetic, made concrete.} Suppose booking a flight is 3 API calls at 99\% per-call reliability, or $\sim$40 GUI actions at a (generous) 97\% per-action reliability: $0.99^3 \approx 0.97$ versus $0.97^{40} \approx 0.30$. Add latency: 3 calls at $\sim$2\,s versus 40 vision-prefill-plus-UI-settle steps at 3--5\,s each---a few seconds versus several minutes. Nothing about better prompting changes this comparison; only collapsing many GUI actions into fewer, more atomic, more verifiable operations does (macro-actions, form-filling primitives, falling back to APIs wherever they exist).
+
+\textbf{Current status, coarsely.} On OSWorld-class benchmarks (real OS/browser environments, execution-based scoring; mechanics in [NLP~10]) humans solve roughly 70\% of tasks and agents, while improving quickly year over year, still trail humans badly---this family is where the discriminative action is, which is exactly why labs invest in it. The pragmatic deployment posture in 2026: \textbf{API-first, GUI as fallback}---use computer use for the long tail of software with no API (legacy enterprise apps, arbitrary websites), keep tasks short-horizon, and gate consequential clicks. It is the universal adapter, priced accordingly in reliability and latency.
+
+%==============================================================================
+\section{Reliability Engineering}
+\label{sec:agent_reliability}
+%==============================================================================
+
+This section is the Staff differentiator. Anyone can draw the loop; the engineering that turns a 60\%-success demo into a 95\%-success product is where senior candidates separate.
+
+\subsection{The Compounding-Error Arithmetic}
+
+\begin{mathresult}{Per-Step Reliability Dominates}
+If a task requires $n$ sequential steps and each succeeds independently with probability $p$, task success is $p^n$:
+\[
+0.98^{50} \approx 0.36, \qquad 0.99^{50} \approx 0.61, \qquad 0.999^{50} \approx 0.95.
+\]
+A 50-step agent whose steps are each ``98\% reliable''---excellent by single-call standards---completes the task barely a third of the time. Inverting: 95\% task success over 50 steps requires per-step reliability around $99.9\%$, i.e., roughly $(0.95)^{1/50}$. No frontier model delivers three-nines per-step autonomy on open-ended actions, so production reliability cannot come from the model alone---it must come from the \textit{system}: fewer steps (better tools, code execution, static structure where possible), and \textbf{recovery} (verification + retry), which changes the exponent's base. With a per-step verifier that catches a failure with probability $d$ and one retry, effective per-step success is $p' = p + (1-p)\,d\,p$: at $p = 0.9$, $d = 0.9$, $p' \approx 0.98$---turning $0.9^{50} \approx 0.5\%$ into $\approx 36\%$ with a single cheap mechanism, and more with deeper retry budgets. The independence assumption is optimistic in one way (errors correlate---a misunderstanding poisons all later steps, which is why checkpoints and context resets matter) and pessimistic in another (agents genuinely self-correct mid-trajectory); the design conclusion survives both caveats: \textit{engineer the per-step failure and recovery rates, because the horizon amplifies whatever they are}.
+\end{mathresult}
+
+The grid below is worth internalizing---interviewers ask for exactly these orders of magnitude:
+
+\begin{table}[H]
+\centering
+\caption{Task success $p^n$ as a function of per-step reliability and horizon}
+\label{tab:pn_grid}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Per-step $p$} & $n=10$ & $n=25$ & $n=50$ & $n=100$ \\
+\midrule
+0.90 & 35\% & 7\% & 0.5\% & 0.003\% \\
+0.95 & 60\% & 28\% & 8\% & 0.6\% \\
+0.98 & 82\% & 60\% & 36\% & 13\% \\
+0.99 & 90\% & 78\% & 61\% & 37\% \\
+0.995 & 95\% & 88\% & 78\% & 61\% \\
+0.999 & 99\% & 98\% & 95\% & 90\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Read the table both ways. Down a column: reliability engineering (raising $p$) buys more than any other investment at fixed horizon. Across a row: shortening the horizon (better tools, code execution collapsing many steps into one, static structure where the task allows it) is the other first-class lever---the same $p = 0.98$ agent is an 82\% product at 10 steps and a coin flip worse than useless at 50. And instrument $p$ per tool and per step-type from trajectory logs: ``our per-step reliability is 97.8\%, dominated by \texttt{edit\_file} argument errors'' is an engineering statement; ``the agent sometimes fails'' is not.
+
+\subsection{The Reliability Toolkit}
+
+\textbf{Idempotent tool design.} Retries are the core recovery mechanism, and retries are only safe if re-executing a step is harmless. Design tools so that repeating a call converges rather than duplicates: idempotency keys on mutating calls (\texttt{create\_ticket(request\_id=...)} returns the existing ticket on replay), declarative ``ensure state'' semantics over imperative ``do action'' semantics (\texttt{set\_status(id, closed)} vs.\ \texttt{toggle\_status(id)}), and check-then-act tools that report what already exists. The failure this prevents is the classic agent incident: a timeout on a call that actually succeeded, followed by a retry that charges the customer twice.
+
+\textbf{Retries with verification, not blind retries.} A retry without a verifier resamples the same distribution that just failed---useful against transient noise, useless against a wrong plan. The productive pattern is \textit{verify $\rightarrow$ diagnose $\rightarrow$ retry}: check the step's postcondition (test passes, record present, file compiles---cheap, mechanical checks beat LLM self-assessment), feed the concrete failure back as an observation, and cap the loop (Reflexion-style ``retry with a memory of why the last attempt failed'' is the scaffold-level version of this). Escalate after $k$ failures rather than burning budget on a step the model cannot do.
+
+\textbf{Checkpointing trajectories.} Persist the trajectory (and, where possible, an environment snapshot---a git commit, a DB transaction point) at meaningful boundaries: plan approved, sub-task completed, before any irreversible action. Benefits compound: crash \textit{resumption} instead of restart (a 40-minute task that dies at minute 38 resumes from the last checkpoint), \textit{rollback} to the last good state when a sub-task goes sideways (revert the branch, restart the sub-task with a note about the failed attempt), and \textit{human handoff}---a checkpoint plus the plan artifact is something a person can pick up. For coding agents, version control is the checkpoint mechanism and one of the quiet reasons agents work so well there.
+
+\textbf{Human-in-the-loop gates.} Classify actions by reversibility and blast radius; let the agent act autonomously on reads and reversible writes, and require explicit human confirmation for irreversible or high-impact actions (send, spend, delete, merge, deploy). The security framing---why the gate must show the concrete action, and how gates interact with injection resistance---is canonical in Section~\ref{sec:agentic_safety}; the reliability framing here is complementary: a gate converts the worst tail outcome from ``unbounded damage'' to ``one wasted approval request,'' which is what makes the rest of the autonomy budget affordable at all.
+
+\textbf{Graceful degradation.} Budget exhaustion, stuck detection, and repeated verification failure should land in a designed terminal state: summarize what was done, what remains, and what blocked progress; package partial work (the branch with passing subset of tests, the draft with open questions); downgrade to a narrower deliverable when the full one is out of reach; escalate with context rather than silently failing. ``The agent either finishes or produces a useful handoff'' is a product property you engineer, not an emergent behavior.
+
+\textbf{Observability: trajectory logging and replay.} Log every step---model input hash, output, tool call, arguments, observation, tokens, latency---as a structured, versioned trace tied to the prompt/tool-definition versions that produced it. This is the substrate for everything else: replay (re-run a failing trajectory against a new prompt or model and diff the divergence point), aggregate dashboards (tool-error rates by tool, step counts, loop-signature alarms---a spike in retries on one tool after a deploy is your regression alarm), and the error taxonomies that drive the eval-iterate loop (Section~\ref{sec:agent_eval}). Teams that cannot replay a trajectory are debugging by anecdote.
+
+\textbf{Anatomy of a typical incident}, to make the toolkit concrete. An ops agent files duplicate purchase orders for three customers. The trace shows: a \texttt{create\_order} call timed out at the gateway (the order had actually landed); the harness retried; the tool, lacking idempotency keys, created a second order; the agent's ``verify'' step checked only that \textit{an} order existed---which it did---so the trajectory terminated green. Every layer of the toolkit maps to a fix: idempotency keys on \texttt{create\_order} (root cause), a postcondition that asserts \textit{exactly one} order per request ID (verification specificity), an anomaly alert on duplicate-entity creation (observability), and a regression case replaying this trajectory (eval loop). The incident was not a model failure at all---the model behaved reasonably at every step. That is the norm, and it is why reliability reviews of agents should start from the trace, not from the prompt.
+
+\begin{table}[H]
+\centering
+\caption{Distributed-systems techniques mapped onto the agent loop}
+\label{tab:ds_mapping}
+\begin{tabularx}{\textwidth}{p{3.3cm}XX}
+\toprule
+\textbf{Classical technique} & \textbf{Agent-loop form} & \textbf{Failure prevented} \\
+\midrule
+Idempotency keys & Mutating tools accept a request ID; replay returns the original result & Duplicate side effects (double-charge) on retry after timeout \\
+Retry + verification & Verify postcondition $\rightarrow$ diagnose $\rightarrow$ bounded retry with the failure as an observation & Blind resampling of a failing distribution; unbounded retry burn \\
+Checkpoint / snapshot & Trajectory + environment snapshot at sub-task boundaries (git commit, DB savepoint) & Restart-from-zero on crash; unrecoverable mid-task corruption \\
+Circuit breaker & Stuck detection: repeated identical calls, oscillation, $N$ consecutive tool errors $\rightarrow$ halt or escalate & Remaining budget converted into identical error messages \\
+Bulkhead isolation & Sub-agent contexts; sandboxed execution & Poisoned exploration contaminating the main trajectory; blast-radius spread \\
+Structured tracing & Versioned trajectory logs with replay & Debugging by anecdote; unattributable regressions \\
+Graceful degradation & Designed terminal states: partial work packaged, escalation with context & Silent failure; all-or-nothing outcomes \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[Reliability Is a Systems Property]
+The unreliable component---the model---is fixed; the system around it is not. Every technique above is a classical distributed-systems idea (idempotency, retries with backoff, checkpointing, circuit breakers, structured logging) applied to a stochastic component. The Staff-level framing: treat each model step as an unreliable RPC with a measurable failure rate, then engineer the envelope---verification, recovery, isolation, budget enforcement---so that task-level reliability is a design output, not a hope. Candidates who reach for ``better prompts'' as the primary reliability lever are answering a junior question; the senior answer changes the exponent, the base, and the blast radius.
+\end{keyinsight}
+
+%==============================================================================
+\section{Evaluating Agents}
+\label{sec:agent_eval}
+%==============================================================================
+
+Agent evaluation methodology is canonical here; the benchmark catalog (which suite measures what) is [NLP~10], and the underlying statistics (estimators, error bars, contamination detection) are Chapter~\ref{chap:evaluation_metrics}.
+
+\subsection{Task Success vs.\ Trajectory Quality}
+
+The primary metric is \textbf{outcome-based task success}, verified against the environment, not the transcript: the tests pass, the database reached the correct final state, the booking exists. Grading final environment state is robust to the agent taking an unexpected-but-valid path; grading the transcript (did it call the tools we expected?) punishes valid creativity and misses invalid luck. But a single success bit is too coarse for engineering, so production evals add \textbf{trajectory-quality} metrics: steps and tokens to success (efficiency), tool-error and retry counts, constraint/policy violations en route (an agent that succeeds while briefly exposing customer data did not succeed), side-effect audits (what did it touch that it did not need to?), and---where judgment is needed---rubric-scored LLM-judge assessments of the trajectory, calibrated against human labels (judge methodology: Chapter~\ref{chap:evaluation_metrics} and [NLP~10]). Outcome metrics tell you \textit{whether} to ship; trajectory metrics tell you \textit{what to fix}.
+
+\subsection{pass@$k$ vs.\ pass\textasciicircum{}$k$: Capability vs.\ Reliability}
+
+For stochastic agents, one number per task is not enough---you must decide which question you are asking:
+
+\begin{itemize}
+    \item \textbf{pass@$k$}: probability that \textit{at least one} of $k$ i.i.d.\ attempts succeeds. The right claim when a verifier can select the winner (code with tests: run $k$ candidates, ship the one that passes). It measures \textit{capability} under search.
+    \item \textbf{pass\textasciicircum{}$k$}: probability that \textit{all} $k$ i.i.d.\ attempts succeed, $\E_{\text{tasks}}[p_{\text{task}}^k]$---popularized by $\tau$-bench precisely because deployed agents do not get an oracle picking their best try. It measures \textit{reliability}: what fraction of tasks the agent handles consistently. With per-task $p = 0.9$: pass@8 $\approx 1.0$ while pass\textasciicircum{}8 $\approx 0.43$---the same agent is ``nearly perfect'' or ``fails most repeat customers'' depending on which you report.
+\end{itemize}
+
+Report pass@$k$ when your product actually runs best-of-$k$ with a verifier; report pass\textasciicircum{}$k$ (or the full per-task success-rate distribution) when the claim is about dependability. The widening gap between the curves as $k$ grows is diagnostic in itself---inconsistent, not incapable---and points at variance-reduction fixes (determinism where possible, verification, tighter tools) rather than capability fixes. Estimators, the biased-plug-in trap, and error bars for both are Section~\ref{sec:pass_at_k}.
+
+\begin{table}[H]
+\centering
+\caption{Agent evaluation metrics: which claim each supports}
+\label{tab:agent_eval_metrics}
+\begin{tabularx}{\textwidth}{p{3.6cm}XX}
+\toprule
+\textbf{Metric} & \textbf{Question it answers} & \textbf{Cautions} \\
+\midrule
+Task success (state-verified) & Did the world end up right? & Grader validity; needs a checkable end state \\
+pass@$k$ & Capability under best-of-$k$ with a selecting verifier & Meaningless without that verifier in production; use the unbiased estimator (Section~\ref{sec:pass_at_k}) \\
+pass\textasciicircum{}$k$ / per-task distribution & Reliability across repeats & Needs multiple seeds per task; means hide bimodality \\
+Policy-violation rate & Did it stay inside the rules en route? & A gate, not an averaged component; severity-tiered \\
+Steps / tokens / \$ per success & Efficiency and unit economics & Compare at matched success; watch the p99 tail \\
+Judge-scored trajectory rubric & Soft quality (tone, communication, process) & Calibrate against human labels; never gates alone \\
+Escalation precision / recall & Does it hand off exactly when it should? & Measure both directions: missed and spurious escalation \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Environment Design}
+
+An agent eval is an \textit{environment} plus a grader, and the environment is where the engineering lives:
+
+\begin{itemize}
+    \item \textbf{Sandboxed real environments} (SWE-bench-style; mechanics in [NLP~10]): containerized repos with real test suites, graded by execution. Strengths: realistic, objective. Design burdens: determinism (pin dependencies; flaky tests poison the signal in both directions), grader validity (under-specified tests mark correct patches wrong---the reason the human-screened ``Verified'' subset exists), and isolation (the agent must not fix the task by breaking the harness).
+    \item \textbf{Simulated users} ($\tau$-bench-style): an LLM plays the customer with a hidden goal and persona; grading checks the final environment state and policy compliance. The simulator is itself a modeling problem: too-cooperative simulated users inflate scores (real users are vague, contradictory, impatient), the simulator can leak the hidden goal, and agents iterated against one simulator overfit its quirks. Treat the simulated user as part of the eval's spec---version it, diversify personas, and periodically calibrate against transcripts of real users.
+    \item \textbf{Static-trace evals} (given this trajectory prefix, is the next action correct?): cheap, deterministic, and good for unit-testing components (tool selection, argument filling), but they cannot measure recovery or long-horizon behavior---necessary, not sufficient.
+\end{itemize}
+
+Three cross-cutting rules:
+
+\begin{itemize}
+    \item \textbf{Grade states, not strings.} Wherever possible the grader checks the world (DB rows, file diffs, test results), because string-matching transcripts is brittle and gameable.
+    \item \textbf{Report the scaffold.} Agent scores are properties of model + tools + prompts + budgets; the same model swings by tens of points across scaffolds, so a number without its scaffold, budget, and $k$ is not a measurement ([NLP~10] develops this for SWE-bench specifically).
+    \item \textbf{Control variance at the source.} Pin environment versions and tool behavior, fix seeds and temperature where the product allows, and make tool output ordering deterministic---variance you engineer out of the environment is variance you do not have to average over with expensive repeated runs (and it improves the product's pass\textasciicircum{}$k$ for free).
+\end{itemize}
+
+\textbf{Trajectory review as a practice.} The labeled taxonomy that drives iteration (below) comes from humans reading trajectories, which does not scale naively. The working compromise: sample failures stratified by task type, have an LLM pre-label the first-wrong-step and category, and human-verify a subset to calibrate the pre-labeler---the same judge-calibration discipline as everywhere else (Chapter~\ref{chap:evaluation_metrics}). The senior habit this builds is non-negotiable regardless of tooling: engineers on an agent product read raw trajectories weekly, because aggregate metrics tell you \textit{that} something broke, and only trajectories tell you \textit{what}.
+
+\subsection{Cost-Adjusted Comparison}
+
+Leaderboards rank by success rate; production ranks by \textbf{success per dollar} (and per minute). The critique formalized by Kapoor et al.\ (2024, ``AI Agents That Matter''): unbounded-budget evaluation invites scaffolds that top the chart with enormous best-of-$n$ sampling, deep retry budgets, and premium models---economically absurd at 10--100$\times$ the cost for a few points of success that a customer would never pay for. A toy but representative comparison: scaffold A reaches 65\% at \$0.90 per task; scaffold B reaches 72\% at \$14 per task via best-of-8 on a frontier model. Per \textit{successful} task that is \$1.38 versus \$19.40---B tops the leaderboard, A ships. The honest presentation is a \textbf{cost--accuracy frontier}: plot each (scaffold, model, budget) configuration as accuracy vs.\ dollars per task and compare frontiers, not points; state the budget at which a comparison holds. In interviews, volunteering ``at what cost per task?'' when quoted an agent benchmark number is precisely the reflex being screened for. (Budget-matched comparison logic is the same as for reasoning models, Section~\ref{sec:reasoning_eval}.)
+
+\subsection{Contamination via Memorized Fixes}
+
+Agent benchmarks built from public history inherit a specific contamination mode: \textit{the solution exists verbatim in pretraining}. SWE-bench tasks are real GitHub issues whose actual fix commits are public; a model can reproduce the remembered patch---or exploit weaker leakage, like knowing which file to edit from the issue text alone---without doing the engineering the benchmark claims to measure. Follow-up analyses have shown models ``solving'' tasks from memorized repository knowledge on exactly such probes. Defenses: temporal holdouts (tasks created after the training cutoff---live/rolling agent benchmarks), private task suites drawn from your own systems (which also fixes distribution match), and mutation testing (perturb the task so the memorized fix no longer applies; memorizers crater, engineers do not). General contamination detection machinery is Section~\ref{sec:contamination}.
+
+\subsection{Online Evaluation and Rollout}
+
+Offline evals authorize a rollout; they do not conclude the evaluation. The standard staging for an agent product:
+
+\begin{enumerate}
+    \item \textbf{Shadow mode}: run the agent on real inputs, log full trajectories, execute nothing (or execute against a replica). Measures distribution match---the first discovery is usually that live inputs are messier than the eval suite---and calibrates offline-vs-online score gaps before any user sees output.
+    \item \textbf{Gated live}: real traffic, but consequential actions route through human approval (the autonomy ladder of Section~\ref{sec:agent_definition}); approval/override rates are themselves a metric---humans rubber-stamping 99\% of gates means the gate can move up; humans rejecting 20\% means the offline eval is missing a failure class.
+    \item \textbf{A/B at task granularity}: randomize at the task or user level against the incumbent (human process or previous agent version), on end-to-end outcomes---resolution rate, time-to-done, cost per success, downstream corrections (a re-opened ticket or reverted PR is a delayed failure signal). Guardrail metrics (policy violations, escalation misses) gate the experiment regardless of the primary metric; the statistics are the standard ones (Section~\ref{sec:statistical_significance}).
+\end{enumerate}
+
+Two agent-specific cautions: trajectories are expensive and variable, so per-arm sample sizes are smaller than classic A/B intuition assumes (power-check before promising a verdict); and agent behavior shifts under upstream model updates you do not control---pin model versions where possible, and treat provider-side upgrades as changes that re-trigger the offline suite.
+
+\subsection{The Eval-Iterate Loop for Agent Products}
+
+For a product team, the eval's purpose is not a leaderboard number---it is a \textbf{diagnosis and regression engine}:
+
+\begin{enumerate}
+    \item \textbf{Collect failures} from trajectory logs (production and eval runs alike).
+    \item \textbf{Build an error taxonomy}: label each failed trajectory with the \textit{first} step where it went wrong and a category---wrong tool selected, bad arguments, misread observation, plan error, lost constraint after compaction, environment/tool bug, grader bug, genuinely-out-of-scope task. The distribution is always lumpy, and the biggest bucket is rarely ``the model is not smart enough.''
+    \item \textbf{Fix the biggest bucket} with the cheapest adequate lever: a tool-description sentence, a merged tool, a verification step, a compaction template fix, a budget change---model upgrades and fine-tuning come \textit{after} the scaffold levers are exhausted.
+    \item \textbf{Grow the regression suite}: every fixed failure becomes a permanent eval case; every production incident becomes a canary (the same discipline as launch evals, Section~\ref{sec:launch_evals}). Run the suite on every prompt, tool, scaffold, and model change---agent behavior is wildly sensitive to all four, and un-regression-tested prompt edits are how fixed bugs return.
+\end{enumerate}
+
+A representative first pass over a failing agent's trajectories looks like this (numbers illustrative, shape typical):
+
+\begin{table}[H]
+\centering
+\caption{A first-pass error taxonomy for a failing agent (illustrative shares)}
+\label{tab:error_taxonomy}
+\begin{tabularx}{\textwidth}{p{4.6cm}cX}
+\toprule
+\textbf{Failure bucket (first wrong step)} & \textbf{Share} & \textbf{Cheapest adequate fix} \\
+\midrule
+Wrong tool / bad arguments & 30\% & Rewrite descriptions; merge overlapping tools; tighten schemas \\
+Error unnoticed (no verification) & 20\% & Postcondition checks; verify--diagnose--retry \\
+Lost constraint after compaction & 15\% & Structured compaction with pinned constraint block \\
+Stuck loops / budget exhaustion & 10\% & Loop signatures; hard budgets; graceful degradation \\
+Environment or tool bug & 10\% & Fix the tool; determinism; machine-actionable error text \\
+Grader bug (agent right, eval wrong) & 8\% & Fix the eval; add grader tests \\
+Genuinely beyond capability & 7\% & Stronger model on that step; human escalation for the slice \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The moral of the shape: roughly three-quarters of failures are \textit{system} failures fixable without touching the model, and a non-trivial slice is the eval's own fault. Teams that skip the taxonomy and jump to ``we need a better model'' spend the most money on the smallest bucket.
+
+\begin{warningbox}
+Your own eval suite is a Goodhart target too. Iterating an agent against a fixed set of 50 internal tasks overfits the same way tuning against a public benchmark does: prompts accrete task-specific hints, tools grow special cases, and the number climbs while generalization does not. Defenses are the standard ones (Section~\ref{sec:contamination}): held-out task splits that the iterating engineers do not see, periodic refresh from live traffic, and treating a widening gap between eval scores and production success as an alarm in its own right.
+\end{warningbox}
+
+\begin{keyinsight}[The Eval Is the Asset]
+Models are rented; scaffolds are copied within months; the durable asset an agent team accumulates is its evaluation stack---environments matched to the real task distribution, a labeled error taxonomy, and a regression suite grown from every incident. It is what lets you swap models in a week, cut costs without fear, and know that 95\% means 95\%. In interviews, proposing the eval loop \textit{before} proposing fixes is among the strongest agent-engineering signals a candidate can send.
+\end{keyinsight}
+
+This loop---taxonomy, targeted fix, regression suite---is the answer skeleton for every ``your agent is failing, improve it'' interview question, including the 60\%$\to$95\% question in Section~\ref{sec:agents_interview}.
+
+%==============================================================================
+\section{Agent Economics}
+\label{sec:agent_economics}
+%==============================================================================
+
+\subsection{The Cost Model: Tokens $\times$ Steps, Compounding}
+
+Agents are expensive in a specific, quantifiable way: because the loop replays the trajectory every step, \textbf{input tokens grow linearly per step and quadratically per task}.
+
+\begin{mathresult}{Trajectory Cost Arithmetic}
+With base context $C_0$ (system prompt + tool schemas) and $\delta$ new tokens per step (action + observation), step $i$'s input is $C_0 + (i-1)\delta$, so a $T$-step task consumes
+\[
+\underbrace{T\,C_0 + \tfrac{T(T-1)}{2}\,\delta}_{\text{total input tokens}} \;=\; O(T^2)\ \text{input tokens.}
+\]
+Worked example: $C_0 = 5$K, $\delta = 2$K, $T = 30$ $\Rightarrow$ $150\text{K} + 870\text{K} \approx 1.0$M input tokens for one task---at \$3/M input, \$3 of input cost before counting outputs, and 4$\times$ that if the task takes 60 steps. \textbf{Prefix caching changes the slope}: all but the newest $\sim\delta$ tokens of each step are a cache hit billed at $\sim$10\% of the input rate, so effective cost $\approx$ (fresh tokens at full rate) + (replayed tokens at $0.1\times$) $\approx$ \$0.5 for the same task---a 5--10$\times$ lever that depends on prompt layout keeping the prefix stable (Section~\ref{sec:prefix_caching}). This is why agent products are engineered around cache hit rate, why compaction has a \textit{cost} rationale in addition to its context-quality one, and why token-hungry patterns (multi-agent fan-out at $\sim$15$\times$ chat-level token use; unbounded retries) need a business case, not just a benchmark win.
+\end{mathresult}
+
+\textbf{Latency compounds the same way.} Wall-clock is the sum of sequential step latencies (model time + tool time), so a 30-step trajectory at 3--10\,s per step is minutes, not seconds---which is why deep agent loops belong in asynchronous, background-task UX (kick off, notify on completion or checkpoint) rather than behind a chat spinner, why parallel fan-out (Section~\ref{sec:agent_orchestration}) is a latency tool as much as a quality tool, and why batch-tier pricing suits agent workloads that are throughput-bound rather than latency-bound.
+
+\subsection{Model Selection per Step}
+
+Nothing forces one model to run every step. The stable pattern: \textbf{a big model where decisions branch, small models where they do not}---frontier model for planning, decomposition, and hard recovery; cheaper models for mechanical steps (formatting, extraction, summarizing observations, sub-agent legwork on narrow briefs); non-model code for everything deterministic (validation, routing on exact conditions---the cheapest ``model'' is an \texttt{if} statement). Orchestrator--worker architectures make this natural (the orchestrator is the expensive model, workers are cheap ones), and escalation ladders make it robust: try the cheap model, verify, escalate to the big model only on verification failure, so the premium price is paid only on the hard minority of steps. The same logic governs retries---a failed step retried on a bigger model is often cheaper than the same step retried twice on the small one, once you count the downstream cost of a poisoned trajectory.
+
+\subsection{When Fine-Tuning Beats Prompting}
+
+Prompting and scaffold iteration should win by default: minutes-scale iteration, no training infrastructure, portable across model upgrades. Fine-tuning the agent policy earns its cost when the workload is \textbf{high-volume, narrow, and stable}: a fixed tool set and domain, enough traffic that per-task token savings amortize training, and a scaffold whose prompt has bloated into thousands of tokens of instructions and examples that SFT could internalize (shorter prompts also mean cheaper cached prefixes). The mechanics: SFT/distillation on curated successful trajectories---often from a bigger model, shrinking the executor model a size class (Chapter~\ref{chap:transfer_learning})---and, when the task has verifiable outcomes, RL on the agentic task itself, which trains when-to-call/retry/stop behavior that SFT anchors weakly (Chapter~\ref{chap:reinforcement_learning}; [NLP~7] covers how tool use is trained in general). The trap to name in an interview: a fine-tuned agent model is coupled to its tool set and freezes your scaffold---every tool change now implies a data refresh and retrain, and a base-model upgrade may beat your tune. Fine-tune the stable core, keep the evolving edge in prompts.
+
+The levers, ranked the way a Staff engineer should reach for them:
+
+\begin{table}[H]
+\centering
+\caption{Agent cost levers, ordered by risk-adjusted return}
+\label{tab:cost_levers}
+\begin{tabularx}{\textwidth}{p{3.4cm}p{2.8cm}p{2.0cm}X}
+\toprule
+\textbf{Lever} & \textbf{Typical saving} & \textbf{Quality risk} & \textbf{Notes} \\
+\midrule
+Prefix caching + prompt layout & 3--6$\times$ on input & None & Stable content first; cache-aware routing (Section~\ref{sec:prefix_caching}) \\
+Shorter trajectories & 1.5--3$\times$ & Low (often helps) & Code execution; lean observations; kill p99 loops \\
+Model routing / cascades & 2--5$\times$ on routed steps & Medium & Escalate on verification failure; guard with evals \\
+Compaction & Caps the quadratic term & Medium & Schedule against the cache; structured templates (Section~\ref{sec:agent_memory}) \\
+Distill / fine-tune executor & A model size class & Medium--high & Narrow, stable, high-volume only; couples model to tool set \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Putting It Together: A Reference Architecture}
+\label{sec:agent_reference_arch}
+%==============================================================================
+
+A closing synthesis, in the shape an interview answer should take. Task: an internal engineering agent that takes a ticket (``bump library X across services, fix what breaks'') and produces reviewed pull requests. Walking the chapter's decisions in order:
+
+\begin{enumerate}
+    \item \textbf{Agency level} (Section~\ref{sec:agent_definition}): the outer structure is a \textit{workflow}---parse ticket $\rightarrow$ enumerate affected services from the build graph $\rightarrow$ per-service fix $\rightarrow$ roll-up report. Only the per-service fix is genuinely input-dependent, so only it is an agent loop. Agency is spent exactly where the environment's response changes what to do next.
+    \item \textbf{Action space and harness} (Section~\ref{sec:agent_loop}): per-service, a short tool set---read/search, edit, run tests, plus a code sandbox for glue; budgets (steps, tokens, wall-clock) enforced by the harness; verified termination: done means the service's tests pass.
+    \item \textbf{Planning} (Section~\ref{sec:agent_planning}): a plan file per service, revised on verification failure; no tree search---linear with verify-and-retry, because the domain gives a free verifier (the test suite) but side effects (commits) are cheap to branch anyway via git.
+    \item \textbf{Memory} (Section~\ref{sec:agent_memory}): the repo and plan file are the memory; structured compaction with pinned constraints (``do not touch generated code'') for long services; the migration playbook learned from early services is externalized to a notes file and injected into later ones.
+    \item \textbf{Orchestration} (Section~\ref{sec:agent_orchestration}): services are independent, read-heavy, compressible $\rightarrow$ parallel fan-out of per-service workers with fresh contexts; a clean-context critic reviews each diff against the playbook before the PR posts.
+    \item \textbf{Reliability} (Section~\ref{sec:agent_reliability}): idempotent by construction (branch per service, PR keyed to ticket); checkpoints are commits; failed services degrade gracefully into a ``needs human'' report section rather than blocking the batch; every trajectory logged and replayable.
+    \item \textbf{Safety} (Section~\ref{sec:agentic_safety}): the agent opens PRs; humans merge. Sandboxed execution, scoped credentials, no egress beyond the code host.
+    \item \textbf{Evaluation} (Section~\ref{sec:agent_eval}): a golden set of historical migrations replayed in sandboxed repos; state-graded (tests pass, no unrelated diffs); pass\textasciicircum{}$k$ tracked per service class; error taxonomy and regression suite from every failed service.
+    \item \textbf{Economics} (Section~\ref{sec:agent_economics}): frontier model plans and reviews; a cheaper model executes mechanical per-service edits; prefix caching over the shared repo context; per-ticket cost reported next to engineer-hours saved.
+\end{enumerate}
+
+None of the nine decisions is exotic; the craft is that each one is \textit{made deliberately} rather than inherited from a framework default. That---not novel architecture---is what a Staff-level agent design sounds like.
+
+Finally, the chapter's content mapped onto the interview prompts it answers:
+
+\begin{table}[H]
+\centering
+\caption{Agent interview prompts and their answer skeletons}
+\label{tab:agent_prompt_map}
+\begin{tabularx}{\textwidth}{p{5.4cm}X}
+\toprule
+\textbf{Prompt} & \textbf{Answer skeleton (and section)} \\
+\midrule
+``Design an agent for X'' & Agency level first (\ref{sec:agent_definition}); tools and budgets (\ref{sec:agent_loop}); verification and gates (\ref{sec:agent_reliability}); eval and rollout (\ref{sec:agent_eval}); cost (\ref{sec:agent_economics}) \\
+``When would you not use an agent?'' & Static decomposability rule; cost/latency/debuggability; hybrid pipeline-with-one-agent-stage (\ref{sec:agent_definition}) \\
+``Your agent is unreliable---fix it'' & Taxonomy $\rightarrow$ biggest bucket $\rightarrow$ scaffold levers $\rightarrow$ regression suite; $p^n$ and verify-retry arithmetic (\ref{sec:agent_reliability}, \ref{sec:agent_eval}) \\
+``Single vs.\ multi-agent?'' & Independent/read-heavy/compressible test; brief quality; token and latency arithmetic; failure evidence (\ref{sec:agent_orchestration}) \\
+``How do you evaluate it?'' & Grade states not strings; pass@$k$ vs.\ pass\textasciicircum{}$k$; cost-adjusted frontier; simulated-user or sandbox environment (\ref{sec:agent_eval}) \\
+``It's too expensive'' & Quadratic replay $\rightarrow$ prefix caching $\rightarrow$ shorter trajectories $\rightarrow$ routing $\rightarrow$ distillation, evals guarding each step (\ref{sec:agent_economics}) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
+\section{Interview Questions}
+\label{sec:agents_interview}
+%==============================================================================
+
+%--- Q1: What is an agent / the loop ---
+
+\begin{interviewq}
+\textbf{Q: What makes an LLM system an ``agent''? Walk me through the agent loop and where the engineering difficulty actually lives.}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+An agent is a system where the model dynamically directs its own process: it reads its context, chooses an action---usually a tool call---the environment executes it, and the observation is appended to the context for the next iteration, until the model produces a final answer or a budget stops it. The contrast class is a workflow, where code fixes the sequence of steps at design time and LLM calls fill slots. The distinguishing property is not ``uses tools''---a single forced function call is not agency---it is that \textit{control flow is decided at runtime by the model based on observations}.
+
+Three structural facts drive the engineering. First, the model is stateless: all state is the trajectory (plus the environment), replayed through the model each step---so context management, cost, and prefix caching are first-order concerns. Second, errors compound across steps: per-step reliability $p$ over $n$ steps gives roughly $p^n$ task success ($0.98^{50} \approx 36\%$), so the difficulty lives in per-step reliability and recovery, not in the loop's plumbing. Third, the action space is the tool set: most agent failures trace to tool design---overlapping tools, vague descriptions, bloated observations---rather than model incapacity.
+
+I would also place the system on the agency spectrum: workflow with LLM steps, single tool-loop, autonomous multi-step with plans and sub-agents---and note that the right design is the lowest level that solves the task.
+
+\redflags
+\begin{itemize}
+    \item Defining an agent as ``an LLM with tools''---misses runtime control flow, the actual distinction.
+    \item Framework-first answers (naming LangChain/AutoGen components) with no grasp of the underlying loop.
+    \item No mention of termination or budgets---an agent that cannot stop is a design bug, not an edge case.
+\end{itemize}
+
+\interviewtest{Whether you understand the loop as a stateless-model-replaying-state system with compounding errors, or just recite ``perceive, think, act.'' Strong candidates immediately connect the definition to its engineering consequences.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Draws the loop correctly, distinguishes agent from workflow, names termination conditions.
+    \item \badgeLsix{L6} Adds the three structural consequences (state replay, error compounding, action-space design) and the levels-of-agency taxonomy.
+    \item \badgeLseven{L7} Frames agency as a budgeted design resource---spend model decisions only where the environment's response changes what to do next---and connects to economics (quadratic trajectory cost, prefix caching) unprompted.
+\end{itemize}
+
+\followups{``Where does the ReAct pattern fit, and what replaced it?'' ``Why is the trajectory replayed every step, and what does that cost?'' ``What state lives outside the context window?''}
+\end{interviewq}
+
+%--- Q2: When NOT to build an agent ---
+
+\begin{interviewq}
+\textbf{Q: When should you NOT build an agent? Your PM wants ``an agent'' for a document-processing product---how do you decide?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+The decision rule: does the task decompose \textit{statically}? If I can write the steps down before seeing the input---and intermediate results do not change which steps run---then a deterministic pipeline with LLM steps dominates an agent on cost, latency, debuggability, and reliability. Document processing is usually exactly this: ingest $\rightarrow$ classify $\rightarrow$ extract fields $\rightarrow$ validate $\rightarrow$ route. Fixed DAG, LLM calls in the slots, code in charge.
+
+The concrete comparison I would give the PM: a pipeline runs a known number of calls with bounded context---predictable unit economics and p95 latency; each stage is unit-testable with fixed inputs, and a failure localizes to a stage. An agent re-decides the workflow at runtime on every input: variable cost, variable latency, and every dynamic decision is a fresh opportunity to be wrong, with errors compounding across steps ($p^n$). You pay all of that to buy adaptivity the task does not need. Debugging alone is decisive at scale: pipeline failures are reproducible; agent failures are points in a trajectory space where every run takes a different path.
+
+When the agent \textit{is} right: the step structure is genuinely input-dependent---the number and identity of actions cannot be known in advance (debugging code, open-ended research, multi-turn support with unpredictable users). And the hybrid is usually the real answer: a static pipeline whose one genuinely-dynamic stage (say, resolving documents that fail validation) is a small, budgeted agent loop---agency spent exactly where the environment's response changes what to do next, and nowhere else.
+
+\redflags
+\begin{itemize}
+    \item Treating ``agent'' as the more advanced/prestigious architecture rather than an engineering cost to justify.
+    \item No decision criterion---hedging ``it depends'' without naming static decomposability as the test.
+    \item Ignoring debuggability and unit economics---the two arguments that actually win this conversation with a PM.
+\end{itemize}
+
+\interviewtest{Judgment under hype. This question screens for candidates who reach for the simplest sufficient architecture and can articulate the price of agency in cost, latency, and reliability terms a business owner understands.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States pipeline-vs-agent trade-offs correctly.
+    \item \badgeLsix{L6} Produces the static-decomposability decision rule, the compounding-error argument, and the hybrid design (agent as one stage of a pipeline).
+    \item \badgeLseven{L7} Quantifies: sketches per-task cost and latency for both designs, proposes measuring what fraction of traffic actually needs dynamic handling before committing, and frames the escalation path (pipeline $\rightarrow$ agent fallback for the hard tail).
+\end{itemize}
+
+\followups{``What fraction of your traffic would need the agent path to justify building it?'' ``How would you migrate if the task later turns out to need adaptivity?'' ``Your pipeline's classify stage is the bottleneck---agent or better prompt?''}
+\end{interviewq}
+
+%--- Q3: Code review agent (system design, required) ---
+
+\begin{interviewq}
+\textbf{Q: Design a code-review agent for your organization's monorepo.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Clarify the objective first.} A review agent's product metric is \textit{trusted, actionable findings}---precision-dominant. A reviewer bot that posts three wrong nitpicks per PR gets muted org-wide within a month; missing some issues is survivable, crying wolf is not. That single decision drives the whole design.
+
+\textbf{Trigger and scope.} Runs on PR-opened/updated. Input is the diff, but a monorepo means the diff is not the context: I need retrieval over the repo---changed files' neighborhoods, callers/callees of changed functions via the build graph, relevant style guides and OWNERS files---because I cannot put a monorepo in a context window. Context assembly is retrieval-based and budgeted (say, 50K tokens), stable-prefix-first so prefix caching absorbs the repeated repo context (Chapter~\ref{chap:inference_optimization}).
+
+\textbf{Architecture.} A short-horizon tool-loop agent, not an autonomous one: tools = \{read file, code search, build-graph query, run targeted tests/linters in a sandbox, post review comment\}. Deterministic analyzers (linters, type checkers, security scanners) run \textit{outside} the model and their output is given to it---never ask an LLM to re-derive what a compiler knows. For depth, a fan-out pattern: sub-reviews per concern (correctness, API compatibility, security-sensitive paths) with isolated contexts, merged by a lead pass that dedupes and ranks. Every posted finding must carry file/line anchors and, where feasible, a verification artifact (a failing test the agent wrote and ran in the sandbox is the gold standard---it converts an opinion into evidence).
+
+\textbf{Reliability and safety.} The agent is read-only plus comment-only: no push, no merge, no approve---the human owns the merge decision (irreversible-action gating, Section~\ref{sec:agentic_safety}). Comments are idempotent (keyed on finding identity, so a force-push does not duplicate them), budgeted per PR, and suppressed below a confidence threshold; ``no findings'' is an acceptable and common output.
+
+\textbf{Evaluation and rollout.} Offline: a golden set from history---PRs whose bugs were caught by humans or caused incidents (did the agent find them?), plus clean PRs (does it stay quiet?); mutation-injected bugs into real diffs for recall measurement without leakage. Online: comment resolution rate---the fraction of findings the author acts on---as the north-star trust metric, per-category, with a feedback control (thumbs-down suppresses a finding class pending triage). Rollout: shadow mode (log, do not post) $\rightarrow$ opt-in teams $\rightarrow$ default-on, with the error-taxonomy/regression-suite loop of Section~\ref{sec:agent_eval} running throughout. Economics: small model triages which PRs/files merit deep review; the frontier model reviews the minority that do.
+
+\redflags
+\begin{itemize}
+    \item Jumping to the loop without the precision-vs-recall product decision---the design follows from it.
+    \item ``Put the repo in context'' for a monorepo, or no retrieval story at all.
+    \item Letting the agent approve or merge; no rollout plan; no measurement of whether humans act on the findings.
+    \item Using the LLM to do what linters/type-checkers do deterministically.
+\end{itemize}
+
+\interviewtest{Can you design an agent as a \textit{product} embedded in a real engineering org---trust dynamics, evaluation against history, staged rollout---rather than as a maximal autonomous loop? The monorepo detail tests whether you reach for retrieval and build-graph structure.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Sensible loop, sensible tools, human keeps the merge.
+    \item \badgeLsix{L6} Precision-first framing, retrieval-based context assembly, verification artifacts (agent-written failing tests), golden-set + shadow-mode eval, comment-resolution-rate metric.
+    \item \badgeLseven{L7} Trust dynamics as the central constraint; mutation-based recall measurement; cost architecture (triage model $\rightarrow$ deep model, prefix caching of repo context); regression suite grown from every bad finding; explicit discussion of what the agent should \textit{not} attempt.
+\end{itemize}
+
+\followups{``How do you measure the false-negative rate in production?'' ``The agent's comments are correct but the team still mutes it---what happened?'' ``Now add auto-fix suggestions---what changes in the risk model?''}
+\end{interviewq}
+
+%--- Q4: 60% -> 95% (L7, required) ---
+
+\begin{interviewq}
+\textbf{Q: Your agent succeeds on 60\% of an internal task suite. Leadership wants 95\%. Take it there.}
+
+\badgeLseven{L7} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+First, refuse to treat ``40\% failures'' as one problem. The entire method is: \textbf{taxonomy $\rightarrow$ biggest bucket $\rightarrow$ cheapest adequate fix $\rightarrow$ regression suite $\rightarrow$ repeat}, with per-step reliability arithmetic guiding where fixes can possibly get us.
+
+\textbf{Step 1: Error taxonomy from trajectories.} Read (and label) every failed trajectory: the \textit{first} wrong step and its category---wrong tool choice, bad arguments, misread observation, planning error, lost constraint after compaction, environment or tool bug, \textit{grader} bug (eval marks correct behavior wrong---always a real bucket), and genuinely-beyond-capability. Also split \textit{consistent} failures (task fails every seed) from \textit{flaky} ones (task passes sometimes): the pass\textasciicircum{}$k$-style distribution tells me whether I face a capability problem or a variance problem, and they have different fixes.
+
+\textbf{Step 2: Fix buckets with scaffold levers before model levers.} Typical distribution and responses: tool-interface confusion $\rightarrow$ rewrite descriptions, merge overlapping tools, tighten schemas (often the single biggest, cheapest win); missing verification $\rightarrow$ add per-step postcondition checks and verify-diagnose-retry, which changes the arithmetic---at $p=0.9$ per step, a verifier catching 90\% of failures with one retry lifts effective per-step success to $\sim$0.98, i.e., orders of magnitude at the task level; lost constraints $\rightarrow$ structured compaction with a pinned constraint block; runaway/stuck trajectories $\rightarrow$ budgets and loop detection; flakiness $\rightarrow$ idempotent tools, determinism in the environment, context-isolation via sub-agents for token-bloated tasks. Only after these: model levers---a stronger model on the planning/recovery steps, then fine-tuning on curated successful trajectories if the domain is narrow and stable (Chapter~\ref{chap:transfer_learning}, Chapter~\ref{chap:reinforcement_learning}).
+
+\textbf{Step 3: Make progress monotonic.} Every fixed failure becomes a permanent regression case; every fix is validated on held-out tasks (not the ones I tuned against---agents overfit to eval quirks fast); prompts, tools, and scaffold are versioned so a regression bisects.
+
+\textbf{Step 4: Be honest about the last few points.} 60$\to$85\% is usually scaffold engineering; 85$\to$95\% is where I audit the residue: some tasks are under-specified (fix the task or the product contract, not the agent), some need capabilities the model lacks (escalate to human-in-the-loop for that slice---95\% \textit{system} success can include ``agent hands off cleanly''), and I renegotiate the metric if needed: 95\% pass@1 autonomous vs.\ 95\% with verified-retry vs.\ 95\% including graceful escalation are different products with different costs. Committing to a number without defining the metric is the trap in the question.
+
+\redflags
+\begin{itemize}
+    \item Reaching for ``better prompts'' or ``GPT-next'' as the first move---no diagnosis.
+    \item Treating the 40\% as homogeneous; never reading actual trajectories.
+    \item No mention of verification/retry---the highest-leverage structural fix---or of the compounding arithmetic that explains why it works.
+    \item Tuning against the full eval set and calling the resulting number progress.
+\end{itemize}
+
+\interviewtest{This is the flagship Staff agent question: it tests error-driven engineering discipline (taxonomy, regression suites), command of the reliability arithmetic, knowing that scaffold levers precede model levers, and the judgment to interrogate the 95\% target itself.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Proposes looking at failures and fixing categories; adds retries.
+    \item \badgeLsix{L6} Full loop: labeled taxonomy with first-wrong-step attribution, verification-with-retry and its arithmetic, held-out validation, regression suite.
+    \item \badgeLseven{L7} Splits consistent-vs-flaky via the per-task success distribution; sequences scaffold-before-model levers with cost awareness; audits grader and task-spec bugs; renegotiates what ``95\%'' means (autonomous vs.\ system-with-escalation) and prices each option.
+\end{itemize}
+
+\followups{``The biggest bucket is `model misreads tool output'---what do you change?'' ``You get to 90\% and plateau---now what?'' ``How do you keep the 95\% from regressing as the underlying model is upgraded?''}
+\end{interviewq}
+
+%--- Q5: Customer support agent eval (required) ---
+
+\begin{interviewq}
+\textbf{Q: Design the evaluation for a customer-support agent that can read accounts, process refunds, and escalate to humans.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Define success at the environment level.} A support episode succeeds when the \textit{final state} is right: the correct refund amount issued (or correctly refused), the account reflects the change, policy was never violated en route, and escalation happened exactly when policy requires it. I grade database state and action logs, not transcript wording---state-based grading is robust to valid conversational variation and immune to eloquent failure.
+
+\textbf{Offline environment: $\tau$-bench-style.} A sandboxed replica of the support stack (accounts DB, refund API, policy engine) plus an \textbf{LLM simulated user} with hidden goals and personas drawn from real ticket distributions---including the adversarial slices that matter commercially: users who push for out-of-policy refunds, provide contradictory information, or get abusive. Simulator discipline: version it, diversify personas, calibrate against real transcripts periodically, and remember agents overfit simulator quirks---the simulator is part of the eval spec. Task suite: stratified by intent and difficulty, from real (redacted) tickets plus authored edge cases; each task ships with a machine-checkable end-state predicate.
+
+\textbf{Metrics, layered.} (1) Task success (state-verified). (2) \textbf{Reliability}: pass\textasciicircum{}$k$ over repeated seeds---a support agent at 90\% per-episode fails almost every customer who contacts it eight times ($0.9^8 \approx 0.43$); I report the per-task success distribution, not just the mean (estimators: Section~\ref{sec:pass_at_k}). (3) \textbf{Policy-violation rate as a hard gate}, not a component of an average---one wrongful \$500 refund is not offset by ten happy chats; violations by severity, with zero-tolerance classes. (4) Escalation quality in both directions: missed-escalation (handled what policy says a human must) and over-escalation (dumping easy tickets on staff). (5) Trajectory quality: turns to resolution, tool-error rate, cost per resolved ticket. (6) Soft quality (tone, correctness of explanation) via rubric-scored LLM judge, calibrated against human labels on a sample---judge scores never gate alone.
+
+\textbf{Online.} Shadow mode against historical tickets first; then limited live traffic with human review of every consequential action; A/B against the human baseline on resolution rate, CSAT, re-contact rate (the customer coming back tomorrow means the ``resolution'' was fake), cost per ticket, and refund-dollar deltas (an agent can buy CSAT with money---watch for it). Every production incident becomes a regression case; the taxonomy-fix-regression loop of Section~\ref{sec:agent_eval} runs continuously.
+
+\redflags
+\begin{itemize}
+    \item Grading transcripts with an LLM judge as the primary metric---gameable, and blind to wrong refunds behind polite prose.
+    \item Reporting only mean success---no pass\textasciicircum{}$k$/reliability view, no severity-gated policy violations.
+    \item No adversarial simulated users; no escalation metrics in both directions; no re-contact rate online.
+\end{itemize}
+
+\interviewtest{Do you evaluate the agent as a \textit{system acting on the world}---state-based grading, hard safety gates, reliability over repeats---rather than as a chatbot with vibes-based scoring? The refund tool is in the prompt to see if you treat money-moving actions differently.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Simulated users, task success metric, some safety checks.
+    \item \badgeLsix{L6} State-based grading, pass\textasciicircum{}$k$ reliability, policy violations as gates, bidirectional escalation metrics, calibrated judge for soft quality, shadow-then-live rollout.
+    \item \badgeLseven{L7} Simulator-overfitting and gaming discussion, refund-dollar economics online, re-contact rate as the anti-Goodhart resolution metric, and the eval as a living regression engine tied to incidents.
+\end{itemize}
+
+\followups{``Your simulated-user scores are 15 points above live performance---why?'' ``How do you eval the escalation boundary without burning real staff time?'' ``The agent learns to offer small refunds to end conversations quickly---which metric catches it?''}
+\end{interviewq}
+
+%--- Q6: pass@k vs pass^k ---
+
+\begin{interviewq}
+\textbf{Q: Explain pass@$k$ vs.\ pass\textasciicircum{}$k$. Your agent team reports 92\% pass@5---what do you tell the VP who wants to ship?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+pass@$k$ is the probability that \textit{at least one} of $k$ independent attempts succeeds; pass\textasciicircum{}$k$ is the probability that \textit{all} $k$ succeed, $\E_{\text{tasks}}[p^k]$ ($\tau$-bench's reliability metric). They answer different product questions. pass@$k$ is the right claim only when the deployed system actually runs best-of-$k$ with a \textit{verifier that selects the winner}---generate five candidate patches, keep the one that passes tests. pass\textasciicircum{}$k$ is the claim about dependability: what fraction of tasks does the agent handle consistently, which is what a user experiences across repeated interactions with no oracle picking the good run.
+
+So my first question to the team: \textit{is there a verifier in production?} If yes---tests, a checker, state validation---then pass@5 describes the shipping configuration, and the remaining diligence is the cost of 5 attempts per task (Section~\ref{sec:agent_eval}'s cost-adjusted framing) and the verifier's false-accept rate. If no---the user sees attempt one---then 92\% pass@5 is compatible with a much lower pass@1 and a dismal reliability profile: per-task $p = 0.4$ already gives pass@5 $\approx 0.92$ while failing 60\% of first attempts. Same headline number, unshippable product. I would ask for pass@1, pass\textasciicircum{}$k$ across seeds, and the per-task success distribution; a wide pass@$k$/pass\textasciicircum{}$k$ gap says \textit{inconsistent, not incapable}---which points at variance fixes (verification, tool tightening, determinism), a different roadmap than capability fixes. Estimator subtleties (the biased plug-in trap, error bars) live in Section~\ref{sec:pass_at_k}.
+
+\redflags
+\begin{itemize}
+    \item Treating pass@$k$ as ``accuracy''---not asking whether a production verifier exists.
+    \item Unable to produce the arithmetic ($p=0.4 \Rightarrow$ pass@5 $\approx 0.92$; $p=0.9 \Rightarrow$ pass\textasciicircum{}8 $\approx 0.43$).
+    \item Not knowing pass\textasciicircum{}$k$ or dismissing the gap between the metrics as pedantry.
+\end{itemize}
+
+\interviewtest{Metric literacy under product pressure: whether you map each metric to the deployment protocol it describes, and whether you can defuse a misleading headline number with two lines of arithmetic.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct definitions plus the is-there-a-verifier-in-production question.
+    \item \badgeLsix{L6} The reverse arithmetic (what 92\% pass@5 permits for pass@1) and the inconsistent-vs-incapable diagnosis from the gap between the metrics.
+    \item \badgeLseven{L7} Ties metric choice to product architecture (selecting verifier, its cost and false-accept rate) and specifies the dashboard: pass@1, pass\textasciicircum{}$k$, and the per-task distribution with error bars (Chapter~\ref{chap:evaluation_metrics}).
+\end{itemize}
+
+\followups{``How would you estimate pass\textasciicircum{}$k$ without $k$ full runs per task?'' ``The verifier itself has a 5\% false-accept rate---what does pass@5 mean now?'' ``Which metric belongs on the team's dashboard?''}
+\end{interviewq}
+
+%--- Q7: single agent vs multi-agent ---
+
+\begin{interviewq}
+\textbf{Q: One agent with 30 tools, or an orchestrator with specialized sub-agents? Argue both sides with numbers.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Default to the single agent, and say why the default matters:} every agent boundary is a lossy natural-language interface---state gets serialized into a brief, whatever the brief omits the sub-agent invents, and the MAST-style failure evidence (Cemri et al., 2025) shows multi-agent systems failing predominantly on inter-agent misalignment and specification gaps, not model weakness. One shared context has no such seams. Thirty tools is near the edge but workable if the action space is disciplined (merged overlaps, sharp descriptions, namespacing)---and tool-set curation is cheaper than distributed-systems debugging.
+
+\textbf{Split when the numbers say so.} The two real benefits are context isolation and parallelism, and both are quantifiable. Worked example (Section~\ref{sec:agent_orchestration}): 8 independent read-heavy sub-tasks, 20K tokens each. Single trajectory: input accumulates to $\sim$830K tokens across the task, 8 sequential steps, late steps reasoning over 150K+ tokens of other modules' leftovers. Orchestrator + 8 parallel workers with fresh contexts: $\sim$230K total input, wall-clock of one step, failures isolated and retried per worker. Fan-out wins \textit{when sub-tasks are independent, read-heavy, and compressible} (a 100K-token exploration collapses to a 2K conclusion). Invert any of those and it flips: dependent sub-tasks mean shared state duplicated into every brief or serialization (no latency win), plus a new error class of inconsistent parallel assumptions---the known failure mode of parallel coding agents editing entangled files. And count the bill honestly: multi-agent research systems that beat single agents (Anthropic's published orchestrator--workers system) do so at roughly 15$\times$ chat-level token consumption; prefix caching meanwhile shrinks the single agent's apparent cost penalty because its accumulated trajectory is a cached prefix (Section~\ref{sec:prefix_caching}).
+
+Also name the third option: a \textbf{critic} sub-agent (clean-context review of the main agent's output) buys error-catching without decomposing the task---often the cheapest multi-agent pattern that pays.
+
+\redflags
+\begin{itemize}
+    \item Multi-agent by org-chart analogy (``a PM agent, an engineer agent, a QA agent'') with no failure-class analysis.
+    \item No numbers---this question explicitly rewards the token/latency arithmetic.
+    \item Ignoring the brief/interface problem, or claiming sub-agents are free because ``they're just more calls.''
+\end{itemize}
+
+\interviewtest{Whether your architecture decisions are driven by measurable properties (independence, compressibility, parallelism, token accounting) versus anthropomorphic intuition---and whether you know the empirical record on multi-agent failure.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names context limits and parallelism as the reasons to split.
+    \item \badgeLsix{L6} Produces the worked arithmetic both ways, states the independent/read-heavy/compressible rule, cites the inter-agent-misalignment failure evidence.
+    \item \badgeLseven{L7} Adds the critic as the minimal multi-agent pattern, the prefix-caching correction to the cost comparison, and a migration story (start single, split at measured context-quality or latency pain, keep briefs versioned and tested like APIs).
+\end{itemize}
+
+\followups{``Your two parallel coding sub-agents produce conflicting edits---prevent or reconcile?'' ``How do you write and test the sub-agent brief?'' ``At what measured signal would you split the single agent?''}
+\end{interviewq}
+
+%--- Q8: computer use ---
+
+\begin{interviewq}
+\textbf{Q: Why do computer-use agents lag API-based agents so badly, and when would you deploy one anyway?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The lag is structural---three multiplicative penalties. \textbf{(1) Step-count inflation at lower per-step reliability:} one schema-validated API call (\texttt{book\_flight(...)}) becomes dozens of clicks, keystrokes, and page loads, each individually \textit{less} reliable than a typed call (grounding errors, mis-clicks, unexpected UI state). Compounding does the rest: $p^n$ with larger $n$ \textit{and} smaller $p$ collapses task success (Section~\ref{sec:agent_reliability}). \textbf{(2) Grounding:} mapping ``the Submit button'' to pixel coordinates is a real vision problem---small targets, dense UIs, elements scrolled out of view; accessibility-tree grounding is sturdier than pixels but not universally available, which is why browser agents outpace desktop agents. \textbf{(3) Latency and cost per step:} every step prefills a fresh screenshot and waits for the UI to settle---seconds per action, no prefix-reuse economics, and no schema to validate an action against before it fires. On OSWorld-class benchmarks humans sit around 70\% while agents, improving fast, still trail substantially.
+
+\textbf{Deploy anyway when there is no API}---that is the whole value proposition: the GUI is the universal interface, so computer use is the adapter for legacy enterprise software, third-party sites, and the long tail where integration will never be built. Deployment posture: API-first with GUI fallback; short-horizon tasks; checkpoint after each verified milestone; high-friction confirmation on consequential clicks (purchases, sends, permission dialogs); and a dedicated VM with no real credentials beyond the task's scope---the threat model, including injection through rendered pixels, is Section~\ref{sec:agentic_safety}. Also worth saying: some of the gap is contingent and closing (better grounding, models trained on GUI trajectories with RL, hybrid DOM+pixel observation), but the step-count-times-latency penalty versus one API call is structural---so the long-run equilibrium is computer use as fallback tier, not primary integration.
+
+\redflags
+\begin{itemize}
+    \item ``The models just aren't smart enough yet''---missing the structural step-count/grounding/latency analysis.
+    \item No connection to compounding-error arithmetic.
+    \item Proposing computer use where an API exists, or ignoring the credential/injection risk of an agent that can click anything.
+\end{itemize}
+
+\interviewtest{Whether you can decompose a capability gap into structural vs.\ contingent causes, connect it to the reliability arithmetic, and still produce a sober deployment case for the technology's actual niche.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names grounding, latency, and error accumulation as the gap's causes.
+    \item \badgeLsix{L6} Makes the compounding argument quantitative (more steps at lower $p$; the $0.99^3$ vs.\ $0.97^{40}$ style comparison), distinguishes accessibility-tree from pixel grounding, and lands on API-first/GUI-fallback.
+    \item \badgeLseven{L7} Separates structural from contingent causes, prices the actual niche (long-tail software with no API), and covers containment: dedicated VM, scoped credentials, gated consequential clicks, injection-through-pixels.
+\end{itemize}
+
+\followups{``Accessibility tree vs.\ raw pixels---trade-offs?'' ``How would you evaluate a computer-use agent beyond task success?'' ``Which of the three penalties would you attack first as a lab, and how?''}
+\end{interviewq}
+
+%--- Q9: memory / context management design ---
+
+\begin{interviewq}
+\textbf{Q: Your agent's tasks run for hours and blow past the context window. Design its memory and state management.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Frame it as a memory hierarchy: the context window is working memory (fast, tiny, lossy under pressure); everything durable must live outside and be paged in on demand.
+
+\textbf{Layer 1: spend the window better.} Before adding machinery: lean tool outputs (summaries with page-into-detail, not 40KB dumps), code execution so intermediate data stays in interpreter variables instead of the trajectory, and sub-agents so exploratory token bloat is isolated from the main line---each worker burns its own 100K and returns 2K (Section~\ref{sec:agent_orchestration}).
+
+\textbf{Layer 2: compaction, engineered against its known failure modes.} Compact the older middle of the trajectory, keep the recent tail verbatim, and---critically---use \textit{structured} compaction: a fixed template with pinned sections (goal, \textbf{hard constraints copied forward verbatim and never re-summarized}, decisions made, open items, exact identifiers). The canonical failure is the lost constraint: ``never touch prod config'' stated at turn 3, paraphrased away by turn 60's summary, violated at turn 80 with full confidence. Second-order failure: summaries of summaries drift, and an early summarization error becomes permanent ground truth---so I externalize before compacting and treat compaction as discardable cache, never the system of record.
+
+\textbf{Layer 3: external memory with the file system as default.} The agent maintains a plan file (revisable artifact, checked off as it goes---doubling as the anti-drift ``recitation'' device and the human-visible progress surface) and notes/artifacts as files: durable, inspectable, diffable, resumable. A retrieval index over large corpora---docs, past tickets, prior trajectories---paged in per step, with the agent choosing when to query (retrieval-as-tool; machinery canonical in [NLP~9] and Chapter~\ref{chap:long_context_rag}). Transactional task state (what is done, what remains) goes in structured storage, not prose.
+
+\textbf{Layer 4: checkpoints tie memory to reliability.} At sub-task boundaries, persist trajectory + plan + environment snapshot (a git commit for coding agents), so an hours-long task resumes from minute 110 instead of restarting, and a human can take over from a checkpoint. Cross-session memory---preferences, learned codebase facts---is a curated store with provenance and an eviction/correction path; I would name its two risks unprompted: stale memories silently poisoning every future run, and memory as an injection-persistence channel (Section~\ref{sec:agentic_safety}). Finally, evaluate the memory system itself: adversarial long-horizon eval tasks where a constraint stated early must be honored after multiple compactions---that is a regression test for the failure mode that matters most.
+
+\redflags
+\begin{itemize}
+    \item ``Use a bigger context window''---ignores degradation over long contexts, quadratic replay cost, and hours-long horizons.
+    \item Naive summarization with no story about lost constraints---the failure mode this question exists to probe.
+    \item Vector-store-first answers that skip the file system, or no checkpoint/resumption design.
+\end{itemize}
+
+\interviewtest{Whether you design memory as a hierarchy with failure modes, costs, and tests---versus naming ``add RAG and summarize old turns'' as if either were free of failure modes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Compaction plus external notes, sensible window budgeting.
+    \item \badgeLsix{L6} Structured compaction with pinned constraints, files-as-memory with a plan artifact, retrieval-as-tool, externalize-before-compact.
+    \item \badgeLseven{L7} Full hierarchy with checkpoint/resume, cross-session memory with poisoning/persistence risks, cost coupling (compaction vs.\ prefix-cache trade-off---rewriting the prefix invalidates the cache, so compaction cadence is also a cost decision), and eval design for memory failures.
+\end{itemize}
+
+\followups{``Compaction invalidates your prefix cache---how do you schedule it?'' ``The agent re-reads its notes and they contradict the live environment---which wins?'' ``How do you test for lost constraints before production finds them?''}
+\end{interviewq}
+
+%--- Q10: economics ---
+
+\begin{interviewq}
+\textbf{Q: Your agent product works but loses money: \$4 of inference per task against \$1.50 of revenue. Fix the economics without wrecking the success rate.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+First, get the cost decomposition---agent cost has a specific shape: input tokens grow quadratically with trajectory length ($T C_0 + \frac{T(T-1)}{2}\delta$, Section~\ref{sec:agent_economics}), so the bill is usually dominated by \textit{replayed input}, not outputs. That ranking of levers:
+
+\textbf{(1) Prefix caching---the single biggest lever.} If cache hit rate is low, fix prompt layout (stable content first, volatile last, no timestamps up top) and serving/routing so the trajectory prefix is reused: cached input bills at $\sim$10\%, and agent workloads reach $>$80\% hit rates---often a 3--6$\times$ cost cut with \textit{zero} behavior change (Section~\ref{sec:prefix_caching}). \textbf{(2) Shorten trajectories.} Fewer, bigger steps: code execution to collapse N-step loops into one step; leaner tool outputs; merge chatty tools; kill the long tail---stuck-loop detection and budgets, because the p99 trajectory is often 10$\times$ the median and pure waste. Fewer steps is also \textit{more} reliable (fewer compounding opportunities)---this lever improves both sides. \textbf{(3) Model routing.} Frontier model only where decisions branch (planning, recovery); small model for mechanical steps; code for deterministic ones; escalate-on-verification-failure so the expensive model touches only the hard minority. \textbf{(4) Compaction} to cap the quadratic term on long tasks---scheduled against the prefix cache, since rewriting the prefix invalidates it. \textbf{(5) Fine-tune/distill} once the workload is narrow, stable, and high-volume: internalize the bloated prompt, drop a model size class on the executor (Chapter~\ref{chap:transfer_learning}); RL if outcomes are verifiable (Chapter~\ref{chap:reinforcement_learning}). Slowest lever, real payoff at volume.
+
+\textbf{Guard the success rate while cutting:} every lever lands behind the regression suite (Section~\ref{sec:agent_eval}), watching success \textit{and} pass\textasciicircum{}$k$ reliability---model downgrades and aggressive compaction are the two levers most likely to silently hurt, so they ship last and behind A/Bs. And do the product math too: cost per \textit{successful} task is the real unit ($\$4/0.8$ success $= \$5$), so a reliability improvement is also an economics improvement; conversely, price/packaging (tiered autonomy, bring-your-own-key, batch-mode latency for cache-friendly scheduling) can move the revenue side while engineering moves cost.
+
+\redflags
+\begin{itemize}
+    \item Jumping to a smaller model first---the highest-risk lever---before the free ones (caching, trajectory shortening).
+    \item No mention of the quadratic input-replay structure or prefix caching: the defining features of agent cost.
+    \item Cutting cost with no regression protection, or optimizing cost per task instead of cost per successful task.
+\end{itemize}
+
+\interviewtest{Do you know where agent dollars actually go (replayed input tokens), can you rank levers by risk-adjusted return, and do you couple every cost cut to the eval that protects quality?}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names caching, smaller models, shorter prompts.
+    \item \badgeLsix{L6} Correct cost decomposition with the quadratic term, ordered lever list starting with zero-behavior-change wins, regression-guarded rollout.
+    \item \badgeLseven{L7} Cost-per-successful-task framing, p99-trajectory kill, compaction/cache interaction, distillation path with its coupling risks, and the revenue-side options alongside the cost side.
+\end{itemize}
+
+\followups{``Your cache hit rate is 30\%---diagnose.'' ``Which steps get the small model, and how do you decide per step?'' ``Marginal cost is now fine but you want 10$\times$ volume---what breaks first?''}
+\end{interviewq}
+
+%--- Q11: MCP / tool ecosystem ---
+
+\begin{interviewq}
+\textbf{Q: What does MCP actually standardize, and what does it change---and not change---about how you architect an agent?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+MCP standardizes the \textit{plumbing around} tool use: tool servers expose tools, resources, and prompt templates over a common client--server protocol; any MCP client can discover them at runtime and inject their JSON-Schema definitions into the model's context. Integration effort drops from $N \times M$ bespoke connectors (every app $\times$ every tool) to $N + M$ implementations against one protocol. From the model's perspective nothing changes---schemas in, structured calls out; the wire-level mechanics are [NLP~7] material.
+
+Two real architectural consequences. First, \textbf{the action space stops being scarce}: when attaching 40 tools is a config line, the discipline previously enforced by integration effort---few, sharp, non-overlapping tools---must be enforced deliberately: per-task allowlists and filtering, on-demand loading of definitions (tool search, or a code-execution layer that imports tools as needed) instead of every schema in every context, and curation as an ongoing editorial job. Unfiltered MCP attachment measurably degrades tool selection and bloats every step's prompt. Second, \textbf{the trust boundary moves}: a third-party server ships text---tool descriptions and results---directly into your model's context, making tool servers an injection and supply-chain surface; provenance, least privilege, and the layered controls of Section~\ref{sec:agentic_safety} apply to them exactly as to retrieved web content.
+
+What it does not change: tool-selection accuracy, description quality, loop reliability, evaluation, economics---every hard problem in this chapter survives standardization. ``We'll use MCP'' answers the integration question and nothing else.
+
+\redflags
+\begin{itemize}
+    \item Presenting MCP as an agent framework or a capability upgrade rather than an integration protocol.
+    \item No mention of the action-space discipline problem that a tool ecosystem creates.
+    \item Missing the security implication of third-party text entering the context.
+\end{itemize}
+
+\interviewtest{Whether you can separate a protocol's real architectural consequences (ecosystem scale, context pressure, trust boundaries) from its marketing---and whether you know which agent problems standardization does not touch.}
+
+\followups{``You attach five MCP servers and task success drops---diagnose.'' ``How do you audit a third-party tool server before letting it into production contexts?'' ``When do you wrap MCP tools behind a code-execution layer instead of exposing schemas directly?''}
+\end{interviewq}
