@@ -2,7 +2,7 @@
 \label{chap:safety_alignment}
 
 \begin{tldr}
-As LLMs move into production, safety and alignment become first-class engineering concerns---not afterthoughts. This chapter covers mechanistic interpretability (probing, circuits, superposition), hallucination (causes, detection, mitigation), RAG as a grounding mechanism, guardrail and content filtering architectures (classifier-based vs.\ rule-based, the guard-model ecosystem, base-rate math), the modern jailbreak taxonomy (GCG suffixes, many-shot, PAIR/TAP, Crescendo, and why safety alignment is ``shallow''), agentic safety (indirect prompt injection, the lethal trifecta, sandboxing, human-in-the-loop gates), red teaming for safety evaluation, and the 2024--2025 alignment research results (alignment faking, sleeper agents, CoT monitoring) that frontier-lab loops probe conversationally. At Staff+ interviews, you are expected to design end-to-end safety systems, not just name techniques. If your answer to ``how do you make this chatbot safe?'' is ``add a content filter,'' you will not pass.
+As LLMs move into production, safety and alignment become first-class engineering concerns---not afterthoughts. This chapter covers mechanistic interpretability (probing, circuits, superposition), hallucination as a safety problem in deployed and agentic settings (its taxonomy, causes, and detection stack are canonical in [NLP~13], RAG grounding in [NLP~9]), guardrail and content filtering architectures (classifier-based vs.\ rule-based, the guard-model ecosystem, base-rate math), the modern jailbreak taxonomy (GCG suffixes, many-shot, PAIR/TAP, Crescendo, and why safety alignment is ``shallow''), agentic safety (indirect prompt injection, the lethal trifecta, sandboxing, human-in-the-loop gates), red teaming for safety evaluation, and the 2024--2025 alignment research results (alignment faking, sleeper agents, CoT monitoring) that frontier-lab loops probe conversationally. At Staff+ interviews, you are expected to design end-to-end safety systems, not just name techniques. If your answer to ``how do you make this chatbot safe?'' is ``add a content filter,'' you will not pass.
 \end{tldr}
 
 %==============================================================================
@@ -69,111 +69,58 @@ Circuit analysis & End-to-end computation & Deepest understanding & Manual; hard
 \end{warningbox}
 
 %==============================================================================
-\section{Hallucination}
+\section{Hallucination as a Safety Problem}
 \label{sec:hallucination}
 %==============================================================================
 
-\subsection{What Hallucination Is}
+\textbf{Canonical treatment: [NLP~13].} The taxonomy (intrinsic vs.\ extrinsic),
+the causes, the detection methods and their limitations, and the mitigation
+stack are canonical in \textbf{[NLP~13]} and are not repeated here. What belongs
+in a safety chapter is the part that is not a quality question: why a fluent
+wrong answer is a \emph{safety} failure, and what it does to the rest of the
+stack in this chapter.
 
-\textbf{Definition.} A model hallucination is generated content that is fluent and plausible-sounding but factually incorrect, unsupported by the input context, or fabricated. Hallucinations are the primary barrier to deploying LLMs in high-stakes domains (medical, legal, financial).
+\textbf{The error is confident.} A hallucination arrives in the same fluent,
+well-formatted, appropriately-hedged register as a correct answer, so the
+user's usual cue to go check is absent. This is structural, not incidental:
+pretraining optimizes next-token fluency and factual accuracy is a byproduct,
+and RLHF can sharpen the problem by rewarding confident, agreeable answers over
+honest uncertainty (sycophancy). A wrong answer that announced itself would be
+a quality bug; one that does not defeats the human oversight the deployment was
+counting on, which is what makes it a safety bug.
 
-\textbf{Two types:}
-\begin{itemize}
-    \item \textbf{Intrinsic hallucination:} The output contradicts the provided source material. Example: a summarization model states the opposite of what the document says.
-    \item \textbf{Extrinsic hallucination:} The output introduces claims that cannot be verified from the source or from known facts. Example: an LLM invents a plausible-sounding citation that does not exist.
-\end{itemize}
+\textbf{It compounds with tool use.} In an agentic loop
+(Section~\ref{sec:agentic_safety}) a fabricated fact is not the end of the
+turn---it becomes the argument to the next tool call. A hallucinated file path,
+account id, or API parameter turns a false statement into an executed action,
+and the blast radius is set by the agent's permissions, not by the model's
+confidence. This is why the agent controls in Section~\ref{sec:agentic_safety}
+(least privilege, sandboxing, human-in-the-loop gates on irreversible actions)
+do more for hallucination risk in an agent than any detector applied to the
+final text: they bound the consequence rather than chasing the claim.
 
-\subsection{Root Causes}
+\textbf{Detection inherits the safety stack's base rates.} A hallucination
+detector run over every response is a rare-positive classifier like any other
+guardrail, so the arithmetic of Section~\ref{sec:base_rates_safety} applies
+unchanged---a respectable precision number still buries reviewers in false
+positives at production volume, and the operating point has to be chosen
+against review capacity, not against a benchmark.
 
-\begin{table}[H]
-\centering
-\caption{Root causes of LLM hallucination}
-\begin{tabularx}{\textwidth}{lXX}
-\toprule
-\textbf{Cause} & \textbf{Mechanism} & \textbf{Example} \\
-\midrule
-Knowledge boundary & Model was never trained on the fact; fills the gap with plausible text & Inventing a paper citation that does not exist \\
-Training data noise & Contradictory or incorrect facts in pretraining data & Stating an incorrect date from noisy web text \\
-Exposure bias & Teacher forcing at training; autoregressive at inference; errors compound & Early token error causes the rest of the sentence to be fabricated \\
-Attention failure & Model attends to wrong context when generating & Attributing a quote to the wrong person in a long document \\
-Sycophancy / RLHF & RLHF rewards confident, agreeable answers over honest uncertainty & Confidently answering ``yes'' to a nonsensical question \\
-Decoding strategy & High temperature or nucleus sampling explores low-probability regions & Sampling produces a rare but incorrect completion \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\begin{keyinsight}[LLMs Are Trained to Be Fluent, Not Factual]
-The pretraining objective (next-token prediction) rewards fluency---generating text that looks like the training distribution. Factual accuracy is a byproduct, not the objective. A model can learn that ``[Person] won the Nobel Prize in [Year]'' is a common pattern and generate fluent instances that happen to be false. RLHF partially addresses this by rewarding helpful and truthful responses, but the tension between fluency and factuality remains fundamental.
-\end{keyinsight}
-
-\subsection{Detection Methods}
-
-\begin{table}[H]
-\centering
-\caption{Hallucination detection approaches}
-\begin{tabularx}{\textwidth}{lXXl}
-\toprule
-\textbf{Method} & \textbf{How It Works} & \textbf{Limitation} & \textbf{Latency} \\
-\midrule
-Self-consistency & Generate $N$ responses; flag inconsistent claims & Consistently wrong facts pass & High ($N\times$) \\
-Retrieval verification & Retrieve evidence; check if claims are supported & KB coverage gaps; retrieval errors & Medium \\
-NLI-based & NLI model checks entailment between source and claim & Requires a source document & Low \\
-Token uncertainty & Flag tokens with high entropy or low probability & Calibration-dependent; high FP rate & Low \\
-LLM-as-judge & Second LLM verifies factual claims & Judge can also hallucinate & Medium \\
-\bottomrule
-\end{tabularx}
-\end{table}
-
-\textbf{Self-consistency sampling}, formalized as SelfCheckGPT (Manakul et al., 2023), is the simplest approach: sample multiple responses at temperature $>0$, extract factual claims, and flag claims that are inconsistent across samples. If the model says ``founded in 1998'' in 3 of 5 samples but ``founded in 2001'' in the other 2, both dates are suspect. Effective but multiplies inference cost by $N$. (Do not confuse this with \textit{self-consistency} in Wang et al., 2023, which votes over sampled chain-of-thought paths to improve reasoning accuracy, not to detect hallucination.)
-
-\textbf{NLI-based checking} uses a natural language inference model to verify whether generated claims are entailed by a source document. For summarization, check each sentence of the summary against the source. This catches intrinsic hallucinations effectively but cannot detect extrinsic hallucinations (claims about topics not in the source).
-
-\subsection{Mitigation Strategies}
-
-\begin{enumerate}
-    \item \textbf{Retrieval-Augmented Generation (RAG):} Ground generation in retrieved evidence. The model generates based on specific retrieved documents rather than parametric memory alone. See Section~\ref{sec:rag_grounding}.
-
-    \item \textbf{Constrained decoding:} Restrict the output space to valid tokens at each step (e.g., generating valid JSON, SQL, or code that compiles). Eliminates structural hallucinations.
-
-    \item \textbf{Calibrated abstention:} Train the model to say ``I don't know'' when uncertain. Requires training data with explicit abstention examples and a reward signal that values honesty over helpfulness.
-
-    \item \textbf{Citation generation:} Require the model to produce inline citations for factual claims. At verification time, check that cited sources exist and support the claim. Products like Perplexity and Microsoft Copilot (formerly Bing Chat) use this pattern.
-
-    \item \textbf{Post-generation fact-checking:} Run a separate verification pipeline on the generated output before serving it to the user. Adds latency but catches errors that the generator missed.
-
-    \item \textbf{Lower temperature / constrain sampling:} Greedy decoding or low temperature ($T \leq 0.3$) reduces hallucination at the cost of diversity and creativity.
-\end{enumerate}
-
-%==============================================================================
-\section{RAG as Grounding}
+\paragraph{Grounding is the first-line control, and it is not a fix.}
 \label{sec:rag_grounding}
-%==============================================================================
-
-\textbf{Note:} RAG system design is covered in detail in Chapter~\ref{chap:long_context_rag}. This section focuses specifically on how RAG reduces hallucination.
-
-\textbf{Why RAG reduces hallucination.} By providing retrieved evidence in the prompt, RAG shifts the generation task from ``recall facts from parameters'' to ``synthesize an answer from provided documents.'' The model no longer needs to rely on potentially incorrect parametric memory---it can ground claims in specific retrieved passages.
-
-\textbf{How it works (briefly):}
-\begin{enumerate}
-    \item \textbf{Retrieve:} Given a user query, retrieve the top-$k$ most relevant documents from a knowledge base using dense retrieval (bi-encoder + ANN index) or hybrid retrieval (dense + BM25).
-    \item \textbf{Augment:} Prepend the retrieved documents to the prompt as context.
-    \item \textbf{Generate:} The LLM generates a response conditioned on both the query and the retrieved context.
-\end{enumerate}
-
-\textbf{How RAG specifically reduces hallucination:}
-\begin{itemize}
-    \item \textbf{Grounds claims in evidence:} The model can point to specific passages rather than generating from memory.
-    \item \textbf{Provides up-to-date information:} The knowledge base can be updated without retraining, eliminating temporal knowledge gaps.
-    \item \textbf{Makes verification possible:} Each claim can be traced back to a retrieved source, enabling automated fact-checking via NLI.
-    \item \textbf{Narrows the generation space:} With good context, the model has less need to ``fill in'' with fabricated details.
-\end{itemize}
-
-\textbf{When RAG does not help:}
-\begin{itemize}
-    \item \textbf{Retrieval failure:} If the retriever returns irrelevant documents, the model may hallucinate anyway---or worse, hallucinate based on misleading context.
-    \item \textbf{Context conflicts:} If retrieved documents contradict each other, the model must resolve the conflict, which can introduce errors.
-    \item \textbf{Reasoning hallucination:} RAG grounds factual claims but does not prevent logical errors in multi-step reasoning.
-\end{itemize}
+Retrieval-augmented generation is the strongest single mitigation, because it
+shifts the task from ``recall facts from parameters'' to ``answer from these
+passages'' and because it makes verification possible---each claim can be
+traced to a retrieved source. The retrieval machinery (chunking, hybrid search,
+reranking, and RAG evaluation) is canonical in \textbf{[NLP~9]} and
+Chapter~\ref{chap:long_context_rag}; the safety-relevant residue is what
+grounding does \emph{not} fix. Retrieval failure hands the model misleading
+context rather than none. Conflicting passages leave the resolution to the
+model. Reasoning errors survive perfectly grounded facts. And an
+attacker-controlled or poisoned document is grounding working exactly as
+designed, against you---the indirect-injection path of
+Section~\ref{sec:agentic_safety}. Grounding lowers the rate; it does not change
+the class of failure, which is why the detection and action layers stay.
 
 %==============================================================================
 \section{Guardrails and Content Filtering}
@@ -593,6 +540,10 @@ Over-refusal is the safety-helpfulness tradeoff made concrete. The model has bee
 
 \badgeLsix{L6} \quad \badgetype{Architecture Design} \quad \badgefreq{\freqmed}
 
+\textit{Scope: the taxonomy, causes, and mitigation menu are [NLP~13]; what is
+tested here is the system---claim extraction, verification, latency budget, and
+action policy.}
+
 \stronganswer
 
 \textbf{Step 1: Problem definition.} Two types of hallucination to detect: \textit{intrinsic} (output contradicts the provided context) and \textit{extrinsic} (output introduces claims not in any source). For a RAG system, intrinsic detection is tractable (compare output to retrieved context); extrinsic detection is harder (requires external knowledge).
@@ -646,30 +597,31 @@ Over-refusal is the safety-helpfulness tradeoff made concrete. The model has bee
 
 \stronganswer
 
-I approach this as a three-layer problem: prevent, detect, and mitigate.
+Three layers---prevent, detect, mitigate---and the honest framing that none of
+them closes the gap. \textbf{Prevention} is grounding first (RAG over a curated
+corpus), then scope: a narrow system prompt and domain fine-tuning, low
+temperature on factual queries, and a model trained to abstain rather than
+fabricate. \textbf{Detection} is NLI entailment of each response sentence
+against the retrieved context for the intrinsic case, self-consistency sampling
+and citation verification for the extrinsic case, with token-level uncertainty
+as a cheap auxiliary signal. \textbf{Mitigation} is what you do with a flag:
+disclaimers and inline citations for low-stakes traffic, human review for
+high-stakes, and user feedback routed back into the eval set. The menu, the
+per-method limitations, and the causes behind them are canonical in
+\textbf{[NLP~13]}; the grounding stack is \textbf{[NLP~9]}.
 
-\textbf{Prevention:}
-\begin{itemize}
-    \item \textbf{RAG:} Ground all factual responses in retrieved documents. The model generates from provided context, not parametric memory. This is the single most effective anti-hallucination measure.
-    \item \textbf{Constrained scope:} Narrow the model's domain through system prompt and fine-tuning.
-    \item \textbf{Low temperature:} Use $T \leq 0.1$ for factual queries. Reserve higher temperatures for creative tasks.
-    \item \textbf{Calibrated abstention:} Fine-tune the model to say ``I don't know'' rather than fabricate. Requires training data with explicit abstention examples and a reward model that values honesty over helpfulness.
-\end{itemize}
-
-\textbf{Detection:}
-\begin{itemize}
-    \item \textbf{NLI verification:} For RAG systems, check whether each sentence in the response is entailed by retrieved documents using an NLI model. Flag ``contradiction'' and ``neutral'' sentences.
-    \item \textbf{Self-consistency:} Generate $N$ responses and check claim consistency. Inconsistent claims are likely hallucinated.
-    \item \textbf{Citation verification:} If the model generates citations, verify they exist and support the claim.
-    \item \textbf{Confidence estimation:} Token-level entropy as a rough signal. Low confidence correlates with hallucination risk.
-\end{itemize}
-
-\textbf{Mitigation:}
-\begin{itemize}
-    \item \textbf{Disclaimers:} ``This is AI-generated and may contain errors.''
-    \item \textbf{Human-in-the-loop:} High-stakes outputs require human review.
-    \item \textbf{User feedback:} Thumbs-up/down signals identify hallucination-prone patterns.
-\end{itemize}
+What makes this a \emph{production} answer rather than a recital of that menu is
+the three things the menu does not give you. \textbf{Pick an operating point
+against review capacity, not a benchmark}: the detector is a rare-positive
+classifier, so its false-positive volume, not its precision, decides whether
+anyone acts on the flags (Section~\ref{sec:base_rates_safety}).
+\textbf{Instrument the rate}: sample production traffic, run the verifier
+offline where the latency budget does not bind, and alert on the trend---a
+hallucination rate you are not measuring is a rate you will hear about from
+users. And \textbf{bound the consequence where detection will not reach}: if the
+output feeds tools or actions, the control that matters is permissions and
+gating (Section~\ref{sec:agentic_safety}), because a detector on the final text
+runs after the tool call already fired.
 
 Hallucination cannot be fully eliminated---only reduced and managed. The fundamental tension: pretraining optimizes fluency, not factuality. RLHF partially addresses this but introduces its own failure modes (sycophancy, reward hacking).
 

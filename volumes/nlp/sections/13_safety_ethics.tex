@@ -238,6 +238,14 @@ ungrounded text---is the single most critical reliability challenge for
 LLM-based systems.  Every production NLP team at a FAANG company spends
 significant engineering effort on hallucination detection and mitigation.
 
+This section is the program's canonical treatment: what hallucination is, why
+it happens, how it is detected, and what actually reduces it.  Two neighbours
+carry the parts that are not this chapter's: the retrieval machinery behind
+grounded generation---chunking, hybrid search, reranking, and RAG
+evaluation---is Chapter~\ref{chap:rag}, and the framing of hallucination as a
+\emph{safety} problem in deployed and agentic settings, where a fabricated fact
+becomes the argument to the next tool call, is [DL~20].
+
 \subsection{Types of Hallucination}
 
 \begin{enumerate}[label=\textbf{\arabic*.}]
@@ -259,6 +267,15 @@ significant engineering effort on hallucination detection and mitigation.
 
 Understanding \emph{why} models hallucinate is essential for designing
 effective mitigations.
+
+\paragraph{Knowledge boundary.}
+The most basic cause: the model was never trained on the fact, or the fact
+postdates its training data.  Next-token prediction gives it no way to represent
+``I have no evidence for this''---the objective rewards a fluent continuation,
+so the gap is filled with something that has the \emph{shape} of the answer.
+This is why fabricated citations are the canonical example: the model has
+learned the form of a reference (plausible authors, a plausible venue, a
+plausible year) far more strongly than any particular reference.
 
 \paragraph{Noisy training data.}
 Pretraining corpora contain factual errors, outdated information, and
@@ -286,6 +303,16 @@ Beam search and even sampling-based methods can produce fluent text that
 is internally consistent but factually wrong.  The model's training
 objective (minimize cross-entropy on the next token) does not directly
 optimize for factual accuracy.
+
+\paragraph{Sycophancy from preference tuning.}
+RLHF optimizes a reward model trained on human preference labels, and human
+raters reliably prefer confident, agreeable, complete-sounding answers to
+hedged or abstaining ones.  The result is a trained-in bias toward answering:
+the model that says ``I do not know'' loses to the model that guesses fluently,
+so preference tuning can \emph{increase} the hallucination rate even while it
+improves helpfulness ratings (Chapter~\ref{chap:rlhf_alignment}).  This is the
+cause most often missed in interviews, because it locates part of the problem
+in the alignment stage rather than in pretraining.
 
 \subsection{Detection Methods}
 
@@ -316,6 +343,31 @@ Token-level confidence & Flag tokens where the model's probability is low
 \end{tabularx}
 \end{table}
 
+\paragraph{How these are actually wired up.}
+A production detector is a pipeline, not a single scorer.  First
+\textbf{decompose} the response into atomic claims (``Paris is the capital of
+France and has 2.1M people'' is two claims), because entailment scores computed
+over a whole paragraph are too coarse to act on.  Then route by what evidence
+you have.  \textbf{With a source document} (any RAG or summarization setting),
+NLI is the workhorse: run a fine-tuned entailment model with the retrieved
+passage as premise and the claim as hypothesis, treat \emph{contradiction} as a
+confirmed intrinsic hallucination and \emph{neutral} as an unsupported claim to
+flag.  It is cheap (tens of milliseconds per claim, batchable) but it can only
+catch what the source can adjudicate---an extrinsic claim about something the
+source never discusses scores neutral whether it is true or invented.
+\textbf{Without a source}, the fallback is self-consistency:
+\textbf{SelfCheckGPT} (Manakul et al., 2023) samples $k$ responses at
+temperature $>0$ and scores each claim by how often it recurs, on the logic
+that a fact the model knows is stable across samples while a fabrication varies.
+The flagging threshold is a tunable operating point on a precision--recall
+curve, not a constant, and the cost is $k\times$ inference.  (Do not confuse
+this with \emph{self-consistency decoding} in Wang et al., 2023, which votes
+over sampled chain-of-thought paths to improve reasoning accuracy---same word,
+different purpose.)  Layer the signals: token-level uncertainty is nearly free
+and makes a reasonable first-stage filter, LLM-as-judge is the expensive last
+resort, and the flag itself needs an action policy---disclaim, cite, suppress,
+or route to a human---or you have built a metric rather than a defense.
+
 \subsection{Mitigation Strategies}
 
 \paragraph{RAG with citations.}
@@ -343,6 +395,18 @@ After generation, retrieve evidence for each factual claim and verify
 consistency.  Claims that cannot be verified are either removed or flagged.
 This is a post-hoc approach that adds latency but catches many hallucinations.
 
+\paragraph{Decoding controls.}
+Two cheap levers before anything trained.  Lower the temperature for factual
+queries ($T \leq 0.3$, or greedy): sampling explores low-probability
+continuations, and low-probability is where fabrication lives, so this trades
+diversity for faithfulness on exactly the traffic where diversity is worthless.
+And use \textbf{constrained decoding} where the output has a grammar---JSON,
+SQL, a fixed label set, a schema---restricting the token distribution at each
+step to continuations the grammar permits.  This eliminates the structural class
+of hallucination outright (invented field names, malformed identifiers,
+out-of-vocabulary categories); it does nothing for factual content inside a
+well-formed structure.
+
 \paragraph{Training-level: RLHF with truthfulness reward.}
 Include truthfulness as a criterion in reward model training.  Human raters
 penalize responses that contain fabricated information.  This shifts the model's
@@ -358,6 +422,16 @@ the problem.  Production systems at FAANG companies use multiple detectors in
 combination, accept a residual error rate, and design user interfaces that
 communicate uncertainty.
 \end{warningbox}
+
+\textbf{Where the neighbouring material lives.}  Everything above is the
+faithfulness problem itself.  The retrieval stack that grounding depends
+on---chunk sizing, hybrid retrieval, reranking, and the RAG evaluation metrics
+you would use to tell whether grounding is working---is
+Chapter~\ref{chap:rag}.  The reason hallucination is escalated from a quality
+bug to a safety one---a fluent wrong answer defeats the human oversight the
+deployment was counting on, and inside an agent loop it becomes the argument to
+the next tool call---is [DL~20], along with the permission and gating controls
+that bound the consequence when detection misses.
 
 % ============================================================================
 % SECTION 3: PROMPT INJECTION AND SECURITY

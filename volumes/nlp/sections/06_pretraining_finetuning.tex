@@ -816,64 +816,23 @@ that can be meaningfully compared.
 \section{Interview Questions}
 \label{sec:pretraining-questions}
 
+\begin{keyinsight}[Which Adaptation Questions Live Where]
+This bank asks the \emph{adaptation decisions} this chapter owns: pre-train,
+continue pre-training, fine-tune, or prompt; full fine-tuning or PEFT at a given
+data and compute budget; and how the choice moves through the pre-training
+$\to$ SFT $\to$ preference-tuning lifecycle.  The \emph{PEFT mechanics}
+questions are canonical in \textbf{[DL~16]} and are deliberately not repeated
+here: ``explain LoRA---why does it work, and how do you pick rank and
+$\alpha$,'' ``what is the low-rank assumption and when does it break,''
+``adapters vs.\ LoRA vs.\ prefix tuning---architectural differences and when to
+use each,'' ``estimate the trainable parameters for rank-16 LoRA on a 7B
+model,'' ``walk through QLoRA (NF4, double quantization, paged optimizers) and
+its memory budget,'' and ``serve 100 LoRA adapters from one base model.''
+Expect an interviewer to cross the line in both directions; answer the decision
+here and hand off the knobs to [DL~16].
+\end{keyinsight}
+
 %% QUESTION 1 %%
-\begin{interviewq}
-\textbf{Q: Explain LoRA. Why does it work? How do you choose rank and alpha?}
-
-\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
-
-\stronganswer
-LoRA freezes the pre-trained weight matrix $\mW_0 \in \R^{d \times k}$ and adds a
-low-rank update $\Delta\mW = \mB\mA$ where $\mB \in \R^{d \times r}$ and
-$\mA \in \R^{r \times k}$, with $r \ll \min(d, k)$.  Only $\mA$ and $\mB$ are
-trained---typically 0.1--1\% of total parameters.  It works because fine-tuning
-updates are empirically low-rank: the intrinsic dimensionality of the fine-tuning
-optimization landscape is much smaller than the full parameter count (Aghajanyan
-et al., 2021 showed intrinsic dimension $\sim$200--800 for BERT tasks on 110M
-parameters).  The model already has good representations; adaptation only needs
-adjustments in a low-dimensional subspace.
-
-$\mB$ is initialized to zero and $\mA$ to random Gaussian so that $\Delta\mW = 0$
-at the start---the model begins from exactly the pre-trained weights.  The effective
-update is scaled by $\alpha/r$, where $\alpha$ controls adaptation strength.  For
-rank: $r = 16$--$32$ is a good default; increase for complex tasks or large domain
-shifts.  For alpha: $\alpha = 2r$ is a common starting point.  Keeping $\alpha/r$
-constant when sweeping $r$ maintains consistent update magnitude.  After training,
-$\mB\mA$ merges into $\mW_0$ for zero inference overhead.
-
-\redflags
-\begin{itemize}
-    \item Cannot state the formula $\mW = \mW_0 + \mB\mA$
-    \item Does not know that $\mB$ is initialized to zero (and why)
-    \item Cannot explain the intrinsic dimensionality argument for why low-rank works
-    \item Unaware of the merging property for zero inference overhead
-\end{itemize}
-
-\interviewtest{Whether the candidate understands LoRA at a mathematical level, not just
-as a library call.  Can they explain the low-rank hypothesis, the initialization choice,
-and the practical implications (merging, multi-task serving)?}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} States the formula, explains the initialization and merging
-          property, gives reasonable defaults for $r$ and $\alpha$
-    \item \badgeLsix{L6} Derives the parameter count savings quantitatively, explains
-          the intrinsic dimensionality argument, discusses which modules to apply LoRA
-          to and why, and compares with other PEFT methods
-    \item \badgeLseven{L7} Discusses the spectral analysis of weight updates, connects
-          to matrix completion theory, addresses when LoRA fails (high-rank updates
-          needed for large distribution shifts), and describes multi-adapter serving
-          architectures
-\end{itemize}
-
-\followups{How does the gradient flow through frozen weights in LoRA?  What is
-QLoRA?  When would LoRA fail?  How would you serve 100 different LoRA adapters
-from one base model?}
-\end{interviewq}
-
-\bigskip
-
-%% QUESTION 2 %%
 \begin{interviewq}
 \textbf{Q: When would you use LoRA vs.\ full fine-tuning? When would LoRA fail?}
 
@@ -900,6 +859,12 @@ this happens when the target distribution differs substantially from pre-trainin
 modifying the embedding layer significantly (e.g., adding a new language). (3) Very
 low rank is used for a complex task---the bottleneck starves the model of capacity.
 
+\textbf{Where the mechanics live:} rank and $\alpha$ selection, which modules to
+target, merging, and QLoRA's internals are canonical in [DL~16].  This question
+is the budget-and-data decision, not the knobs---an answer that opens with the
+LoRA formula and never reaches ``how much data, how much GPU, how many tasks on
+one base'' has missed what is being asked.
+
 \redflags
 \begin{itemize}
     \item Says ``always use LoRA'' or ``always use full fine-tuning''
@@ -922,70 +887,14 @@ maturity and understanding of tradeoffs.}
           LoRA for others)
 \end{itemize}
 
-\followups{How would you decide the rank for a specific task?  What if you need to
-add a new language to the model?  How does LoRA interact with quantization?}
+\followups{What if you need to add a new language to the model?  How would you
+decide between LoRA and continued pre-training?  (Rank selection and the
+LoRA/quantization interaction are [DL~16] territory.)}
 \end{interviewq}
 
 \bigskip
 
-%% QUESTION 3 %%
-\begin{interviewq}
-\textbf{Q: Compare LoRA, prefix tuning, and prompt tuning. What are the tradeoffs?}
-
-\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
-
-\stronganswer
-\textbf{LoRA} adds low-rank matrices to attention (and optionally FFN) weights.
-Trainable params: 0.1--1\%.  After training, merges into base weights for zero
-inference overhead.  Quality: 90--99\% of full fine-tuning.  Best all-around
-PEFT method.
-
-\textbf{Prefix tuning} prepends learnable virtual tokens to keys and values at
-every layer.  Trainable params: $\sim$0.1\%.  Adds inference overhead (extra KV
-per layer) and consumes context window positions.  Quality: 85--95\%.  Cannot
-merge into base weights.
-
-\textbf{Prompt tuning} adds learnable soft tokens to the input embedding only (not
-every layer).  Trainable params: $< 0.1\%$.  Simplest method, fewest parameters.
-Quality scales with model size: poor below 1B, competitive above 10B.
-
-\textbf{Key tradeoffs:} (1) LoRA is the only method with zero inference overhead
-(via merging). (2) Prompt tuning is the simplest but works well only for large
-models. (3) Prefix tuning is more expressive than prompt tuning (touches every
-layer) but less so than LoRA (cannot modify weight behavior, only prepend context).
-(4) LoRA modifies \emph{how} the model processes tokens; prefix/prompt tuning
-modifies \emph{what} the model processes (by adding virtual context).
-
-\redflags
-\begin{itemize}
-    \item Conflates prefix tuning with prompt tuning
-    \item Does not mention LoRA's merging advantage
-    \item Cannot explain the architectural difference (weight modification vs.\ input modification)
-\end{itemize}
-
-\interviewtest{Whether the candidate understands the \emph{mechanism} of each method,
-not just their names.  The weight vs.\ input modification distinction is the key
-conceptual insight.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} Correctly describes all three methods with parameter counts
-          and quality ranges
-    \item \badgeLsix{L6} Explains the architectural distinction (weight modification
-          vs.\ virtual token injection), discusses when each is appropriate, and mentions
-          adapters and IA3 as additional alternatives
-    \item \badgeLseven{L7} Discusses the theoretical expressiveness hierarchy, connects
-          prefix tuning to the kernel perspective on attention, and analyzes how
-          different methods compose (e.g., LoRA + prompt tuning)
-\end{itemize}
-
-\followups{Can you combine LoRA with prefix tuning?  How does prompt tuning relate
-to discrete prompt engineering?  What is IA3?}
-\end{interviewq}
-
-\bigskip
-
-%% QUESTION 4 %%
+%% QUESTION 2 %%
 \begin{interviewq}
 \textbf{Q: How would you fine-tune an LLM for a domain-specific task with only
 1,000 labeled examples?}
@@ -996,23 +905,23 @@ to discrete prompt engineering?  What is IA3?}
 With only 1,000 examples, full fine-tuning of a large LLM risks severe overfitting.
 My approach:
 
-(1)~\textbf{Start with LoRA} (rank 16--32) on a strong base model (e.g., LLaMA-2 7B
-or 13B).  Low-rank adaptation with few parameters is naturally regularizing.
+(1)~\textbf{Start with LoRA} on a strong base model (e.g., LLaMA-2 7B or 13B).
+At this data scale the argument is regularization, not memory: a small adapter
+has too little capacity to memorize 1,000 examples the way a full fine-tune
+would.  (Rank, $\alpha$, target modules, and the LoRA learning-rate scale are
+[DL~16]; so is the 10K-example pipeline with its wall-clock and cost anchors.)
 (2)~\textbf{Data quality audit:} ensure the 1,000 examples are diverse, correct,
 and representative.  1,000 high-quality examples can be remarkably effective (LIMA
 demonstrated this).
-(3)~\textbf{LoRA-appropriate learning rate} ($1\text{e-}4$ to $3\text{e-}4$,
-roughly $10\times$ the full fine-tuning rate, because only the small adapter
-matrices are being trained) with cosine schedule and warmup.
-(4)~\textbf{Train for 3--5 epochs} with early stopping based on validation loss.
-(5)~\textbf{Data augmentation:} use the base model itself to generate synthetic
+(3)~\textbf{Train for 3--5 epochs} with early stopping based on validation loss.
+(4)~\textbf{Data augmentation:} use the base model itself to generate synthetic
 examples (bootstrap from the 1,000), filter by quality, and add to training.
-(6)~\textbf{Evaluation:} hold out 10--15\% for validation; use task-specific
+(5)~\textbf{Evaluation:} hold out 10--15\% for validation; use task-specific
 metrics, not just loss.
 
-If quality is still insufficient: (7)~continued pre-training on domain-specific
+If quality is still insufficient: (6)~continued pre-training on domain-specific
 unlabeled text (before SFT) to adapt the model's representations to the domain.
-(8)~Few-shot prompting as a baseline---for some tasks, a well-prompted LLM with
+(7)~Few-shot prompting as a baseline---for some tasks, a well-prompted LLM with
 5 examples outperforms fine-tuning on 1,000 examples when the fine-tuning data
 is noisy.
 
@@ -1048,7 +957,7 @@ between LoRA and few-shot prompting?  What if the 1,000 examples are noisy?}
 
 \bigskip
 
-%% QUESTION 5 %%
+%% QUESTION 3 %%
 \begin{interviewq}
 \textbf{Q: What is catastrophic forgetting? How do you mitigate it during fine-tuning?}
 
@@ -1101,7 +1010,7 @@ encoder-only vs.\ decoder-only models?  Can you recover from forgetting?}
 
 \bigskip
 
-%% QUESTION 6 %%
+%% QUESTION 4 %%
 \begin{interviewq}
 \textbf{Q: Why is data quality more important than data quantity for SFT?}
 
@@ -1157,7 +1066,7 @@ data play?  How do you evaluate SFT data quality before training?}
 
 \bigskip
 
-%% QUESTION 7 %%
+%% QUESTION 5 %%
 \begin{interviewq}
 \textbf{Q: Explain ELECTRA's pre-training approach. Why is it more efficient than MLM?}
 
@@ -1211,7 +1120,7 @@ How does ELECTRA compare to T5's span corruption?}
 
 \bigskip
 
-%% QUESTION 8 %%
+%% QUESTION 6 %%
 \begin{interviewq}
 \textbf{Q: What is the difference between feature extraction and fine-tuning?
 When would you use each?}
@@ -1270,63 +1179,7 @@ probing and why does it matter?}
 
 \bigskip
 
-%% QUESTION 9 %%
-\begin{interviewq}
-\textbf{Q: Walk through the QLoRA paper. How does it enable fine-tuning a 65B
-model on a single GPU?}
-
-\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
-
-\stronganswer
-QLoRA combines three innovations to make large-model fine-tuning memory-feasible.
-
-(1)~\textbf{NF4 quantization:} Base model weights are stored in 4-bit precision
-using a data type whose quantization bins are optimally spaced for normally
-distributed values (which pre-trained weights empirically follow).  This reduces
-the base model from $\sim$130\,GB (FP16) to $\sim$33\,GB for a 65B model.
-
-(2)~\textbf{Double quantization:} Each block of 64 weights has a FP32 quantization
-constant (scale factor).  These constants are themselves quantized to FP8, reducing
-the overhead from $\sim$0.5 bits/parameter to $\sim$0.13 bits/parameter---saving
-$\sim$3\,GB for a 65B model.
-
-(3)~\textbf{Paged optimizers:} When gradient computation causes GPU memory spikes,
-optimizer states are offloaded to CPU RAM via CUDA unified memory, then paged back
-when needed.
-
-During the forward pass, 4-bit weights are dequantized to BF16 for computation.
-LoRA adapters ($\mA, \mB$) remain in BF16 throughout.  Gradients only update the
-LoRA parameters---the quantized base weights are never modified.  Total memory
-for a 65B model: $\sim$33\,GB base + $\sim$0.5\,GB LoRA + optimizer states for
-LoRA only $\approx$ fits in a single 48\,GB A6000 GPU.
-
-\redflags
-\begin{itemize}
-    \item Does not know what NF4 is or why normal-float is better than uniform INT4
-    \item Cannot explain double quantization
-    \item Thinks the 4-bit weights are trained (they are frozen)
-\end{itemize}
-
-\interviewtest{Whether the candidate understands the systems-level innovations that
-make large-scale PEFT practical, not just the algorithmic idea.}
-
-\goodgreat
-\begin{itemize}
-    \item \badgeLfive{L5} Describes the three innovations and the overall memory savings
-    \item \badgeLsix{L6} Explains NF4 vs.\ uniform quantization, quantifies memory at
-          each stage, and discusses the quality-memory tradeoff
-    \item \badgeLseven{L7} Discusses the interaction between quantization error and LoRA
-          rank, compares with GPTQ/AWQ post-training quantization, and analyzes when
-          QLoRA quality degrades (very low bit-widths, models with outlier activations)
-\end{itemize}
-
-\followups{What is the difference between QLoRA and GPTQ?  How does quantization
-affect LoRA's effective rank?  Can you do QLoRA with 2-bit quantization?}
-\end{interviewq}
-
-\bigskip
-
-%% QUESTION 10 %%
+%% QUESTION 7 %%
 \begin{interviewq}
 \textbf{Q: Compare the major pre-training objectives: MLM, CLM, span corruption,
 and ELECTRA. When would you choose each?}
