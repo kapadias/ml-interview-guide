@@ -16,6 +16,9 @@ sync-style:
 	@for v in $(VOLS); do \
 	  cp style/essentials.sty volumes/$$v/essentials.sty 2>/dev/null && echo "synced sty -> $$v" || true; \
 	  cp style/program_map.tex volumes/$$v/program_map.tex && echo "synced map -> $$v" || true; \
+	  for k in part0_kernel core50 numbers_card; do \
+	    cp kernel/$$k.tex volumes/$$v/$$k.tex || true; \
+	  done; echo "synced kernel -> $$v"; \
 	done
 
 .PHONY: index

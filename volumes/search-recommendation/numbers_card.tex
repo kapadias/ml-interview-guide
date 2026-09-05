@@ -1,0 +1,459 @@
+% THE NUMBERS CARD — program-wide quantitative layer (Phase E kernel).
+% Authored once in kernel/, synced verbatim into all four volumes. Compiles
+% under essentials.sty (Vols III/IV) and the inline preambles of Vols I/II.
+% No \ref, no new macros, no tikz, no interviewq.
+
+\chapter*{The Numbers Card}
+\addcontentsline{toc}{chapter}{The Numbers Card}
+\markboth{The Numbers Card}{The Numbers Card}
+
+Staff interviews reward what you can \emph{rebuild}, not what you recall. This
+card holds the quantities worth producing cold and, beside each, the arithmetic
+that regenerates them. Pointers are textual because the page is shared across
+volumes: [DL~$n$] is Volume~I, [NLP~$n$] Volume~II, [SR~$n$] Volume~III,
+[CML~$n$] Volume~IV.
+
+\begin{keyinsight}[How to spend a number in an interview]
+\begin{enumerate}[leftmargin=*,itemsep=1pt,topsep=2pt]
+\item \textbf{State the assumption before the number.} ``Dense BF16, no
+sparsity''; ``at 40\% MFU''; ``batch 1, FP16 weights''; ``2\% base rate, 80\%
+power.'' The assumption is usually the thing being tested.
+\item \textbf{Compute out loud at one significant figure.} $989 \approx 10^{3}$,
+$3.35 \approx 3$, a day $\approx 10^{5}$ s. Nobody wants three digits; everybody
+wants to watch the exponents.
+\item \textbf{Sanity-check against a published system.} ``I get 60K H100-hours;
+Meta reported 184K A100-hours for that run and an H100 is $\sim$3$\times$ an
+A100 in BF16, so that checks.'' This step is what separates L6 from L5.
+\item \textbf{Say when it is a range, and when it is undisclosed.} MFU is
+40--55\%, not 47\%. Closed-model training budgets are not published;
+``undisclosed---here is the envelope I would bound it with'' is a complete
+answer, and inventing precision is the fastest way to lose the room.
+\end{enumerate}
+\end{keyinsight}
+
+% --- 1. Hardware ---
+\section*{1. Hardware}
+
+\noindent Ground truth: [DL~26] (GPU fundamentals), [DL~15] (utilization).
+
+\begin{table}[H]
+\centering
+\small
+\caption{H100 SXM5 anchors. \textbf{Dense} means no 2:4 structured sparsity.}
+\begin{tabularx}{\textwidth}{@{}llX@{}}
+\toprule
+\textbf{Quantity} & \textbf{Number} & \textbf{Note} \\
+\midrule
+BF16/FP16 tensor, dense & 989 TFLOP/s & \textit{The} training number; 1{,}979 for BF16 is the sparsity figure \\
+FP8 tensor, dense & $\sim$1{,}979 TFLOP/s & $2\times$ BF16, FP32 accumulation \\
+TF32 / FP32 vector & $\sim$494 / $\sim$67 TFLOP/s & Opted-in ``FP32'' matmul / everything that is not a matmul \\
+HBM3 & 80 GB at $\sim$3.35 TB/s & The denominator of every decode estimate \\
+L2 / shared memory & 50 MB / up to 228 KB per SM & 132 SMs, $\sim$30 MB total: FlashAttention's ``SRAM'' \\
+NVLink 4, per GPU & $\sim$900 GB/s aggregate & $\sim$450 GB/s per direction, NVSwitch all-to-all in node \\
+InfiniBand NDR, per NIC & 400 Gb/s $\approx$ 50 GB/s & 8 NICs per node; the node boundary is a $\sim$9$\times$ cliff \\
+PCIe Gen5 x16 & $\sim$64 GB/s per direction & $\sim$50$\times$ slower than HBM; never in an inner loop \\
+Ridge point, BF16 & $\sim$295 FLOP/byte & $989{\times}10^{12}/(3.35{\times}10^{12})$; FP8 $\approx$ 590 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{Other silicon.} A100 SXM-80GB: 312 TFLOP/s dense BF16, 80 GB at
+$\sim$2.0 TB/s, NVLink 3 at 600 GB/s, ridge $\sim$155. H200: \emph{same} Hopper
+die (still 989 TFLOP/s) but 141 GB HBM3e at 4.8 TB/s, which \emph{lowers} the
+ridge to $\sim$206---the one generation where memory outran compute. B200
+(coarse): $\sim$192 GB HBM3e at $\sim$8 TB/s, $\sim$2.2 PFLOP/s dense BF16,
+$\sim$4.5 PFLOP/s dense FP8, hardware FP4, ridge $\sim$280. Know A100 and H100
+well rather than five columns badly.
+\item \textbf{Bytes per parameter.} FP32 $=4$, BF16/FP16 $=2$, FP8/INT8 $=1$,
+INT4 $=0.5$. Every memory estimate below is this times a parameter count times a
+multiplier.
+\item \textbf{Reading the ridge.} $\mathrm{AI} = \text{FLOPs}/\text{bytes
+moved}$; compute-bound iff $\mathrm{AI} > \text{peak}/\text{bandwidth}$. One
+byte of H100 HBM traffic costs $\sim$295 forgone BF16 FLOPs. Elementwise ops sit
+at $\mathrm{AI}\approx0.2$, norms and softmax at $1$--$2$, batch-1 decode at
+$\approx 1$---$\sim$300$\times$ below the ridge, which is the whole case for
+batching. A tiled GEMM reaches $\mathrm{AI}=b/2$, so clearing the ridge needs an
+effective tile $b \sim 600$.
+\item \textbf{MFU bands.} Frontier pretraining targets \textbf{40--55\% on
+H100-class}. ``30--40\% is the ceiling'' is an A100-era reflex; $>$60\% on a
+large multi-node run should draw \emph{your} skepticism. A 7B single-node run at
+50\%+ and a 400B multi-thousand-GPU run at 38--45\% are both good. FP8 doubles
+peak, so say which peak your MFU is against.
+\item \textbf{Interconnect rule.} NVLink is $\sim$9$\times$ InfiniBand at the
+node boundary: TP stays inside a node, PP/DP crosses. Ring all-reduce moves
+$\tfrac{2(N-1)}{N}S \to 2S$ bytes per GPU, so time $\approx 2S/B$: a 70B model's
+140 GB of BF16 gradients is $\sim$0.5--0.7 s over NVLink, $\sim$10$\times$ worse
+over IB.
+\item \textbf{Prices (September 2026---restate the date, they move quarterly).}
+H100 on specialist GPU clouds \$2--3.50 per GPU-hour (median published on-demand
+rate near \$3.4); hyperscalers \$4--14. An 8$\times$H100 node is \$20--28/hr, and
+[DL~19]'s \$25/hr is defensible. A GPU-month is 730 GPU-hours.
+\end{itemize}
+
+% --- 2. Model arithmetic ---
+\section*{2. Model arithmetic}
+
+\noindent Ground truth: [DL~5] (parameters and FLOPs), [DL~15] (training
+memory), [DL~19] (KV cache).
+
+\textbf{Parameters.} With dimension $d$, $L$ layers, FFN expansion $f$,
+vocabulary $V$:
+\[
+N \approx L\,(4 + 2f)\,d^{2} + V d
+\quad\xrightarrow{\;f=4\;}\quad
+N \approx 12 L d^{2} + V d .
+\]
+Attention is $4d^{2}$ per layer ($W^{Q},W^{K},W^{V},W^{O}$), the FFN $2fd^{2}$;
+norms and biases ($\sim$4$d$/layer) are noise. About two-thirds of parameters
+live in the MLPs. SwiGLU uses \emph{three} matrices at $d_{\text{ff}} \approx
+\tfrac{8}{3}d$ and still lands at $\approx 8d^{2}$---count two and you are wrong
+by 50\%.
+
+\textbf{Worked, as spoken.} ``Llama-2 7B: $12 \times 32 \times 4096^{2}$.
+$4096^{2}$ is 16.8M, $\times 12$ is $\sim$200M per layer, $\times 32$ layers is
+$\sim$6.4B; embeddings $32\text{K} \times 4096 \approx 130$M, doubled if untied.
+Total $\approx$ 6.7B---matches the nominal 7B.''
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item With GQA, attention is $2d^{2} + 2\,d\,(n_{kv} d_{\text{head}})$, not
+$4d^{2}$. Below $\sim$1B the embedding table is a large share (BERT-base
+$30{,}522 \times 768 \times 4$ B $\approx$ 90 MB $\approx$ 21\% of 110M); at 70B
+under 1\%. For MoE quote \emph{total} and \emph{active} separately: compute
+follows active, weight memory follows total, KV is unaffected.
+\item \textbf{FLOPs/token}: $\approx 6N$ to train (2 forward $+$ 4 backward),
+$\approx 2N$ for a forward pass---which is the inference formula. Full
+activation checkpointing adds one forward, so measured cost is $\approx 8N$ at
+$\sim$33\% extra compute. The excluded attention term is $4n^{2}d$ per layer per
+forward; per [DL~5] attention block and FFN cost the same at $n \approx 2d$
+($n \approx 8$K at $d = 4096$).
+\item \textbf{Training memory: 16 bytes/parameter.} BF16 weights (2) $+$ BF16
+grads (2) $+$ FP32 $m,v$ (8) $+$ FP32 master (4); it is 18 with FP32 gradients,
+so \emph{state the convention}---interviewers redo this live. A 7B needs
+$\sim$112 GB and a 70B $\sim$1{,}120 GB before activations.
+\item \textbf{Activations}: about $s\,b\,d\,(34 + 5as/d)$ bytes per layer.
+Flash\-Attention deletes the second (attention-matrix) term; full checkpointing
+collapses the rest to $\approx 2\,b\,s\,d\,L$ bytes. ZeRO-1 shards the 12
+optimizer bytes ($\sim4\times$), ZeRO-2 also shards gradients ($\sim8\times$),
+and ZeRO-3 (FSDP) also shards parameters ($N_{\text{GPU}}\times$) at higher
+communication cost.
+\item \textbf{LoRA} adds $r\,(d_{\text{in}} + d_{\text{out}})$ parameters per
+adapted matrix: \emph{additive} in the dimensions, not multiplicative---writing
+$r\,d_{\text{in}}\,d_{\text{out}}$ just reproduces the full matrix. The saving
+is not ``fewer parameters'' but that the frozen base carries no gradients,
+optimizer states, or master weights: 2 bytes/param instead of 16. [DL~15]'s 13B
+case: full 240--270 GB, LoRA 56--86 GB, QLoRA 37 GB.
+\item \textbf{Embedding tables}: $V \times d \times$ bytes. 128K vocab at
+$d{=}4096$ in BF16 $\approx$ 1 GB (double if untied). Vocabularies: GPT-2
+50{,}257; BERT 30{,}522; Llama 2 32K; Llama 3 128K; \texttt{o200k\_base}
+$\sim$200K; Gemma 256K. In recsys the tables \emph{are} the model: $10^{9}$ IDs
+$\times$ 128 dims $\times$ 4 B $=$ 512 GB for one feature, while the MLP on top
+is $<$0.1\% of parameters ([DL~12], [SR~6]).
+\end{itemize}
+
+\textbf{KV cache.} Per token, $2 \times L \times n_{kv} \times d_{\text{head}}
+\times \text{bytes}$ (the 2 is K and V). Use $n_{\text{heads}}$ instead of
+$n_{kv}$ on a GQA model and you are off by $8\times$.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The cache ladder ([DL~19]): per-token KV in FP16.}
+\begin{tabularx}{\textwidth}{@{}llX@{}}
+\toprule
+\textbf{Configuration} & \textbf{Per token} & \textbf{Consequence} \\
+\midrule
+Llama-2 70B, GQA-8 ($L{=}80$, $d_h{=}128$) & $\approx$ 0.32 MB & 1.3 GB at 4K; $\approx$ 40 GB at 128K---one request exceeds a GPU \\
+DeepSeek-V3 scale, MHA-equivalent & $\approx$ 4.0 MB & 131 GB at 32K: infeasible \\
+DeepSeek-V3 scale, GQA-8-equivalent & $\approx$ 250 KB & 8.2 GB at 32K \\
+DeepSeek-V3 scale, MLA (actual) & $\approx$ 70 KB & $57\times$ below MHA, $3.6\times$ below GQA-8; $\approx$ 9 GB at 128K \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% --- 3. Training at scale ---
+\section*{3. Training at scale}
+
+\noindent Ground truth: [DL~2] (Chinchilla), [DL~25] (corpora), [DL~15]
+(throughput).
+
+\textbf{Chinchilla.} Compute-optimal is $D \approx 20N$---twenty tokens per
+parameter. With $C \approx 6ND$ this gives $C = 120N^{2}$, so
+$N_{\text{opt}} = \sqrt{C/120}$ and $D_{\text{opt}} = 20N_{\text{opt}}$, both
+scaling as $C^{0.5}$. At $C = 10^{22}$: $N = \sqrt{8.3{\times}10^{19}} \approx
+9$B, $D \approx 180$B; check $6 \times 9{\times}10^{9} \times 1.8{\times}10^{11}
+\approx 10^{22}$. But 20:1 is a \emph{training}-compute optimum, not a law:
+production over-trains for inference economics---Llama~3 trains 8B through 405B
+all on $\sim$15T tokens, putting the 8B near 1875:1.
+
+\textbf{GPU-hour constants.} At 40\% MFU one H100-hour is
+$989{\times}10^{12} \times 0.4 \times 3600 \approx 1.4{\times}10^{18}$ FLOPs
+(``an H100-hour is $\sim$1.4 exaFLOPs of useful work''); an A100-hour is
+$\approx 4.5{\times}10^{17}$. Throughput follows:
+$\text{tokens/s} = (n_{\text{GPU}} \times \text{peak} \times \text{MFU})/6N$.
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{Llama-2 7B} (the best sanity anchor to carry in): 2T tokens,
+184{,}320 A100-80GB hours, published. Check: $C = 6 \times 7{\times}10^{9}
+\times 2{\times}10^{12} = 8.4{\times}10^{22}$, divided by
+$184{,}320 \times 3600 \times 312{\times}10^{12}$ gives \textbf{41\% MFU}. The
+formula and the paper agree. (Llama-2 70B: 1{,}720{,}320 A100-hours.)
+\item \textbf{Llama-3.1 405B}: 15.6T tokens, so $C \approx 6ND \approx
+3.8{\times}10^{25}$ FLOPs. At 40\% MFU that is $\sim$27M H100-hours; Meta's
+model card reports \textbf{30.84M}, implying $\sim$35\% effective end-to-end MFU
+once long-context and annealing stages are counted. Either way,
+\$2.5--3.5/GPU-hour puts it at \$70--110M of rented compute---and [DL~25] frames the wall clock as
+$\sim$2 months on 16K H100s at $\sim$2.7M tokens/s.
+\item \textbf{Corpora}: FineWeb 15T tokens (96 CommonCrawl snapshots);
+FineWeb-Edu 1.3T; DCLM 240T pool $\rightarrow$ 3.8T ($\sim$1.6\% survival);
+RedPajama-V2 30T; Nemotron-CC 6.3T (1.9T synthetic); Stack~v2 67.5 TB
+$\approx$ 900B unique code tokens; FineMath-3+ 34B. Pools exploded while
+\emph{trainable} corpora converged to 3--15T---that gap is the data wall.
+\item \textbf{Repetition}: $\sim$4 epochs nearly free, $\sim$16 the practical
+wall; $6ND$ counts tokens \emph{seen}, epochs included. English BPE runs
+$\sim$4 bytes/token ($\approx$0.75 words); a low-resource script can run 1.3
+bytes/token---that is tokenizer fertility in budget terms.
+\item \textbf{Batch and LR} (Llama-2's published recipe, a defensible default):
+global batch 4M tokens; AdamW $\beta = (0.9, 0.95)$, weight decay 0.1, clip 1.0;
+2000-step warmup then cosine to 10\% of peak; peak LR $3{\times}10^{-4}$ at
+7B/13B and $1.5{\times}10^{-4}$ at 34B/70B---peak LR shrinks as models widen.
+GPT-3-style runs \emph{ramp} the batch (32K $\rightarrow$ 3.2M tokens over the
+first 4--12B tokens) because the critical batch size is the gradient noise
+scale, which grows during training; linear LR scaling holds only below it.
+\end{itemize}
+
+\begin{warningbox}
+\textbf{What is genuinely undisclosed.} For closed frontier models, the training
+token count, parameter count, data mixture, cluster size, MFU, and dollar cost
+are \textbf{not published}; every circulated figure is estimate or rumor. Say
+so, then bound it: ``Undisclosed. From the public envelope---a
+$10^{25}$--$10^{26}$ FLOP class run, H100-generation hardware at 30--50\% MFU,
+\$2--4/GPU-hour---I would put the compute bill in the high tens to low hundreds
+of millions, and I would want to know which of those three assumptions you want
+me to vary.'' What \emph{is} published, and therefore safe to cite, is the
+Llama, Chinchilla, DeepSeek, and OLMo family of runs.
+\end{warningbox}
+
+% --- 4. Inference and serving ---
+\section*{4. Inference and serving}
+
+\noindent Ground truth: [DL~19], with the roofline from [DL~26].
+
+\textbf{Two phases, two capacity problems.} Prefill is compute-bound
+($\mathrm{AI} \sim 100+$): time $\approx 2N s_{\text{prompt}}/(\text{peak}
+\times \text{MFU})$. Decode is bandwidth-bound at low batch ($\mathrm{AI} \sim
+1$--$10$): tokens/s $\approx$ aggregate HBM bandwidth / bytes touched per token.
+Size them separately---input-heavy workloads stay compute-bound at serving time,
+reasoning workloads are $>$95\% decode.
+
+\textbf{Worked: 70B FP16 on 8$\times$H100, TP$=$8.} Weights 140 GB, 17.5 GB per
+GPU. Single-stream decode reads 17.5 GB at 3.35 TB/s $= 5.2$ ms; with two TP
+all-reduces per layer call it $\sim$6 ms, i.e.\ $\sim$170 tok/s theoretical,
+100--150 real. At batch 128 the same weight read serves 128 tokens:
+$128/0.006 \approx 21$K tok/s; at batch 256 it turns compute-bound at
+$\approx 28$K. Production nodes at real SLOs land at \textbf{16--25K output
+tok/s}. Prefill of a 1K prompt is $1000 \times 140$ GFLOP $= 140$ TFLOP total,
+17.5 TFLOP per GPU, $\approx$35 ms at $\sim$50\% of dense peak---hence
+\textbf{TTFT 50--100 ms} and
+\textbf{ITL 20--50 ms} (25 ms typical at high batch). Trap: 200 output tokens at
+25 ms is 5 s, so a 2 s p99 needs an output cap, speculation, or FP8.
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{KV sets concurrency, not weights.} A 70B in INT4 is 35 GB; on a
+640 GB node that leaves $\sim$600 GB of KV, and at 1.3 GB per 4K-context request
+that is $\sim$400 concurrent requests per node. A reasoning model emitting 20K
+thinking tokens moves per-request KV from $\sim$0.8 GB to $\sim$7 GB
+($\sim$9$\times$) and residence time $\sim$40$\times$; with budget tiers and FP8
+KV the honest re-plan is $\sim$10--15$\times$ the old fleet, not $\sim$350.
+\item \textbf{Quantization (70B)}: FP16 140 GB, FP8/INT8 70 GB, INT4 35 GB plus
+$\sim$6.25\% for group scales at group size 128. Quality: 4-bit 70B typically
+$<$1\% degradation on MMLU/HumanEval/GSM8K, perplexity $+$0.1--0.5, and a 4-bit
+large model beats a 4-bit small one. \textbf{Weight quantization does not
+relieve KV pressure}---different pool; quantize the KV cache or use GQA/MLA.
+\item \textbf{Cost}: $\$/\text{1M output tokens} = (\text{node \$/hr}) /
+(\text{tok/s} \times 3600) \times 10^{6}$, then divide by utilization. At
+\$25/hr and 20K tok/s that is \textbf{\$0.35 per 1M} at full utilization,
+$\sim$\$0.90 at the 40\% a real fleet sustains. Input tokens cost $\approx 2N$
+each and batch well, which is why providers price them 3--6$\times$ below output
+and bill \emph{cached} input at $\sim$10\% of normal.
+\item \textbf{API price magnitudes (September 2026---date them).} Frontier tier
+roughly \$5--10 per 1M input and \$25--50 per 1M output; mid-tier \$1--3 in /
+\$5--15 out; cheap-but-capable \$0.10--0.30 in / \$0.30--1.20 out. Against a
+\$0.35--1 hardware floor for a 70B-class model, that spread buys model quality
+and funds the free tier, not GPU time. Two chapters here use different
+\emph{illustrative} anchors (\$3/\$15 in [NLP~7], \$10/\$30 in [DL~21])---which
+is the right way to use a price: as a stated variable, never as a fact.
+\end{itemize}
+
+% --- 5. Retrieval, embeddings, and ranking ---
+\section*{5. Retrieval, embeddings, and ranking}
+
+\noindent Ground truth: [SR~3] (index sizing, ANN), [SR~4] (funnel, reranker
+cost), [SR~7] (metrics), [SR~8] (latency budgets).
+
+\begin{table}[H]
+\centering
+\small
+\caption{Storage per \textbf{1M} 768-d vectors (vectors only). Scales linearly in $d$ and in corpus size.}
+\begin{tabularx}{\textwidth}{@{}llX@{}}
+\toprule
+\textbf{Representation} & \textbf{Per 1M} & \textbf{Quality cost} \\
+\midrule
+fp32 & 3.07 GB & exact \\
+fp16 & 1.54 GB & ranking-neutral in practice; always the first move \\
+int8 scalar quantization & 0.77 GB & $\lesssim$1 recall point, faster SIMD \\
+PQ, $L{=}64$ (IVF-PQ64) & 64 MB & $48\times$; exact rerank of a few hundred candidates mandatory \\
+PQ, $L{=}32$ & 32 MB & $96\times$; rerank not optional \\
+HNSW graph overhead & $+\sim$0.13 GB & $2M \times 4$ B per node at $M{=}16$, on top of the vectors \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+At $10^{8}$ vectors: 307 GB fp32, 77 GB int8, 6.4 GB at PQ64---the difference
+between a fleet and a machine. Embedding \emph{dimension} is a multiplicative
+infrastructure cost across storage, index memory, and latency at once, so 3072
+versus 256 dims is an architecture decision.
+
+\begin{table}[H]
+\centering
+\small
+\caption{ANN recall--latency operating points ([SR~3]).}
+\begin{tabularx}{\textwidth}{@{}lllX@{}}
+\toprule
+\textbf{Workload} & \textbf{Corpus} & \textbf{Latency / QPS} & \textbf{Recall target} \\
+\midrule
+Web-scale candidate generation & $10^{9}$--$10^{10}$ & 5--20 ms, $10^{4}$--$10^{5}$ QPS & recall@1000 $\geq$ 0.95 \\
+Recsys retrieval (two-tower) & $10^{7}$--$10^{9}$ & 5--20 ms, very high QPS & recall@500 $\geq$ 0.9 \\
+RAG over an enterprise corpus & $10^{5}$--$10^{8}$ & 20--100 ms, low QPS & recall@50 $\geq$ 0.95 \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{Dials}: HNSW \texttt{efConstruction} 100--500 (build-time, cheap
+insurance) and \texttt{efSearch} $k$--512 (\emph{the} recall--latency dial;
+latency near-linear, recall with diminishing returns). IVF: $C \approx
+\sqrt{m\,\texttt{nprobe}}$, with Faiss practice at $2^{16}$--$2^{18}$ centroids
+at billion scale and \texttt{nprobe} as the dial. Flat search is still right
+below $\sim$1--5M vectors on CPU or $\sim$50--100M on a batched GPU: 1M $\times$
+768 fp32 is 3.1 GB, scanned in 10--30 ms on CPU, $\sim$1.5 ms on a 2 TB/s GPU.
+\item \textbf{Funnel}: corpus $10^{6}$--$10^{9}$ $\rightarrow$ retrieval 1000s
+$\rightarrow$ ranking 100s $\rightarrow$ rerank/policy 10s. A 250 ms p99 budget
+splits as query understanding 15 ms, L0 retrieval 40 ms (legs run in
+\emph{parallel}---a max, not a sum), L1 30 ms, L2 rerank 90 ms, blending 15 ms,
+network 30 ms, reserve 30 ms ([SR~8]).
+\item \textbf{Rerank depth} is linear in cost: a MiniLM-class 22M cross-encoder
+does 100 candidates in $\sim$3--10 ms, BERT-base 110M in $\sim$15--60 ms. So an
+80 ms L2 slot buys BERT-base over $\sim$100 candidates or MiniLM over
+$\sim$1000, and nothing LLM-sized fits a consumer hot path at depth.
+\item \textbf{NDCG magnitudes, with the caveat that makes the answer correct.}
+Absolute NDCG is \emph{not portable}: it is normalized per query against that
+query's own judged documents, so it moves with judgment depth, gain convention,
+and cutoff. Public anchors: BM25 averages nDCG@10 $\approx$ 0.43--0.44 across
+BEIR; strong 2026 embedders sit near 0.60--0.63 on MTEB retrieval; a
+cross-encoder rerank adds a few points. In production the number that counts is
+the \emph{delta} with a confidence interval, per slice, at matched pooling
+depth---``our NDCG is 0.62'' says nothing until you name the judgment set.
+\end{itemize}
+
+% --- 6. Statistics and evaluation ---
+\section*{6. Statistics and evaluation}
+
+\noindent Ground truth: [CML~6] (power, CUPED), [SR~7] (ranking experiments),
+[DL~23] and [NLP~10] (benchmarks, judges).
+
+\textbf{Sample size.} At $\alpha = 0.05$ and 80\% power,
+$(1.96 + 0.84)^{2} = 7.84$, so per group $n \approx 16\sigma^{2}/\delta^{2}$,
+and for a rate $n \approx 16\,p(1-p)/\delta^{2}$. \textbf{The canonical case}:
+2\% base CTR, 1\% \emph{relative} lift means $\delta = 0.02 \times 0.01 =
+0.0002$ absolute, so $n \approx 16(0.02)(0.98)/(2{\times}10^{-4})^{2} =
+0.3136/4{\times}10^{-8} \approx \mathbf{7.84}$ \textbf{million per group}. Two
+consequences to volunteer: $n \propto 1/\delta^{2}$, so halving the detectable
+effect costs $4\times$ the traffic; and the honest framing is MDE, not sample
+size---if the MDE exceeds any plausible effect, do not run the test.
+
+\textbf{CUPED.} With $Y' = Y - \theta(X - \bar{X})$ and $\theta^{\star} =
+\mathrm{Cov}(Y,X)/\mathrm{Var}(X)$, the expectation is unchanged and
+$\mathrm{Var}(Y') = \mathrm{Var}(Y)(1 - \rho^{2})$. At $\rho = 0.7$---typical
+when the covariate is the same metric over the prior two weeks---variance falls
+51\%, so the 7.84M test above needs $\sim$4M per group. CUPED does nothing for
+new users (no pre-period) or rare conversions with weak self-correlation, and
+the covariate must be strictly pre-treatment. For ranking comparisons,
+interleaving reaches significance with 10--100$\times$ less traffic, but
+compares \emph{rankings only}---not latency, UI, or revenue.
+
+\begin{itemize}[leftmargin=*,itemsep=1pt]
+\item \textbf{Benchmark noise before benchmark scores.} MMLU has
+$n = 14{,}042$, so a score near 70\% carries SE $\approx$ 0.4 points and two
+independent scores differ with SE $\approx$ 0.57. GPQA-Diamond has 198
+questions: SE $\approx$ 3.5 points at 60\%, so a 5-point gap is noise. AIME is
+30 problems a year: a single run at 60--70\% carries SE $\approx$ 9 points.
+Always put an error bar on the gap; prefer a paired per-item test.
+\item \textbf{Bands that count as strong (September 2026---date the claim).}
+\emph{Saturated}---citing them as evidence of frontier capability is a staleness
+signal: MMLU (ceiling $\sim$90\%, residual is label noise), HellaSwag $>$95\%,
+HumanEval $>$95\% pass@1, GSM8K $>$95\%, MATH $>$95\%. \emph{Still
+discriminating, barely}: SWE-bench Verified, frontier cluster in the low-to-mid
+90s and itself saturating; GPQA-Diamond, top scores in the mid-90s; MMLU-Pro,
+functionally saturated above $\sim$88--90\%. The durable answer is structural:
+every row migrates to a harder, contamination-resistant successor (MMLU
+$\rightarrow$ MMLU-Pro/GPQA; HumanEval $\rightarrow$ LiveCodeBench/SWE-bench
+Verified), so quote the \emph{generation}, not just the score, and expect any
+number here to be stale within two quarters.
+\item \textbf{Judge--human agreement.} A judge is a measurement instrument. Validate
+against \emph{expert} labels from your own distribution; agreement should reach,
+not exceed, the human--human ceiling on the same items---\textbf{roughly 80\%}
+for chat quality in the MT-Bench study. Re-measure per domain, pin judge version
+and prompts (a silent model upgrade shifts all win rates), and correct
+verbosity, position, and self-preference bias---length-controlled win rates
+exist because verbosity alone moves leaderboards several points.
+\item \textbf{Eval cost---derive it, do not memorize it.} A 1{,}000-item suite
+at 2K input $+$ 500 output tokens against a frontier model at \$5/\$25 per 1M
+costs $2\text{M}\,{\times}\,\$5/10^{6} + 0.5\text{M}\,{\times}\,\$25/10^{6}
+\approx \$23$ per pass---cheap enough to run every checkpoint. Swap in a
+reasoning model at 15K thinking tokens per item and the same suite costs
+$15\text{M} \times \$25/10^{6} \approx \$375$, a $\sim$16$\times$ jump that
+changes gating policy. Expert human labels run roughly \$1--5 per item, so the
+gold set behind the judge is a \$1--5K asset---which is exactly why the pipeline
+is ``calibrate the judge against humans once, then run the judge continuously.''
+\end{itemize}
+
+% --- 7. Orders of magnitude: the night before ---
+\section*{7. Orders of magnitude: the night before}
+
+\begin{table}[H]
+\centering
+\small
+\caption{One significant figure each. Produce this cold and you can rebuild the rest of the card.}
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+\textbf{Quantity} & \textbf{To one significant figure} \\
+\midrule
+H100 dense BF16 & 1 PFLOP/s (989 TFLOP/s); FP8 is $2\times$. Never quote 1{,}979 as BF16 \\
+H100 memory & 80 GB at 3 TB/s (3.35). A100: 80 GB at 2 TB/s, 300 TFLOP/s \\
+H100 ridge point & 300 FLOP/byte (295). Batch-1 decode sits at 1 \\
+An H100-hour at 40\% MFU & 1 exaFLOP of useful work ($1.4{\times}10^{18}$) \\
+Cost of a token & 6 FLOPs per parameter to train, 2 to serve \\
+Training state & 16 bytes per parameter: a 7B needs 110 GB before activations \\
+Chinchilla & 20 tokens per parameter; production over-trains far past it \\
+A run to check against & Llama-2 7B: 2T tokens, 200K A100-hours $=$ 41\% MFU \\
+A frontier run & $3{\times}10^{25}$ FLOPs, 30M H100-hours, $\sim$\$100M of rented compute \\
+70B GQA KV cache & 0.3 MB per token: 40 GB at 128K context \\
+An 8$\times$H100 node & \$25/hr, 20K output tok/s: \$0.4 per 1M output tokens at full utilization \\
+Frontier API output price & $\sim$\$30 per 1M tokens: 30--100$\times$ the 70B-class hardware floor \\
+1M 768-d vectors & 3 GB fp32, 0.8 GB int8, 60 MB at PQ64 \\
+An A/B test at 2\% CTR, 1\% lift & 8M users per group; CUPED at $\rho{=}0.7$ halves it \\
+A judge's ceiling & $\sim$80\% agreement---the same as two humans \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{tldr}
+Formula $\rightarrow$ substitute at one significant figure $\rightarrow$
+sanity-check against a published system $\rightarrow$ name the binding
+constraint and one lever that relaxes it. Every number above is derived from a
+formula on this page or published by the lab that ran it. Where neither
+holds---closed-model training budgets, next quarter's prices, next quarter's
+benchmark ceilings---the accurate answer is a dated range, or ``undisclosed,''
+and saying so beats a confident fabrication.
+\end{tldr}
