@@ -4,7 +4,7 @@ A four-volume interview preparation program for Staff-level ML roles at frontier
 labs and platform companies, covering ML breadth, ML depth, ML system design,
 and ML coding rounds — in one repository.
 
-**609 interview questions across ~2,220 pages**, every one carrying a level
+**609 interview questions across ~2,100 pages**, every one carrying a level
 badge (L5/L6/L7), a type, and how often it actually comes up.
 
 ## The volumes
