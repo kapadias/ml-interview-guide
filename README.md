@@ -4,7 +4,7 @@ A four-volume interview preparation program for Staff-level ML roles at frontier
 labs and platform companies, covering ML breadth, ML depth, ML system design,
 and ML coding rounds — in one repository.
 
-**543 interview questions across ~1,870 pages**, every one carrying a level
+**609 interview questions across ~2,220 pages**, every one carrying a level
 badge (L5/L6/L7), a type, and how often it actually comes up.
 
 ## The volumes
@@ -14,7 +14,7 @@ badge (L5/L6/L7), a type, and how often it actually comes up.
 | I | `volumes/deep-learning` | Foundations, transformers, training and distributed systems, efficiency, RL and reasoning, inference and serving, pretraining at scale, GPU performance, agents, safety, long context, plus the interview-craft chapters (coding rounds, the staff loop) | 29 chapters, 301 questions |
 | II | `volumes/nlp` | Classical and statistical NLP through LLMs, pretraining and adaptation, in-context learning, alignment, RAG, benchmarks, production NLP, safety | 13 chapters, 128 questions |
 | III | `volumes/search-recommendation` | Query understanding, lexical and vector retrieval, neural retrieval and reranking, learning to rank, recommenders, ranking evaluation, production retrieval | 8 chapters, 92 questions |
-| IV | `volumes/conventional-ml` | Linear models, trees and gradient boosting, unsupervised methods, probabilistic foundations, applied craft and leakage, experimentation and causal inference, time series, the classical coding canon | 8 chapters, 22 questions (chapters 2 and 6 written; the rest in progress) |
+| IV | `volumes/conventional-ml` | Linear models, trees and gradient boosting, unsupervised methods, probabilistic foundations, applied craft and the leakage taxonomy, experimentation and causal inference, time series, the classical coding canon | 8 chapters, 88 questions |
 
 Every volume opens with **the Program Map**, which names the canonical home for
 each of the 21 overlap zones. One topic, one deep treatment; everywhere else a
@@ -29,7 +29,7 @@ short summary and a pointer. Cross-volume references read `[DL 5]`, `[NLP 9]`,
   depth tracks, a coding week, and a night-before pass
 - `drills/` — runnable, self-testing implementations for the coding round, plus
   `debug_round.py`, which plants one bug in a training script for you to diagnose
-- `index/master_question_index.md` — all 543 questions, generated from the source
+- `index/master_question_index.md` — all 609 questions, generated from the source
 - `tools/gen_question_index.py` — regenerates every question index; `--check`
   fails when one is stale
 - `ci/` — `facts.yaml` drift sentinels and `check_drift.py` (forbidden-claim grep
