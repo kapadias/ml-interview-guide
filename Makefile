@@ -17,3 +17,7 @@ sync-style:
 	  cp style/essentials.sty volumes/$$v/essentials.sty 2>/dev/null && echo "synced sty -> $$v" || true; \
 	  cp style/program_map.tex volumes/$$v/program_map.tex && echo "synced map -> $$v" || true; \
 	done
+
+.PHONY: index
+index:
+	python3 tools/gen_question_index.py
