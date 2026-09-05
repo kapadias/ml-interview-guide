@@ -14,7 +14,9 @@ check:
 
 sync-style:
 	@for v in $(VOLS); do \
-	  cp style/essentials.sty volumes/$$v/essentials.sty 2>/dev/null && echo "synced sty -> $$v" || true; \
+	  grep -q "usepackage{essentials}" volumes/$$v/main.tex \
+	    && cp style/essentials.sty volumes/$$v/essentials.sty && echo "synced sty -> $$v" \
+	    || true; \
 	  cp style/program_map.tex volumes/$$v/program_map.tex && echo "synced map -> $$v" || true; \
 	  for k in part0_kernel core50 numbers_card; do \
 	    cp kernel/$$k.tex volumes/$$v/$$k.tex || true; \
@@ -24,3 +26,7 @@ sync-style:
 .PHONY: index
 index:
 	python3 tools/gen_question_index.py
+
+.PHONY: verify
+verify: check
+	python3 tools/gen_question_index.py --check
