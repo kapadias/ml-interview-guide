@@ -1,7 +1,7 @@
 # Drills
 
 Runnable, self-testing reference implementations for the problems in
-Volume I, Chapter 28 (*ML Coding Rounds*). Every function here was executed
+Volume I, Chapter 28 (*ML Coding Rounds*) and Volume IV, Chapter 8 (*The From-Scratch Coding Canon*). Every function here was executed
 before it was printed in the book; each file asserts its own correctness
 and prints a one-line result per problem.
 
@@ -12,6 +12,7 @@ python3 canon_a_attention_optim.py
 python3 canon_b_inference_retrieval.py
 python3 canon_c_search_classical.py
 python3 canon_d_torch_debug.py     # needs torch; the others need only numpy
+python3 canon_e_classical.py
 ```
 
 ## Problem index
@@ -22,6 +23,7 @@ python3 canon_d_torch_debug.py     # needs torch; the others need only numpy
 | `canon_b_inference_retrieval.py` | greedy decode with a KV cache (checked against full recomputation); BM25 over an inverted index; NDCG@k; two-tower in-batch softmax loss; HNSW-style greedy graph search (checked against brute force) |
 | `canon_c_search_classical.py` | cleaned KV-cache decode; beam search with length normalization; logistic regression via SGD; k-means with k-means++; gradient boosting with stumps; conv2d via im2col |
 | `canon_d_torch_debug.py` | minimal training loop with gradient clipping; planted-bug demonstrations (missing `zero_grad`, runaway learning rate, train/eval mode, causal-mask off-by-one producing NaN) |
+| `canon_e_classical.py` | The classical from-scratch canon of Volume IV, Chapter 8: k-means with k-means++ and empty-cluster repair; logistic regression by minibatch SGD (finite-difference gradient check); decision-tree split finding and a small tree (checked against an exhaustive re-partitioning scan); boosting with second-order stumps; PCA by power iteration (checked against `np.linalg.svd`); brute-force kNN; kd-tree build and search (checked against brute force, with the high-dimensional degeneration measured); AUC (checked against pairwise counting); linear regression by normal equations and GD; naive Bayes; stratified folds; a CV harness with a measured feature-selection leak |
 | `debug_round.py` | The debug-the-training-code round: generates a training script with one planted bug for you to diagnose (`--list`, `--bug N`, `--reveal FILE`, `--clean`) |
 
 ## How to practice

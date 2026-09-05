@@ -2,27 +2,917 @@
 \label{cml:chap:coding_canon}
 
 \begin{tldr}
-Placeholder — this chapter is written per docs/coverage-spec.md, seeded by the author's own conventional-ML document when it arrives (Phase C3).
+Classical ML coding rounds draw from a canon of roughly ten algorithms, and unlike the deep-learning problems in [DL 28] every one of them has a reference implementation the interviewer has read: \texttt{sklearn}. That changes what is being tested. Nobody needs your k-means; they need to know whether you know what \texttt{KMeans} does when a cluster empties, what \texttt{PCA} does when you forget to center, and what \texttt{DecisionTreeClassifier} does that makes it $O(n \log n)$ instead of $O(n^2)$. This chapter works the canon---k-means with k-means++, logistic regression with SGD, decision-tree split finding, a boosting round with second-order leaf weights, PCA by power iteration, kNN with a kd-tree---plus the warm-ups (normal equations, AUC, naive Bayes, stratified folds) that fill the first ten minutes of a round. Each problem gets the ask, the design decisions an interviewer probes, complexity, the edge cases you should volunteer, a reference implementation, and the grading bar at each level. Every listing here was executed against an independent reference---an exhaustive scan, \texttt{np.linalg.svd}, brute force---before it was printed; the runnable versions with their tests live in \texttt{drills/canon\_e\_classical.py}. Round strategy, the debug-the-training-code variant, and the deep-learning problems live in [DL 28]; this chapter is the classical half of the same round.
 \end{tldr}
 
+%==============================================================================
+\section{What Makes a Classical Coding Round Different}
+\label{cml:sec:classical_round}
+%==============================================================================
+
+The deep-learning coding round is mostly a shape round. Multi-head attention is graded on whether you can keep \texttt{(B, H, T, dh)} straight, mask before the softmax, and scale by $\sqrt{d_h}$; the algorithm itself is four lines of linear algebra. The classical round is different in three specific ways, and candidates who do not notice tend to under-perform on problems they believe they know cold.
+
+\textbf{A reference implementation exists, and the interviewer has read it.} Every problem here is one \texttt{import} away in production. So the exercise is never ``can you produce a clustering''; it is ``do you know what the library is doing on your behalf.'' That reframes what a good answer contains. \texttt{sklearn.cluster.KMeans} runs multiple restarts with k-means++ seeding and relocates empty clusters; \texttt{PCA} centers but does not scale, and switches to a randomized SVD above a size threshold; \texttt{DecisionTreeClassifier} pre-sorts and sweeps rather than re-partitioning. Every one of those choices is a question waiting to be asked, and ``I'd call \texttt{fit}'' answers none of them. The strongest candidates narrate the library's decisions while writing their own: ``I'm doing five restarts here because Lloyd's is only locally optimal---sklearn defaults to ten for the same reason.''
+
+\textbf{The traps are numerical and methodological, not dimensional.} In [DL 28] the bugs are transposes. Here they are $\exp$ overflow in a sigmoid, $\log(0)$ in a naive Bayes with an unseen word, a covariance formed as $X^\top X$ where a QR would have been backward-stable, cancellation in the $\|a-b\|^2 = \|a\|^2 + \|b\|^2 - 2a^\top b$ expansion, floats compared with \texttt{==} as a convergence test, and a \texttt{nan} centroid from an empty cluster. Alongside them sits a second family that is methodological rather than arithmetic: an unstratified fold that leaves a rare class out of a validation set, unscaled features in a distance-based method, a threshold swept on the data you then report. None of these raise an exception. They return plausible numbers, which is exactly why interviewers plant them.
+
+\textbf{The complexity conversation is the point, not a coda.} Split finding is the canonical case: the naive ``for each candidate threshold, re-partition and recount'' is $O(n^2)$ per feature, the sorted incremental sweep is $O(n \log n)$, and the entire exercise exists to see whether you reach for the sweep unprompted. The same test recurs as \texttt{argpartition} versus \texttt{argsort} in kNN, matrix-free products versus forming a $d \times d$ covariance in PCA, and $O(1)$ variance updates from running sums in a regression tree. State the complexity of what you are about to write \emph{before} you write it; Table~\ref{cml:tab:canon_glance} collects the numbers for the whole canon.
+
+\begin{keyinsight}[The Five Things Actually Being Scored]
+Interviewer rubrics for this round reduce to five checks, in roughly this weight order: (1) \textbf{correctness on edge cases you volunteered}---empty cluster, single class, constant feature, $k > n$, all-tied scores; (2) \textbf{vectorization and complexity fluency}---no accidental $O(n^2)$ where a sort suffices, big-O stated without being asked; (3) \textbf{numerical hygiene}---stable sigmoid and log-sum-exp, centering, tolerance-based convergence; (4) \textbf{API and test discipline}---a \texttt{fit}/\texttt{predict} shape decided out loud, and a hand-checkable test written before anyone asks for one; (5) \textbf{connecting code to theory}---``this residual is the negative gradient because $\partial L/\partial F = p - y$'' is the sentence that separates staff from senior. Everything below is organized around these five.
+\end{keyinsight}
+
+\textbf{The opening two minutes.} Clarify the spec before typing: \texttt{fit}/\texttt{predict} objects or plain functions? numpy only, or may I use \texttt{scipy}? Must it be vectorized, or is a readable loop acceptable for the first pass? What should it do with $k > n$, a constant feature, a single class? Then write the API skeleton---signature, docstring with shapes, \texttt{return}---and fill it in. This costs ninety seconds and buys a specification you can be graded against, plus the impression of someone who has shipped code rather than only submitted it.
+
+The clarifying questions that actually change the code are worth having memorized, because they are short and each one eliminates a branch of work:
+
+\begin{itemize}
+    \item \textbf{k-means}: fixed iteration budget or converge to a tolerance? Do you want restarts? Should it return labels, centroids, or inertia---or all three?
+    \item \textbf{Logistic regression}: full-batch, minibatch, or one sample at a time? Do you want the loss history? Is regularization in scope, and does the bias get penalized (no)?
+    \item \textbf{Split finding}: one node or a whole tree? Classification or regression? Are the features numeric only? Should I assume the labels are $0 \ldots K{-}1$ so I can \texttt{bincount}?
+    \item \textbf{Boosting}: squared loss or log loss? May I assume a tree learner exists, or am I writing that too? First-order or second-order leaf values?
+    \item \textbf{PCA}: how many components, and is $d$ large enough that forming the covariance is a problem? Should I return the transformed data or the components?
+    \item \textbf{kNN}: classification or regression? Is the data standardized already? Exact or approximate, and how many queries against how many points?
+\end{itemize}
+
+\textbf{The closing two minutes.} Write a test you can verify by hand and run it out loud: three well-separated blobs must produce three clusters; a logistic regression on nearly separable data must reach high accuracy with a weight vector pointing along the true direction; PCA on data with one dominant direction must return that direction. If you cannot execute, say what the output would be and why. ``Claims the code works without testing anything'' is on every red-flag list in this chapter for a reason.
+
+\begin{table}[H]\centering
+\caption{The canon at a glance: cost, and the one detail that decides the grade}
+\label{cml:tab:canon_glance}
+\small
+\begin{tabular}{p{3.0cm}p{3.0cm}p{7.6cm}}
+\toprule
+\textbf{Problem} & \textbf{Complexity} & \textbf{The discriminating detail} \\
+\midrule
+k-means & $O(nkd)$ per iteration & k-means++ seeding and empty-cluster repair \\
+Logistic regression & $O(nd)$ per epoch & stable sigmoid; the gradient is $X^\top(p-y)/n$ \\
+Tree split finding & $O(dn\log n)$ per node & sorted sweep with $O(1)$ count updates, not re-partitioning \\
+Boosting round & one split pass per round & residual $=$ negative gradient; shrinkage; early stopping \\
+PCA & $O(nd)$ per iteration & center first; never form the $d \times d$ covariance \\
+Brute-force kNN & $O(nd + n)$ per query & \texttt{argpartition}, not \texttt{argsort}; standardize first \\
+kd-tree kNN & $O(\log n)$ expected, $O(n)$ worst & the pruning test, and that it dies above $d \approx 20$ \\
+Normal equations & $O(nd^2 + d^3)$ & \texttt{solve}, never \texttt{inv}; QR/SVD for conditioning \\
+AUC & $O(n\log n)$ & rank formulation; ties get half credit \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{The test you write is part of the answer.} Rubric item four is the cheapest one to satisfy and the one candidates skip under time pressure. Every problem in this chapter has an invariant you can check in two lines and narrate in one sentence; Table~\ref{cml:tab:canon_tests} lists them. Note the shape of the good ones: they compare against something independent (an exhaustive scan, \texttt{np.linalg.svd}, a full sort, chance) rather than re-deriving the same computation a second way, which is how you catch a shared misconception rather than a typo.
+
+\begin{table}[H]\centering
+\caption{Invariants worth asserting, unprompted, in front of the interviewer}
+\label{cml:tab:canon_tests}
+\small
+\begin{tabular}{p{3.4cm}p{10.2cm}}
+\toprule
+\textbf{Problem} & \textbf{The check} \\
+\midrule
+k-means & Three well-separated blobs give three clusters and a hand-plausible inertia; a rerun from a different seed gives the same partition. \\
+Logistic regression & Loss decreases across epochs; the analytic gradient matches finite differences to $10^{-9}$; learned $w$ is collinear with the planted $w$. \\
+Split finding & Identical result to an exhaustive re-partitioning scan on 20 rows; zero gain on a constant feature; a hand-computed Gini on eight rows. \\
+Boosting & Training loss is monotone; with squared loss, $\lambda=0$ and $\eta=1$, round one reproduces the mean residual exactly. \\
+PCA & Components match \texttt{np.linalg.svd} up to sign; the eigenvalues sum to the total variance (agreement to $4\times10^{-15}$ in my test). \\
+Brute-force kNN & The \texttt{argpartition} neighbor set equals the full-sort neighbor set. \\
+kd-tree & Identical neighbors to brute force on 30 random queries at every dimension. \\
+AUC & Perfect ranking gives $1.0$, reversed gives $0.0$, all-tied gives $0.5$, one class gives \texttt{nan}. \\
+Linear regression & Matches \texttt{np.linalg.lstsq}; the residual is orthogonal to every column of $X$ ($\max |X^\top r| = 2\times10^{-13}$ in my test). \\
+CV harness & The test folds partition the indices exactly; with shuffled labels the score collapses to chance. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
 \section{k-means}
-% TODO Phase C3
+\label{cml:sec:canon_kmeans}
+%==============================================================================
 
+The single most-asked classical implementation. [DL 28] carries a compact version of this problem inside its mixed canon; what follows is the fuller treatment---restarts, empty-cluster repair, a real convergence criterion, and the numerical caveat on the distance expansion---which is where the follow-up ladder actually goes. The clustering theory behind it (why spherical, how to choose $k$, when to use something else) is Chapter~\ref{cml:chap:unsupervised}.
+
+\begin{interviewq}
+\textbf{Q: Implement k-means with k-means++ initialization. Handle empty clusters and give me a real convergence criterion.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Lloyd's algorithm alternates two steps until the centroids stop moving: assign each point to its nearest centroid, then set each centroid to the mean of the points assigned to it. Both steps monotonically decrease the inertia $\sum_i \|x_i - c_{a(i)}\|^2$, which is why it converges---to a local optimum, in finitely many steps, since there are finitely many assignments.
+
+Vectorize the assignment with the expansion $\|x - c\|^2 = \|x\|^2 + \|c\|^2 - 2x^\top c$, which turns the $(n, k)$ distance matrix into one matmul instead of a Python loop, and skip the square root because \texttt{argmin} is invariant to monotone transforms. Volunteer the numerical caveat, because it is the staff-level detail here: that expansion is a difference of large similar numbers, so cancellation produces small negative entries when coordinates are large. On my test data shifted by $10^6$ the raw expansion returned entries as low as $-4.9 \times 10^{-4}$; unclipped, the square root of that is \texttt{nan}. Clip at zero.
+
+Three things separate a working implementation from a correct one. \textbf{Initialization}: uniformly random seeds land in bad local optima constantly---on three well-separated blobs, 63 of 200 random inits converged to more than twice the best inertia, the worst at $1492$ against an optimum of $32.3$. k-means++ samples each new seed with probability proportional to $D(x)^2$, the squared distance to the nearest seed already chosen, which spreads the seeds across the blobs and carries an $O(\log k)$ expected-approximation guarantee; combine it with a handful of restarts and keep the lowest-inertia run. \textbf{Empty clusters}: if no point is assigned to a centroid, its mean is $0/0$ and the run silently fills with \texttt{nan}. Reseed that centroid on the point currently farthest from any centroid---and if several clusters empty at once, give each a \emph{distinct} point, or you have merely reproduced the collision. \textbf{Convergence}: stop when the maximum centroid shift falls below a tolerance, not when \texttt{np.array\_equal} says the floats are identical, and re-run the assignment after the final centroid move so the labels you return match the centroids you return.
+
+State the cost as $O(nkd)$ per iteration times iterations times restarts, note that mini-batch k-means replaces the full assignment pass with a sampled one at large $n$, and close with the caveat that inertia decreases monotonically in $k$ and therefore cannot select $k$---that is what the elbow, silhouette, or a downstream metric are for (Chapter~\ref{cml:chap:unsupervised}).
+
+\redflags
+\begin{itemize}
+    \item No empty-cluster handling, so the first adversarial input produces \texttt{nan} centroids.
+    \item Random initialization with no mention of local optima or restarts.
+    \item A Python loop over points for the assignment step.
+    \item \texttt{while not np.array\_equal(C, newC)} as the convergence test, or a bare fixed iteration count with no rationale.
+    \item Using inertia to choose $k$, or claiming k-means finds the global optimum.
+\end{itemize}
+
+\interviewtest{Whether you know the failure modes of the simplest clustering algorithm. Empty clusters and initialization are what bite in production, and both are absent from the version most candidates memorized.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct Lloyd iteration, vectorized assignment, happy path.
+    \item \badgeLsix{L6} k-means++, empty-cluster repair, tolerance convergence, restarts, complexity stated unprompted.
+    \item \badgeLseven{L7} Mini-batch variant for scale, the cancellation caveat in the expansion trick, ties the failure modes to init and to cluster geometry, and writes the two-blob test before being asked.
+\end{itemize}
+
+\followups{``Why is $D^2$ sampling the right proposal distribution?'' ``How would you choose $k$?'' ``What if the clusters are elongated or very different in size?'' ``Scale this to 100M points.''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={k-means with k-means++, empty-cluster repair, and tolerance convergence. Verified: recovers three planted blobs at inertia 32.34, and survives k=5 on three distinct points with no NaN.}]
+def sqdist(X, C):
+    """||x-c||^2 = ||x||^2 + ||c||^2 - 2 x.c : one matmul, O(nkd)."""
+    d2 = (X**2).sum(1)[:, None] + (C**2).sum(1)[None, :] - 2.0 * X @ C.T
+    return np.maximum(d2, 0.0)      # cancellation can make these slightly negative
+
+def kmeanspp(X, k, rs):
+    C = [X[rs.integers(len(X))]]
+    for _ in range(k - 1):
+        d2 = sqdist(X, np.array(C)).min(1)          # dist to nearest chosen seed
+        tot = d2.sum()
+        p = d2 / tot if tot > 0 else np.full(len(X), 1.0 / len(X))
+        C.append(X[rs.choice(len(X), p=p)])         # D^2 sampling
+    return np.array(C, dtype=float)
+
+def kmeans(X, k, n_init=5, max_iter=100, tol=1e-6, seed=0):
+    rs = np.random.default_rng(seed)
+    best = None
+    for _ in range(n_init):                         # restarts: Lloyd is local-only
+        C = kmeanspp(X, k, rs)
+        for _ in range(max_iter):
+            d2 = sqdist(X, C)
+            lab = d2.argmin(1)
+            cnt = np.bincount(lab, minlength=k)
+            far = np.argsort(-d2.min(1)) if (cnt == 0).any() else None
+            newC, nxt = np.empty_like(C), 0
+            for j in range(k):
+                if cnt[j]:
+                    newC[j] = X[lab == j].mean(0)
+                else:                               # empty cluster: reseed on the
+                    newC[j] = X[far[nxt]]           # worst-served point, and use a
+                    nxt += 1                        # DISTINCT point per empty cluster
+            shift = np.sqrt(((newC - C) ** 2).sum(1)).max()
+            C = newC
+            if shift <= tol:                        # tolerance, never ==
+                break
+        d2 = sqdist(X, C)
+        lab = d2.argmin(1)                          # re-assign after the last move
+        inertia = float(d2.min(1).sum())
+        if best is None or inertia < best[2]:
+            best = (C, lab, inertia)
+    return best
+\end{lstlisting}
+
+%==============================================================================
 \section{Logistic Regression with SGD}
-% TODO Phase C3
+\label{cml:sec:canon_logreg}
+%==============================================================================
 
+The floor check of the classical round: an interviewer with ten minutes and one question asks for this. [DL 28] carries the pure-SGD version; the treatment here adds minibatching, the stable objective, and the finite-difference gradient check that is the strongest single move available in this problem.
+
+\begin{interviewq}
+\textbf{Q: Implement logistic regression trained by minibatch SGD, derive the gradient, and convince me the gradient is right.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Derive first, because the derivation is short and the code falls out of it. With $z = w^\top x + b$, $p = \sigma(z)$, and log loss $L = -[y \log p + (1-y)\log(1-p)]$, we have $\partial L/\partial p = (p-y)/(p(1-p))$ and $\sigma'(z) = p(1-p)$; the two cancel exactly, leaving $\partial L / \partial z = p - y$. Averaged over a batch, $\nabla_w = X^\top(p - y)/n$ and $\nabla_b = \overline{(p-y)}$. The cancellation is not luck---it is what happens whenever the link is the canonical one for an exponential-family loss (Chapter~\ref{cml:chap:supervised_core}), which is why linear regression with squared loss has the same $X^\top(\hat y - y)/n$ form.
+
+Then the details that show experience. \textbf{Stability}: write the sigmoid branchwise so a large positive $z$ is never exponentiated---$\sigma(z) = 1/(1+e^{-z})$ for $z \ge 0$ and $e^z/(1+e^z)$ for $z < 0$---because the naive form overflows at $z = -1000$ and, in \texttt{float32} pipelines, silently saturates $p$ to exactly $1$, after which $\log p$ is $-\infty$. Compute the loss as $\mathrm{mean}\big(\log(1+e^{z}) - yz\big)$ via \texttt{np.logaddexp}, never as $\log \sigma(z)$. \textbf{Shuffling}: reshuffle every epoch, since a fixed order makes consecutive updates correlated and, on data sorted by label, makes every batch single-class. \textbf{Regularization}: apply L2 to the weights and not the bias---penalizing the intercept pulls predictions toward $p = 0.5$ for no benefit. Carry the bias as an appended column of ones and mask it out of the penalty.
+
+Verify it in front of them, two ways. A finite-difference gradient check---$(L(w + \epsilon e_i) - L(w - \epsilon e_i))/2\epsilon$ against the analytic gradient---agreed to a relative error of $3 \times 10^{-10}$ on my run, and offering it unprompted is the single strongest signal in this problem. Then a behavioral test: accuracy $0.963$ on noisy synthetic data, with learned weights collinear with the truth at $\cos = 0.999$. Add the observation that pays off in the follow-up: on \emph{perfectly separable} data the MLE does not exist and the weight norm grows without bound---mine went $2.8 \to 4.9 \to 7.1$ at 50, 500, and 5000 epochs, while $\ell_2 = 10^{-2}$ pinned it at $2.9$. That is the honest reason production logistic regressions are always regularized.
+
+Cost is $O(nd)$ per epoch. Mention that for small $d$ you would not use SGD at all: IRLS/Newton converges in a handful of iterations because the Hessian $X^\top \mathrm{diag}(p(1-p)) X$ is cheap, and L-BFGS is what \texttt{sklearn} defaults to; SGD is the answer when $n$ is large or the data streams.
+
+\redflags
+\begin{itemize}
+    \item Unable to derive $p - y$, or deriving it with a sign error.
+    \item \texttt{1/(1+np.exp(-z))} with no comment on overflow, or computing the loss as \texttt{np.log(sigmoid(z))}.
+    \item Regularizing the bias term.
+    \item Never shuffling; iterating batches in a fixed order.
+    \item Forgetting the $1/n$, so the effective learning rate scales with batch size.
+    \item Mixing $\{-1, +1\}$ labels into a $\{0, 1\}$ formulation.
+\end{itemize}
+
+\interviewtest{Whether the most basic classifier in the field is something you can derive, implement, and validate---not just call. The gradient check is the discriminator between people who have debugged models and people who have only run them.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct gradient and a working SGD loop that trains on toy data.
+    \item \badgeLsix{L6} Stable sigmoid and loss, per-epoch shuffling, L2 excluding the bias, vectorized batches, complexity stated.
+    \item \badgeLseven{L7} Finite-difference gradient check, the separable-data divergence, class weights for imbalance, and a comparison to IRLS/L-BFGS on when SGD is not the right tool.
+\end{itemize}
+
+\followups{``Extend it to multiclass softmax.'' ``What happens on perfectly separable data?'' ``Add class weights for a 1:100 imbalance.'' ``How would you calibrate these probabilities?'' (Chapter~\ref{cml:chap:probabilistic_foundations}.)}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Logistic regression by minibatch SGD. Verified: accuracy 0.963, and the analytic gradient agrees with finite differences to a relative 3e-10.}]
+def sigmoid(z):
+    """Stable at both tails: never exponentiate a large positive number."""
+    out = np.empty_like(z, dtype=float)
+    pos = z >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    e = np.exp(z[~pos])
+    out[~pos] = e / (1.0 + e)
+    return out
+
+def logreg_obj(w, X, y, l2, mask):
+    """mean(log(1+e^z) - y z) is the stable BCE; grad is X^T (p - y)/n."""
+    z = X @ w
+    loss = float(np.mean(np.logaddexp(0.0, z) - y * z) + 0.5 * l2 * (mask * w * w).sum())
+    grad = X.T @ (sigmoid(z) - y) / len(y) + l2 * mask * w
+    return loss, grad
+
+def logreg_sgd(X, y, lr=0.5, epochs=40, batch=32, l2=1e-3, seed=0):
+    n, d = X.shape
+    Xb = np.hstack([X, np.ones((n, 1))])        # bias as an appended column
+    w = np.zeros(d + 1)
+    mask = np.ones(d + 1); mask[-1] = 0.0       # never regularize the intercept
+    rs, hist = np.random.default_rng(seed), []
+    for _ in range(epochs):
+        for idx in np.array_split(rs.permutation(n), max(1, n // batch)):  # reshuffle
+            w -= lr * logreg_obj(w, Xb[idx], y[idx], l2, mask)[1]
+        hist.append(logreg_obj(w, Xb, y, l2, mask)[0])   # monitor: should decrease
+    return w, hist
+
+def grad_check(w, X, y, l2, mask, eps=1e-6):
+    """The staff-level move: prove the analytic gradient, don't assert it."""
+    g = logreg_obj(w, X, y, l2, mask)[1]
+    num = np.zeros_like(g)
+    for i in range(len(w)):
+        e = np.zeros_like(w); e[i] = eps
+        num[i] = (logreg_obj(w + e, X, y, l2, mask)[0]
+                  - logreg_obj(w - e, X, y, l2, mask)[0]) / (2 * eps)
+    return float(np.abs(num - g).max() / np.abs(g).max())
+\end{lstlisting}
+
+%==============================================================================
 \section{Decision Tree Split Finding}
-% TODO Phase C3
+\label{cml:sec:canon_split}
+%==============================================================================
 
+Usually posed as ``find the best split for one node,'' sometimes extended to ``now grow the tree.'' This is the most algorithmically interesting problem in the canon, and the one where the gap between a correct answer and a fast one is widest. The theory---impurity concavity, why Gini over misclassification error, pruning---is Section~\ref{cml:sec:cart}.
+
+\begin{interviewq}
+\textbf{Q: Given a node's samples and labels, find the split that maximizes impurity decrease. What is the complexity of your approach?}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Start with the objective, out loud: for a candidate split of node $P$ into $L$ and $R$, the weighted impurity decrease is $\Delta = I(P) - \frac{n_L}{n}I(L) - \frac{n_R}{n}I(R)$, with Gini $I = 1 - \sum_k p_k^2$ or entropy $I = -\sum_k p_k \log_2 p_k$. Gini is the usual default because it avoids the logarithm; the two disagree on a small minority of splits and produce indistinguishable trees.
+
+Now the algorithm, which is the actual question. The naive approach---for every candidate threshold, partition the node and recount the classes---is $O(n)$ per candidate and $O(n^2)$ per feature. Instead, \textbf{sort each feature once} ($O(n \log n)$) and \textbf{sweep} left to right, moving one sample at a time from the right child to the left and updating the class counts in $O(1)$ per step. Evaluating the criterion costs $O(K)$ for $K$ classes, so the total is $O(d \cdot n(\log n + K))$ per node. That is the answer the exercise exists to elicit; on my machine the pure-Python sweep is already about $2\times$ faster than a \emph{vectorized} re-partitioning reference at $n = 500$ and about $9\times$ at $n = 8000$, and the ratio keeps growing because one side is quadratic and the other is not.
+
+Three correctness details that candidates drop. \textbf{Only split between distinct values}: when the sorted feature has $x_i = x_{i+1}$, no threshold separates them, so skip that index---forgetting this evaluates splits that cannot be realized and can report a gain no tree can achieve. \textbf{Use the midpoint} $(x_i + x_{i+1})/2$ as the threshold, so the boundary generalizes to test points falling between the two training values. \textbf{Respect \texttt{min\_samples\_leaf}} and return a sentinel when no admissible split exists---a constant feature, or a node of identical rows with conflicting labels---because a recursion that always splits will not terminate on duplicate points.
+
+For \textbf{regression}, the same sweep works with the identity $\mathrm{SSE} = \sum y^2 - (\sum y)^2/n$: keep $\sum y$ and $\sum y^2$ for the left side, subtract for the right, and every candidate costs $O(1)$. Derive that identity if asked---it is the reason variance splitting is cheap and, symmetrically, the reason an MAE criterion is slow, since there is no constant-time update for a median. Note the numerical caveat too: that identity is a difference of large numbers when $|y|$ is large, so a production implementation centers the targets or uses a Welford-style update. Finally, connect it forward: LightGBM replaces the sorted sweep with histogram binning, turning the per-node cost into $O(dn)$ over precomputed bins plus $O(d \cdot \mathrm{bins})$ to scan them (Section~\ref{cml:sec:lightgbm}), and XGBoost's exact mode is precisely this sweep over a pre-sorted columnar layout (Section~\ref{cml:sec:xgboost}).
+
+\redflags
+\begin{itemize}
+    \item Re-partitioning the node at every candidate threshold with no awareness that a sweep exists.
+    \item Evaluating a split at every value including duplicates, or splitting \emph{at} a data value rather than between two.
+    \item Off-by-one in the left/right counts---the classic symptom is a gain that disagrees with a hand computation on eight rows.
+    \item Computing the impurity of an empty side, or dividing by $n_L = 0$.
+    \item No stopping condition, so identical points with conflicting labels recurse forever.
+    \item Claiming the greedy split is optimal for the tree---it is one-step myopic, and optimal tree learning is NP-hard.
+\end{itemize}
+
+\interviewtest{Whether you can turn a formula into an algorithm with the right asymptotics. This is the clearest complexity test in the classical canon, and the incremental-count sweep is the whole reason for asking.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct gain computation; a naive threshold loop is acceptable if the candidate names its cost.
+    \item \badgeLsix{L6} Sorted incremental sweep, correct tie and constant-feature handling, midpoint thresholds, complexity stated, clean recursion with stopping rules.
+    \item \badgeLseven{L7} Derives the $O(1)$ variance update from running sums and its numerical caveat, connects to histogram binning and \texttt{min\_impurity\_decrease}, and knows the presort is done once per tree rather than once per node.
+\end{itemize}
+
+\followups{``Now make it a regression tree.'' ``How does LightGBM make this faster?'' ``How would you handle a categorical feature with 500 levels?'' ``What changes for missing values?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Split finding by sorted incremental sweep, classification and regression. Verified against an exhaustive re-partitioning scan on 30 random problems with duplicate values and a constant feature.}]
+def best_split_gini(X, y, n_cls, min_leaf=1):
+    """(gain, feature, threshold). Sort once per feature, then move one sample at a
+    time from the right child to the left: O(d n (log n + K))."""
+    n = len(y)
+    tot = np.bincount(y, minlength=n_cls).astype(float)
+    parent = 1.0 - ((tot / n) ** 2).sum()
+    best = (0.0, -1, np.nan)                       # sentinel: no admissible split
+    for f in range(X.shape[1]):
+        order = np.argsort(X[:, f], kind="mergesort")     # O(n log n), ONCE
+        xs, ys = X[order, f], y[order]
+        left, right = np.zeros(n_cls), tot.copy()
+        for i in range(n - 1):                     # i = last index on the left
+            left[ys[i]] += 1.0
+            right[ys[i]] -= 1.0                    # O(1) count update
+            if xs[i] == xs[i + 1]:                 # split BETWEEN distinct values only
+                continue
+            nl, nr = i + 1, n - i - 1
+            if nl < min_leaf or nr < min_leaf:
+                continue
+            gl = 1.0 - ((left / nl) ** 2).sum()
+            gr = 1.0 - ((right / nr) ** 2).sum()
+            gain = parent - (nl * gl + nr * gr) / n           # weighted decrease
+            if gain > best[0] + 1e-12:
+                best = (gain, f, 0.5 * (xs[i] + xs[i + 1]))   # midpoint threshold
+    return best
+
+def best_split_sse(X, g, min_leaf=1):
+    """Regression twin: SSE = sum y^2 - (sum y)^2 / n, so two accumulators per side."""
+    n = len(g)
+    S, Q = g.sum(), (g * g).sum()
+    parent = Q - S * S / n
+    best = (0.0, -1, np.nan, 0.0, 0.0)
+    for f in range(X.shape[1]):
+        order = np.argsort(X[:, f], kind="mergesort")
+        xs, gs = X[order, f], g[order]
+        sl = ql = 0.0
+        for i in range(n - 1):
+            sl += gs[i]; ql += gs[i] * gs[i]       # the O(1) update, from the identity
+            if xs[i] == xs[i + 1]:
+                continue
+            nl, nr = i + 1, n - i - 1
+            if nl < min_leaf or nr < min_leaf:
+                continue
+            sse = (ql - sl * sl / nl) + ((Q - ql) - (S - sl) ** 2 / nr)
+            if parent - sse > best[0] + 1e-12:
+                best = (parent - sse, f, 0.5 * (xs[i] + xs[i + 1]),
+                        sl / nl, (S - sl) / nr)    # leaf means come for free
+    return best
+
+def grow(X, y, n_cls, depth=0, max_depth=6, min_leaf=1, min_gain=1e-7):
+    counts = np.bincount(y, minlength=n_cls)
+    leaf = ("leaf", int(counts.argmax()))          # majority vote
+    if depth >= max_depth or counts.max() == len(y) or len(y) < 2 * min_leaf:
+        return leaf
+    gain, f, thr = best_split_gini(X, y, n_cls, min_leaf)
+    if f < 0 or gain < min_gain:      # identical rows / constant features: STOP, or
+        return leaf                   # this recursion never terminates
+    m = X[:, f] <= thr
+    return ("node", f, thr,
+            grow(X[m], y[m], n_cls, depth + 1, max_depth, min_leaf),
+            grow(X[~m], y[~m], n_cls, depth + 1, max_depth, min_leaf))
+\end{lstlisting}
+
+%==============================================================================
 \section{One Boosting Round}
-% TODO Phase C3
+\label{cml:sec:canon_boosting}
+%==============================================================================
 
+The natural sequel to split finding, and the problem where the theory-to-code connection is worth the most. [DL 28] carries the squared-loss version with mean-valued stumps; the version here is the classification one---log loss, updates in logit space, second-order leaf weights---which is what an interviewer who wants to reach XGBoost asks for. The derivations live in Sections~\ref{cml:sec:boosting_theory} and~\ref{cml:sec:xgboost}.
+
+\begin{interviewq}
+\textbf{Q: Implement gradient boosting for binary classification with stumps. Then tell me where the leaf values come from.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Boosting fits an additive model stagewise in \emph{function} space. Initialize $F_0$ with the optimal constant---for log loss the log-odds prior $\log\frac{\bar y}{1 - \bar y}$, for squared loss the mean. Then repeat: compute the negative gradient of the loss with respect to the current predictions, fit a small tree to it, and add a shrunken version, $F \leftarrow F + \eta h$. For log loss with $p = \sigma(F)$, the gradient is $g = p - y$ and the Hessian is $h = p(1-p)$---the same $p - y$ that fell out of the logistic derivation two sections ago, which is the sentence to say aloud: \emph{residual fitting is the squared-loss special case, not the definition of boosting.}
+
+The most common implementation bug is updating in probability space. Everything---$F$, the leaf values, the update---lives in logits; the sigmoid is applied only when you need $p$ for the gradient or for a prediction. Updating $p$ directly lets predictions leave $[0,1]$ and destroys the additive structure.
+
+For the leaf values, take the second-order expansion of the loss around the current predictions. Minimizing $\sum_{i \in \text{leaf}} (g_i w + \tfrac12 h_i w^2) + \tfrac12 \lambda w^2$ gives the closed form $w^\star = -G/(H + \lambda)$ with $G = \sum g_i$ and $H = \sum h_i$, and the matching split gain is $\tfrac12\big[\frac{G_L^2}{H_L + \lambda} + \frac{G_R^2}{H_R + \lambda} - \frac{G^2}{H + \lambda}\big]$. That is the XGBoost formula, and it comes with a sanity check worth stating: under squared loss every $h_i = 1$, so with $\lambda = 0$ the leaf weight is exactly the mean negative residual---the first-order algorithm, recovered as a special case. My implementation verifies that identity numerically.
+
+Then the two hyperparameters that matter. \textbf{Shrinkage} $\eta$ makes the ensemble take many small steps instead of a few greedy ones, and it trades directly against the number of rounds: on my test $\eta = 1.0$ reached its best validation loss of $0.298$ in 24 rounds while $\eta = 0.1$ needed 318 rounds to reach $0.297$. That is the classic inverse relation---and an honest reminder that with stumps on clean data, shrinkage buys path safety rather than a materially better optimum; the gap opens up with deeper base learners and noisier targets. \textbf{Early stopping} is mandatory, because training loss decreases monotonically forever: track validation loss, keep the best round, stop after \texttt{patience} rounds without improvement. My run's training loss fell $0.6656 \to 0.1912$ monotonically over 328 rounds with validation bottoming at round 318---and validation log loss of $0.297$ against $0.691$ for the constant model is the comparison to report, because ``it beat the base rate'' is the actual claim being made.
+
+\redflags
+\begin{itemize}
+    \item Fitting each tree to $y$ rather than to the current gradient---that is not boosting.
+    \item Updating in probability space instead of logit space.
+    \item No learning rate, or asserting $\eta = 1$ is fine because the training loss looks great.
+    \item Choosing the number of rounds by training loss.
+    \item Not knowing that residuals are the negative gradient, and so unable to extend past squared loss.
+    \item Omitting $\lambda$ from the leaf denominator, then dividing by a near-zero Hessian sum on a tiny leaf.
+\end{itemize}
+
+\interviewtest{Whether boosting is functional gradient descent to you, or a library with good defaults. The leaf-weight formula is the bridge to every XGBoost follow-up.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Working squared-loss residual loop with shrinkage and a provided tree learner.
+    \item \badgeLsix{L6} Log-loss version with derived gradients, updates in logit space, shrinkage plus early stopping, monotone-training-loss sanity test.
+    \item \badgeLseven{L7} Second-order leaf weights and gain formula derived, the squared-loss special case checked numerically, row and column subsampling, and the rounds-versus-$\eta$ trade quantified.
+\end{itemize}
+
+\followups{``Derive the leaf weight.'' ``Where does $\lambda$ enter, and what does $\gamma$ do?'' ``How does this become LambdaMART?'' ([SR 5].) ``What changes for multiclass?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Boosting with second-order stumps on log loss. Verified: monotone training loss 0.6656 to 0.1912, validation log loss 0.297 against 0.691 for the constant model, and the squared-loss leaf equals the mean residual.}]
+def newton_stump(X, g, h, lam=1.0, min_leaf=5):
+    """Split by the XGBoost gain; leaf weight w* = -G/(H+lambda)."""
+    n = len(g)
+    G, H = g.sum(), h.sum()
+    root = G * G / (H + lam)
+    best = (0.0, -1, np.nan, 0.0, 0.0)
+    for f in range(X.shape[1]):
+        order = np.argsort(X[:, f], kind="mergesort")
+        xs, gs, hs = X[order, f], g[order], h[order]
+        gl = hl = 0.0
+        for i in range(n - 1):
+            gl += gs[i]; hl += hs[i]               # same O(1) sweep as split finding
+            if xs[i] == xs[i + 1] or i + 1 < min_leaf or n - i - 1 < min_leaf:
+                continue
+            gr, hr = G - gl, H - hl
+            gain = 0.5 * (gl * gl / (hl + lam) + gr * gr / (hr + lam) - root)
+            if gain > best[0]:
+                best = (gain, f, 0.5 * (xs[i] + xs[i + 1]),
+                        -gl / (hl + lam), -gr / (hr + lam))    # the leaf weights
+    return best
+
+def gbm_logistic(X, y, Xv, yv, rounds=600, lr=0.1, lam=1.0, patience=10):
+    p0 = float(np.clip(y.mean(), 1e-6, 1 - 1e-6))
+    F0 = float(np.log(p0 / (1 - p0)))       # log-odds prior = optimal constant model
+    F, Fv, trees = np.full(len(y), F0), np.full(len(yv), F0), []
+    tr_hist, va_hist, best = [], [], (np.inf, 0)
+    for m in range(rounds):
+        p = sigmoid(F)
+        g, h = p - y, p * (1 - p)           # gradient and hessian IN LOGIT SPACE
+        gain, f, thr, wl, wr = newton_stump(X, g, h, lam)
+        if f < 0:
+            break
+        F += lr * np.where(X[:, f] <= thr, wl, wr)      # shrinkage: many small steps
+        Fv += lr * np.where(Xv[:, f] <= thr, wl, wr)
+        trees.append((f, thr, wl, wr))
+        tr_hist.append(float(np.mean(np.logaddexp(0.0, F) - y * F)))
+        va_hist.append(float(np.mean(np.logaddexp(0.0, Fv) - yv * Fv)))
+        if va_hist[-1] < best[0] - 1e-9:
+            best = (va_hist[-1], m + 1)
+        elif m + 1 - best[1] >= patience:               # early stop on VALIDATION
+            break
+    return trees, F0, tr_hist, va_hist, best[1]
+\end{lstlisting}
+
+%==============================================================================
 \section{PCA via Power Iteration}
-% TODO Phase C3
+\label{cml:sec:canon_pca}
+%==============================================================================
 
+Asked when the interviewer wants numerical linear algebra rather than modeling. It is the one canon problem where you can be simultaneously fast, confident, and wrong---by forgetting to center.
+
+\begin{interviewq}
+\textbf{Q: Implement PCA. Use power iteration rather than calling an eigensolver, and return the top $k$ components.}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+PCA finds the orthonormal directions of maximum variance, i.e.\ the top eigenvectors of the covariance $C = X_c^\top X_c/(n-1)$ where $X_c$ is the \emph{centered} data. Say ``centered'' as you type it: without centering, the first ``component'' is dominated by the mean vector rather than by any structure in the data. That is measurable, not folklore---on my test data (a Gaussian with mean $\approx (0, 10, 20, \ldots)$) the uncentered top vector aligned with the mean direction at $|\cos| = 1.0000$ and with the true first principal component at only $0.119$.
+
+Power iteration: start from a random unit $v$ and repeatedly set $v \leftarrow Cv/\|Cv\|$. Write $v_0 = \sum_i \alpha_i u_i$ in the eigenbasis; after $t$ steps the coefficient of $u_i$ is $\alpha_i \lambda_i^t$, so the second direction decays relative to the first as $(\lambda_2/\lambda_1)^t$---linear convergence at the rate of the eigengap, which is the argument to sketch when asked why it works. Two implementation points earn the grade. \textbf{Never form $C$}: compute $X_c^\top (X_c v)$ as two matrix-vector products, $O(nd)$ per iteration with no $d \times d$ matrix in memory---the difference between feasible and impossible when $d = 10^5$ and $n = 10^3$. \textbf{Renormalize every step}, or the iterate overflows or underflows geometrically.
+
+For components $2 \ldots k$, deflate. The textbook form subtracts $\lambda vv^\top$ from $C$; the version to write when you are not forming $C$ is to project the accumulated components out of the iterate at every step ($w \leftarrow w - \sum_j (u_j^\top w)u_j$), which is Gram--Schmidt against orthogonality drift rather than a one-time correction. Take the eigenvalue from the Rayleigh quotient $v^\top C v$, and report the explained-variance ratio $\lambda_i / \sum_j \lambda_j$, since that is what anyone actually wants from PCA.
+
+Converge on $|v_t^\top v_{t-1}| \to 1$---absolute value included, because the iterate can flip sign between steps without having moved, and treating a sign flip as non-convergence is a real bug that burns the iteration budget. Validate against \texttt{np.linalg.svd} of the centered matrix, which is both the test and the answer to ``how does this relate to SVD?'': if $X_c = U S V^\top$ then the rows of $V^\top$ are the principal directions and $\lambda_i = s_i^2/(n-1)$; no covariance is ever formed, and the SVD route is better conditioned. My implementation matches numpy's components at $|\cos| = 1 - 2\times10^{-12}$ and the eigenvalues to a relative $3 \times 10^{-13}$, in 14 to 34 iterations per component.
+
+The caveat to volunteer: convergence dies when $\lambda_1 \approx \lambda_2$. With exactly-controlled empirical spectra I measured 17, 95, and 581 iterations for gap ratios $\lambda_2/\lambda_1$ of $0.5$, $0.9$, and $0.99$, against $(\lambda_2/\lambda_1)^t$ predictions of roughly 16, 106, and 1111. At an exact degeneracy the individual eigenvectors are not identified at all---only the subspace is---and that is when you name the production answer: randomized SVD (a Gaussian sketch, a QR, and a small dense SVD), which gets the whole top-$k$ subspace in essentially one pass and is what \texttt{sklearn} switches to on large inputs.
+
+\redflags
+\begin{itemize}
+    \item Forgetting to center---silently wrong, and the most common failure in this problem.
+    \item Forming the $d \times d$ covariance explicitly for wide data.
+    \item Not renormalizing each iteration.
+    \item Deflating with unnormalized vectors, or deflating once and letting orthogonality drift over many components.
+    \item Testing convergence on $v^\top v_{\text{prev}} \to 1$ without the absolute value, so a sign flip looks like divergence.
+    \item Claiming PCA always requires standardized (not merely centered) features---it depends on whether the units are comparable.
+\end{itemize}
+
+\interviewtest{Numerical maturity: whether you know what an iterative eigensolver does, what it costs, when it fails, and how to check it against a library you are not allowed to call.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct centered power iteration for the first component.
+    \item \badgeLsix{L6} Matrix-free products, deflation for $k$ components, a real convergence criterion, and an SVD cross-check written as a test.
+    \item \badgeLseven{L7} The $(\lambda_2/\lambda_1)^t$ convergence argument, the degenerate-eigenvalue caveat, randomized SVD as the production method, and explained-variance reporting.
+\end{itemize}
+
+\followups{``How many iterations will this need?'' ``What if the top two eigenvalues are equal?'' ``How would you do this for a $10^6 \times 10^5$ sparse matrix?'' ``Relate this to SVD.''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={PCA by matrix-free power iteration with deflation. Verified against numpy SVD: components agree to 1e-12 and eigenvalues to a relative 3e-13.}]
+def pca_power(X, k, iters=100000, tol=1e-12, seed=0):
+    """Top-k principal components without ever forming the d x d covariance."""
+    rs = np.random.default_rng(seed)
+    Xc = X - X.mean(0)                              # centering is NOT optional
+    n, d = Xc.shape
+    comps, evals = [], []
+    for _ in range(k):
+        v = rs.normal(size=d); v /= np.linalg.norm(v)
+        for t in range(iters):
+            w = Xc.T @ (Xc @ v) / (n - 1)           # matrix-free: two matvecs, O(nd)
+            for u in comps:                         # deflate: project out found PCs
+                w -= (u @ w) * u                    # every step, against drift
+            nw = np.linalg.norm(w)
+            if nw < 1e-300:
+                break
+            w /= nw                                 # renormalize EVERY step
+            done = abs(abs(w @ v) - 1.0) < tol      # abs(): a sign flip is not motion
+            v = w
+            if done:
+                break
+        comps.append(v)
+        evals.append(float(v @ (Xc.T @ (Xc @ v)) / (n - 1)))   # Rayleigh quotient
+    return np.array(comps), np.array(evals)
+
+# The check to write unprompted: X_c = U S V^T, so the components are the rows
+# of V^T and the eigenvalues are s^2/(n-1).
+def pca_svd(X, k):
+    Xc = X - X.mean(0)
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    return Vt[:k], S[:k] ** 2 / (len(X) - 1)
+\end{lstlisting}
+
+%==============================================================================
 \section{kNN with a kd-Tree}
-% TODO Phase C3
+\label{cml:sec:canon_knn}
+%==============================================================================
 
+Asked in two tiers. Tier one---vectorized brute force---is a warm-up you should finish in five minutes. Tier two---a kd-tree with a correct pruning test---is a real data-structures problem, and the only one in this chapter whose honest answer ends with ``and in high dimensions you should not use this.''
+
+\begin{interviewq}
+\textbf{Q: Implement k-nearest-neighbors classification. Make the query as fast as you can without a tree.}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Compute the full $(q, n)$ squared-distance matrix with the same expansion as in k-means---one matmul, no square root, because ranking is invariant to it---then select the $k$ smallest per row with \texttt{np.argpartition}, not \texttt{np.argsort}. That is the detail the problem exists for: introselect is $O(n)$ per query against $O(n \log n)$ for a full sort, and you only need the $k$ smallest, unordered (sort those $k$ afterwards if you need them ranked). On $200$K points the partition ran two to five times faster than the sort across repeated runs, and the gap widens with $n$. Predict by majority vote for classification (\texttt{np.bincount(...).argmax()}, noting that it breaks ties toward the lower class index---say so, or use distance weighting) and by the mean for regression.
+
+Volunteer the two things that make kNN work or fail in practice. \textbf{Standardize the features}: the metric is whatever your units say it is, so one feature measured in a larger unit silently becomes the entire distance. I multiplied a single feature by $1000$ on otherwise well-scaled data and accuracy fell from $0.92$ to $0.34$; standardizing recovered $0.92$ exactly. Fit the scaler on the training split only---this is a leakage classic (Chapter~\ref{cml:chap:applied_craft}). \textbf{The curse of dimensionality}: as $d$ grows, the ratio between the nearest and the farthest neighbor distance concentrates toward one, so ``nearest'' stops meaning ``similar'' (Chapter~\ref{cml:chap:supervised_core}). kNN is a strong baseline in low dimensions and on learned embeddings; it is a weak one on raw high-dimensional features.
+
+Cost is $O(nd)$ per query for the distances plus $O(n)$ for the selection, with no training. Memory is the whole training set, which is the real production objection: at $10^7$ points and $d = 128$ you are holding 5 GB and paying it on every query, which is why the answer to ``how would you serve this?'' is an ANN index ([SR 3]), not this function.
+
+\redflags
+\begin{itemize}
+    \item \texttt{argsort} on the full distance matrix when only $k$ neighbors are needed.
+    \item A Python loop over query points.
+    \item Taking the square root before ranking (harmless, but it shows the invariance went unnoticed).
+    \item Forgetting to standardize, or standardizing with statistics computed over train and test together.
+    \item Silently ignoring vote ties, or an even $k$ in a binary problem.
+\end{itemize}
+
+\interviewtest{numpy fluency and metric hygiene. \texttt{argpartition} is the specific API the question is fishing for; standardization is the methodological half.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct vectorized distances and $k$ smallest via \texttt{argpartition}.
+    \item \badgeLsix{L6} Adds standardization, tie handling, distance weighting, and states the memory cost.
+    \item \badgeLseven{L7} Frames exact-versus-approximate honestly: when brute force on a GPU is genuinely the right production answer, and when an index earns its complexity ([SR 3]).
+\end{itemize}
+
+\followups{``Now make it a kd-tree.'' ``How do you choose $k$?'' ``What if one class is 100$\times$ rarer?'' ``How would you serve 10M vectors at 5 ms?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Brute-force kNN. Verified: neighbor sets identical to a full sort, and accuracy 0.92 to 0.34 to 0.92 across the rescaling experiment.}]
+def knn(Xtr, ytr, Xq, k=5, classify=True):
+    d2 = (Xq**2).sum(1)[:, None] + (Xtr**2).sum(1)[None, :] - 2 * Xq @ Xtr.T
+    idx = np.argpartition(d2, kth=k - 1, axis=1)[:, :k]   # O(n) select, not O(n log n)
+    if classify:
+        return np.array([np.bincount(ytr[r]).argmax() for r in idx])  # ties -> low class
+    return ytr[idx].mean(1)
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Now build a kd-tree and use it for nearest-neighbor search. When does it stop helping?}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Build.} Recursively split the point set by a hyperplane on one axis. Choose the axis of widest spread rather than cycling through dimensions---cycling is the textbook version, widest-spread produces better-shaped cells on anisotropic data---and split at the \emph{median} along that axis, found with \texttt{np.argpartition} in $O(n)$ rather than by a full sort in $O(n \log n)$; the recursion is then $O(n \log n)$ total and the tree is balanced by construction. Stop at a leaf bucket of 16 or 32 points and brute-force inside it: buckets amortize the recursion overhead and vectorize well. Store the splitting value, and maintain the invariant that every point in the left subtree has coordinate $\le$ the threshold and every point on the right has $\ge$---which is exactly what \texttt{argpartition} gives you, ties included.
+
+\textbf{Search.} Keep a max-heap of the $k$ best candidates so far, keyed by \emph{squared} distance. Descend to the leaf containing the query, scoring every point in that bucket, then unwind: at each internal node the near side has already been visited, and the far side must be visited only if the current best ball can cross the splitting plane---that is, if $(q_a - t)^2 < d_k^2$, the current $k$-th best squared distance, or if fewer than $k$ candidates have been found at all. That inequality is the entire algorithm, and the classic bug is mixing conventions: comparing a squared distance from the heap against an unsquared axis gap. Keep everything squared, everywhere, and say so while you write it.
+
+\textbf{When it stops helping.} The pruning test fires only when the ball is small relative to the cell geometry, and in high dimensions it essentially never fires, because the query's distance to its nearest neighbor becomes comparable to its distance to everything else while each of the $d$ axis gaps stays small relative to it. This is measurable, and measuring it is the answer that lands. On 4000 Gaussian points with $k = 5$, my implementation computed distances to $1\%$ of the dataset at $d = 2$, $14\%$ at $d = 5$, $80\%$ at $d = 10$, and $100\%$ at $d = 20$ and $d = 50$---at which point the tree is brute force plus pointer-chasing overhead, and slower than the vectorized matmul from the previous problem. The rule of thumb, $d \gtrsim 20$, is exactly what the measurement shows. Expected query cost is $O(\log n)$ in low dimensions; the worst case is $O(n)$, always.
+
+So the production answer is: exact search in low dimensions uses a kd-tree or ball tree; exact search in high dimensions uses brute force, ideally on a GPU; and approximate search in high dimensions uses HNSW or IVF-PQ, trading an exactness guarantee for orders of magnitude in latency ([SR 3]). Knowing which of those three regimes you are in is the actual skill; the kd-tree is how the interviewer checks that you know the regimes exist.
+
+\redflags
+\begin{itemize}
+    \item A pruning test that mixes squared and unsquared distances---the bug that silently returns wrong neighbors.
+    \item Never visiting the far subtree, i.e.\ greedy descent presented as exact search.
+    \item Sorting to find the median instead of partitioning, giving an $O(n \log^2 n)$ build.
+    \item Forgetting to score the points in the leaf bucket itself, or dropping the node's own point in a point-per-node variant.
+    \item Claiming kd-trees are why vector databases are fast.
+    \item No answer to ``what happens at $d = 100$?''
+\end{itemize}
+
+\interviewtest{Whether you can implement a recursive spatial data structure correctly under time pressure, and whether you know the honest limits of the thing you just built.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct build; single-nearest-neighbor search with the pruning idea explained even if the code needs a hint.
+    \item \badgeLsix{L6} Correct $k$-NN with a bounded heap, correct pruning test, median partitioning, and the high-dimensional caveat stated.
+    \item \badgeLseven{L7} Quantifies the degeneration (fraction of points visited versus $d$), contrasts the exact and approximate regimes, and names what production actually runs ([SR 3]).
+\end{itemize}
+
+\followups{``Make it return the $k$ nearest rather than one.'' ``What is the worst-case query cost?'' ``How would a ball tree differ?'' ``How does HNSW avoid this problem?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={kd-tree build and k-NN search with the pruning bound. Verified exact against brute force at every dimension tested; distances computed rise from 1 percent of the data at d=2 to 100 percent at d=20.}]
+class Node:
+    __slots__ = ("axis", "thr", "left", "right", "idx")
+
+def kdbuild(X, idx, leaf_size=16):
+    nd = Node()
+    if len(idx) <= leaf_size:
+        nd.axis, nd.idx = -1, idx                   # leaf: brute force the bucket
+        return nd
+    a = int((X[idx].max(0) - X[idx].min(0)).argmax())   # widest spread > round-robin
+    m = len(idx) // 2
+    idx = idx[np.argpartition(X[idx, a], m)]        # median in O(n), not a full sort
+    nd.axis, nd.thr, nd.idx = a, float(X[idx[m], a]), None
+    nd.left = kdbuild(X, idx[:m], leaf_size)        # every coord here is <= thr
+    nd.right = kdbuild(X, idx[m:], leaf_size)       # every coord here is >= thr
+    return nd
+
+def kdquery(nd, X, q, k, heap):
+    if nd.axis == -1:
+        for i in nd.idx:
+            dist = float(((X[i] - q) ** 2).sum())   # squared, consistently
+            if len(heap) < k:
+                heapq.heappush(heap, (-dist, int(i)))       # max-heap of the k best
+            elif dist < -heap[0][0]:
+                heapq.heapreplace(heap, (-dist, int(i)))
+        return
+    diff = q[nd.axis] - nd.thr
+    near, far = (nd.left, nd.right) if diff <= 0 else (nd.right, nd.left)
+    kdquery(near, X, q, k, heap)                    # descend the near side first
+    if len(heap) < k or diff * diff < -heap[0][0]:  # ball crosses the plane: must visit
+        kdquery(far, X, q, k, heap)
+
+def kdknn(root, X, q, k):
+    heap = []
+    kdquery(root, X, q, k, heap)
+    return sorted((-d, i) for d, i in heap)         # (sq_dist, index), nearest first
+\end{lstlisting}
+
+%==============================================================================
+\section{Warm-Ups and Adjacent Asks}
+\label{cml:sec:canon_extras}
+%==============================================================================
+
+These fill the first ten minutes of a round, or the last ten. They are shorter than the canon proper but not easier to get exactly right, and two of them---linear regression and AUC---are asked often enough to deserve full treatment.
+
+\begin{interviewq}
+\textbf{Q: Implement linear regression two ways: the closed form and gradient descent. Which would a library use?}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The closed form comes from setting the gradient of $\|Xw - y\|^2$ to zero: $X^\top X w = X^\top y$, so $w = (X^\top X)^{-1}X^\top y$ mathematically---and \texttt{np.linalg.solve(XtX, Xty)} in code. Never call \texttt{inv}. Explicit inversion costs more, is less accurate, and computes $d^2$ numbers you then use once. Handle the intercept by appending a column of ones, and for ridge add $\lambda I$ with a zero in the intercept's diagonal position so the intercept stays unpenalized. Cost is $O(nd^2)$ to form the Gram matrix plus $O(d^3)$ to solve, which is why the closed form stops being the answer around $d$ in the tens of thousands.
+
+The staff-level point is the one nobody volunteers: \textbf{libraries do not solve the normal equations at all}. Forming $X^\top X$ squares the condition number, so a design matrix with $\kappa(X) = 10^8$---perfectly ordinary with correlated features---yields a Gram matrix at $10^{16}$, right at the edge of double precision. I measured it: recovering a known coefficient vector from noiseless data, the normal equations gave a maximum error of $4.9 \times 10^{-1}$ while \texttt{lstsq}, which uses an SVD, gave $2.0 \times 10^{-10}$. At $\kappa = 10^4$ the two were $6.0\times10^{-10}$ and $6.4\times10^{-15}$. That is many orders of magnitude of accuracy on the same problem, and it is why \texttt{sklearn}'s \texttt{LinearRegression} calls a least-squares driver (QR or SVD) rather than the textbook formula.
+
+Gradient descent is the fallback when $d$ is large or the data streams: $w \leftarrow w - \eta X^\top(Xw - y)/n$. Choose the step size from the curvature rather than by guessing---$\eta = 1/L$ with $L = \lambda_{\max}(X^\top X/n)$ is a safe constant step, and above $2/L$ the iteration diverges. Say that out loud, then check convergence against the closed form on a small problem, which is exactly what my test does (agreement to $10^{-8}$).
+
+\redflags
+\begin{itemize}
+    \item \texttt{np.linalg.inv(X.T @ X)}.
+    \item Not knowing why the normal equations are numerically inferior to QR/SVD.
+    \item Penalizing the intercept in the ridge version.
+    \item A hand-tuned learning rate with no reference to curvature or to divergence above $2/L$.
+    \item Forgetting the $1/n$ in the gradient, so the step size depends on the sample size.
+\end{itemize}
+
+\interviewtest{Whether the first model you ever learned still has depth for you: conditioning, cost, and why the library disagrees with the textbook.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct closed form with an intercept and a working GD loop.
+    \item \badgeLsix{L6} Uses \texttt{solve} over \texttt{inv}, states $O(nd^2 + d^3)$, adds ridge correctly, picks the step size from $\lambda_{\max}$.
+    \item \badgeLseven{L7} Explains the squared condition number with a number attached, names QR/SVD as what libraries actually do, and knows when iterative methods win.
+\end{itemize}
+
+\followups{``Add L2 and show what changes.'' ``What if $X$ is rank-deficient?'' ``When is $d^3$ actually a problem?'' ``How would you do this across 100 machines?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Linear regression, closed form and gradient descent. Verified against numpy lstsq to 1e-10; at condition number 1e8 the normal equations lose eight digits that the QR route keeps.}]
+def linreg_normal(X, y, l2=0.0):
+    Xb = np.hstack([X, np.ones((len(X), 1))])
+    P = np.eye(Xb.shape[1]); P[-1, -1] = 0.0        # don't penalize the intercept
+    return np.linalg.solve(Xb.T @ Xb + l2 * P, Xb.T @ y)   # solve, NEVER inv()
+
+def linreg_gd(X, y, steps=2000, l2=0.0):
+    Xb = np.hstack([X, np.ones((len(X), 1))])
+    n = len(y)
+    w = np.zeros(Xb.shape[1])
+    L = float(np.linalg.eigvalsh(Xb.T @ Xb / n).max()) + l2   # 1/L is the safe step
+    for _ in range(steps):
+        w -= (1.0 / L) * (Xb.T @ (Xb @ w - y) / n + l2 * w)
+    return w
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Implement AUC from scratch. What do you do about ties?}
+
+\badgeLfive{L5} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Do not sweep thresholds and integrate a curve---that is the definition, not the algorithm. Use the ranking identity: AUC is the probability that a random positive scores above a random negative, so it equals the normalized Mann--Whitney $U$ statistic,
+\[
+\mathrm{AUC} = \frac{\sum_{i \in \text{pos}} r_i - n_+(n_+ + 1)/2}{n_+ n_-},
+\]
+where $r_i$ is the rank of example $i$ in ascending score order. One sort, $O(n \log n)$, no thresholds, no curve. The subtracted term is the rank sum a perfectly-ordered positive set would occupy, $1 + 2 + \cdots + n_+$.
+
+Ties are the whole test. Equal scores must receive the \emph{average} of the ranks they span, which is exactly what makes a tied pair contribute $0.5$ instead of $1$ or $0$---the trapezoidal convention every library uses. Get it wrong and a model that outputs a constant scores $0$ or $1$ instead of $0.5$; get it right and the all-tied case returns $0.5$ by construction. This matters more than it sounds: shallow tree models, and any pipeline that rounds or bins scores, produce heavy ties routinely.
+
+State the edge cases as you write them. With only one class present AUC is undefined---return \texttt{nan}, do not silently return $0.5$. AUC is invariant to any monotone transform of the scores, so calibration does not change it, which is precisely why it is the wrong metric when you care about probability quality ([DL 23]). And it is insensitive to class balance in a way that flatters models on rare-positive problems, where PR-AUC is usually the more honest number. Test against brute-force pair counting on small inputs---mine matches on 200 random cases including heavy ties, and returns $1.0$, $0.0$, $0.5$, and \texttt{nan} on the perfect, reversed, all-tied, and single-class cases.
+
+\redflags
+\begin{itemize}
+    \item Threshold sweeping with a nested loop, i.e.\ $O(n^2)$.
+    \item Ignoring ties, or breaking them by input order.
+    \item Returning $0.5$ when only one class is present.
+    \item Not knowing AUC is invariant to monotone score transforms.
+    \item Confusing ROC-AUC with average precision.
+\end{itemize}
+
+\interviewtest{Whether the metric your models are graded on is one you understand mechanically. The rank formulation and the tie convention are the two things being checked.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct $O(n \log n)$ rank formulation.
+    \item \badgeLsix{L6} Correct average-rank tie handling, degenerate cases, and a brute-force cross-check.
+    \item \badgeLseven{L7} Explains when AUC misleads---heavy imbalance, threshold-dependent products, calibration-sensitive consumers---and what to report instead.
+\end{itemize}
+
+\followups{``Now do PR-AUC.'' ``How would you compute AUC over a billion rows?'' ``How do you put a confidence interval on it?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={AUC by the rank formulation, with average ranks for ties. Verified against exhaustive pairwise counting on 200 random cases.}]
+def auc(y, s):
+    """Mann-Whitney U in rank form: O(n log n); ties get half credit."""
+    y, s = np.asarray(y, dtype=float), np.asarray(s, dtype=float)
+    order = np.argsort(s, kind="mergesort")
+    ss = s[order]
+    ranks = np.empty(len(s), dtype=float)
+    ranks[order] = np.arange(1, len(s) + 1)
+    i = 0
+    while i < len(s):                      # average the ranks inside each tied group
+        j = i
+        while j + 1 < len(s) and ss[j + 1] == ss[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = 0.5 * (i + 1 + j + 1)
+        i = j + 1
+    npos, nneg = float(y.sum()), float((1 - y).sum())
+    if npos == 0 or nneg == 0:
+        return float("nan")                # undefined with a single class present
+    return float((ranks[y == 1].sum() - npos * (npos + 1) / 2) / (npos * nneg))
+\end{lstlisting}
+
+\subsection{Two More Skeletons Worth Having Memorized}
+
+\textbf{Multinomial naive Bayes for text.} Two ideas, and each is the answer to a trap. Work in log space---you are multiplying thousands of small probabilities, and the product underflows to zero in \texttt{float64} well before a document ends, so sum logs instead. And smooth: a word never seen in a class has count zero, so its log-likelihood is $-\infty$ and one unseen word vetoes an entire class regardless of all other evidence. Laplace ($\alpha = 1$) or Lidstone ($\alpha < 1$) smoothing adds $\alpha$ to every count before normalizing. On my synthetic corpus, 2 of the $K \times V$ count cells were zero---a small vocabulary and only 300 documents, and the bug is already live. Classification is then one matmul: $\arg\max_c\ \log \pi_c + \sum_w x_w \log \theta_{cw}$.
+
+\begin{lstlisting}[language=Python,caption={Multinomial naive Bayes in log space with Laplace smoothing. Verified: a hand-checkable two-word table gives 0.75 and 0.25 as expected.}]
+def nb_fit(counts, y, n_cls, alpha=1.0):
+    """counts: (n, V) term counts. Everything in logs; alpha is Laplace smoothing."""
+    logprior = np.log(np.bincount(y, minlength=n_cls) + alpha) \
+             - np.log(len(y) + alpha * n_cls)
+    cw = np.vstack([counts[y == c].sum(0) + alpha for c in range(n_cls)])   # (K, V)
+    return logprior, np.log(cw) - np.log(cw.sum(1, keepdims=True))
+
+def nb_predict(counts, logprior, loglik):
+    return (counts @ loglik.T + logprior).argmax(1)   # add logs; never multiply probs
+\end{lstlisting}
+
+\textbf{A stratified k-fold splitter.} Asked to test indexing care and to see whether you know why stratification exists. Shuffle the indices \emph{within each class}, then deal them round-robin into folds; every fold then carries the population class mix, up to rounding. On a $10\%$-positive dataset my stratified folds each had a positive rate of exactly $0.100$, while a plain shuffled split of the same data gave folds at $0.075, 0.05, 0.15, 0.075, 0.15$---a threefold spread in the very quantity you are trying to measure, and that is at $n = 200$ with a class that is not even rare. Assert the invariants in front of the interviewer: the test folds partition the indices exactly, train and test are disjoint, and each fold's class rate matches the population. Then name the two extensions unprompted: grouped splitting when rows share an entity (the leakage case, Chapter~\ref{cml:chap:applied_craft}) and time-ordered splitting when rows are temporally dependent, where stratified shuffling is actively wrong (Chapter~\ref{cml:chap:time_series}).
+
+\begin{lstlisting}[language=Python,caption={Stratified k-fold from scratch. Verified: exact class rates in every fold, disjoint train and test, and the folds partition the data.}]
+def stratified_folds(y, k=5, seed=0):
+    """Deal each class round-robin so every fold sees the population class mix."""
+    rs = np.random.default_rng(seed)
+    fold = np.empty(len(y), dtype=int)
+    for c in np.unique(y):
+        idx = np.where(y == c)[0]
+        rs.shuffle(idx)                              # shuffle WITHIN class, then deal
+        fold[idx] = np.arange(len(idx)) % k
+    return [(np.where(fold != f)[0], np.where(fold == f)[0]) for f in range(k)]
+\end{lstlisting}
+
+\begin{interviewq}
+\textbf{Q: Write a cross-validation harness without sklearn, and use it to compare two models. Where does leakage sneak in?}
+
+\badgeLsix{L6} \quad \badgetype{Coding} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The harness is ten lines and the API design is the interesting half. Take a callable with the signature \texttt{fit\_predict(X\_train, y\_train, X\_test) -> y\_hat} rather than a fitted model object, because that signature makes the correct behavior structurally hard to violate: everything the model learns---scaler statistics, imputation values, feature selection, encoders, the hyperparameter search itself---must happen inside the callable, on the training fold only. Then loop the folds, score, and report the mean \emph{and the spread}: a single averaged number hides that fold-to-fold variance is often larger than the difference between the two models you are comparing, and reporting mean $\pm$ std unprompted is a seniority signal.
+
+Now the part the question is really about. The classic leak is fitting anything on all the data before splitting, and feature selection is the version that produces the most spectacular numbers. I ran the standard demonstration: $n = 100$ rows, $d = 2000$ pure-noise features, labels drawn independently of $X$, so the truth is exactly chance. Selecting the ten features most correlated with $y$ \emph{using the whole dataset} and then cross-validating the classifier on those ten reported $0.813$ accuracy on average over ten independent datasets (range $0.79$--$0.87$). Doing the selection inside each fold reported $0.491$ (range $0.37$--$0.58$), which is chance, which is the truth. That is a 32-point illusion on data that contains no signal at all, and the code that produces it looks completely reasonable.
+
+The same mechanism, in decreasing order of how often it appears in real pipelines: a scaler or imputer fit before the split; target encoding computed over all rows; oversampling (SMOTE) applied before splitting, so a synthetic point in training is interpolated from a test point; hyperparameters tuned on the same folds you then report---which is what nested CV exists to fix; and, for grouped or temporal data, folds that split a single user or that put the future in the training set (Chapter~\ref{cml:chap:applied_craft}, Chapter~\ref{cml:chap:time_series}). Say the diagnostic out loud as well: shuffle the labels and re-run the whole harness. An honest pipeline collapses to chance; anything that does not is leaking, and this is the cheapest leak detector that exists.
+
+\redflags
+\begin{itemize}
+    \item Scaling, imputing, encoding, or selecting features before the fold loop.
+    \item Reporting a mean CV score with no spread across folds.
+    \item Tuning hyperparameters on the same folds that produce the reported number.
+    \item Shuffled splitting on grouped or temporal data.
+    \item An API that takes a pre-fitted model, so the correct thing is not the easy thing.
+\end{itemize}
+
+\interviewtest{Whether you know that the evaluation harness is where most real-world overstatement comes from, and whether your API design makes leakage hard rather than merely discouraged.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct fold construction and a working loop.
+    \item \badgeLsix{L6} Stratification, an API that forces fitting inside the fold, mean and spread reported, and the leakage list.
+    \item \badgeLseven{L7} Nested CV for tuning, grouped and time-ordered variants, the shuffled-label sanity check, and a quantified example of what the leak is worth.
+\end{itemize}
+
+\followups{``Now do nested CV.'' ``How would you cross-validate 5 years of transactions?'' ``Your CV says 0.95 and production says 0.72---where do you look first?''}
+\end{interviewq}
+
+\begin{lstlisting}[language=Python,caption={Cross-validation harness whose API forces fitting inside the fold. Verified: on 2000 pure-noise features, honest CV returns chance at 0.491 while selecting features before splitting returns 0.813.}]
+def cross_val_score(fit_predict, X, y, k=5, seed=0):
+    """fit_predict(Xtr, ytr, Xte) -> yhat. EVERYTHING fitted -- scalers, imputers,
+    encoders, feature selection, tuning -- must happen INSIDE this callable."""
+    out = []
+    for tr, te in stratified_folds(y, k, seed):
+        yhat = fit_predict(X[tr], y[tr], X[te])
+        out.append(float((yhat == y[te]).mean()))
+    return float(np.mean(out)), float(np.std(out))   # report the spread, not just mean
+
+def select_and_fit(Xtr, ytr, Xte, m=10):
+    """Selection is INSIDE, so it only ever sees the training fold."""
+    c = np.abs(((Xtr - Xtr.mean(0)) * (ytr - ytr.mean())[:, None]).mean(0)
+               / (Xtr.std(0) * ytr.std() + 1e-12))
+    keep = np.argsort(-c)[:m]
+    mu0, mu1 = Xtr[ytr == 0][:, keep].mean(0), Xtr[ytr == 1][:, keep].mean(0)
+    d0 = ((Xte[:, keep] - mu0) ** 2).sum(1)
+    d1 = ((Xte[:, keep] - mu1) ** 2).sum(1)
+    return (d1 < d0).astype(float)
+\end{lstlisting}
+
+%==============================================================================
 \section{Grading Rubrics and Red Flags}
-% TODO Phase C3
+\label{cml:sec:canon_rubrics}
+%==============================================================================
 
+\subsection{What Interviewers Actually Score}
+
+The per-problem bars above are specific; this is the general rubric they instantiate, in the order it is weighted. Read it as a self-grading checklist after every practice attempt---the pattern of what you miss is usually stable across problems, and it tells you exactly what to drill.
+
+\begin{enumerate}
+    \item \textbf{Correctness on edge cases, volunteered rather than prompted.} Empty cluster, single class in a node, constant feature, $k > n$, all-tied scores, duplicate points, one-class AUC. The signal is not that you handle them---it is that you raised them. A candidate who asks ``what should this do if a cluster empties?'' before writing the loop has already passed the part of the rubric most candidates fail.
+    \item \textbf{Vectorization and complexity fluency.} State big-O before writing, not after being asked. No Python loop over samples where a matmul or a sort suffices; no $O(n^2)$ split finding; \texttt{argpartition} where the full order is not needed. Equally, know where a loop is fine---over $k$ clusters, over boosting rounds, over tree nodes---and say why.
+    \item \textbf{Numerical hygiene.} Stable sigmoid and log-sum-exp, centering before PCA, clipping the distance expansion, $\epsilon$ inside the denominator, tolerance-based convergence instead of float equality, log space for products of probabilities. These are reflexes; an interviewer can tell within one function whether you have them.
+    \item \textbf{API and test discipline.} A decided \texttt{fit}/\texttt{predict} shape, documented array shapes, and a hand-checkable test written before anyone asks. ``Three blobs, three clusters, inertia around 32'' is worth more than one more feature.
+    \item \textbf{Connecting code to theory.} ``This residual is the negative gradient because $\partial L/\partial F = p - y$, so the same loop optimizes any differentiable loss.'' ``This leaf value is $-G/(H+\lambda)$ because minimizing the second-order expansion gives that closed form.'' ``Power iteration converges at $(\lambda_2/\lambda_1)^t$, so a small eigengap is slow.'' This is the staff/senior discriminator, and it costs one sentence per problem.
+\end{enumerate}
+
+\subsection{Red-Flag Performances}
+
+Each of these ends a round, or caps it well below the bar. They are ordered roughly by how often interviewers report them.
+
+\begin{itemize}
+    \item \textbf{Reciting the sklearn API instead of implementing.} ``I would just call \texttt{KMeans}''---and then unable to write the assignment step, the impurity function, or the sigmoid from memory. The library knowledge is necessary; it is not sufficient, and this round exists precisely to separate the two.
+    \item \textbf{No convergence criterion.} A hard-coded ten iterations with no rationale, or \texttt{while True} with a \texttt{break} on exact float equality. Say what you are converging on, and to what tolerance.
+    \item \textbf{Overflow on the first adversarial input.} $\exp$ of a large positive number in a sigmoid or a softmax, $\log(0)$ in a loss or a naive Bayes. The interviewer will hand you $z = 1000$; assume it.
+    \item \textbf{$O(n^2 d)$ split finding with no awareness that a sort-based sweep exists.} The most common complexity failure in the classical canon, and the one the tree problem is designed to surface.
+    \item \textbf{Cannot connect the implementation to the math.} ``Why is that the gradient?'' answered with ``that's the formula.'' If you can only recall the code, you cannot extend it---and every follow-up in this chapter is an extension.
+    \item \textbf{Claiming the code works without running or testing anything.} Especially after a compile-free whiteboard implementation. State the test you would run and its expected output; if you can execute, execute.
+    \item \textbf{Silent methodological errors presented as results.} Unstandardized features in a distance method, an unstratified split on an imbalanced problem, a threshold tuned on the set you then report, PCA without centering. These produce numbers, which is what makes them dangerous---and catching them unprompted is the clearest seniority signal available in this round.
+\end{itemize}
+
+\subsection{Triage: The Twenty-Minute Version}
+
+Most of these problems are posed with a 20- to 25-minute budget and a follow-up ladder the interviewer never expects you to finish. Knowing what to write first---and, crucially, what to \emph{name and defer} out loud---is the difference between a partial solution that reads as competent and one that reads as incomplete. The pattern is always the same, and Table~\ref{cml:tab:canon_triage} applies it problem by problem: build the correct core, say the name of every refinement you are skipping, and add them in the order the grader weights them.
+
+\begin{table}[H]\centering
+\caption{What to write first, and what to name and defer}
+\label{cml:tab:canon_triage}
+\small
+\begin{tabular}{p{2.6cm}p{5.4cm}p{5.6cm}}
+\toprule
+\textbf{Problem} & \textbf{The core, first} & \textbf{Name, then add if time} \\
+\midrule
+k-means & Vectorized assign/update loop with tolerance convergence & k-means++, empty-cluster repair, restarts, mini-batch \\
+Logistic regression & Stable sigmoid, gradient, minibatch loop & L2 excluding bias, gradient check, class weights \\
+Split finding & Gini plus the sorted sweep for one node & Recursion and stopping rules, regression variant, histogram binning \\
+Boosting & Squared-loss residual loop with shrinkage & Log loss in logit space, Newton leaves, early stopping \\
+PCA & Centered power iteration for PC1 & Deflation to $k$, matrix-free products, SVD cross-check \\
+kNN / kd-tree & Brute force with \texttt{argpartition} & kd-tree build, pruning test, the high-$d$ analysis \\
+AUC & Rank formulation & Tie averaging, degenerate cases, PR-AUC \\
+CV harness & Fold loop with a fit-inside API & Stratification, nested tuning, grouped and temporal splits \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Deferring out loud is not a concession, it is a demonstration: ``I'll seed uniformly for now---k-means++ samples proportional to $D^2$ and I'll swap it in once the loop is correct, since bad seeds are the main failure mode here'' tells the grader you know the full answer and are sequencing it. Silence while you write the simple version tells them nothing. And when the timer wins, finish the sentence rather than the function: ``the remaining piece is the far-subtree visit, gated on $(q_a - t)^2 < d_k^2$; without it this is approximate rather than exact'' converts an unfinished implementation into a demonstrated plan, which is worth most of the credit.
+
+\begin{warningbox}
+\textbf{Practice protocol, borrowed from [DL 28] and specialized.} Set a 45-minute timer, open a plain editor with no autocomplete and no assistant, and implement one problem end to end \emph{including its test}; only then run it and diff against the reference. A workable two-week cadence for the classical track: days 1--3 k-means and logistic regression until both are reliably under 20 minutes; days 4--6 split finding and a boosting round, which share machinery; days 7--8 PCA with the SVD cross-check; days 9--10 kNN and the kd-tree; days 11--12 the warm-ups (normal equations, AUC, naive Bayes, stratified folds) under a 15-minute timer each; days 13--14 mixed random draws plus one mock with another person. Runnable versions of every listing in this chapter, with the tests each answer claims, are in \texttt{drills/canon\_e\_classical.py}---read them only after your own attempt runs.
+\end{warningbox}

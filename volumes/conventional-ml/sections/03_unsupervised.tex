@@ -2,24 +2,1041 @@
 \label{cml:chap:unsupervised}
 
 \begin{tldr}
-Placeholder — this chapter is written per docs/coverage-spec.md, seeded by the author's own conventional-ML document when it arrives (Phase C3).
+Unsupervised learning is where interviews test whether you can do mathematics without a label column to hide behind. Two derivations dominate: \textbf{PCA} (maximize $w^\top S w$ subject to $\norm{w}=1$, get an eigenproblem, then explain why every library actually runs an SVD) and the \textbf{GMM's EM updates} (responsibilities by Bayes' rule, weighted-MLE M-step, then the ELBO argument for why the likelihood cannot go down). Around them sits a ring of judgment questions that separate people who have clustered production data from people who have read about it: why Lloyd's algorithm converges but only to a local optimum, why k-means++ exists, why ``choose $k$ by the elbow'' is a non-answer, which of k-means/GMM/hierarchical/DBSCAN matches which cluster geometry, and---the single most reliable trap in the whole chapter---what you may and may not conclude from a t-SNE plot that looks beautiful. This chapter derives all four whiteboard results in full, enumerates the failure modes as checklists you can produce on demand, and puts the caveats \emph{before} the methods for the manifold-visualization section, because that is the order in which they matter. Embedding \emph{learning} lives in [NLP 3] and [DL 6]; approximate nearest neighbor indexes live in [SR 3]; the from-scratch k-means and PCA implementations are drilled in [DL 28] and in this volume's coding-canon chapter (Chapter~\ref{cml:chap:coding_canon}).
 \end{tldr}
 
+%==============================================================================
 \section{k-means}
-% TODO Phase C3
+\label{cml:sec:kmeans}
+%==============================================================================
 
+k-means is the most-asked unsupervised algorithm in interviews for the same reason it is the most-used one in practice: it is four lines of code, it scales, and everybody believes they understand it. The questions are therefore never ``what is k-means'' but ``what exactly is it optimizing,'' ``why does that loop terminate,'' ``what does it assume about your data,'' and ``what do you do when those assumptions are false''---all of which have crisp answers that most candidates cannot produce.
+
+\subsection{The Objective and Lloyd's Algorithm}
+
+Given $n$ points $x_1, \ldots, x_n \in \R^d$ and a target cluster count $k$, k-means seeks an assignment $c: \{1,\ldots,n\} \to \{1,\ldots,k\}$ and centroids $\mu_1, \ldots, \mu_k \in \R^d$ minimizing the \textbf{within-cluster sum of squares} (WCSS, or inertia):
+
+\begin{mathresult}{The k-means Objective}
+\begin{equation}
+J(c, \mu) \;=\; \sum_{k'=1}^{K} \sum_{i \,:\, c(i) = k'} \norm{x_i - \mu_{k'}}_2^2
+\;=\; \sum_{i=1}^{n} \norm{x_i - \mu_{c(i)}}_2^2 .
+\end{equation}
+This is a joint minimization over a \emph{discrete} variable (the assignment) and a \emph{continuous} one (the centroids), and it is NP-hard in general---even for $k=2$ in general dimension, and even in the plane for general $k$ (Aloise et al., 2009; Mahajan et al., 2009). Every practical algorithm is a heuristic. Lloyd's algorithm is \textbf{alternating minimization}: solve exactly for one block with the other held fixed, and repeat.
+\end{mathresult}
+
+\textbf{Lloyd's algorithm} (Lloyd, 1957/1982), the thing everyone means by ``k-means'':
+\begin{enumerate}
+    \item \textbf{Initialize} $\mu_1, \ldots, \mu_k$ (see Section~\ref{cml:sec:kmeanspp}---this step matters far more than its one line suggests).
+    \item \textbf{Assignment step.} $c(i) \leftarrow \argmin_{k'} \norm{x_i - \mu_{k'}}^2$ for every $i$. With the centroids fixed, the objective decouples across points, so assigning each point to its nearest centroid is not a heuristic---it is the \emph{exact} minimizer over $c$.
+    \item \textbf{Update step.} $\mu_{k'} \leftarrow \frac{1}{|C_{k'}|}\sum_{i \in C_{k'}} x_i$. With the assignment fixed, the objective decouples across clusters, and the mean is the \emph{exact} minimizer of each cluster's SSE (derived below).
+    \item Repeat 2--3 until assignments stop changing.
+\end{enumerate}
+
+Cost is $O(nkd)$ per iteration for the assignment step (the update step is $O(nd)$), and practical runs converge in tens of iterations, which is why k-means handles tens of millions of points on a laptop while every other clustering algorithm in this chapter does not.
+
+\begin{mathresult}{The Mean Minimizes SSE (the ``why the update step is exact'' derivation)}
+Fix a cluster $C$ with $m = |C|$ points and minimize $f(\mu) = \sum_{i \in C} \norm{x_i - \mu}^2$ over $\mu \in \R^d$. The gradient is
+\begin{equation}
+\nabla_\mu f = \sum_{i \in C} -2(x_i - \mu) = -2\Big(\sum_{i \in C} x_i\Big) + 2m\mu,
+\end{equation}
+which vanishes at $\mu^\star = \frac{1}{m}\sum_{i \in C} x_i$, the cluster mean. The Hessian is $2m I \succ 0$, so $f$ is strictly convex and $\mu^\star$ is the unique global minimizer. This one-line argument is also the answer to ``why squared Euclidean distance and not something else'': the update step is a closed-form mean \emph{because} the loss is squared error. Change the distance to $L_1$ and the optimal centre becomes the coordinate-wise median (k-medians); require the centre to be an actual data point and you get k-medoids/PAM, whose update step is a search, not a formula, and costs $O(m^2)$ per cluster.
+\end{mathresult}
+
+\subsection{Why It Converges, and to What}
+
+\begin{keyinsight}[The Convergence Argument in Three Sentences]
+Both steps of Lloyd's algorithm minimize the \emph{same} objective $J$ exactly over one block of variables, so $J$ is \textbf{non-increasing} across every step and strictly decreasing whenever any assignment changes. $J$ depends on the data only through the assignment $c$, and there are finitely many assignments (at most $k^n$), so the sequence of assignments can never revisit one and must stop. Therefore Lloyd's algorithm terminates in a \textbf{finite} number of iterations---at a \textbf{local} optimum, or more precisely at a fixed point where no single point's reassignment and no centroid's recomputation improves $J$; it says nothing whatsoever about the global optimum.
+\end{keyinsight}
+
+Two refinements worth having ready. First, ``finite'' is not ``fast'': the worst-case number of Lloyd iterations is superpolynomial---$2^{\Omega(\sqrt{n})}$ even in the plane (Arthur \& Vassilvitskii, 2006)---though \emph{smoothed} analysis shows polynomial behaviour under tiny perturbations, which is why nobody sees this in practice. Second, the fixed point can be arbitrarily bad, and the standard demonstration takes ten seconds on a whiteboard.
+
+\textbf{A worked local optimum.} Take six points on a line: $\{0, 1, 10, 11, 20, 21\}$ with $k = 3$. The optimal clustering is obviously $\{0,1\}, \{10,11\}, \{20,21\}$ with centroids $0.5, 10.5, 20.5$ and $J^\star = 6 \times 0.25 = 1.5$ (each of the six points sits $0.5$ from its centroid). Now initialize centroids at $\{0, 1, 15.5\}$---two seeds landed inside the same true cluster. Assignment: $0 \to \mu_1$, $1 \to \mu_2$, and $10, 11, 20, 21$ all go to $\mu_3$ (e.g., $|10 - 1| = 9 > |10 - 15.5| = 5.5$). Update: $\mu_1 = 0$, $\mu_2 = 1$, $\mu_3 = \frac{10+11+20+21}{4} = 15.5$. Nothing moved---this is a fixed point, and Lloyd's algorithm stops here with
+\begin{equation*}
+J = 0 + 0 + (5.5^2 + 4.5^2 + 4.5^2 + 5.5^2) = 30.25 + 20.25 + 20.25 + 30.25 = 101,
+\end{equation*}
+which is $67\times$ worse than the optimum. Nothing about the algorithm is broken; two seeds in one true cluster is a stable configuration, and \emph{that} is the whole motivation for the next subsection.
+
+\subsection{Initialization: k-means++ and the Restart Discipline}
+\label{cml:sec:kmeanspp}
+
+\textbf{Why uniformly random initialization fails.} Sample $k$ seeds uniformly from the data and the probability that each of $k$ equal-sized true clusters receives exactly one seed is $k!/k^k$, which is $\approx 3.8\%$ at $k=5$, $0.04\%$ at $k=10$, and effectively zero beyond that---the birthday problem, in cluster form. The typical random initialization therefore puts two seeds in one cluster and none in another, and as the worked example above shows, that is often a stable configuration Lloyd's algorithm cannot escape. Random initialization of \emph{centroids anywhere in the bounding box} (Forgy vs.\ random-partition variants aside) is worse still: seeds in empty regions produce empty clusters, which libraries then have to patch with ad-hoc relocation rules.
+
+\begin{mathresult}{k-means++ ($D^2$ Seeding; Arthur \& Vassilvitskii, 2007)}
+\begin{enumerate}
+    \item Choose the first centre $\mu_1$ uniformly at random from the data.
+    \item For each remaining point $x$, let $D(x) = \min_{j \le t} \norm{x - \mu_j}$ be the distance to the nearest centre chosen so far. Choose the next centre to be $x$ with probability
+    \begin{equation}
+    \prob{x} = \frac{D(x)^2}{\sum_{x'} D(x')^2}.
+    \end{equation}
+    \item Repeat until $k$ centres are chosen, then run Lloyd's algorithm from them.
+\end{enumerate}
+The $D^2$ weighting spreads seeds out---a point far from every existing centre is quadratically more likely to be picked---while the randomness keeps a lone outlier from being chosen deterministically. The guarantee: the expected cost of the \emph{seeding alone}, before a single Lloyd iteration, satisfies $\E[J] \le 8(\ln k + 2)\, J^\star$, i.e., k-means++ is $O(\log k)$-competitive. (Makarychev et al., 2020, sharpened the constant to $5(\ln k + 2)$; the interview-relevant fact is the $O(\log k)$ form, not the constant.) Seeding costs $k$ passes over the data, $O(nkd)$ total---the same order as a single Lloyd iteration, so it is effectively free.
+\end{mathresult}
+
+\textbf{The restart discipline.} k-means++ improves the \emph{expected} outcome; it does not eliminate bad runs. The production recipe is: k-means++ seeding, $n_{\text{init}}$ independent restarts with different seeds, keep the run with the lowest inertia. One live gotcha worth knowing because it silently changed people's results: scikit-learn's \texttt{KMeans} default for \texttt{n\_init} was $10$ for years, became \texttt{"auto"} in version 1.4, and \texttt{"auto"} means \textbf{1 restart} when \texttt{init="k-means++"} (and 10 when \texttt{init="random"}). Code that upgraded across that boundary quietly went from ten restarts to one. Set \texttt{n\_init} explicitly---a handful of restarts costs seconds and removes an entire class of irreproducibility.
+
+\begin{warningbox}
+``k-means converges to the global optimum'' is the single most common wrong answer in this chapter, and it is a hard fail at any level. The correct statement has three parts: the objective decreases monotonically; the assignment sequence is finite so the algorithm terminates; the fixed point is local, and which one you land in is determined by initialization. If you also cannot name k-means++ or restarts as the mitigation, the interviewer concludes you have never had a clustering job go wrong.
+\end{warningbox}
+
+\subsection{Choosing k, Honestly}
+\label{cml:sec:choosing_k}
+
+The honest framing---and interviewers reward hearing it first---is that \textbf{there is usually no true $k$}. Inertia is monotonically non-increasing in $k$ and hits zero at $k = n$, so the objective itself cannot select $k$; every method below is a heuristic that trades off fit against parsimony or against a null model, and different heuristics routinely disagree by a factor of two on real data. The senior answer is that $k$ is chosen by the \emph{downstream use}: if the output is 12 marketing segments a team must staff, $k$ is bounded by headcount, not by a silhouette curve. Table~\ref{cml:tab:choosing_k} is the portfolio to run---and to present together, since agreement across methods is the evidence, not any single curve.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Methods for choosing $k$, and what each actually tells you}
+\label{cml:tab:choosing_k}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Method} & \textbf{Quantity} & \textbf{What it is good for, and its limit} \\
+\midrule
+Elbow & Inertia $J(k)$ & Look for the kink where marginal inertia reduction flattens. Cheap and universal, but the curve is usually smooth: the ``elbow'' is often an artifact of the aspect ratio of your plot. Never present it alone. \\
+Silhouette & Mean $s(i)$ & $s(i) = \big(b(i)-a(i)\big)/\max\!\big(a(i),b(i)\big)$ with $a$ the mean distance to a point's own cluster and $b$ the mean distance to the nearest other cluster; mean $s \in [-1,1]$, higher is better. Has an actual optimum in $k$ and gives per-point diagnostics, but is $O(n^2)$ in distances (subsample), and structurally favours compact convex clusters---it will punish a correct DBSCAN-shaped solution. \\
+Gap statistic & $\mathrm{Gap}(k)$ & $\mathrm{Gap}(k) = \E^\star[\log W_k] - \log W_k$ compares $\log$ inertia $W_k$ to its expectation under a uniform reference distribution fit to the data's bounding box or PCA hull; pick the smallest $k$ with $\mathrm{Gap}(k) \ge \mathrm{Gap}(k{+}1) - s_{k+1}$ (Tibshirani et al., 2001). The only common method that can return $k=1$ (``no cluster structure''), which is its real value. Costs $B$ reference clusterings. \\
+Information criteria & BIC / AIC & Requires a likelihood, so fit a GMM rather than k-means (Section~\ref{cml:sec:gmm_em}); BIC $= -2\log \hat{L} + p \log n$ penalizes parameters and is the principled option when a probabilistic model is acceptable. \\
+Stability & Resample agreement & Cluster bootstrap or split-half resamples and measure label agreement (adjusted Rand, Jaccard) after matching; $k$ values whose partitions do not reproduce are not real. Expensive but the most convincing evidence to a skeptical reviewer. \\
+Downstream utility & Task metric & If the clusters feed a model, a routing rule, or a human workflow, evaluate them there. This dominates every intrinsic index and is the answer a staff candidate leads with. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+If labels happen to exist for a subset (a common situation: a few thousand hand-tagged records), \textbf{external} indices---adjusted Rand index, normalized mutual information, V-measure---become available and are far more persuasive than any internal index. Say so; candidates routinely forget that ``unsupervised'' describes the training signal, not the evaluation.
+
+\subsection{The Assumptions, and the Failures They Cause}
+
+k-means is not assumption-free: minimizing $\sum_i \norm{x_i - \mu_{c(i)}}^2$ is exactly maximum likelihood for a mixture of \emph{isotropic Gaussians with equal variance and equal mixing weights, under hard assignment} (Section~\ref{cml:sec:kmeans_gmm_limit} makes this precise). Every failure mode is a violation of that generative story, which is why the list is memorizable rather than arbitrary---each row of Table~\ref{cml:tab:kmeans_failures} is one assumption breaking.
+
+\begin{table}[H]
+\centering
+\small
+\caption{k-means failure modes, the assumption violated, and the standard fix}
+\label{cml:tab:kmeans_failures}
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+\textbf{Symptom} & \textbf{Assumption violated} & \textbf{Fix} \\
+\midrule
+Rings, moons, filaments & Clusters are convex and isotropic; decision boundaries between centroids are linear (a Voronoi tessellation) & DBSCAN/HDBSCAN, spectral clustering, or kernel k-means---all of which cluster in a space where the shapes become separable \\
+Elliptical or correlated clusters & Equal isotropic covariance & GMM with full or diagonal covariance (Section~\ref{cml:sec:gmm_em}) \\
+A big cluster is split, a small one absorbed & Equal cluster sizes/weights (implicit in the equal-mixing-weight reading) & GMM with free $\pi_k$; or accept it, since the SSE objective genuinely prefers to split mass \\
+Extreme points drag the centroids & The centroid is a mean, and means are not robust & k-medoids/PAM, k-medians, trimmed k-means, or remove/winsorize outliers first \\
+Clusters look arbitrary in high $d$ & Euclidean distance is discriminative & Reduce first (PCA, Section~\ref{cml:sec:pca}) or use cosine distance on $L_2$-normalized vectors (spherical k-means) \\
+Results change with a change of units & Features are commensurable & Standardize (or explicitly weight) before clustering---non-negotiable \\
+Categorical or mixed features & Means exist and squared Euclidean distance is meaningful & k-modes / k-prototypes (Huang, 1998), or Gower distance with a medoid method \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Two of these deserve amplification because they are where interviews go deep.
+
+\textbf{Scaling is part of the model, not preprocessing hygiene.} k-means minimizes Euclidean distance, so the feature with the largest numeric spread dominates the objective. Cluster customers on \texttt{annual\_spend} (range $0$--$50{,}000$) and \texttt{visits\_per\_month} (range $0$--$30$) without standardizing and you have clustered on spend alone: the visit feature contributes at most $30^2 = 900$ to a squared distance while spend contributes up to $2.5\times 10^9$. Standardization is the default; but note that standardizing is itself a modelling choice (it declares all features equally important), and when a feature is known to be noise, scaling it up to unit variance actively hurts.
+
+\textbf{High dimension erodes the objective.} As $d$ grows with fixed $n$, distances between points concentrate: the ratio of the farthest to the nearest neighbour distance tends to $1$ under broad conditions (Beyer et al., 1999), so ``nearest centroid'' becomes a decision among near-ties and the assignment step turns noisy. The standard pipeline is PCA (or truncated SVD for sparse data) down to tens of components followed by k-means---which also speeds up the $O(nkd)$ inner loop---at the cost that the clusters now live in a rotated space and must be interpreted through the loadings.
+
+\subsection{Scaling k-means}
+
+Three engineering facts round out the topic. \textbf{Mini-batch k-means} (Sculley, 2010) replaces the full assignment/update sweep with a stochastic update on batches of a few hundred to a few thousand points, using a per-centroid learning rate that decays with that centroid's count; it typically reaches inertia within a few percent of full Lloyd at one or two orders of magnitude less compute, and it is what you reach for above a few million points. \textbf{Elkan's and Hamerly's algorithms} exploit the triangle inequality to cache bounds and skip most distance computations---exact, same answer, often several times faster in low-to-moderate dimension, degrading toward no benefit as $d$ grows. And \texttt{k-means}$\|$ (Bahmani et al., 2012) parallelizes $D^2$ seeding by oversampling in a handful of rounds instead of $k$ sequential passes, which is what distributed implementations use.
+
+\begin{keyinsight}[k-means as a Quantizer]
+Change the framing from ``find the groups'' to ``find $k$ codewords that minimize squared reconstruction error'' and k-means becomes \textbf{vector quantization}: it is Lloyd's algorithm from signal processing, and $\mu_{c(x)}$ is a lossy code for $x$. This reading is why k-means is the workhorse inside approximate-nearest-neighbour indexes---the coarse quantizer that defines IVF's inverted lists, and the sub-space codebook learner inside product quantization. Those index structures and their recall/latency trade-offs are [SR 3]'s material; what belongs here is the recognition that the same objective serves both ``segment my users'' and ``compress my vectors,'' and that in the second use nobody cares whether the clusters are interpretable.
+\end{keyinsight}
+
+%==============================================================================
 \section{Gaussian Mixtures and EM}
-% TODO Phase C3
+\label{cml:sec:gmm_em}
+%==============================================================================
 
+The Gaussian mixture model is what k-means becomes when you take the probability seriously, and its EM derivation is the depth-probe of this chapter---frontier labs use it to check whether ``I know EM'' means ``I can write both steps and justify the monotonicity'' or ``I can say the letters E and M.'' The derivation is also the cleanest classical rehearsal for variational inference, which is why it keeps showing up in interviews for teams that do generative modelling.
+
+\subsection{The Mixture Likelihood and Why Direct MLE Fails}
+
+A $K$-component Gaussian mixture models the data density as a convex combination of Gaussians:
+\begin{equation}
+p(x \given \theta) = \sum_{k=1}^{K} \pi_k \, \mathcal{N}(x \given \mu_k, \Sigma_k), \qquad \pi_k \ge 0, \quad \sum_{k=1}^K \pi_k = 1,
+\end{equation}
+with parameters $\theta = \{\pi_k, \mu_k, \Sigma_k\}_{k=1}^K$. The log-likelihood of an i.i.d.\ sample is
+\begin{equation}
+\ell(\theta) = \sum_{i=1}^{n} \log \sum_{k=1}^{K} \pi_k \, \mathcal{N}(x_i \given \mu_k, \Sigma_k).
+\label{eq:cml:gmm_loglik}
+\end{equation}
+
+\textbf{Why you cannot just differentiate this.} The $\log$ sits \emph{outside} a sum, so it does not distribute over the components and the exponentials never cancel. Setting $\nabla_{\mu_k} \ell = 0$ gives $\mu_k = \frac{\sum_i \gamma_{ik} x_i}{\sum_i \gamma_{ik}}$ where $\gamma_{ik}$ itself depends on \emph{all} the parameters---a coupled fixed-point system with no closed-form solution, and one that generic gradient methods handle badly because of the positive-definiteness constraint on each $\Sigma_k$ and the simplex constraint on $\pi$. (Say this explicitly in an interview: ``log of a sum'' is the phrase the interviewer is listening for.)
+
+\textbf{The latent-variable formulation.} Introduce, for each point, a one-hot assignment $z_i \in \{0,1\}^K$ with $p(z_{ik} = 1) = \pi_k$ and $p(x_i \given z_{ik} = 1) = \mathcal{N}(x_i \given \mu_k, \Sigma_k)$. Marginalizing $z_i$ recovers the mixture. The \textbf{complete-data} log-likelihood---the one we would write if we knew $z$---is
+\begin{equation}
+\ell_c(\theta) = \sum_{i=1}^n \sum_{k=1}^K z_{ik}\Big[\log \pi_k + \log \mathcal{N}(x_i \given \mu_k, \Sigma_k)\Big],
+\label{eq:cml:complete_ll}
+\end{equation}
+and now the $\log$ is \emph{inside}: the terms separate, and each parameter has a closed-form maximizer. EM exploits exactly this gap---it is a strategy for optimizing an intractable marginal likelihood by repeatedly optimizing the tractable complete-data one under a guess about $z$.
+
+\subsection{The E Step}
+
+\begin{mathresult}{E Step: Responsibilities by Bayes' Rule}
+With parameters $\theta^{(t)}$ fixed, the posterior over the latent assignment of point $i$ is
+\begin{equation}
+\gamma_{ik} \;\equiv\; p\big(z_{ik} = 1 \given x_i, \theta^{(t)}\big) \;=\; \frac{\pi_k \, \mathcal{N}(x_i \given \mu_k, \Sigma_k)}{\sum_{j=1}^{K} \pi_j \, \mathcal{N}(x_i \given \mu_j, \Sigma_j)},
+\end{equation}
+by Bayes' rule with prior $\pi_k$ and likelihood $\mathcal{N}(x_i \given \mu_k, \Sigma_k)$. The $\gamma_{ik}$ are the \textbf{responsibilities}: $\gamma_{ik} \in [0,1]$ and $\sum_k \gamma_{ik} = 1$, so each point distributes one unit of membership across the components. Because $\ell_c$ in Eq.~\eqref{eq:cml:complete_ll} is \emph{linear} in $z_{ik}$, taking its expectation under this posterior amounts to substituting $\E[z_{ik}] = \gamma_{ik}$:
+\begin{equation}
+Q\big(\theta \given \theta^{(t)}\big) = \E_{z \sim p(z \given X, \theta^{(t)})}\big[\ell_c(\theta)\big] = \sum_{i=1}^n \sum_{k=1}^K \gamma_{ik}\Big[\log \pi_k + \log \mathcal{N}(x_i \given \mu_k, \Sigma_k)\Big].
+\end{equation}
+That linearity is why the GMM's E step is ``just compute $\gamma$'' rather than a full posterior---a point worth making, because in models where $\ell_c$ is not linear in the latent, the E step is genuinely a distribution and the tractability disappears.
+\end{mathresult}
+
+\textbf{A concrete responsibility.} Two 1-D components, $\mathcal{N}(0,1)$ and $\mathcal{N}(3,1)$, with $\pi = (0.5, 0.5)$, evaluated at $x = 1$. The unnormalized weights are $0.5 \cdot e^{-1/2}$ and $0.5 \cdot e^{-2}$ (the $1/\sqrt{2\pi}$ and the $0.5$ cancel in the ratio), so
+\begin{equation*}
+\gamma_1 = \frac{e^{-0.5}}{e^{-0.5} + e^{-2}} = \frac{0.6065}{0.6065 + 0.1353} = 0.818, \qquad \gamma_2 = 0.182 .
+\end{equation*}
+The point is ``82\% component 1.'' Keep this example: it is the seed of the k-means limit in Section~\ref{cml:sec:kmeans_gmm_limit}.
+
+\subsection{The M Step}
+
+\begin{mathresult}{M Step: Weighted MLE in Closed Form}
+Maximize $Q(\theta \given \theta^{(t)})$ over $\theta$ with the $\gamma_{ik}$ held fixed. Write $N_k = \sum_{i=1}^n \gamma_{ik}$ for the \textbf{effective count} of component $k$ (a soft cluster size, $\sum_k N_k = n$).
+
+\textbf{Means.} Only the Gaussian log-density depends on $\mu_k$, and $\log \mathcal{N}(x \given \mu_k, \Sigma_k) = -\tfrac{1}{2}(x-\mu_k)^\top \Sigma_k^{-1}(x - \mu_k) + \text{const}$. Then
+\begin{equation}
+\nabla_{\mu_k} Q = \sum_{i=1}^n \gamma_{ik}\, \Sigma_k^{-1}(x_i - \mu_k) = 0
+\;\;\Longrightarrow\;\;
+\boxed{\;\mu_k^{(t+1)} = \frac{1}{N_k}\sum_{i=1}^n \gamma_{ik} x_i \;}
+\end{equation}
+($\Sigma_k^{-1}$ is invertible, so it drops out): the \textbf{responsibility-weighted mean}.
+
+\textbf{Covariances.} Using $\log \mathcal{N} = -\tfrac{1}{2}\log\det\Sigma_k - \tfrac{1}{2}(x-\mu_k)^\top\Sigma_k^{-1}(x-\mu_k) + \text{const}$ and the matrix identities $\partial \log\det \Sigma / \partial \Sigma = \Sigma^{-1}$ and $\partial (a^\top \Sigma^{-1} a)/\partial \Sigma = -\Sigma^{-1} a a^\top \Sigma^{-1}$, setting $\partial Q/\partial \Sigma_k = 0$ gives
+\begin{equation}
+\boxed{\;\Sigma_k^{(t+1)} = \frac{1}{N_k}\sum_{i=1}^n \gamma_{ik}\,\big(x_i - \mu_k^{(t+1)}\big)\big(x_i - \mu_k^{(t+1)}\big)^\top \;}
+\end{equation}
+the \textbf{responsibility-weighted covariance}.
+
+\textbf{Mixing weights.} These carry the constraint $\sum_k \pi_k = 1$, so use a Lagrange multiplier on $\sum_k N_k \log \pi_k$:
+\begin{equation}
+\frac{\partial}{\partial \pi_k}\Big[\sum_{k'} N_{k'}\log \pi_{k'} + \lambda\Big(\sum_{k'}\pi_{k'} - 1\Big)\Big] = \frac{N_k}{\pi_k} + \lambda = 0 \;\Longrightarrow\; \pi_k = -\frac{N_k}{\lambda}.
+\end{equation}
+Summing over $k$ and using the constraint: $1 = -\frac{1}{\lambda}\sum_k N_k = -\frac{n}{\lambda}$, so $\lambda = -n$ and
+\begin{equation}
+\boxed{\;\pi_k^{(t+1)} = \frac{N_k}{n}\;}
+\end{equation}
+Every update is the ordinary MLE formula with hard counts replaced by soft responsibilities---which is the sentence to say out loud, because it makes all three results memorable rather than memorized.
+\end{mathresult}
+
+\subsection{Why EM Monotonically Increases the Likelihood}
+
+This is the part candidates skip and interviewers ask for. The argument is a decomposition of the log-likelihood that also happens to be the entire foundation of variational inference.
+
+\begin{mathresult}{The ELBO Decomposition and the Ascent Property}
+For \emph{any} distribution $q(Z)$ over the latents, multiply and divide inside the marginal and apply the definition of KL divergence:
+\begin{equation}
+\log p(X \given \theta) \;=\; \underbrace{\sum_Z q(Z) \log \frac{p(X, Z \given \theta)}{q(Z)}}_{\textstyle \mathcal{F}(q, \theta) \;\text{(the ELBO)}} \;+\; \underbrace{\KL\big(q(Z) \,\|\, p(Z \given X, \theta)\big)}_{\textstyle \ge 0}.
+\label{eq:cml:elbo}
+\end{equation}
+The identity is exact (expand the KL term and the $q$-dependence cancels), and since $\KL \ge 0$ by Jensen's inequality, $\mathcal{F}(q,\theta)$ is a \textbf{lower bound} on the log-likelihood for every $q$---tight exactly when $q$ equals the posterior.
+
+Now read EM as coordinate ascent on $\mathcal{F}(q, \theta)$:
+\begin{itemize}
+    \item \textbf{E step} maximizes $\mathcal{F}$ over $q$ with $\theta^{(t)}$ fixed. Since $\log p(X\given\theta^{(t)})$ does not depend on $q$, maximizing the bound means \emph{minimizing} the KL term, and the minimum ($\KL = 0$) is attained at $q^{(t+1)} = p(Z \given X, \theta^{(t)})$---the responsibilities. The bound is now \textbf{tight}: $\mathcal{F}(q^{(t+1)}, \theta^{(t)}) = \log p(X \given \theta^{(t)})$.
+    \item \textbf{M step} maximizes $\mathcal{F}$ over $\theta$ with $q^{(t+1)}$ fixed. Since $\mathcal{F}(q,\theta) = \E_q[\log p(X,Z\given\theta)] + H(q)$ and the entropy $H(q)$ is $\theta$-free, this is exactly maximizing $Q(\theta \given \theta^{(t)})$---the M step of the previous subsection.
+\end{itemize}
+Chaining the two:
+\begin{equation}
+\log p\big(X \given \theta^{(t+1)}\big) \;\ge\; \mathcal{F}\big(q^{(t+1)}, \theta^{(t+1)}\big) \;\ge\; \mathcal{F}\big(q^{(t+1)}, \theta^{(t)}\big) \;=\; \log p\big(X \given \theta^{(t)}\big),
+\end{equation}
+where the first inequality is the bound, the second is the M step's optimality, and the equality is the E step's tightness. \textbf{The likelihood never decreases.} Since it is bounded above for a well-regularized model, the sequence converges---to a stationary point of $\ell$, generically a local maximum or a saddle, never with any global guarantee.
+\end{mathresult}
+
+The picture to draw on the whiteboard: the log-likelihood as a curve in $\theta$, the ELBO as a second curve lying below it that \emph{touches} it at $\theta^{(t)}$ (E step), and the M step walking to the maximum of the lower curve, which must be at least as high as the touch point (minorize-maximize). Two consequences worth volunteering: EM makes rapid progress early and crawls near convergence (its rate is linear, with the constant governed by the fraction of missing information---which is why practitioners run EM for a while and switch to a quasi-Newton method if they need precision); and a decreasing log-likelihood in your training log is not a modelling result, it is a \textbf{bug} (usually a covariance update that used the old means, or an unnormalized responsibility).
+
+\begin{keyinsight}[The Bridge to Variational Inference]
+Equation~\eqref{eq:cml:elbo} is the whole of variational inference, one restriction away. EM assumes you can set $q(Z) = p(Z \given X, \theta)$ exactly. When that posterior is intractable---a deep latent-variable model, say---you instead restrict $q$ to a tractable family $q_\phi$ and maximize the same ELBO over $\phi$ jointly with $\theta$ by gradient ascent. The residual $\KL(q_\phi \| p)$ no longer goes to zero, so the bound stays loose, and that gap is precisely the ``variational'' in variational autoencoder. Being able to say ``the VAE's ELBO is this same decomposition with an amortized, restricted $q$'' is a strong signal in any interview that touches generative modelling; the deep-learning treatment is [DL 11].
+\end{keyinsight}
+
+\subsection{Covariance Structure, Singularities, and Model Selection}
+
+\textbf{Covariance parameterization is a bias-variance dial.} The number of free parameters per component in $d$ dimensions is $d(d+1)/2$ for a full covariance, $d$ for diagonal, and $1$ for spherical; ``tied'' shares one matrix across components. Table~\ref{cml:tab:gmm_cov} makes the cost concrete for $K=5$, $d=10$ (counting means, covariances, and $K-1$ free mixing weights).
+
+\begin{table}[H]
+\centering
+\small
+\caption{GMM covariance options: free parameters for $K=5$ components in $d=10$ dimensions}
+\label{cml:tab:gmm_cov}
+\begin{tabularx}{\textwidth}{@{}l l l X@{}}
+\toprule
+\textbf{Type} & \textbf{Cov.\ params} & \textbf{Total} & \textbf{Use when} \\
+\midrule
+Spherical & $K$ & $4 + 50 + 5 = 59$ & Very little data, or you want a soft k-means \\
+Diagonal & $Kd$ & $4 + 50 + 50 = 104$ & High $d$; features roughly axis-aligned. The default in high dimension \\
+Tied (full) & $d(d+1)/2$ & $4 + 50 + 55 = 109$ & Clusters share a shape but differ in location (LDA-like assumption) \\
+Full & $K d(d+1)/2$ & $4 + 50 + 275 = 329$ & Enough data per component ($\gg d^2$); genuinely correlated, differently shaped clusters \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{warningbox}
+\textbf{The singularity/degeneracy failure.} The GMM log-likelihood in Eq.~\eqref{eq:cml:gmm_loglik} is \textbf{unbounded above}. Let one component's mean sit exactly on a data point, $\mu_k = x_i$, and shrink $\Sigma_k = \sigma^2 I$ toward zero: that component's density at $x_i$ is $(2\pi\sigma^2)^{-d/2} \to \infty$, so $\ell \to +\infty$ while the model has learned nothing. EM will happily walk into this---you see a component's effective count $N_k$ collapse toward $1$, its determinant underflow, and the log-likelihood spike. Standard fixes, in order of preference: (1) \textbf{covariance regularization}, adding $\epsilon I$ to every $\Sigma_k$ (scikit-learn's \texttt{reg\_covar}, default $10^{-6}$)---equivalently, MAP-EM with an inverse-Wishart prior; (2) constrain the covariance type (spherical/diagonal/tied cannot collapse as easily); (3) detect collapse and reinitialize that component; (4) more data per component, or fewer components. The point to make in an interview is the diagnosis, not the fix list: \textbf{maximum likelihood for mixtures is an ill-posed problem, and the ``best'' solution by likelihood is a degenerate one}, so we are always seeking a good local optimum, never the global one.
+\end{warningbox}
+
+\textbf{Choosing $K$.} Because a GMM has a likelihood, information criteria apply directly: $\mathrm{BIC} = -2\log\hat{L} + p\log n$ and $\mathrm{AIC} = -2\log\hat{L} + 2p$, with $p$ the free-parameter count from Table~\ref{cml:tab:gmm_cov}. BIC's heavier penalty ($\log n$ vs.\ $2$) makes it the conservative choice and the usual default for \emph{selecting the number of clusters}, where over-splitting is the failure you fear; AIC targets predictive density and tends to choose more components. Both should be computed on a grid over $K$ \emph{and} covariance type together, since those trade against each other. The Bayesian alternative---a Dirichlet-process or variational-Bayes GMM---puts a prior over the number of active components and prunes unneeded ones automatically (scikit-learn's \texttt{BayesianGaussianMixture}); it is the right name-drop when asked ``what if I do not want to choose $K$ at all.''
+
+\textbf{When a GMM beats k-means.} Elliptical or correlated clusters (full covariance buys the shape); clusters of genuinely different sizes and spreads (free $\pi_k$ and $\Sigma_k$); anywhere you need \emph{soft} membership---a probability that a user belongs to a segment, useful for routing decisions with a confidence threshold, for downstream features, or for flagging the ambiguous points a human should review; and anywhere you actually want a \emph{density}, e.g., novelty detection by thresholding $\log p(x)$. The costs: more parameters (so more data needed), $O(nKd^2)$ per iteration with full covariances, more failure modes (singularities, label switching), and no better global guarantee than k-means has.
+
+\subsection{k-means as the Zero-Variance Limit of a GMM}
+\label{cml:sec:kmeans_gmm_limit}
+
+\begin{mathresult}{Hard Assignment Is the $\sigma \to 0$ Limit}
+Constrain every component to $\Sigma_k = \sigma^2 I$ with a \emph{shared, fixed} $\sigma$ and equal mixing weights $\pi_k = 1/K$. The responsibility becomes a softmax over negative half-squared distances:
+\begin{equation}
+\gamma_{ik} = \frac{\exp\!\big(-\norm{x_i - \mu_k}^2 / 2\sigma^2\big)}{\sum_j \exp\!\big(-\norm{x_i - \mu_j}^2 / 2\sigma^2\big)},
+\end{equation}
+with $1/(2\sigma^2)$ playing the role of an inverse temperature. As $\sigma^2 \to 0$ the exponent differences blow up, the nearest centroid's term dominates every other by a factor $\exp\!\big((d_j^2 - d_{\min}^2)/2\sigma^2\big) \to \infty$, and $\gamma_i \to$ one-hot at $\argmin_k \norm{x_i - \mu_k}$. So:
+\begin{itemize}
+    \item the \textbf{E step becomes the assignment step} (nearest centroid);
+    \item the \textbf{M step} $\mu_k = \sum_i \gamma_{ik}x_i / N_k$ \textbf{becomes the cluster mean};
+    \item and the expected complete-data log-likelihood reduces to $-\frac{1}{2\sigma^2}\sum_i \norm{x_i - \mu_{c(i)}}^2 + \text{const}$, so maximizing it \textbf{is} minimizing the k-means objective.
+\end{itemize}
+\textbf{k-means is EM for an isotropic, equal-variance, equal-weight Gaussian mixture under hard assignment.} Every k-means failure mode in Table~\ref{cml:tab:kmeans_failures} is now readable as an assumption in this generative model.
+\end{mathresult}
+
+The numbers make the limit vivid. Reuse the two components $\mathcal{N}(\mu_1, \sigma^2)$ and $\mathcal{N}(\mu_2, \sigma^2)$ with $x$ at squared distances $d_1^2 = 1$ and $d_2^2 = 4$; then $\gamma_1 = \big(1 + e^{-3/(2\sigma^2)}\big)^{-1}$. At $\sigma = 1$ that is $1/(1+e^{-1.5}) = 0.818$---the soft value computed earlier. At $\sigma = 0.3$ the exponent is $-3/0.18 = -16.7$, giving $\gamma_1 = 1 - 5.7\times10^{-8}$: numerically hard. The ``softness'' of a GMM is not a separate mechanism, it is a temperature, and k-means is that temperature at zero.
+
+\begin{keyinsight}[Soft vs.\ Hard, and What Softness Buys]
+Hard assignment throws away the one number that makes the model useful in ambiguous regions. A point equidistant from two centroids gets $\gamma = (0.5, 0.5)$ from a GMM---information a downstream system can act on (route to human review, blend two treatments, abstain)---whereas k-means picks one and reports it with the same confidence as a point sitting on top of a centroid. Softness also stabilizes optimization: responsibilities change continuously with the parameters, so EM does not have the discrete cliff-edges that make Lloyd's algorithm land in the local optimum next door. The costs are compute ($d^2$ per component per point with full covariances) and calibration honesty---a GMM's ``probability'' is only as trustworthy as the Gaussian assumption behind it.
+\end{keyinsight}
+
+%==============================================================================
 \section{Hierarchical Clustering and DBSCAN}
-% TODO Phase C3
+\label{cml:sec:hier_dbscan}
+%==============================================================================
 
+These two exist because k-means and GMMs share a defect: both require $K$ up front and both impose a convex, roughly ellipsoidal cluster shape. Hierarchical clustering removes the first requirement; DBSCAN removes both. Interviews treat them at survey depth---you need the mechanism, the hyperparameters, the characteristic failure, and the ability to choose among all four families under a stated data description.
+
+\subsection{Agglomerative Clustering and Linkage}
+
+Agglomerative (bottom-up) clustering starts with $n$ singleton clusters and repeatedly merges the two closest, recording the merge height, until one cluster remains. The output is not a partition but a \textbf{dendrogram}---a binary merge tree---from which any number of clusters is obtained by cutting at a chosen height. That is the family's selling point: one fit gives you every $K$ at once, plus a picture of the nesting structure, which is why it is the default in bioinformatics and in exploratory work where the hierarchy itself is the finding.
+
+The entire modelling choice is the \textbf{linkage criterion}: how to define the distance between two \emph{clusters} given a distance between points. Table~\ref{cml:tab:linkage} is the set worth memorizing, because ``which linkage and why'' is the only technical question this family reliably draws.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Linkage criteria and their characteristic geometry}
+\label{cml:tab:linkage}
+\begin{tabularx}{\textwidth}{@{}l l X@{}}
+\toprule
+\textbf{Linkage} & \textbf{$d(A,B)$} & \textbf{Behaviour and failure mode} \\
+\midrule
+Single & $\min_{a \in A, b \in B} d(a,b)$ & Follows filaments; the only linkage that finds long, non-convex, snake-like clusters. Its failure is \textbf{chaining}: a thin bridge of noise points between two dense blobs merges them, so one stray path destroys the partition. Equivalent to cutting the Euclidean minimum spanning tree. \\
+Complete & $\max_{a \in A, b \in B} d(a,b)$ & Produces compact, roughly equal-diameter clusters. Its failure is \textbf{crowding}: it will split a large genuine cluster to keep diameters small, and a single outlier inflates every distance to its cluster. \\
+Average (UPGMA) & $\frac{1}{|A||B|}\sum_{a,b} d(a,b)$ & The compromise; reasonably robust, no strong shape prior, the common default outside Ward. Not invariant to monotone transforms of the distance. \\
+Centroid & $\norm{\bar{a} - \bar{b}}$ & Cheap but admits \textbf{inversions} (a merge at lower height than its children), which makes the dendrogram non-monotone and hard to read. Rarely worth it. \\
+Ward & $\frac{|A||B|}{|A|+|B|}\norm{\bar{a} - \bar{b}}^2$ & Merges the pair that increases total within-cluster SSE least---the exact identity for $\mathrm{SSE}(A \cup B) - \mathrm{SSE}(A) - \mathrm{SSE}(B)$. Gives compact, similarly sized clusters and is the closest relative of k-means (same objective, greedy agglomerative search instead of alternating minimization). Requires Euclidean distance. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+All of these are computed by the same $O(1)$ update---the Lance--Williams recurrence expresses $d(A \cup B, C)$ as a linear combination of $d(A,C)$, $d(B,C)$, and $d(A,B)$ with linkage-specific coefficients---so the implementations differ only in three constants.
+
+\textbf{Cost is the reason this is not the default everywhere.} The naive algorithm is $O(n^3)$ time and $O(n^2)$ memory; with priority queues and nearest-neighbour chains it drops to $O(n^2 \log n)$ or $O(n^2)$ (SLINK for single linkage, and the nearest-neighbour-chain algorithm for any reducible linkage including Ward). The memory bound is the binding constraint in practice: at $n = 100{,}000$ the condensed distance matrix holds $n(n-1)/2 \approx 5\times10^9$ doubles $\approx 40$\,GB. So hierarchical clustering is for $n$ in the thousands to low tens of thousands---above that, cluster a sample, or run mini-batch k-means to a few thousand micro-clusters and build the dendrogram over \emph{those} (a standard and defensible two-stage answer).
+
+\textbf{Reading a dendrogram honestly.} The height of a merge is the linkage distance at which it happened, so a long vertical gap before a merge means those groups stayed distinct for a wide range of thresholds---weak evidence for a cut there. Horizontal order is \emph{not} meaningful: any internal node may be flipped, so $2^{n-1}$ drawings represent the same tree, and ``these two leaves are adjacent'' means nothing. Divisive (top-down) clustering exists as the mirror image; it is $O(2^n)$ exactly and $O(n^2)$ with heuristics like bisecting k-means, and shows up mainly as a name to know.
+
+\subsection{DBSCAN and Density-Based Clustering}
+
+DBSCAN (Ester, Kriegel, Sander \& Xu, 1996) drops the notion of a centre entirely and defines clusters as \textbf{connected regions of high density}, separated by low-density regions. Two hyperparameters: a radius $\varepsilon$ and a count \texttt{minPts}.
+
+\begin{itemize}
+    \item \textbf{Core point}: at least \texttt{minPts} points lie within distance $\varepsilon$ (scikit-learn's \texttt{min\_samples} \emph{includes the point itself}---a detail worth getting right, since it shifts every threshold by one).
+    \item \textbf{Border point}: within $\varepsilon$ of a core point but not itself core.
+    \item \textbf{Noise}: neither. DBSCAN is the only algorithm in this chapter that natively refuses to assign a point.
+\end{itemize}
+A point $q$ is \emph{directly density-reachable} from core point $p$ if $q \in N_\varepsilon(p)$; \emph{density-reachable} is the transitive closure through core points; two points are \emph{density-connected} if both are density-reachable from a common core point. A cluster is a maximal density-connected set. Operationally: pick an unvisited point, if it is core, flood-fill its $\varepsilon$-neighbourhood through other core points; otherwise mark it noise (it may be relabelled a border point later).
+
+\textbf{What this buys.} Arbitrary cluster shapes (rings, moons, spirals---the standard demo where k-means visibly fails); no $K$ to choose; outliers labelled rather than forced into a cluster, which makes DBSCAN a legitimate anomaly detector; and robustness to a few extreme points, which no centroid method has.
+
+\begin{warningbox}
+\textbf{DBSCAN's failure is varying density.} A single global $\varepsilon$ must be small enough to separate the dense clusters and large enough to connect the sparse ones---and if the dataset contains both, no single value works: you either merge the dense clusters or shred the sparse one into noise. The second failure is dimensionality: $\varepsilon$ is a distance, and in high dimension distances concentrate, so the $\varepsilon$ that captures anything captures nearly everything. Reduce dimension first, or use cosine distance on normalized vectors, or expect a single giant cluster plus noise. And ``DBSCAN needs the number of clusters'' is a red-flag answer---not needing $K$ is its headline property.
+\end{warningbox}
+
+\textbf{Choosing the parameters.} \texttt{minPts} is usually set by rule of thumb---at least $d+1$, commonly $2d$, larger for noisy data---and mainly controls how aggressively points are called noise. Then $\varepsilon$ is read off the \textbf{k-distance plot}: for every point compute the distance to its $(\texttt{minPts}-1)$-th nearest neighbour, sort descending, and plot; the knee where the curve turns sharply upward marks the transition from within-cluster to between-cluster distances, and $\varepsilon$ goes there. This is a genuine heuristic with the same subjectivity problem as the elbow, so say ``and then I sweep $\varepsilon$ around the knee and check stability of the cluster count and the noise fraction.'' One more honest caveat: DBSCAN is not fully deterministic---a border point reachable from two clusters is assigned to whichever is processed first---though core-point structure is stable.
+
+\textbf{HDBSCAN} (Campello, Moulavi \& Sander, 2013) is the modern default and the right name to drop. It replaces the fixed $\varepsilon$ with a hierarchy: define the \emph{mutual reachability distance} $d_{\mathrm{mreach}}(a,b) = \max\{\mathrm{core}_k(a), \mathrm{core}_k(b), d(a,b)\}$ (which pushes sparse points apart while leaving dense regions untouched), build the minimum spanning tree under it, and condense the resulting hierarchy, then extract the flat clustering whose clusters are most \emph{persistent} across the density threshold. The practical consequence is that HDBSCAN handles variable density---DBSCAN's headline weakness---and its main knob is \texttt{min\_cluster\_size}, which is far more interpretable than $\varepsilon$. It has been in scikit-learn proper since version 1.3.
+
+\textbf{Spectral clustering}, one paragraph, because it is the other standard answer to non-convex shapes: build a similarity graph (k-NN or Gaussian kernel), form the graph Laplacian $L = D - W$ (or its normalized versions), embed the points in the space spanned by the eigenvectors of the $K$ smallest nonzero eigenvalues, and run k-means \emph{there}. It works because clusters that are non-convex in the input space become convex blobs in the Laplacian eigenspace, so the k-means assumption becomes true after the transformation. Cost is the eigendecomposition, $O(n^3)$ dense (much less with sparse graphs and Lanczos methods), so it lives in the same size regime as hierarchical clustering; the sensitive knob is the similarity kernel bandwidth.
+
+\subsection{Choosing an Algorithm}
+
+The comparison splits cleanly into two questions an interviewer will ask in sequence: what does each method assume about cluster \emph{shape}, and what does each do with points that do not belong anywhere (Table~\ref{cml:tab:clustering_compare}); then, what does each cost and what do you have to tune (Table~\ref{cml:tab:clustering_cost}).
+
+\begin{table}[H]
+\centering
+\small
+\caption{Clustering families: shape assumptions and outlier handling}
+\label{cml:tab:clustering_compare}
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+\textbf{Method} & \textbf{Shape assumption} & \textbf{What happens to outliers} \\
+\midrule
+k-means & Convex, isotropic, similar size; boundaries are linear (a Voronoi tessellation) & Pulled into a cluster and distort its centroid; no noise label exists \\
+GMM (EM) & Ellipsoidal, with per-component covariance and mixing weight & Absorbed with low responsibility, or capture a component and trigger a singularity \\
+Hierarchical & Depends on linkage: Ward behaves like k-means; single-link finds filaments & Complete/Ward distorted by them; single-link chains \emph{through} them \\
+DBSCAN, HDBSCAN & Arbitrary shape; clusters are density-connected regions & \textbf{Labelled as noise}---the only native handling in the table \\
+Spectral & Arbitrary shape, via connectivity in a similarity graph & Can split off as singleton components in the graph \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Clustering families: cost and hyperparameters}
+\label{cml:tab:clustering_cost}
+\begin{tabularx}{\textwidth}{@{}l X X@{}}
+\toprule
+\textbf{Method} & \textbf{Scalability} & \textbf{Hyperparameters} \\
+\midrule
+k-means & $O(nkd)$ per iteration; millions of points; mini-batch beyond that & $k$, initialization, number of restarts \\
+GMM (EM) & $O(nKd^2)$ per iteration with full covariances; hundreds of thousands of points & $K$, covariance type, \texttt{reg\_covar}, initialization \\
+Hierarchical & $O(n^2)$ memory and $O(n^2\log n)$ time; practical only for $n \lesssim 10^4$ & Linkage, distance metric, cut height (or $k$) \\
+DBSCAN, HDBSCAN & $O(n\log n)$ with a spatial index in low $d$, degrading to $O(n^2)$ in high $d$ & $\varepsilon$ and \texttt{minPts} (DBSCAN); \texttt{min\_cluster\_size} (HDBSCAN) \\
+Spectral & Eigendecomposition of the Laplacian; $n \lesssim 10^4$ dense, $10^5$ with a sparse graph & $k$, graph construction, kernel bandwidth \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[The Decision Rule in One Breath]
+Start with \textbf{k-means} (scaled features, k-means++, several restarts) because it is fast and it is the baseline everyone will compare against. Move to a \textbf{GMM} when you need soft membership, a density, or elliptical clusters. Move to \textbf{HDBSCAN} when the clusters are visibly non-convex, when a meaningful fraction of the data is noise that should stay unassigned, or when you cannot defend any particular $K$. Use \textbf{hierarchical} when $n$ is small enough and the nesting structure is itself the deliverable. And in every case, validate the same way: stability across resamples and seeds, plus a downstream or human check---because with no labels, an internal index alone is not evidence.
+\end{keyinsight}
+
+%==============================================================================
 \section{PCA}
-% TODO Phase C3
+\label{cml:sec:pca}
+%==============================================================================
 
+``Derive PCA'' is the most frequently asked whiteboard question in classical ML, and it is asked precisely because it is short enough to finish in five minutes and rich enough to expose everything: constrained optimization, eigenvalue intuition, the variance/reconstruction duality, numerical linear algebra, and a preprocessing discipline (centering, scaling) that people get wrong in production. Throughout, let $X \in \R^{n \times d}$ be the data matrix with rows $x_i^\top$, \textbf{already centered} so that $\sum_i x_i = 0$, and let
+\begin{equation}
+S = \frac{1}{n-1} X^\top X \in \R^{d \times d}
+\end{equation}
+be the sample covariance matrix---symmetric and positive semidefinite, so it has an orthonormal eigenbasis with real nonnegative eigenvalues.
+
+\subsection{Variance Maximization Gives the Eigenproblem}
+
+\begin{mathresult}{PCA by Constrained Variance Maximization}
+Seek the unit direction $w \in \R^d$ along which the projected data $\{w^\top x_i\}$ has maximal variance. Because the data are centered, the projections have mean zero, so their variance is
+\begin{equation}
+\frac{1}{n-1}\sum_{i=1}^n (w^\top x_i)^2 = \frac{1}{n-1} w^\top X^\top X w = w^\top S w .
+\end{equation}
+The norm constraint is essential---without it the objective is unbounded, since scaling $w$ by $c$ scales the variance by $c^2$. Form the Lagrangian
+\begin{equation}
+\mathcal{L}(w, \lambda) = w^\top S w - \lambda\big(w^\top w - 1\big)
+\end{equation}
+and set the gradient to zero (using $\nabla_w\, w^\top S w = 2Sw$ for symmetric $S$):
+\begin{equation}
+\nabla_w \mathcal{L} = 2Sw - 2\lambda w = 0 \;\;\Longrightarrow\;\; \boxed{\;S w = \lambda w\;}
+\end{equation}
+\textbf{The stationary points are exactly the eigenvectors of the covariance matrix.} Left-multiplying by $w^\top$ and using $\norm{w} = 1$ gives $w^\top S w = \lambda$: \textbf{the Lagrange multiplier \emph{is} the variance explained by that direction}. So the maximum is attained at the eigenvector with the largest eigenvalue---the first principal component.
+
+\textbf{Subsequent components.} For the second component, add the orthogonality constraint $w_2^\top w_1 = 0$:
+\begin{equation}
+\mathcal{L} = w_2^\top S w_2 - \lambda\big(w_2^\top w_2 - 1\big) - \phi\, w_1^\top w_2, \qquad
+\nabla_{w_2}\mathcal{L} = 2Sw_2 - 2\lambda w_2 - \phi w_1 = 0 .
+\end{equation}
+Left-multiply by $w_1^\top$: the first term is $2w_1^\top S w_2 = 2(Sw_1)^\top w_2 = 2\lambda_1 w_1^\top w_2 = 0$ by symmetry of $S$ and the constraint, the second term is $0$ by the same constraint, and $w_1^\top w_1 = 1$---so $\phi = 0$ and we are back to $Sw_2 = \lambda w_2$ with $w_2 \perp w_1$: the eigenvector with the second-largest eigenvalue. By induction, \textbf{the $j$-th principal direction is the eigenvector of $S$ with the $j$-th largest eigenvalue}, and $\lambda_j$ is the variance along it. Because $S$ is symmetric, the eigenvectors are mutually orthogonal, so PCA delivers an orthonormal basis for free---it is a rotation.
+\end{mathresult}
+
+Three facts to state immediately after the derivation, because they are what the follow-ups probe. First, $\tr(S) = \sum_j \lambda_j$ equals the total variance, so the \textbf{explained-variance ratio} of component $j$ is $\lambda_j / \sum_{j'} \lambda_{j'}$. Second, projecting onto the eigenbasis \textbf{decorrelates} the data: the covariance of the scores $XW$ is $W^\top S W = \Lambda$, diagonal by construction---so PCA is exactly the rotation that diagonalizes the covariance matrix, and ``PCA removes linear correlation between features'' is a theorem, not a slogan. Third, this is an \emph{unsupervised} rotation: nothing in the derivation mentions a target.
+
+\subsection{The Same Problem: Minimum Reconstruction Error}
+
+\begin{mathresult}{Maximizing Variance $=$ Minimizing Reconstruction Error}
+Approximate each centered point by its projection onto a single unit direction $w$, i.e., $\hat{x}_i = (w^\top x_i)\, w$, and measure squared reconstruction error. Since $w$ is a unit vector, the projection and the residual are orthogonal, and Pythagoras gives
+\begin{equation}
+\norm{x_i - \hat{x}_i}^2 = \norm{x_i}^2 - (w^\top x_i)^2 .
+\end{equation}
+Summing over the data,
+\begin{equation}
+\underbrace{\sum_{i=1}^n \norm{x_i - \hat{x}_i}^2}_{\text{reconstruction error}} = \underbrace{\sum_{i=1}^n \norm{x_i}^2}_{\text{constant in } w} - \underbrace{w^\top X^\top X w}_{\propto\;\text{projected variance}} .
+\end{equation}
+The first term does not depend on $w$, so \textbf{minimizing reconstruction error and maximizing projected variance are the same optimization problem}, differing by a constant and a sign. The result generalizes: the rank-$r$ subspace minimizing total squared reconstruction error is spanned by the top $r$ eigenvectors, with residual error $\sum_{j > r}\lambda_j \cdot (n-1)$---which is the Eckart--Young theorem in the guise you are most likely to need.
+\end{mathresult}
+
+Saying ``these are the same problem, and here is the Pythagoras line that shows it'' is one of the cheapest strong signals available in a classical-ML interview: most candidates know both characterizations and have never connected them. It also makes the ``choose the number of components'' question quantitative, since the cumulative explained-variance ratio at $r$ is one minus the fraction of squared reconstruction error remaining.
+
+\subsection{PCA via SVD, and Why You Never Form $X^\top X$}
+
+\begin{mathresult}{The SVD Route}
+Take the (thin) singular value decomposition of the \textbf{centered} data matrix,
+\begin{equation}
+X = U \Sigma V^\top, \qquad U \in \R^{n \times r},\; \Sigma = \diag(\sigma_1 \ge \cdots \ge \sigma_r) ,\; V \in \R^{d \times r},
+\end{equation}
+with $U^\top U = V^\top V = I$. Then
+\begin{equation}
+S = \frac{X^\top X}{n-1} = \frac{V \Sigma U^\top U \Sigma V^\top}{n-1} = V \left(\frac{\Sigma^2}{n-1}\right) V^\top ,
+\end{equation}
+which is an eigendecomposition of $S$ read off directly. Therefore:
+\begin{itemize}
+    \item \textbf{Principal directions (loadings)} $=$ the right singular vectors, the columns of $V$;
+    \item \textbf{Explained variances} $\lambda_j = \sigma_j^2/(n-1)$;
+    \item \textbf{Scores (the transformed data)} $= XV = U\Sigma$---so the SVD hands you the projections without a second matrix multiply.
+\end{itemize}
+\end{mathresult}
+
+\textbf{Why SVD is the numerically preferred computation.} Forming $X^\top X$ \emph{squares the condition number}: $\kappa(X^\top X) = \kappa(X)^2$. If $X$ has $\kappa(X) = 10^6$---unremarkable for real feature matrices with correlated or badly scaled columns---then $\kappa(X^\top X) = 10^{12}$, and against double precision's $\approx 16$ significant digits that leaves about four digits of accuracy in the small eigenvalues, which are exactly the ones you use to decide how many components to discard. The SVD works on $X$ directly and never builds the Gram matrix, so it delivers the same answer at $\kappa(X)$ rather than $\kappa(X)^2$; catastrophic cancellation in the cross-product is a real, documented failure, not a theoretical worry. Cost also favours SVD when $n \gg d$ or $d \gg n$: a thin SVD is $O(nd\min(n,d))$, and \textbf{randomized SVD} (Halko, Martinsson \& Tropp, 2011) gets the top $r$ components in roughly $O(ndr)$ with strong probabilistic accuracy---which is what scikit-learn's \texttt{svd\_solver="randomized"} does and why PCA on a $10^6 \times 10^3$ matrix for 50 components is seconds, not minutes.
+
+\begin{warningbox}
+Two answers that cost you the question. (1) \textbf{``I would compute the eigendecomposition of $X^\top X$''} with no mention of conditioning---acceptable as a derivation, damaging as an implementation plan. (2) \textbf{Forgetting to center.} If $X$ is uncentered, $X^\top X/(n-1)$ is a second-moment matrix, not a covariance; the first ``principal component'' will point at the data's mean vector and explain a large, meaningless share of the ``variance.'' Every library centers for you (scikit-learn's \texttt{PCA} does; \texttt{TruncatedSVD} deliberately does not, which is the entire reason it exists---see Section~\ref{cml:sec:pca_hurts}), so this is a question about whether you know what the library is doing on your behalf.
+\end{warningbox}
+
+\subsection{Centering, Scaling, and Whitening}
+
+\textbf{Centering: always.} It is part of the definition, not a preprocessing option.
+
+\textbf{Scaling: when units are incommensurable, which is most of the time.} PCA on the raw covariance matrix is dominated by the highest-variance features, and variance carries units. The canonical demonstration: cluster or reduce a dataset of \texttt{height} and \texttt{weight}, with height in centimetres (variance $\approx 100$\,cm$^2$) and weight in kilograms (variance $\approx 25$\,kg$^2$). PC1 loads mostly on height. Now record height in metres: its variance becomes $0.01$\,m$^2$, and PC1 flips to load almost entirely on weight---\textbf{same data, different answer, purely from a unit change}. The fix is to standardize each feature to unit variance, which is identical to running PCA on the \textbf{correlation} matrix instead of the covariance matrix. Use covariance PCA only when the features share units and their relative variances are meaningful (pixel intensities, replicate sensor channels, returns on comparable assets); use correlation PCA everywhere else. Note the flip side, since interviewers push here: standardizing declares every feature equally important a priori, so it \emph{amplifies} low-variance noise features. If some columns are known garbage, drop them rather than promoting them to unit variance.
+
+\textbf{Whitening.} Projecting onto the eigenbasis decorrelates; dividing each score by its standard deviation additionally equalizes the variances:
+\begin{equation}
+Z = X V \Lambda^{-1/2}, \qquad \Lambda = \diag(\lambda_1, \ldots, \lambda_r) \;\Longrightarrow\; \Cov(Z) = \Lambda^{-1/2}\,\Lambda\,\Lambda^{-1/2} = I .
+\end{equation}
+In SVD terms $Z = U\Sigma \cdot (\Sigma/\sqrt{n-1})^{-1} = \sqrt{n-1}\,U$: the whitened scores are just the left singular vectors, rescaled. Whitening helps algorithms that assume isotropy---k-means, kNN, and distance-based methods generally, plus some optimizers---and hurts whenever the variance ordering was information: it \textbf{boosts the smallest components, which are usually the noisiest}, so a whitened representation can have a far worse signal-to-noise ratio than the plain scores. Regularized whitening ($\lambda_j + \epsilon$ in the denominator) is the standard compromise. Do not confuse whitening with standardizing the input features: the first equalizes variance along the principal axes \emph{after} rotation, the second along the original axes before it.
+
+\subsection{Choosing the Number of Components}
+
+Options, roughly in order of how defensible they are in an interview:
+\begin{itemize}
+    \item \textbf{Explained-variance target.} Keep the smallest $r$ with cumulative $\sum_{j\le r}\lambda_j / \sum_j \lambda_j \ge$ a threshold (90\%, 95\%, 99\%). Honest, arbitrary, and universally accepted---but say which threshold and why.
+    \item \textbf{Scree plot / elbow.} Same subjectivity problem as the k-means elbow, and worth flagging as such.
+    \item \textbf{Downstream cross-validation.} If PCA feeds a supervised model, $r$ is just another hyperparameter: tune it \emph{inside} the CV loop, fitting PCA on each training fold only. Fitting PCA on all the data before splitting is a genuine (if mild) leak---the components saw the validation rows.
+    \item \textbf{Reconstruction-error target.} The dual of the variance target, and the natural framing when PCA is being used for compression or denoising rather than as a feature step.
+    \item \textbf{Principled/statistical rules.} Kaiser's ``keep $\lambda_j > 1$'' on the correlation matrix (crude, known to over-retain); parallel analysis, which compares the scree curve to eigenvalues from permuted or random data of the same shape---the same idea as the gap statistic and the most defensible of the automatic rules; and, for a probabilistic answer, Minka's Bayesian model selection for probabilistic PCA (scikit-learn's \texttt{n\_components="mle"}).
+\end{itemize}
+
+\subsection{When PCA Hurts}
+\label{cml:sec:pca_hurts}
+
+\begin{warningbox}
+\textbf{PCA is unsupervised: the highest-variance directions need not be the predictive ones.} This is the favourite trap probe of the whole chapter. Construct the counterexample in your head and you will never fumble it: two features, $x_1 \sim \mathcal{N}(0, 100)$ pure noise and $x_2 \sim \mathcal{N}(0,1)$ with $y = x_2$. PC1 is essentially $x_1$ and explains $99\%$ of the variance; keeping ``the top component'' throws away $100\%$ of the signal. Variance is a statement about the inputs; predictiveness is a statement about the input--output relationship, and PCA never looks at $y$. If you want a supervised projection, that is PLS (partial least squares), LDA (for classification, at most $C-1$ directions), or simply a regularized model on the original features. In practice PCA-then-regress usually works---signal often does live in high-variance directions---but ``usually'' is the honest word, and the interviewer is testing whether you know it is an empirical accident rather than a guarantee.
+\end{warningbox}
+
+\textbf{Sparse, high-dimensional data.} On a $100{,}000 \times 10{,}000$ TF-IDF matrix at $0.5\%$ density, the sparse representation holds $5\times10^6$ nonzeros---tens of megabytes. Centering subtracts a dense mean vector from every row and destroys the sparsity: the dense matrix is $10^9$ float64 entries, $8$\,GB, and you have turned a cheap operation into an out-of-memory error. This is exactly what \textbf{TruncatedSVD} (\emph{a.k.a.} latent semantic analysis) is for---it computes the SVD without centering, so it stays sparse, and it is the correct tool for bag-of-words and one-hot features. Say plainly that it is \emph{not} PCA: the components are not covariance eigenvectors, and the first one typically captures the document mean direction.
+
+\textbf{Nonlinear structure.} PCA is a linear projection, so a Swiss roll, a circle, or a checkerboard defeats it: the best linear subspace can be uninformative even when the data lie on a clean low-dimensional manifold. \textbf{Kernel PCA} runs the same eigenproblem on the centered kernel matrix $K$ (implicitly in a feature space, so $O(n^2)$--$O(n^3)$ and no exact out-of-sample inverse), autoencoders are the neural generalization, and t-SNE/UMAP (Section~\ref{cml:sec:manifold}) are the visualization-only options. Knowing that kernel PCA \emph{exists} and that its cost is quadratic in $n$ is the expected depth here.
+
+\textbf{Interpretation caveats.} Components are linear combinations of \emph{all} features, not a feature subset---``PCA does feature selection'' is wrong, and if you need selection, use L1 or an importance-based method (Chapter~\ref{cml:chap:supervised_core}, Chapter~\ref{cml:chap:applied_craft}) or sparse PCA. Loadings carry a \textbf{sign indeterminacy}: $w$ and $-w$ are equally valid eigenvectors, so ``PC1 went up'' has no meaning across refits, and libraries impose an arbitrary sign convention that can flip when the data change slightly. Eigenvectors are also unstable when eigenvalues are near-degenerate ($\lambda_j \approx \lambda_{j+1}$ makes the individual directions arbitrary within their shared subspace, though the subspace is stable). And PCA is sensitive to outliers, because covariance is: a handful of extreme rows can pull PC1 toward themselves---the fixes are robust covariance estimation (MCD), robust PCA, or winsorizing first.
+
+\begin{keyinsight}[The Standard Pipeline, and Why It Works]
+Standardize $\to$ PCA to $r$ components $\to$ k-means or kNN is a workhorse for a reason that follows from everything above: the distance-based method's assumptions (isotropy, meaningful Euclidean distance) are least violated in a decorrelated, denoised, low-dimensional space, and the $O(nkd)$ or $O(nd)$ inner loops shrink with $d$. It is also the correct answer to ``how do I cluster $768$-dimensional embeddings''---reduce to tens of dimensions first, and be aware you are clustering a rotation of the space, so cluster interpretation must go back through the loadings or through exemplar records. What PCA is \emph{not} is a way to visualize clusters and then draw conclusions about their separation; two components of a 768-dimensional space typically explain a small fraction of variance, and apparent overlap in that plot is not evidence of anything.
+\end{keyinsight}
+
+%==============================================================================
 \section{t-SNE and UMAP: Caveats First}
-% TODO Phase C3
+\label{cml:sec:manifold}
+%==============================================================================
 
+This section is written backwards on purpose. Nobody in an interview is asked to derive t-SNE; people are asked what a t-SNE plot means, and the overwhelmingly common failure is over-reading it. So the caveats come first, and the mechanics follow only far enough to \emph{explain} the caveats---which is also the order that makes the answer convincing, because ``cluster sizes are meaningless'' lands very differently when you can say why.
+
+\subsection{The Caveat List}
+
+\begin{warningbox}
+\textbf{What a t-SNE (or UMAP) plot does not tell you.}
+\begin{enumerate}
+    \item \textbf{Cluster sizes are meaningless.} t-SNE has a per-point bandwidth chosen to hit a target perplexity, so it expands sparse regions and contracts dense ones. A tight blob and a sprawling one can have identical variance in the original space.
+    \item \textbf{Distances between clusters are meaningless.} Two clusters far apart on the plot are not more different than two that are close. The objective (below) barely penalizes putting dissimilar points anywhere at all, so the between-cluster layout is largely unconstrained.
+    \item \textbf{Global structure is not preserved} in general---and the amount that survives depends mostly on the \emph{initialization}, not on the algorithm.
+    \item \textbf{The result depends on hyperparameters and the seed.} Perplexity (or \texttt{n\_neighbors}) changes the picture qualitatively; different seeds give different pictures. A conclusion that does not survive re-running at three perplexities and three seeds is not a conclusion.
+    \item \textbf{It can manufacture clusters from noise.} Run t-SNE at low perplexity on i.i.d.\ Gaussian noise and you will get crisp, convincing, entirely spurious islands. This is the single most dangerous property of the method.
+    \item \textbf{It is a visualization, not a feature transform.} Plain t-SNE has no out-of-sample mapping---the embedding is a set of free parameters optimized for \emph{these} points---so there is no honest \texttt{transform()} for new data, and a downstream model trained on 2-D t-SNE coordinates is trained on an arbitrary, non-reproducible, information-destroying summary. Never do it.
+\end{enumerate}
+The classic reference for the first five is Wattenberg, Viégas \& Johnson, ``How to Use t-SNE Effectively'' (Distill, 2016); the interactive figures there are the fastest way to internalize them.
+\end{warningbox}
+
+\subsection{t-SNE Mechanics, Enough to Explain the Caveats}
+
+t-SNE (van der Maaten \& Hinton, 2008) matches two distributions over \emph{pairs}.
+
+\textbf{High dimension.} For each point $i$, define a conditional similarity with a Gaussian centered on $x_i$,
+\begin{equation}
+p_{j|i} = \frac{\exp\!\big(-\norm{x_i - x_j}^2 / 2\sigma_i^2\big)}{\sum_{k \ne i} \exp\!\big(-\norm{x_i - x_k}^2 / 2\sigma_i^2\big)}, \qquad p_{ij} = \frac{p_{j|i} + p_{i|j}}{2n},
+\end{equation}
+where the per-point bandwidth $\sigma_i$ is found by binary search so that the \textbf{perplexity} $2^{H(P_i)}$ (with $H$ the Shannon entropy of $P_i$ in bits) equals a user-set target---a smooth measure of ``effective number of neighbours,'' typically $5$--$50$ (scikit-learn defaults to $30$). \emph{This is caveat 1's mechanism}: $\sigma_i$ adapts per point, so density information is deliberately normalized away.
+
+\textbf{Low dimension.} In the 2-D embedding, similarities use a Student-$t$ distribution with one degree of freedom (a Cauchy):
+\begin{equation}
+q_{ij} = \frac{\big(1 + \norm{y_i - y_j}^2\big)^{-1}}{\sum_{k \ne l} \big(1 + \norm{y_k - y_l}^2\big)^{-1}} .
+\end{equation}
+\textbf{Why heavy tails---the crowding problem.} The volume of a ball of radius $r$ grows like $r^m$ in $m$ dimensions, so a point in $50$ dimensions can have far more ``moderately distant'' neighbours than there is room for at moderate distance in $2$ dimensions. With a Gaussian in the low-dimensional space, all those moderate pairs get crushed into the centre. The $t$-distribution's heavy tail assigns a much larger $q$ to a given large low-dimensional distance, so moderately dissimilar points can be pushed far apart at little cost---which is exactly what creates the clean gaps between clusters that make t-SNE plots look so persuasive.
+
+\textbf{The objective.} Minimize $\KL(P \,\|\, Q) = \sum_{i \ne j} p_{ij}\log\frac{p_{ij}}{q_{ij}}$ by gradient descent on the embedding coordinates $y_i$, with
+\begin{equation}
+\frac{\partial \mathrm{KL}}{\partial y_i} = 4\sum_{j \ne i} (p_{ij} - q_{ij})(y_i - y_j)\big(1 + \norm{y_i - y_j}^2\big)^{-1} .
+\end{equation}
+\emph{This is caveat 2's mechanism}: the KL is asymmetric. A pair with large $p_{ij}$ and small $q_{ij}$ (near points placed far apart) incurs a large penalty; a pair with small $p_{ij}$ and large $q_{ij}$ (far points placed near) costs almost nothing, since the $p_{ij}$ prefactor is tiny. So t-SNE is aggressive about preserving neighbourhoods and nearly indifferent to where the neighbourhoods end up relative to one another---\textbf{inter-cluster geometry is not being optimized at all}.
+
+Practicalities worth knowing: the exact algorithm is $O(n^2)$ per iteration, Barnes--Hut brings it to $O(n\log n)$ for 2-D/3-D outputs (the standard implementation), and FIt-SNE with interpolation-based repulsion is roughly linear for millions of points. Early exaggeration (temporarily inflating $P$) helps the clusters separate before fine layout. And the initialization matters more than any of it: Kobak \& Linderman (2021) showed that UMAP's reputed advantage in preserving global structure is essentially attributable to its Laplacian-eigenmap initialization, and that \textbf{t-SNE initialized from PCA preserves global structure just as well}---which is why scikit-learn's \texttt{TSNE} now defaults to \texttt{init="pca"}. Always initialize from PCA; it also makes runs reproducible up to the optimizer's noise.
+
+\subsection{UMAP}
+
+UMAP (McInnes, Healy \& Melville, 2018) builds a weighted k-nearest-neighbour graph, converts the edge weights to fuzzy membership strengths (using a per-point local scale $\sigma_i$ calibrated so that $\sum_j \exp(-(d(x_i,x_j) - \rho_i)/\sigma_i) = \log_2 k$, with $\rho_i$ the distance to the nearest neighbour---the ``local connectivity'' assumption that guarantees every point is connected to something), symmetrizes, and then lays out the graph in low dimension by minimizing a \emph{cross-entropy} between the high- and low-dimensional fuzzy sets, optimized with negative sampling like a word2vec-style objective.
+
+What differs from t-SNE in practice:
+\begin{itemize}
+    \item \textbf{Speed.} The approximate-nearest-neighbour graph plus stochastic negative-sampling optimization makes UMAP substantially faster at large $n$, and it handles hundreds of thousands to millions of points routinely.
+    \item \textbf{An explicit repulsive term.} t-SNE's repulsion comes only through the normalization of $Q$; UMAP's cross-entropy penalizes non-edges directly, which is why its clusters are typically more compact and more separated. \texttt{min\_dist} (default $0.1$) directly controls that compactness and is a purely aesthetic knob---it changes nothing about the data.
+    \item \textbf{A real \texttt{transform()}.} New points can be embedded by placing them in the existing graph, so unlike t-SNE, UMAP \emph{has} an out-of-sample mapping. This tempts people into using UMAP output as model features. It is defensible occasionally---a fixed, versioned UMAP model as a nonlinear compressor---but the output dimensions are uninterpretable, unstable under refit, and optimized for a visual objective, so PCA/autoencoders are the better answer nearly every time.
+    \item \textbf{Its main knob, \texttt{n\_neighbors}} (default $15$), plays perplexity's role: small values emphasize local structure and fragment the picture, large values emphasize global structure and merge it.
+\end{itemize}
+
+\textbf{The honest summary on global structure}: UMAP tends to preserve more of it than randomly initialized t-SNE, mostly for initialization reasons, and neither method's inter-cluster distances should be read quantitatively. Chari \& Pachter's ``The Specious Art of Single-Cell Genomics'' (PLOS Comput.\ Biol., 2023) makes the point vividly by training an autoencoder (``Picasso'') that maps real single-cell data into the shape of an elephant while preserving as much local structure as a standard UMAP does---a useful thing to be able to cite when someone wants to make a decision from a picture.
+
+\subsection{Choosing Between PCA, t-SNE, and UMAP}
+
+Table~\ref{cml:tab:dimred_compare} is the summary; the rule underneath it is simpler than the table.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Linear vs.\ manifold dimensionality reduction}
+\label{cml:tab:dimred_compare}
+\begin{tabularx}{\textwidth}{@{}l X X X@{}}
+\toprule
+ & \textbf{PCA / TruncatedSVD} & \textbf{t-SNE} & \textbf{UMAP} \\
+\midrule
+Mapping & Linear, deterministic, invertible (up to truncation) & Nonlinear; no out-of-sample map & Nonlinear; has \texttt{transform()} \\
+Preserves & Global variance structure; distances up to truncation error & Local neighbourhoods only & Local neighbourhoods; some global with good init \\
+Reproducible & Yes (up to sign) & Only with fixed seed and init & Only with fixed seed and init \\
+Cost & $O(ndr)$ randomized; trivial at scale & $O(n\log n)$ Barnes--Hut & $O(n\log n)$-ish; fastest in practice \\
+Main knobs & $r$ & Perplexity, init, learning rate & \texttt{n\_neighbors}, \texttt{min\_dist}, init \\
+Use for & Feature transforms, denoising, compression, preprocessing for clustering/kNN & Visualization, exploratory QA of embeddings & Visualization at scale; occasionally a versioned nonlinear compressor \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[The Rule That Survives Every Follow-Up]
+\textbf{Use PCA when the output feeds a model; use t-SNE or UMAP when the output feeds a human eye---and then verify every claim the picture suggests with a measurement in the original space.} If two visual clusters look distinct, test it: train a simple classifier to separate them and check held-out accuracy; compute silhouette or centroid separation on the original (or PCA) representation; check whether the split is explained by a known covariate (batch, date, device, tenant). A t-SNE plot is a hypothesis generator. It is never evidence.
+\end{keyinsight}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C3
+\label{cml:sec:unsupervised_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: Derive PCA from first principles. Whiteboard it.}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+State the setup before writing anything: $X \in \R^{n\times d}$ with rows $x_i^\top$, \textbf{centered}, and $S = \frac{1}{n-1}X^\top X$ the sample covariance. Goal: the unit direction of maximal projected variance.
+
+Because the data are centered, the projections $w^\top x_i$ have mean zero, so their variance is $\frac{1}{n-1}\sum_i (w^\top x_i)^2 = w^\top S w$. Note aloud why the constraint $\norm{w}=1$ is required---without it the objective scales as $c^2$ and is unbounded. Form the Lagrangian $\mathcal{L} = w^\top S w - \lambda(w^\top w - 1)$, set $\nabla_w \mathcal{L} = 2Sw - 2\lambda w = 0$, and read off
+\begin{equation*}
+S w = \lambda w ,
+\end{equation*}
+so the stationary points are the eigenvectors of $S$. Left-multiplying by $w^\top$ gives $w^\top S w = \lambda$: \textbf{the multiplier is the explained variance}, so the maximum is the top eigenvector. For the second component, add $w_2^\top w_1 = 0$; left-multiplying the stationarity condition by $w_1^\top$ kills the extra multiplier (using symmetry of $S$), leaving $Sw_2 = \lambda w_2$ with $w_2 \perp w_1$---the second eigenvector, and by induction the rest.
+
+Then volunteer the three things that turn a correct derivation into a strong one. (1) \textbf{Equivalence}: minimizing reconstruction error is the same problem---$\norm{x_i - (w^\top x_i)w}^2 = \norm{x_i}^2 - (w^\top x_i)^2$ by Pythagoras, and the first term is constant in $w$. (2) \textbf{SVD}: with $X = U\Sigma V^\top$, $S = V\frac{\Sigma^2}{n-1}V^\top$, so the components are the columns of $V$, $\lambda_j = \sigma_j^2/(n-1)$, and the scores are $XV = U\Sigma$; libraries use the SVD because forming $X^\top X$ squares the condition number. (3) \textbf{Preconditions}: center always, standardize when units differ (covariance vs.\ correlation PCA), and remember the whole thing is unsupervised.
+
+\redflags
+\begin{itemize}
+    \item Omitting the norm constraint, or writing a Lagrangian and never explaining that $\lambda$ is the variance.
+    \item Forgetting to center---or not knowing that skipping it makes PC1 point at the mean vector.
+    \item ``I'd eigendecompose $X^\top X$'' as the implementation plan, with no mention of SVD or conditioning.
+    \item Claiming PCA selects features (components are dense linear combinations of all of them).
+\end{itemize}
+
+\interviewtest{Whether you can run a short constrained optimization cleanly under pressure and connect it to the numerical reality of the library you use. The orthogonality step for the second component is where memorized answers stop.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Clean Lagrangian derivation to $Sw = \lambda w$, $\lambda$ identified as explained variance, centering stated.
+    \item \badgeLsix{L6} Adds the reconstruction-error equivalence with the Pythagoras line, the SVD identities including $\lambda_j = \sigma_j^2/(n-1)$, and the covariance-vs-correlation choice with a units example.
+    \item \badgeLseven{L7} Discusses the condition-number argument quantitatively, randomized SVD for the top-$r$ regime, and the limits---nonlinear structure (kernel PCA, autoencoders), sign indeterminacy, near-degenerate eigenvalues making individual directions unstable while the subspace is stable.
+\end{itemize}
+
+\followups{``Show me that maximizing variance and minimizing reconstruction error are the same problem.'' ``What is whitening and when does it hurt?'' ``I have 10 million rows and want 50 components---what do you run?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why does k-means converge, and what does it converge to? And why do you need k-means++?}
+
+\badgeLfive{L5} \quad \badgetype{First Principles} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Convergence.} Name the objective first: $J = \sum_i \norm{x_i - \mu_{c(i)}}^2$. Lloyd's algorithm alternates two steps, and \emph{each one is the exact minimizer of $J$ over one block with the other fixed}---assignment to the nearest centroid is exactly optimal given centroids (the objective decouples across points), and the mean is exactly optimal given the assignment (set $\nabla_\mu \sum_{i \in C}\norm{x_i - \mu}^2 = 0$ to get $\mu = \bar{x}_C$; the Hessian $2|C|I$ is positive definite). So $J$ is non-increasing, and strictly decreases whenever an assignment changes. $J$ depends on the data only through the assignment, there are finitely many assignments ($\le k^n$), and no assignment can repeat---so the algorithm \textbf{terminates in finitely many iterations}.
+
+\textbf{To what.} A local optimum---strictly, a fixed point of the alternation. The global problem is NP-hard, and the local optimum can be arbitrarily bad. Give the two-line example: points $\{0,1,10,11,20,21\}$, $k=3$, seeds at $\{0,1,15.5\}$ is a fixed point with $J = 101$ against the optimum $J = 1.5$, because two seeds landed in one true cluster and nothing can pull them apart.
+
+\textbf{Why k-means++.} Uniform seeding puts one seed in each of $k$ equal clusters with probability $k!/k^k$---about $4\%$ at $k=5$, effectively zero by $k=10$---so the typical random initialization is exactly the pathological configuration above. k-means++ seeds by $D^2$ sampling: first centre uniform, then each subsequent centre drawn with probability proportional to its squared distance to the nearest chosen centre. That spreads seeds while staying randomized (so a single outlier is not chosen deterministically), costs one extra $O(nkd)$ pass, and comes with a guarantee: expected cost of the \emph{seeding alone} is within $8(\ln k + 2)$ of optimal, i.e., $O(\log k)$-competitive. It reduces bad runs; it does not eliminate them, so run several restarts and keep the lowest inertia---and set \texttt{n\_init} explicitly, since scikit-learn's \texttt{"auto"} default means one restart with k-means++.
+
+\redflags
+\begin{itemize}
+    \item ``k-means converges to the global optimum.'' Hard fail.
+    \item Asserting convergence without naming the objective or explaining why each step is exactly optimal for its block.
+    \item ``It might not converge / it could oscillate''---it cannot; the finiteness argument rules that out.
+    \item Describing k-means++ as ``pick spread-out points'' with no mention that it is a randomized $D^2$ draw, or claiming it guarantees the global optimum.
+\end{itemize}
+
+\interviewtest{Whether ``alternating minimization of a bounded objective over a finite set'' is a proof you can construct rather than a phrase you have heard, and whether you connect the local-optimum fact to the initialization machinery that exists because of it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Monotonicity + finiteness argument, local optimum stated, k-means++ and restarts named.
+    \item \badgeLsix{L6} Derives the mean-minimizes-SSE step, produces a concrete stuck example, quotes the birthday-problem probability and the $O(\log k)$ guarantee, and mentions the \texttt{n\_init} default change as an operational hazard.
+    \item \badgeLseven{L7} Notes the worst case is superpolynomial in iterations but polynomial under smoothed analysis, that k-means$\|$ parallelizes the seeding, and reframes the whole thing as EM at zero temperature so the convergence story matches the GMM's.
+\end{itemize}
+
+\followups{``Prove the mean minimizes SSE.'' ``How many restarts is enough?'' ``What changes if I use $L_1$ distance?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Derive the EM updates for a Gaussian mixture model, and explain why the likelihood increases monotonically.}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{Set up the obstacle.} The log-likelihood is $\ell(\theta) = \sum_i \log \sum_k \pi_k \mathcal{N}(x_i \given \mu_k, \Sigma_k)$: the log sits outside a sum, so nothing cancels and there is no closed form. Introduce latent one-hot $z_i$ with $p(z_{ik}=1) = \pi_k$; the \emph{complete-data} log-likelihood $\sum_i\sum_k z_{ik}[\log\pi_k + \log\mathcal{N}(x_i\given\mu_k,\Sigma_k)]$ puts the log inside, and every parameter separates.
+
+\textbf{E step.} Posterior over the latent, by Bayes:
+\begin{equation*}
+\gamma_{ik} = \frac{\pi_k \mathcal{N}(x_i \given \mu_k,\Sigma_k)}{\sum_j \pi_j \mathcal{N}(x_i \given \mu_j,\Sigma_j)} .
+\end{equation*}
+Since the complete-data log-likelihood is linear in $z_{ik}$, taking the expectation is just substituting $\gamma_{ik}$, giving $Q(\theta\given\theta^{(t)}) = \sum_i\sum_k \gamma_{ik}[\log\pi_k + \log\mathcal{N}(x_i\given\mu_k,\Sigma_k)]$.
+
+\textbf{M step.} With $N_k = \sum_i \gamma_{ik}$: setting $\nabla_{\mu_k}Q = \sum_i \gamma_{ik}\Sigma_k^{-1}(x_i-\mu_k) = 0$ gives $\mu_k = \frac{1}{N_k}\sum_i \gamma_{ik}x_i$; the analogous matrix derivative gives $\Sigma_k = \frac{1}{N_k}\sum_i \gamma_{ik}(x_i-\mu_k)(x_i-\mu_k)^\top$; and $\pi_k$ needs a Lagrange multiplier for $\sum_k \pi_k = 1$: $\frac{N_k}{\pi_k}+\lambda = 0 \Rightarrow \pi_k = -N_k/\lambda$, and summing gives $\lambda = -n$, hence $\pi_k = N_k/n$. Summarize: \textbf{every update is the ordinary MLE with hard counts replaced by soft responsibilities}.
+
+\textbf{Why it ascends.} For any $q(Z)$, $\log p(X\given\theta) = \mathcal{F}(q,\theta) + \KL(q \| p(Z\given X,\theta))$ where $\mathcal{F}$ is the ELBO; since $\KL \ge 0$, $\mathcal{F}$ is a lower bound, tight iff $q$ is the posterior. The E step sets $q = p(Z\given X,\theta^{(t)})$, driving the KL to zero and making the bound \textbf{touch} the likelihood; the M step maximizes $\mathcal{F}$ over $\theta$, which can only raise it. Chaining: $\log p(X\given\theta^{(t+1)}) \ge \mathcal{F}(q^{(t+1)},\theta^{(t+1)}) \ge \mathcal{F}(q^{(t+1)},\theta^{(t)}) = \log p(X\given\theta^{(t)})$. Monotone ascent; bounded above for a regularized model; converges to a stationary point---local, not global. Close with the practical consequence: a \emph{decreasing} log-likelihood in your training log is a bug, not a result.
+
+\redflags
+\begin{itemize}
+    \item ``EM alternates two steps until convergence'' with no ELBO or Jensen argument for why the likelihood rises.
+    \item Not being able to say why direct MLE fails (``log of a sum'').
+    \item Dropping the Lagrange multiplier for $\pi$, or claiming $\pi_k = 1/K$.
+    \item Claiming EM finds the global maximum---or not knowing the GMM likelihood is unbounded above.
+\end{itemize}
+
+\interviewtest{The chapter's centerpiece derivation. Interviewers watch three checkpoints: Bayes' rule for the responsibilities, the Lagrange multiplier on the mixing weights, and whether the monotonicity argument is a real argument (bound + tightness + maximization) or hand-waving.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Both steps written correctly with the responsibilities derived, and a gesture at Jensen for monotonicity.
+    \item \badgeLsix{L6} Full M-step derivation including the multiplier, the complete ELBO chain, and the local-optimum/initialization caveat (k-means-initialized EM is the standard practice).
+    \item \badgeLseven{L7} Adds the singularity pathology and its regularization fix, the covariance-parameterization bias-variance dial with BIC for model selection, EM's linear convergence rate near the optimum, and the bridge to variational inference: restrict $q$ to a tractable family and the same ELBO becomes the VAE objective [DL 11].
+\end{itemize}
+
+\followups{``What happens if a component collapses onto one point?'' ``How do you choose the number of components?'' ``Where does this become the VAE?'' ``What is the E step when the complete-data likelihood is not linear in $z$?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: How do you choose $k$? Your teammate says the elbow plot shows 8 clusters.}
+
+\badgeLfive{L5} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Lead with the honest framing: \textbf{there is usually no true $k$}. Inertia decreases monotonically in $k$ and hits zero at $k=n$, so the objective cannot select $k$; every method is a heuristic trading fit against parsimony or against a null model, and they routinely disagree by a factor of two on real data.
+
+On the elbow specifically: it is a legitimate first look and a terrible final answer. The curve is usually smooth, so the perceived kink depends on the plot's aspect ratio and on where the axis starts---two people reading the same chart pick different $k$. Ask your teammate to overlay $k$ from other methods before defending 8.
+
+The portfolio I would actually run: \textbf{silhouette} (has a genuine optimum in $k$ and gives per-point diagnostics, but favours compact convex clusters and is $O(n^2)$ in distances, so subsample); the \textbf{gap statistic}, which compares $\log$ inertia to its expectation under a uniform reference and is the only common method that can return $k=1$, i.e., ``there is no cluster structure''---that null answer is its real value; \textbf{BIC on a GMM} if a probabilistic model is acceptable, since it gives a principled parameter penalty; and \textbf{stability}, clustering bootstrap or split-half resamples and measuring label agreement (adjusted Rand) after matching---partitions that do not reproduce across resamples are not real, and this is the most persuasive evidence for a skeptical reviewer. If even a few thousand labelled records exist, external indices (ARI, NMI) beat every internal one.
+
+Then the staff-level move: \textbf{decide by the downstream use}. If these are marketing segments a team has to staff and write copy for, $k$ is bounded by headcount and attention---8 might be right because it is operable, not because inertia bent there. If they feed a model, $k$ is a hyperparameter tuned on the model's metric. If they are quantization codewords, $k$ is set by the memory/recall budget. Report the range over which conclusions are stable rather than a single number.
+
+\redflags
+\begin{itemize}
+    \item Naming the elbow and stopping, with no acknowledgment of its subjectivity.
+    \item Trying to choose $k$ by minimizing inertia (it is monotone---this is the tell that the objective is not understood).
+    \item No mention that the answer should depend on what the clusters are for.
+    \item Unaware that silhouette structurally penalizes non-convex clusters, so it can reject a correct density-based solution.
+\end{itemize}
+
+\interviewtest{Whether you can be honest about an underdetermined problem. Interviewers use this to separate people who have shipped a segmentation---and had to defend it to a stakeholder---from people who have run \texttt{KMeans} in a notebook.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Elbow's subjectivity, plus silhouette and one other method, plus ``no true $k$.''
+    \item \badgeLsix{L6} Adds gap statistic (including the $k=1$ answer), stability/resampling as the strongest internal evidence, and the covariance-type--$K$ interaction if using a GMM with BIC.
+    \item \badgeLseven{L7} Reframes around the decision the clusters serve, proposes reporting a stable range plus a per-cluster profile a human can validate, and flags that clusters must be monitored for drift after launch since their meaning shifts with the population.
+\end{itemize}
+
+\followups{``What does the gap statistic actually compare against?'' ``Silhouette says 2, BIC says 11---what now?'' ``How would you show a PM these clusters are real?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your t-SNE plot of user embeddings shows five clean, well-separated clusters. What can you conclude?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Almost nothing yet---and saying so immediately is the whole test. What a clean t-SNE picture licenses is a \emph{hypothesis}: there may be local neighbourhood structure in the embedding space. What it explicitly does not license:
+
+\begin{itemize}
+    \item \textbf{That there are five clusters.} t-SNE optimizes a local-neighbourhood objective and its heavy-tailed low-dimensional kernel actively creates gaps (it exists to solve the crowding problem). Run it on i.i.d.\ Gaussian noise at low perplexity and you will get crisp islands. Apparent separation is partly a property of the algorithm.
+    \item \textbf{That the clusters are equally important.} Cluster sizes on the plot are meaningless: the per-point bandwidth $\sigma_i$ is tuned to hit a fixed perplexity, which expands sparse regions and contracts dense ones.
+    \item \textbf{That two clusters far apart are more different.} The KL objective is asymmetric---putting dissimilar points far apart is nearly free---so inter-cluster geometry is essentially unoptimized. Reading distances off the plot is the classic error.
+    \item \textbf{That the picture is stable.} Perplexity and seed change it qualitatively; global structure depends mostly on the initialization (PCA init versus random).
+\end{itemize}
+
+\textbf{What I would do instead.} (1) Re-run at perplexity $5$, $30$, $100$ with PCA init and three seeds; keep only what survives all nine. (2) Test the hypothesis in the \emph{original} space: assign the visual groups as tentative labels and train a simple classifier to separate them---if held-out accuracy is near chance, the groups do not exist; also compute silhouette or centroid separation on the raw or PCA representation. (3) Cluster properly in the original space (k-means with a chosen $k$, or HDBSCAN if the shapes are irregular) and check whether those clusters agree with the visual ones by adjusted Rand. (4) \textbf{Check for a confound}: run the obvious suspects---signup cohort, country, device, tenant, model version---as colourings. In my experience the most common cause of five beautiful islands in an embedding plot is five values of a categorical feature, or an artifact of how the embeddings were produced. (5) Only then profile the clusters on interpretable features and decide whether they are actionable.
+
+And the non-negotiable: \textbf{never fit a downstream model on the 2-D t-SNE coordinates.} Plain t-SNE has no out-of-sample mapping, the coordinates change every run, and they discard nearly all the information in the embedding.
+
+\redflags
+\begin{itemize}
+    \item ``There are five user segments'' as a conclusion.
+    \item Reading inter-cluster distances or cluster sizes as meaningful.
+    \item Proposing to use the t-SNE coordinates as features for a classifier.
+    \item No plan to validate in the original space; no awareness that seed and perplexity change the picture.
+\end{itemize}
+
+\interviewtest{Applied skepticism about a tool everyone uses and almost nobody interrogates, plus whether you can propose concrete validation rather than just listing caveats. Candidates who recite the caveats but cannot say what they would run next stop at good.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the size/distance caveats and the seed/perplexity sensitivity, and declines to conclude.
+    \item \badgeLsix{L6} Explains \emph{why} from the mechanism (per-point bandwidth, asymmetric KL, heavy tails for crowding) and proposes the original-space validation plan plus the confound check.
+    \item \badgeLseven{L7} Adds the initialization result (Kobak \& Linderman: UMAP's global-structure advantage is mostly initialization; PCA-initialized t-SNE matches it), the noise-hallucination demonstration as a team norm, and the organizational fix---embedding plots ship with perplexity, seed, init, and a stability check, or they do not ship.
+\end{itemize}
+
+\followups{``Why does t-SNE use a Student-$t$ in the low-dimensional space?'' ``Would UMAP fix any of this?'' ``How would you actually cluster these embeddings?'' ``What would convince you the five groups are real?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: When does k-means fail, and what do you use instead?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Organize the answer around the generative model instead of reciting a list: minimizing $\sum_i\norm{x_i - \mu_{c(i)}}^2$ is maximum likelihood for a mixture of \emph{isotropic, equal-variance, equal-weight} Gaussians under hard assignment. Every failure is one of those assumptions breaking, which makes the list derivable on the spot:
+
+\begin{itemize}
+    \item \textbf{Non-convex shapes} (rings, moons, filaments): centroid-based assignment gives linear Voronoi boundaries, which cannot carve a ring. $\to$ DBSCAN/HDBSCAN, spectral clustering, kernel k-means.
+    \item \textbf{Elliptical or unequally spread clusters}: violates isotropy/equal variance. $\to$ GMM with full or diagonal covariance.
+    \item \textbf{Very unequal cluster sizes}: the SSE objective prefers to split a large mass and absorb a small one. $\to$ GMM with free mixing weights, or accept and post-process.
+    \item \textbf{Outliers}: centroids are means, and means are not robust. $\to$ k-medoids/PAM, k-medians, trimmed k-means, or remove them first; DBSCAN if you want them \emph{labelled} as noise.
+    \item \textbf{High dimension}: distance concentration makes nearest-centroid a near-tie. $\to$ PCA/SVD first, or cosine distance on normalized vectors (spherical k-means).
+    \item \textbf{Unscaled features}: the largest-range feature owns the objective---spend in dollars versus visits per month is a $10^6$ mismatch in squared distance. $\to$ standardize, always.
+    \item \textbf{Categorical or mixed data}: means and squared Euclidean distance are undefined. $\to$ k-modes/k-prototypes, or Gower distance with a medoid method.
+    \item \textbf{Bad initialization}: not an assumption violation but the most common practical failure. $\to$ k-means++ with explicit restarts.
+\end{itemize}
+
+Close with the honest coda: k-means is still the right first move on most tabular clustering problems---it is fast, it is what everyone will compare against, and its failures are visible. Diagnose before switching: plot a PCA projection coloured by cluster, look at cluster sizes and per-cluster feature profiles, and check whether the partition is stable across seeds and resamples.
+
+\redflags
+\begin{itemize}
+    \item An unstructured list with no unifying reason, or naming failures without naming the alternative for each.
+    \item Missing scaling---the single most common real-world cause of nonsense clusters.
+    \item Suggesting ``more clusters'' as the fix for non-convex shapes (it patches a ring with many small blobs and destroys interpretability).
+    \item Not knowing that k-means implicitly assumes equal isotropic covariance.
+\end{itemize}
+
+\interviewtest{Whether your knowledge is organized by mechanism rather than memorized as a list, and whether each failure comes with the specific tool that fixes it. The generative-model framing is what distinguishes a strong answer.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Five or more failures with correct alternatives, scaling included.
+    \item \badgeLsix{L6} Derives the list from the isotropic-equal-variance-equal-weight generative model, and adds the diagnosis-before-switching discipline.
+    \item \badgeLseven{L7} Discusses cost and operability of each alternative at scale (HDBSCAN's memory, spectral's $O(n^3)$, GMM's $d^2$ per component), and notes that clusters serving a product need stability and interpretability, which often argues for the simpler model even when it fits worse.
+\end{itemize}
+
+\followups{``Why exactly are k-means boundaries linear?'' ``Show me a dataset where k-means is guaranteed to fail.'' ``Would scaling fix the rings problem?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What is the relationship between PCA and SVD, and why do libraries use the SVD?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+They compute the same thing by different routes. PCA as usually defined is the eigendecomposition of the covariance $S = \frac{1}{n-1}X^\top X$ of the \emph{centered} data. Substituting the SVD $X = U\Sigma V^\top$,
+\begin{equation*}
+S = \frac{1}{n-1}V\Sigma U^\top U \Sigma V^\top = V\frac{\Sigma^2}{n-1}V^\top ,
+\end{equation*}
+which is an eigendecomposition by inspection. So the \textbf{principal directions are the right singular vectors} $V$, the \textbf{explained variances are $\lambda_j = \sigma_j^2/(n-1)$}, and the \textbf{scores are $XV = U\Sigma$}---no second matrix product needed.
+
+\textbf{Why SVD in practice.} Three reasons, in order of importance. (1) \textbf{Conditioning}: forming the Gram matrix squares the condition number, $\kappa(X^\top X) = \kappa(X)^2$. With $\kappa(X)=10^6$---ordinary for correlated or badly scaled columns---you get $10^{12}$, and against double precision's $\approx16$ digits that leaves about four digits in the small eigenvalues, exactly the ones that decide how many components to drop. The SVD operates on $X$ and never builds $X^\top X$. (2) \textbf{Cost and shape}: a thin SVD is $O(nd\min(n,d))$ and handles $d \gg n$ gracefully; forming a $d\times d$ Gram matrix when $d = 10^5$ is hopeless while the SVD's rank is capped at $n$. (3) \textbf{Truncation}: randomized SVD gets the top $r$ components in about $O(ndr)$ with strong probabilistic accuracy, which is what \texttt{svd\_solver="randomized"} runs and why 50 components of a $10^6\times10^3$ matrix take seconds.
+
+One thing to flag unprompted: the equivalence requires \textbf{centering}. Run an SVD on uncentered data and you get \texttt{TruncatedSVD}/LSA, which is a different (and deliberately chosen) method for sparse text---useful precisely because centering would destroy sparsity.
+
+\redflags
+\begin{itemize}
+    \item ``They're unrelated'' / ``SVD is just faster PCA'' with no statement of the identity.
+    \item Getting the variance relationship wrong---$\sigma_j$ instead of $\sigma_j^2/(n-1)$.
+    \item Confusing left and right singular vectors: $V$ holds the directions in feature space, $U\Sigma$ holds the scores in sample space.
+    \item Not mentioning centering, or claiming TruncatedSVD is PCA.
+\end{itemize}
+
+\interviewtest{Whether you can move between two representations of the same linear algebra, and whether you know the numerical reason the textbook formula is not the implementation. This is a fluency check that takes ninety seconds and is very hard to fake.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} The substitution, correct identification of $V$, $\lambda_j$, and the scores.
+    \item \badgeLsix{L6} Adds the condition-number argument with numbers, the $d \gg n$ shape argument, and the centering/TruncatedSVD distinction.
+    \item \badgeLseven{L7} Discusses randomized SVD and when to use it, incremental/streaming PCA for data that does not fit in memory, and the connection to low-rank approximation via Eckart--Young.
+\end{itemize}
+
+\followups{``What is $U$ in PCA terms?'' ``How would you do PCA on data that doesn't fit in RAM?'' ``Why does TruncatedSVD exist if PCA is better?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: How is k-means a special case of a Gaussian mixture model?}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Constrain the GMM to isotropic covariances with a \emph{shared, fixed} variance, $\Sigma_k = \sigma^2 I$, and equal mixing weights $\pi_k = 1/K$. The E-step responsibility becomes a softmax over negative half-squared distances:
+\begin{equation*}
+\gamma_{ik} = \frac{\exp(-\norm{x_i-\mu_k}^2/2\sigma^2)}{\sum_j \exp(-\norm{x_i-\mu_j}^2/2\sigma^2)} ,
+\end{equation*}
+with $1/(2\sigma^2)$ acting as an inverse temperature. Take $\sigma^2 \to 0$: the ratio between the nearest centroid's term and any other blows up like $\exp\big((d_j^2 - d_{\min}^2)/2\sigma^2\big) \to \infty$, so $\gamma_i$ becomes one-hot at $\argmin_k\norm{x_i - \mu_k}$. Then:
+\begin{itemize}
+    \item the E step is the \textbf{assignment step} (nearest centroid);
+    \item the M step $\mu_k = \sum_i\gamma_{ik}x_i/N_k$ becomes the \textbf{cluster mean};
+    \item and $Q(\theta\given\theta^{(t)})$ reduces to $-\frac{1}{2\sigma^2}\sum_i\norm{x_i-\mu_{c(i)}}^2 + \text{const}$, so maximizing it \emph{is} minimizing the k-means objective.
+\end{itemize}
+Make it numerical if the interviewer wants it: with squared distances $1$ and $4$ to two centroids, $\gamma_1 = (1+e^{-3/(2\sigma^2)})^{-1}$, which is $0.82$ at $\sigma=1$ and $1 - 6\times10^{-8}$ at $\sigma = 0.3$. Softness is a temperature, and k-means is that temperature at zero.
+
+The payoff is not trivia: it tells you exactly what k-means assumes---spherical, equal-variance, equal-weight clusters with hard membership---so every k-means failure mode becomes a violated assumption with a named fix (free $\Sigma_k$ for elliptical clusters, free $\pi_k$ for unequal sizes, soft $\gamma$ when membership is genuinely ambiguous). It also explains why k-means is the standard \emph{initializer} for EM: it is the same algorithm at zero temperature, so it lands you in a sensible basin cheaply.
+
+\redflags
+\begin{itemize}
+    \item ``k-means is hard assignment, GMM is soft'' and nothing more---true but not an answer to ``special case.''
+    \item Forgetting the equal-covariance or equal-weight constraints (a GMM with free $\Sigma_k$ does \emph{not} reduce to k-means even with hard assignment---it becomes a Mahalanobis-distance method).
+    \item Not being able to say what happens to the objective in the limit.
+\end{itemize}
+
+\interviewtest{Whether you see the two algorithms as one family with a temperature parameter, and whether you can carry a limit argument through a softmax. It is also a stealth test of the k-means assumption list.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the constraints and that responsibilities become one-hot, mapping E/M to assignment/update.
+    \item \badgeLsix{L6} Carries the limit through explicitly, shows the objective reduces to WCSS, and reads the k-means failure modes off the assumptions.
+    \item \badgeLseven{L7} Notes the intermediate regime is fuzzy/soft k-means and connects the temperature to deterministic annealing (start hot to avoid poor local optima, cool toward hard assignment), plus the practice of k-means-initializing EM.
+\end{itemize}
+
+\followups{``What if the covariances are free but assignment is hard?'' ``Why is k-means used to initialize EM?'' ``What is deterministic annealing buying you?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You have 10K-dimensional sparse features and want to reduce them for a downstream classifier. PCA, or something else?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+First establish why plain PCA is the wrong default here: \textbf{PCA centers, and centering destroys sparsity}. On a $100{,}000\times10{,}000$ matrix at $0.5\%$ density you have $5\times10^6$ nonzeros---tens of megabytes---but the centered matrix is $10^9$ float64 entries, $8$\,GB. You converted a cheap operation into an out-of-memory error.
+
+Then lay out the real options and the criteria:
+\begin{itemize}
+    \item \textbf{TruncatedSVD (LSA)}: the SVD without centering, so it stays sparse. The correct linear reduction for TF-IDF, bag-of-words, and one-hot features; costs $O(\text{nnz}\cdot r)$ with a randomized or Lanczos solver. Caveat: the components are not covariance eigenvectors, and the first typically captures the mean/document-length direction, so people often drop it.
+    \item \textbf{Sparse random projection}: the Johnson--Lindenstrauss route. Distances are preserved within $1\pm\epsilon$ using $r \gtrsim 4\ln n/(\epsilon^2/2 - \epsilon^3/3)$ dimensions---for $n=10^5$ and $\epsilon = 0.2$ that is about $2{,}700$---and the projection is data-independent, so there is nothing to fit, nothing to leak, and it streams. Use it when you need speed and a distance guarantee more than you need interpretable axes.
+    \item \textbf{Feature hashing} for the same job upstream of the model: fixed-width, no vocabulary state, collisions traded for memory.
+    \item \textbf{Do not reduce at all.} This is often the right answer and the one interviewers are hoping to hear. A linear model with L1/L2 (or a linear SVM) handles $10^4$ sparse features natively and cheaply---sparse features are the regime linear models were built for---and L1 does the selection implicitly. A GBDT will also happily ingest sparse input, though it is less at home with very wide, very sparse data.
+    \item \textbf{Supervised alternatives}: if the goal is prediction, an unsupervised rotation may discard the signal (PCA does not look at $y$). Consider PLS, LDA, supervised feature selection by mutual information or L1 path, or---if the features are text---an embedding model, which is [NLP 3]'s territory.
+\end{itemize}
+
+\textbf{How I would decide.} Baseline first: L2-regularized logistic regression on the raw sparse matrix, cross-validated. That takes minutes and sets the bar. Then, only if there is a concrete motive---serving latency, a downstream distance-based model, or memory---try TruncatedSVD at a few ranks and random projection, each fit \emph{inside} the CV folds so the reduction cannot leak. Report the accuracy-versus-dimension curve and pick on the operational constraint, not on ideology.
+
+\redflags
+\begin{itemize}
+    \item Reaching for PCA without noticing the centering/sparsity problem.
+    \item Assuming reduction is required---for $10^4$ sparse features it usually is not.
+    \item Fitting the reduction on the full dataset before the train/test split.
+    \item Not knowing TruncatedSVD exists, or claiming it is identical to PCA.
+\end{itemize}
+
+\interviewtest{Whether you map a data property (sparsity) to a mechanism (centering) to a consequence (memory blowup) to a tool---and whether you have the confidence to say ``do nothing'' when that is right. The leakage check inside CV is the seniority marker.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the centering problem and TruncatedSVD, and considers not reducing.
+    \item \badgeLsix{L6} Adds random projection with the JL bound and a number, the supervised-vs-unsupervised distinction, and the fit-inside-CV discipline.
+    \item \badgeLseven{L7} Frames the whole thing by the operational motive (latency, memory, downstream model class), quantifies the memory arithmetic, and notes that if the features are text the modern move is a learned embedding, with the ANN/serving consequences that follow [SR 3].
+\end{itemize}
+
+\followups{``What does TruncatedSVD's first component usually represent?'' ``How many random-projection dimensions do you need, and why?'' ``When would PCA actually beat leaving the features alone?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your GMM's training log-likelihood spikes toward infinity and one component's weight collapses. What happened and what do you do?}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Diagnose it as the \textbf{singularity/degeneracy} of maximum likelihood for mixtures, which is a property of the objective and not a bug in your code. If one component's mean sits on a data point, $\mu_k = x_i$, and its covariance shrinks, the density at that point is $(2\pi\sigma^2)^{-d/2}\to\infty$ as $\sigma\to0$: the log-likelihood in Eq.~\eqref{eq:cml:gmm_loglik} is \textbf{unbounded above}, so the ``best'' solution by likelihood is degenerate. The symptoms match exactly---an effective count $N_k$ falling toward $1$, a covariance determinant underflowing, a likelihood spike, and often a numerical error in the Cholesky factorization on the next iteration.
+
+Fixes, in the order I would apply them:
+\begin{enumerate}
+    \item \textbf{Covariance regularization}: add $\epsilon I$ to every $\Sigma_k$ (scikit-learn's \texttt{reg\_covar}, default $10^{-6}$; raise it). This is MAP-EM with an inverse-Wishart prior in disguise---i.e., a principled fix, not a hack---and it makes the objective bounded.
+    \item \textbf{Constrain the covariance type}: spherical, diagonal, or tied. Fewer parameters per component means far less room to collapse, and in high dimension diagonal should probably have been the default anyway---a full covariance needs on the order of $d^2$ points per component to be estimated at all.
+    \item \textbf{Reduce $K$ or get more data.} A collapsing component is often the model telling you there is no fifth cluster; check the BIC curve.
+    \item \textbf{Detect and restart}: monitor $N_k$ and the smallest eigenvalue of each $\Sigma_k$; on collapse, reinitialize that component (e.g., at the point with the lowest likelihood) or restart from a different k-means seed. Multiple restarts keeping the best \emph{non-degenerate} solution is standard.
+    \item \textbf{Check the data first.} Exact duplicate rows are a classic trigger---a repeated record gives a component a zero-variance target to collapse onto---as are constant or near-constant columns, which make the covariance singular by construction. Deduplicate and drop degenerate columns before blaming the model.
+    \item \textbf{Go Bayesian} if this keeps happening: \texttt{BayesianGaussianMixture} places priors on the weights and covariances, prunes unneeded components, and does not chase singularities.
+\end{enumerate}
+The framing to state explicitly: we never wanted the global maximum of this likelihood---it is degenerate---so we are always seeking a good \emph{local} optimum, and regularization is what defines ``good.''
+
+\redflags
+\begin{itemize}
+    \item Treating it as an implementation bug and hunting for it in the code.
+    \item ``Increase the number of components'' (more components, more collapse opportunities).
+    \item Not knowing the GMM likelihood is unbounded above---this is the fact the question is built on.
+    \item Suppressing the symptom by clipping the log-likelihood rather than regularizing the covariance.
+\end{itemize}
+
+\interviewtest{Whether you understand that some optimization pathologies are properties of the objective. Candidates who have only used EM through a library assume any explosion is a bug; candidates who derived it know the likelihood is unbounded and can name the regularizer that fixes it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies the singularity and names covariance regularization.
+    \item \badgeLsix{L6} Adds the covariance-type dial with the $d^2$-points-per-component rule of thumb, restart-on-collapse monitoring, and the duplicate-rows/constant-columns data check.
+    \item \badgeLseven{L7} Connects regularization to MAP-EM with an inverse-Wishart prior, proposes the Bayesian/variational GMM as the structural fix, and adds the production guardrail: assert on $N_k$ and covariance conditioning in the training job so a degenerate model can never be promoted.
+\end{itemize}
+
+\followups{``Why is $\epsilon I$ equivalent to a prior?'' ``How many points per component do you need for a full covariance?'' ``Would this happen with k-means?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design a weekly user-segmentation system: 80M users, roughly 200 behavioural features, output consumed by marketing and by a personalization service.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+Start with the requirement that determines everything: two consumers with different needs. Marketing needs \textbf{few, stable, describable} segments they can write copy for; personalization needs a \textbf{feature} that is fresh and available at serving time. Those are different artifacts, and trying to serve both with one $k$ is the mistake this question is built to surface. My design produces a small labelled partition for humans and a continuous representation (cluster distances or soft responsibilities) for the model.
+
+\textbf{Features and preprocessing.} Aggregate behaviour over a fixed window with explicit as-of timestamps so the pipeline is reproducible and leak-free (Chapter~\ref{cml:chap:applied_craft}). Transform skewed counts ($\log1p$), clip extremes---means are not robust and a few whales will otherwise define a segment---then standardize. Fit the scaler on the training snapshot and \textbf{version it with the model}: silently refitting the scaler each week is the most common cause of segments that ``randomly'' change meaning.
+
+\textbf{Algorithm.} PCA/TruncatedSVD to a few tens of components (denoises, decorrelates, and shrinks the $O(nkd)$ inner loop), then mini-batch k-means at $80$M rows---full Lloyd is feasible but wasteful, and mini-batch lands within a few percent of the same inertia. k-means++ seeding, multiple restarts, fixed seed recorded in metadata. Choose $k$ by a portfolio (silhouette on a subsample, gap statistic, stability across resamples) \emph{bounded by} what marketing can operate---typically 5--12. Validate that the segments are describable: per-cluster feature profiles versus the population, plus a handful of exemplar users a human can sanity-check.
+
+\textbf{Stability is the hard requirement, and it is what separates this from a notebook.} Re-running k-means weekly on shifting data produces (a) permuted labels and (b) genuinely different partitions. Both break downstream consumers. Mitigations: warm-start from last week's centroids instead of reseeding; match new centroids to old by the Hungarian algorithm on centroid distance so segment IDs keep their meaning; measure week-over-week churn (fraction of users changing segment, adjusted Rand between partitions) and alert on a threshold; and re-derive the segmentation from scratch only on a deliberate, announced cadence---quarterly, with a migration note---rather than implicitly every week.
+
+\textbf{Serving.} Assignment is a nearest-centroid lookup over a few tens of dimensions: microseconds, and trivially embeddable in the personalization service, so publish the centroids and the fitted transforms as a small versioned artifact rather than shipping 80M precomputed labels. Also publish per-user distances (or GMM responsibilities if soft membership is wanted) as features---far more informative to a downstream ranker than a one-hot segment ID. Batch-write labels to the warehouse for marketing and analytics.
+
+\textbf{Monitoring and governance.} Track segment sizes, centroid drift, within-cluster inertia, and the churn metric; alert when a segment collapses or explodes. Keep the previous version's assignments queryable so campaign analyses remain reproducible. And set expectations explicitly: segments are a \emph{description}, not a causal claim---``segment 3 converts better'' is a correlation, and any intervention built on it needs an experiment (Chapter~\ref{cml:chap:experimentation_causal}).
+
+\redflags
+\begin{itemize}
+    \item No stability or label-continuity plan---refitting weekly and handing marketing new segment IDs.
+    \item Choosing $k$ by an elbow plot alone, with no reference to what the consumers can act on.
+    \item Ignoring scaling/outliers at this scale, where a handful of extreme accounts will own a cluster.
+    \item Precomputing and shipping 80M labels when centroids plus a transform are kilobytes.
+    \item Treating segment membership as a causal driver of behaviour.
+\end{itemize}
+
+\interviewtest{Whether unsupervised learning extends past \texttt{fit()} into the operational realities---versioning, label continuity, two consumers with different needs, drift monitoring, and the boundary between description and causation. The stability problem is the one strong candidates raise unprompted.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Sensible pipeline (scale, reduce, mini-batch k-means, choose $k$ with more than an elbow) and a batch-serving story.
+    \item \badgeLsix{L6} Adds label continuity via warm start and centroid matching, churn monitoring, versioned transforms, and distances-as-features for the model consumer.
+    \item \badgeLseven{L7} Separates the two consumers explicitly, sets a re-derivation cadence with a migration plan, quantifies the artifact size versus 80M precomputed labels, and draws the description-versus-causation line for the stakeholders.
+\end{itemize}
+
+\followups{``How do you keep segment 3 meaning the same thing next quarter?'' ``Marketing wants 40 segments---what do you say?'' ``How would you tell whether the segmentation is adding value at all?'' ``What would you change if the features were 768-dimensional embeddings?''}
+\end{interviewq}

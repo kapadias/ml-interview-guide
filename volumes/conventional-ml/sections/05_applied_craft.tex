@@ -2,24 +2,1215 @@
 \label{cml:chap:applied_craft}
 
 \begin{tldr}
-Placeholder — this chapter is written per docs/coverage-spec.md, seeded by the author's own conventional-ML document when it arrives (Phase C3).
+This is the chapter that applied-ML rounds weight most heavily after trees, and its centerpiece is \textbf{leakage}---the failure mode that ends careers quietly, because it does not look like a failure until the model is in production. The chapter opens with a full leakage taxonomy (target, contamination, temporal, group, duplicate, label-derived), each with a named example, a detection method, and a fix, plus the detection playbook you run when a number looks too good. It then covers the craft that surrounds it: categorical encodings, with the out-of-fold construction that makes target encoding honest; missing-data handling and why trees do it natively; imbalanced learning, where thresholding a calibrated model beats blind SMOTE and resampling silently breaks your probabilities; cross-validation failure modes, nested CV, and the variance of a CV estimate; and the interpretability traps---correlated features splitting SHAP credit, permutation importance evaluated off-manifold, and the hard rule that no attribution method is causal. GBDT internals and TreeSHAP mechanics live in Chapter~\ref{cml:chap:trees_ensembles}; feature stores and point-in-time join infrastructure live in [DL 22]; metric definitions live in [DL 23]; the experiment that settles a causal question lives in Chapter~\ref{cml:chap:experimentation_causal}. What this chapter owns is the \emph{methodology}: how a competent Staff engineer keeps a training set honest.
 \end{tldr}
 
+%==============================================================================
+\section{Leakage: The Taxonomy}
+\label{cml:sec:leakage}
+%==============================================================================
+
+\textbf{Leakage is an information-set mismatch.} A training row and a serving request are supposed to carry the same information: everything knowable at prediction time, and nothing else. Leakage is any violation of that contract---the training row saw something the serving request will not have, or will not have \emph{yet}, or will not have with the same meaning. The model learns the shortcut, the offline metric rewards it, and production takes it away.
+
+Two properties make this the most valuable topic in an applied interview. First, it is common: every practitioner with real experience has shipped a leak, and interviewers ask because the answer separates people who have run a pipeline in anger from people who have run notebooks. Second, and much more important:
+
+\begin{warningbox}
+\textbf{Leakage is worse than overfitting, and the reason is structural.} Overfitting is a \emph{detectable} pathology: it is precisely what held-out data is for. Train error falls, validation error rises, you see it, you fix it. Leakage contaminates the validation data too. The leaked feature is present in every fold, in the test set, in the bootstrap resample, in the confidence interval---so cross-validation, the one instrument you trust, reports the inflated number with a tight error bar. \textbf{Leakage survives cross-validation.} The model looks excellent right up until the moment it is serving live traffic, at which point the shortcut vanishes and performance collapses to whatever the honest features could do alone. The cost asymmetry is what makes it career-defining: an overfit model is caught before launch and costs you a week; a leaked model is launched, is built upon by other teams, and is discovered a month later by a business metric that did not move.
+\end{warningbox}
+
+\begin{keyinsight}[The Point-in-Time Question]
+There is exactly one question that catches most leakage, and it is asked of \emph{every feature, individually}: \textbf{``At the instant this prediction must be made in production, what was the value of this feature, and how do I know?''} Not ``is this column in my warehouse''---warehouses store the present. The question has three parts: (1) does the value exist at prediction time; (2) is it the value \emph{as of} prediction time, or the current value written later; (3) will it be retrievable at prediction time with the same latency and the same semantics. A feature that fails any part is either leakage or, if it exists but arrives late, training--serving skew ([DL 22]). Candidates who ask this question before touching a model are visibly senior; candidates who reach for feature importance first are not.
+\end{keyinsight}
+
+\subsection{Class 1: Target Leakage}
+
+The feature is computed from the target, or sits downstream of the target in the data-generating process. The canonical example, and the one worth having on the tip of your tongue:
+
+\textbf{\texttt{account\_closed\_date} predicting churn.} You are predicting which subscribers will churn in the next 30 days. The warehouse's account table has a \texttt{account\_closed\_date} column. It is NULL for everyone who has not churned and populated for everyone who has. The feature is not correlated with the label---it \emph{is} the label, re-encoded as a missingness pattern. AUC comes back at 0.997. In production, every scored account is open, every value is NULL, and the model has learned nothing else.
+
+That version is obvious once stated. The dangerous versions are one hop downstream, where the feature is generated by a \emph{process that the outcome triggers}:
+\begin{itemize}
+    \item \textbf{\texttt{num\_collections\_calls} predicting loan default.} Collections calls happen \emph{because} the account went delinquent. At origination-time scoring the count is always zero.
+    \item \textbf{\texttt{total\_charges} predicting telecom churn.} The lifetime-charges column stops accumulating when the customer leaves, so it encodes tenure-at-exit; the classic public churn dataset has exactly this trap.
+    \item \textbf{\texttt{discharge\_disposition} predicting in-hospital mortality.} ``Discharged to hospice'' is recorded at the end of the stay and is nearly the outcome.
+    \item \textbf{\texttt{chargeback\_notice\_received} predicting fraud} when the fraud label \emph{is} the chargeback. The feature and the label are two reads of the same event.
+    \item \textbf{\texttt{support\_ticket\_count} predicting cancellation}, when the ticket is the cancellation request.
+\end{itemize}
+
+\textbf{Detection.} Reason about the \emph{write path} of every column: which system writes this value, at what moment in the entity's lifecycle, and is that write triggered---directly or indirectly---by the outcome you are predicting? Two mechanical checks back the reasoning up: (1) compute the missingness rate of each feature conditioned on the label---a column whose NULL rate is 4\% in one class and 96\% in the other is announcing itself; (2) ablate the suspect (retrain without it) and see whether the metric falls to a plausible number. The single most useful habit is to demand, for every feature, the name of the table and the timestamp column that governs it.
+
+\subsection{Class 2: Train--Test Contamination}
+
+The features are legitimate; the \emph{procedure} leaks, because a transform with learned state was fit on data that includes the evaluation rows. This is the canonical ``spot the bug'' interview question because it is a three-line mistake that any notebook makes by default.
+
+Every transform that has a \texttt{fit} is a leakage surface: standardization (means and standard deviations), imputation (medians, model-based imputers), target and frequency encoders (per-category statistics), PCA and other decompositions (the basis), discretizers (bin edges), text vectorizers (vocabulary and IDF weights), variance/correlation filters, and---worst of all---supervised feature selection.
+
+The severity is not uniform, and saying so is a seniority signal:
+\begin{itemize}
+    \item \textbf{Mild:} a \texttt{StandardScaler} fit on 100K rows including 20K validation rows. The mean shifts by a hair; the optimism is typically unmeasurable. It is still wrong, still gets flagged in review, and still must be fixed---but do not claim it explains a ten-point gap.
+    \item \textbf{Severe:} \textbf{supervised feature selection on the full dataset.} This is the one with famous arithmetic. Take $n = 50$ samples, $p = 5{,}000$ pure-noise predictors, and a coin-flip label. Screen the full dataset for the 100 predictors most correlated with $y$, \emph{then} run 10-fold cross-validation using only those 100. The reported error comes back near 3\% instead of the truthful 50\%: the screening step already looked at every label, so the ``held-out'' fold was used to choose the features that predict it. This example (Ambroise \& McLachlan, 2002; \emph{ESL} \S7.10.2) is the cleanest demonstration that leakage defeats cross-validation, and it is worth being able to state in twenty seconds.
+    \item \textbf{Severe:} resampling (SMOTE, random oversampling) applied \emph{before} the split, which places synthetic near-copies of training points into the test set---the model is graded on interpolations of rows it memorized.
+\end{itemize}
+
+\begin{mathresult}{The Arithmetic of a Contaminated Selection Step}
+Why supervised feature selection outside the fold is the most damaging contamination, in numbers. Take $n = 50$ rows, $p = 5{,}000$ predictors of pure noise, and a coin-flip label, so the truth is 50\% error. With $p \gg n$, the sample correlation of a noise predictor with $y$ has standard deviation $\approx 1/\sqrt{n} \approx 0.14$, and the maximum over 5{,}000 independent draws lands near $3.5/\sqrt{n} \approx 0.5$: screening \emph{will} surface a hundred predictors that look strongly related to $y$ in this sample. Cross-validating a model built on those hundred reports about 3\% error---because the screening step already consumed every label, including the ones the ``held-out'' folds are supposed to be testing.
+
+The fix and its consequence: put the screening inside the fold, so each fold re-screens using only its own training rows, and the reported error returns to 50\% where it belongs. The general statement---\textbf{any step that looks at $y$ is part of the model and must be refit inside every fold}---covers feature selection, target encoding, supervised binning, threshold choice, and outlier removal by residual (Ambroise \& McLachlan, 2002; \emph{ESL} \S7.10.2).
+\end{mathresult}
+
+
+\textbf{Detection and fix.} Audit the \emph{fit scope} of every stateful transform: enumerate them and confirm each one's \texttt{fit} sees training-fold rows only. The structural fix is to make the mistake impossible rather than to remember not to make it: put every transform inside a pipeline object and cross-validate the \emph{pipeline}, so \texttt{fit} is called once per fold on that fold's training portion. ``I cross-validate the pipeline, not the model'' is the one-sentence answer.
+
+\subsection{Class 3: Temporal Leakage}
+
+Any feature that is not knowable at prediction time \emph{because of when it was computed}. This class is the most common in production systems and the least visible in a notebook, because the offending value is a perfectly legitimate number in a perfectly legitimate column---just computed with a clock the serving path does not have.
+
+\textbf{(a) Random splits on time-ordered data.} Shuffled $k$-fold trains on February and tests on January. The model interpolates within a period it has already seen, and any temporally global structure (a promotion, an outage, a seasonal shift, a fraud ring's active window) is shared across the split. The estimate answers ``how well do I fill in gaps in the past,'' which is not the deployment question. Fix: rolling-origin or expanding-window splits (Chapter~\ref{cml:chap:time_series}).
+
+\textbf{(b) Centered or two-sided windows.} \texttt{rolling(window=7, center=True)} on a daily series averages three days of \emph{future}. So do interpolation of missing values by \texttt{method='linear'} across a gap, two-sided smoothing, and any resampling that fills forward and backward. The symptom is a feature that tracks the target suspiciously tightly at exactly the smoothing scale.
+
+\textbf{(c) Future-fit aggregates.} A per-user statistic---mean basket size, fraud rate, 90th-percentile latency---computed over the \emph{entire} history table and joined onto every row. The January row now carries information from December. This is the most frequent leak in real feature pipelines because the aggregation query looks correct in isolation; only the join is wrong. Every aggregate needs a window anchored to the row's own timestamp.
+
+\textbf{(d) Mutable dimension attributes---the warehouse trap.} A dimension table stores the \emph{current} value: the user's current subscription tier, the merchant's current risk band, the account's current status. Joining it to an event from eleven months ago attaches a value that did not exist then, and if the attribute was updated \emph{because} of the outcome (the merchant was moved to ``high risk'' after the fraud), it is target leakage wearing a join's clothing. The fix is a \textbf{point-in-time correct join}: reconstruct each feature as of the event timestamp from a versioned or event-sourced history rather than reading the latest row. This is exactly what a feature store's point-in-time join is for---the infrastructure is [DL 22]; the methodology is that you must ask for it.
+
+\textbf{(e) Label-window overlap.} You predict 30-day churn from features as of $t$, with the label observed over $[t, t{+}30]$. If any feature window extends past $t$---even by a day---it peeks into the label window. When labels have a maturation period, consecutive training rows also share label windows, which is why financial ML uses \emph{purging} (drop training rows whose label window overlaps the validation period) and an \emph{embargo} (a gap after the validation block) on top of a time-ordered split.
+
+\textbf{Detection.} Give every feature a timestamp and compare it to the prediction timestamp---the audit is mechanical once the metadata exists. The cheap empirical test: score the same feature set under a random split and under a strictly time-ordered split. A large gap between the two is a leakage estimate, and the time-ordered number is the one that will match production.
+
+\subsection{Class 4: Group Leakage}
+
+The same entity appears in both splits, so the model is graded on entities it has memorized. The rows are distinct, the split is random, nothing looks wrong.
+
+The canonical stories: \textbf{the same patient} contributing fourteen chest X-rays, split at random, so the network identifies the patient (implants, body habitus, scanner) rather than the pathology---the reason medical imaging benchmarks publish patient-disjoint splits, and the reason several published results collapsed when re-split by patient. \textbf{The same user} contributing hundreds of sessions to a conversion model. \textbf{The same merchant} across thousands of transactions. \textbf{The same document} appearing under two IDs, or a near-duplicate news article syndicated to six sites. \textbf{The same query} with its documents split across folds in a ranking dataset (Chapter~\ref{cml:chap:trees_ensembles}; [SR 7] for ranking evaluation).
+
+\textbf{Fix:} \texttt{GroupKFold} / \texttt{GroupShuffleSplit}, or split deterministically on a hash of the entity ID; use \texttt{StratifiedGroupKFold} when the class balance also needs protecting.
+
+\begin{keyinsight}[Group by the Entity the Deployment Question Names]
+Grouping is not automatically conservative-is-better---it is a modeling decision that must match the serving population. If the model will score \emph{users it has never seen}, group by user: the honest estimate must exclude memorized identities. If the model will score \emph{new events for users it already knows} (a churn model rescoring the existing base every week), then a user-disjoint split \emph{understates} production performance, because in production the model genuinely does have that user's history. Same data, two different correct answers, decided by the deployment question and not by a rule of thumb. Stating this distinction unprompted is a reliable L6+ signal.
+\end{keyinsight}
+
+\subsection{Class 5: Duplicate and Near-Duplicate Leakage}
+
+Exact duplicates arrive from ETL fan-out (a one-to-many join silently multiplying rows), retried event deliveries, backfills re-emitting history, or a naive union of overlapping extracts. Near-duplicates arrive from the domain: the same support ticket refiled, the same product listed under two SKUs, boilerplate legal text, images resized or re-encoded, records differing only in a timestamp.
+
+The effect is memorization credited as generalization: a test row whose twin sits in the training set is not a test of anything. It also inflates apparent data volume, so the model looks like it is learning from 2M rows when the effective sample is 400K.
+
+\textbf{Detection:} hash rows (or a stable subset of key columns) and count collisions across the split boundary; for near-duplicates, MinHash/SimHash over shingles for text, perceptual hashes for images, or embedding nearest-neighbours with a similarity cutoff. A practical triage: take the test rows the model is most confident about and look for a near neighbour in training---if the top-confidence rows are all twins, you have found the whole story. \textbf{Fix:} deduplicate \emph{before} splitting, and treat duplicate clusters as groups.
+
+\subsection{Class 6: Label-Derived Features and Proxy Targets}
+
+The most conceptual class, and the one that survives the longest without being noticed. It has two shapes.
+
+\textbf{Label-derived features.} A feature built from the same pipeline that builds the label. If the fraud label is ``a chargeback was filed within 90 days'' and a feature is ``count of disputes in the last 90 days'' computed at label time, the two share a source. A feature engineered from a \emph{previous} model's output whose training labels came from the same source is the recursive version, common in production: the score of yesterday's model is a feature for today's, and the leakage of the original leaks forward.
+
+\textbf{Proxy-target leakage.} The label is a proxy for the thing you care about, and a feature is a shortcut to the \emph{proxy} rather than to the concept. The medical-imaging classic: a pneumonia detector that learned to read the portable-scanner marker burned into the image, because portable scans are taken of patients too sick to move; the marker predicts the label without predicting the disease. In tabular systems it looks like a routing flag---``was this transaction sent to manual review''---which predicts the fraud label because reviewers create the labels.
+
+\textbf{Detection:} write down the label's own definition, name every system that touches it, and check whether any feature is produced by one of them. The tell is a feature that is powerful, non-obvious, and impossible to explain mechanistically---if nobody can say \emph{why} it should predict the outcome, it is a leak until proven otherwise.
+
+Table~\ref{cml:tab:leakage_taxonomy} is the compressed form of all six classes, and it is the thing to be able to reproduce from memory---an interviewer asking ``what kinds of leakage are there'' is asking for exactly this, with an example attached to each row.
+
+\begin{table}[H]
+\centering
+\small
+\caption{The leakage taxonomy: example, detection, fix}
+\label{cml:tab:leakage_taxonomy}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Class} & \textbf{Named example} & \textbf{Detection} & \textbf{Fix} \\
+\midrule
+Target & \texttt{account\_closed\_date} for churn; collections calls for default & Write-path reasoning; NULL rate conditioned on the label; single-feature ablation & Drop, or recompute as of prediction time \\
+Contamination & Scaler / imputer / encoder / \texttt{SelectKBest} fit before the split & Audit the \texttt{fit} scope of every stateful transform & Pipeline; \texttt{fit} inside the fold only \\
+Temporal & Centered rolling window; whole-history aggregate joined to every row; current dimension attribute & Feature timestamp vs.\ prediction timestamp; random-split minus time-split gap & Point-in-time joins; anchored windows; rolling-origin CV; purge and embargo \\
+Group & Same patient / user / merchant / query across folds & Count entities appearing in both splits & \texttt{GroupKFold}, hash-based split, dedupe by entity \\
+Duplicate & ETL fan-out; syndicated articles; re-encoded images & Row hashing; MinHash / embedding neighbours across the boundary & Deduplicate before splitting; cluster as groups \\
+Label-derived & Dispute count when the label is a chargeback; portable-scanner marker as a pneumonia proxy & Trace the label's own pipeline; demand a mechanism for every strong feature & Rebuild the feature from a source independent of the label \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{How Leakage Enters a Codebase}
+
+Leakage is rarely written deliberately; it arrives through a small number of recurring organizational paths, and knowing them is what lets you review for it rather than stumble on it.
+
+\begin{itemize}
+    \item \textbf{The notebook promoted to production.} Exploration legitimately looks at all the data; the split comes later, and by then three transforms have already been fit on everything. The cell order that was fine for looking is a leak once it is a training script.
+    \item \textbf{The warehouse join.} Analysts' tables are built for reporting the present, so joining ``the customer table'' to an event log attaches today's attributes to last year's events. The query is correct; the semantics are not.
+    \item \textbf{The helpful utility function.} A shared \texttt{prepare\_features(df)} that scales, imputes, and encodes is called once on the full frame because that is what its signature invites. One function, every model in the team, the same leak.
+    \item \textbf{The shared feature table.} A platform team publishes \texttt{user\_features\_v3} with per-user aggregates recomputed nightly over full history. Every consumer inherits the temporal leak, and no consumer can see it from their own code.
+    \item \textbf{The cached dataset.} Someone saves a resampled or imputed dataframe to disk as ``the clean data'' and everyone downstream splits it. The leak is now upstream of every experiment in the project.
+    \item \textbf{The copied kernel.} Competition and tutorial code is optimized for a leaderboard whose split is already fixed, so it routinely fits encoders on the concatenation of train and test. Copying it into a production pipeline imports an assumption that no longer holds.
+    \item \textbf{The retrained model that inherits a score.} Yesterday's model output is a feature for today's; if the original was leaked, or if the score was computed with information later than the new prediction time, the leak propagates forward and is nearly invisible.
+\end{itemize}
+
+\subsection{Leakage in Published and Competition Work}
+
+This is not a beginner's problem that mature fields have solved. A systematic review across seventeen scientific fields found leakage in 294 papers spanning hundreds of studies, with the same taxonomy recurring---no clean train/test separation, preprocessing before splitting, temporal leakage, and duplicates---and reported performance that failed to survive corrected evaluation (Kapoor \& Narayanan, ``Leakage and the Reproducibility Crisis in ML-based Science,'' 2023). Clinical prediction models have repeatedly collapsed on external validation for exactly these reasons, and imaging benchmarks have been re-released with patient-disjoint splits after the original random splits were shown to be memorization tests.
+
+Competition history is a useful catalog of the mechanisms because the leaks were found and documented: identifiers correlated with the target because rows were exported grouped by outcome; file timestamps and row order encoding the label; near-duplicate images across the train/test boundary; and, most instructively, ``leakage features'' that reliably won leaderboards while being worthless for the sponsor's actual deployment. The transferable lesson is the one this chapter opens with: an offline metric is a claim about a data-generating process, and the process is what needs auditing.
+
+\subsection{The Detection Playbook}
+
+Run this in order. The order matters: it is cheapest-first, and each step narrows what the next has to explain.
+
+\textbf{1. Suspicion, calibrated by a prior.} The first signal is almost always \emph{a number that is too good}. This is Twyman's law---any figure that looks interesting or unusual is usually wrong (Section~\ref{cml:sec:pathologies})---applied to offline metrics. It only works if you carry priors for your domain: churn models live around 0.75--0.85 AUC, credit risk 0.70--0.80, ads CTR 0.70--0.80, and card-fraud models genuinely can reach 0.97+ because fraud is behaviourally distinctive. So 0.99 AUC is not universally impossible; it is impossible for churn, and the seniority signal is knowing which. A jump from a long-standing 0.82 to 0.97 after a feature-pipeline change is leakage until proven otherwise, and the burden of proof is on the improvement.
+
+\textbf{2. Single-feature dominance.} Look at feature importance not for insight but as an alarm: one feature carrying most of the model is the standard leakage silhouette. Confirm by training a model on that feature \emph{alone}---if one column reproduces most of the full model's AUC, you have found the shortcut. (Importance itself is untrustworthy for other reasons, Section~\ref{cml:sec:interpretability}; here you are using it as a smoke detector, not a measurement.)
+
+\textbf{3. Ablation.} Drop the suspect, refit, and compare. This is the arbiter: if removing one column takes AUC from 0.99 to 0.81, the column was doing the work, and 0.81 is your real starting point. Ablate groups too---all features from one source table at a time---which localizes a leak to a pipeline rather than a column.
+
+\textbf{4. The fit-scope audit.} Enumerate every stateful transform and confirm where \texttt{fit} was called. In a leaked pipeline this step usually terminates the investigation in ten minutes.
+
+\textbf{5. The point-in-time audit.} For every surviving feature, the question from the key-insight box above: value, timestamp, retrievability. Do it as a table with one row per feature; the empty cells are the findings. This is the step that separates a debugging story from a methodology.
+
+\textbf{6. Split-integrity checks.} Entities in both splits; duplicate rows across the boundary; is the split temporal where it must be; do label windows overlap.
+
+\textbf{7. Adversarial validation.} Train a classifier to distinguish training rows from test rows using the features. AUC near 0.5 means the splits are exchangeable. High AUC means they are not---which diagnoses distribution shift, and, when a single feature carries that classifier, exposes an ordering or ID artifact that a random split turned into signal. Its cousin: check whether row index or file order predicts the label, which catches data that arrived sorted by outcome.
+
+\textbf{8. The honest replay.} Rebuild the training set with a strict as-of cutoff and evaluate on the following period, using only feature values reconstructible at that cutoff. A backtest and a random-CV estimate that disagree are settled in favour of the backtest, always.
+
+\textbf{9. The production gate.} Shadow-score live traffic and compare the offline and online score distributions before anyone sees a lift number. Offline--online metric parity is the last checkpoint, and drift/skew monitoring after launch is [DL 22].
+
+\subsection{A Worked Point-in-Time Audit}
+
+The audit is a table with one row per feature (Table~\ref{cml:tab:pit_audit}), and its value is that it forces a verdict on every column instead of only on the ones that look suspicious. For a weekly churn model scoring the active base on Monday morning, predicting cancellation over the following 30 days:
+
+\begin{table}[H]
+\centering
+\small
+\caption{A point-in-time audit for a churn model scored on Monday 00:00}
+\label{cml:tab:pit_audit}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Feature} & \textbf{As-of semantics} & \textbf{Verdict} \\
+\midrule
+\texttt{logins\_last\_28d} & Trailing window ending Sunday 23:59, from an append-only event log & Keep \\
+\texttt{days\_since\_last\_login} & Anchored to scoring time; undefined for never-logged-in users & Keep, with an explicit no-history code \\
+\texttt{plan\_tier} & Dimension table holding the \emph{current} tier; downgrades often precede churn & \textbf{Leak}: rebuild from plan-change history \\
+\texttt{account\_closed\_date} & Written by the cancellation event itself & \textbf{Leak}: it is the label \\
+\texttt{lifetime\_revenue} & Sums all invoices, including those after the scoring week & \textbf{Leak}: re-anchor the window \\
+\texttt{support\_tickets\_28d} & Trailing window, but includes the cancellation-request ticket & \textbf{Leak}: exclude cancellation-type tickets \\
+\texttt{nps\_score} & Survey response, arriving late, present for 6\% of users & Keep with an indicator, if dated before scoring \\
+\texttt{predicted\_ltv} & Output of another model, refreshed nightly at 02:00 & Skew risk: keep only if that run is guaranteed first \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Four of the eight rows are findings: three genuine leaks, two of which are invisible in any correlation plot, and one scheduling dependency that is skew rather than leakage---exactly the distinction the audit exists to make. Doing this once on a real model is the fastest way to internalize the habit; doing it as a template makes it reviewable by someone who did not build the features.
+
+\subsection{Prevention as Design}
+
+Detection is what you do after a smell; prevention is what makes the smell rare.
+
+\begin{itemize}
+    \item \textbf{Pipelines, always.} Every stateful transform inside a pipeline object; cross-validate the pipeline. This eliminates class 2 by construction.
+    \item \textbf{Timestamps as a schema requirement.} Every feature carries the timestamp of the value and the timestamp of its computation. A feature without an as-of semantics cannot be reviewed and should not ship.
+    \item \textbf{Point-in-time joins as the default access pattern}, with the current-value join as the exception that requires an argument ([DL 22] for the infrastructure).
+    \item \textbf{A locked temporal holdout}: the most recent period, sealed at the start of the project, evaluated once at the end. It catches temporal leaks that in-sample folds cannot.
+    \item \textbf{A leakage checklist in code review}, four lines long: where does each transform fit; what is each feature's as-of time; what is the group key; are duplicates removed. Reviews catch what individuals rationalize.
+    \item \textbf{Serving-path parity.} The strongest structural defence is computing training features with the same code that computes serving features. When that is impossible, log the serving features and train on the logs---a leak cannot survive a feature vector that was actually produced at request time.
+\end{itemize}
+
+\begin{warningbox}
+\textbf{Not every leak should be deleted.} If the feature genuinely \emph{is} available at prediction time and you removed it out of superstition, you have thrown away signal. The decision tree: available at prediction time with the same semantics $\Rightarrow$ keep it. Available but arriving after the decision (a batch job that lands at 03:00 for a real-time endpoint) $\Rightarrow$ this is training--serving skew, not leakage; either wait for the value, re-time the prediction, or replace it with a delayed version you can guarantee. Not available $\Rightarrow$ remove it, and consider whether the \emph{prediction time} was chosen wrongly---sometimes the fix is to score later, when the information legitimately exists, and ask whether the decision is still useful then.
+\end{warningbox}
+
+\subsection{Leakage versus Skew, Drift, and Overfitting}
+
+The four explanations for ``it worked offline'' are distinguishable, and the differential (Table~\ref{cml:tab:leak_differential}) is what an interviewer is grading in a debugging question.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Differential diagnosis for an offline--online performance gap}
+\label{cml:tab:leak_differential}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Cause} & \textbf{Offline signature} & \textbf{Confirming test} & \textbf{Typical size} \\
+\midrule
+Leakage & Metric implausibly high; one dominant feature; random-split score far above time-split score & Ablate the feature; rebuild with an as-of cutoff and backtest & Large: tens of points \\
+Overfitting & Train metric far above validation metric; gap widens with capacity & Reduce capacity or add data and watch the gap close & Moderate, and visible before launch \\
+Training--serving skew & Offline metric plausible; online scores differ from offline scores for the \emph{same} entities & Log serving feature vectors and diff them against training features & Moderate; often a subset of features \\
+Distribution drift & Offline metric plausible and once matched online; degradation is gradual or follows an event & Population and feature-distribution comparison over time; backtest on recent data & Gradual, unless an upstream change is abrupt \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The magnitude column carries the practical rule: a gap of a few points invites the drift and skew hypotheses; a gap of thirty points is leakage, and the search should start there.
+
+\subsection{Reporting a Leak}
+
+Finding the leak is the easy half. The Staff-level half is what you do next, because the number that has to be retracted is usually one the organization has already planned around.
+
+Report it in the order the audience needs: (1) what the honest number is, measured---not ``the old number was wrong'' but ``the corrected backtest is 0.81''; (2) what the mechanism was, stated concretely enough that a reviewer can verify it; (3) what decisions were made on the bad number and which of them change; (4) what makes the class of failure impossible next time, not merely detected. Bring the corrected estimate to the meeting rather than an alarm without one---an alarm invites debate about whether the leak is real, while a measured replacement moves the conversation to the decision.
+
+And take the blameless line seriously, because leakage is a system property. The notebook that leaked, the shared feature table that inherited it, and the review that passed it are all part of the same failure, and a fix that consists of one person being more careful will not survive the next quarter.
+
+%==============================================================================
 \section{Feature Engineering}
-% TODO Phase C3
+\label{cml:sec:feature_engineering}
+%==============================================================================
 
-\section{The Leakage Taxonomy}
-% TODO Phase C3
+Feature engineering is where domain knowledge enters a tabular model, and it is still where most of the measurable gain lives---a GBDT with the right features beats a tuned GBDT with the wrong ones by more than any hyperparameter sweep will ever recover. The interview version of this topic is not a list of transforms; it is whether you can say, for each transform, \emph{which model family needs it and why}, and whether you notice which transforms are leakage surfaces.
 
+\subsection{Categorical Encodings}
+
+The choice is governed by two variables: the cardinality of the feature and the family of the model. Table~\ref{cml:tab:encodings} is the decision surface.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Categorical encodings: mechanics, fit, and failure mode}
+\label{cml:tab:encodings}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Encoding} & \textbf{Mechanics} & \textbf{Use when} & \textbf{Failure mode} \\
+\midrule
+One-hot & One binary column per level & Cardinality $\lesssim 50$; linear models, NNs, distance methods & Dimension explosion; collinearity (drop one level when the model has an intercept); starves tree splits at high cardinality \\
+Ordinal / label & Map levels to $0,1,2,\dots$ & Genuinely ordered levels; trees, at any cardinality & Invents an order for unordered levels---fatal for linear/distance models, merely inefficient for trees \\
+Frequency / count & Replace level by its count or share & High cardinality; when popularity is itself predictive & Collides levels with equal counts; shifts when the base rate shifts \\
+Target / mean & Replace level by a smoothed $\E[y \mid \text{level}]$ & High cardinality with real per-level signal; GBDTs & \textbf{Leaks unless computed out-of-fold}; unstable for rare levels; needs a rule for unseen levels \\
+Hashing & Hash the level into $m$ buckets & Very high or unbounded cardinality; streaming; ads-scale linear models & Collisions mix unrelated levels (controlled noise); not invertible, so no interpretation \\
+Learned embedding & A trainable dense vector per level & Neural stacks; IDs with millions of levels and abundant data & Needs a NN and data volume; cold start for new levels; [DL 22], [SR 6] \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{keyinsight}[The Encoding Decision in One Line]
+Pick the encoding from \textbf{cardinality $\times$ model family}, not from habit. Low cardinality: one-hot for linear models and NNs, native categorical or ordinal for trees---the difference barely matters. Medium (tens to hundreds): native categorical handling for GBDTs; one-hot with regularization for linear models. High (thousands to millions): out-of-fold target encoding or CatBoost's ordered statistics for GBDTs, hashing for linear models at scale, learned embeddings when a neural stack already exists. Then answer the two questions that every encoding must answer regardless of choice---\emph{what happens to a level unseen in training}, and \emph{does this encoder touch the target} (if yes, it goes out-of-fold and inside the CV fold).
+\end{keyinsight}
+
+Three points that interviewers probe past the table.
+
+\textbf{One-hot and trees do not mix well at cardinality.} Each one-hot column can only produce a one-level-versus-rest split, so a 40-level feature needs a deep chain of low-mass splits to express ``these six levels behave alike,'' and the individual splits look weak against the split-gain threshold. Native categorical handling (LightGBM's gradient-sorted partitioning, CatBoost's ordered statistics---Chapter~\ref{cml:chap:trees_ensembles}) exists precisely because of this.
+
+\textbf{Hashing is a real answer, not a hack.} Fix $m$ buckets, hash the level, and accept collisions. Memory is bounded regardless of how many new merchant IDs appear tomorrow, unseen levels are handled by construction, and the collision noise behaves like a mild regularizer; with $m$ comfortably larger than the number of frequent levels, the frequent levels rarely collide with each other. Pair it with L2 regularization and, if you need it, use multiple hash functions. This is the workhorse of large-scale linear ad models, and the price is that you cannot read a coefficient back to a merchant.
+
+\textbf{Unseen levels are a serving question, not a training question.} Every encoder needs a defined answer for a level absent from training: one-hot gives all zeros, hashing gives a bucket, frequency gives zero or a global minimum, target encoding must fall back to the global prior. Decide it explicitly, because in production it happens on day one.
+
+\subsection{Target Encoding, Done Honestly}
+
+Target encoding is the highest-value and highest-risk encoding, so it earns its own treatment. Two things must be right: \emph{shrinkage} (so rare levels do not get wild estimates) and \emph{out-of-fold computation} (so no row's own label enters its own feature).
+
+\begin{mathresult}{Smoothed Target Encoding, Out of Fold}
+For level $c$ with $n_c$ training rows and level mean $\bar y_c$, and global mean $\bar y$, the smoothed statistic is
+\begin{equation}
+\hat t_c \;=\; \frac{n_c\,\bar y_c \;+\; m\,\bar y}{n_c + m},
+\end{equation}
+an empirical-Bayes posterior mean that shrinks toward the prior with weight $m$. The optimal $m$ is the ratio of within-level noise variance to between-level signal variance; in practice it is tuned, with $m$ between 5 and 100 covering most problems. Two limits make the behaviour obvious: $n_c \gg m$ gives $\hat t_c \to \bar y_c$ (trust the level), and $n_c \to 0$ gives $\hat t_c \to \bar y$ (trust the prior).
+
+\textbf{The honesty condition.} Compute $\hat t_c$ for the rows of fold $k$ using only the rows \emph{outside} fold $k$. Formally, with folds $F_1,\dots,F_K$, row $i \in F_k$ receives the statistic built from $\bigcup_{j \neq k} F_j$. Without this, a singleton level has $\bar y_c = y_i$: \textbf{the feature is literally the label}, and the tree will find it.
+\end{mathresult}
+
+The construction has four rules, and interviewers check all four:
+
+\begin{enumerate}
+    \item \textbf{Inner folds for the training set.} Split the training data into $K$ inner folds and encode each fold from the other $K-1$. Use a group-aware or time-aware inner split if the outer split is group- or time-aware---otherwise you have fixed leakage at one level and reintroduced it at another.
+    \item \textbf{Full-training statistics for validation, test, and serving.} Once training rows are encoded out-of-fold, the encoder that ships is fit on the entire training set; validation, test, and production rows use that single map. This is not leakage: those rows contributed no labels to it.
+    \item \textbf{Nest it inside cross-validation.} The whole procedure sits inside the CV fold. Encoding once on all data before the outer split is class-2 contamination (Section~\ref{cml:sec:leakage}) in the most damaging form, because the encoder carries labels.
+    \item \textbf{Handle rare and unseen levels explicitly.} A level with two rows should be dominated by the prior; a level unseen in training must fall back to the prior. Optionally add small Gaussian noise to the training-side encodings as an extra regularizer---CatBoost's ordered statistics achieve the same effect more principledly by encoding each row from a random prefix of the data (Chapter~\ref{cml:chap:trees_ensembles}).
+\end{enumerate}
+
+\begin{lstlisting}[language=Python, caption={Out-of-fold target encoding: the construction that keeps it honest.}]
+def fit_transform_oof(train_df, col, y, K=5, m=20.0, groups=None):
+    prior = y.mean()
+    oof = np.full(len(train_df), np.nan)
+    splitter = (GroupKFold(K).split(train_df, y, groups) if groups is not None
+                else StratifiedKFold(K, shuffle=True, random_state=0).split(train_df, y))
+    for fit_idx, enc_idx in splitter:          # fit on K-1 folds, encode the held-out one
+        stats = y.iloc[fit_idx].groupby(train_df[col].iloc[fit_idx]).agg(["sum", "count"])
+        smoothed = (stats["sum"] + m * prior) / (stats["count"] + m)
+        oof[enc_idx] = train_df[col].iloc[enc_idx].map(smoothed).fillna(prior).values
+    # the encoder that ships: fit on ALL training rows, applied to val/test/serving
+    stats = y.groupby(train_df[col]).agg(["sum", "count"])
+    final_map = (stats["sum"] + m * prior) / (stats["count"] + m)
+    return oof, final_map, prior
+\end{lstlisting}
+
+\subsection{Numerical Transforms, Binning, and Interactions}
+
+\textbf{Monotone transforms are for the model, not the data.} Trees split on sort order, so any strictly increasing transform---log, square root, Box--Cox---leaves a tree model \emph{exactly} unchanged. It changes everything for linear models, distance methods, and neural networks. So: \texttt{log1p} for right-skewed, multiplicative quantities (income, counts, prices, latencies) turns products into sums and compresses tails; Box--Cox (positive data) and Yeo--Johnson (any sign) tune the exponent by likelihood; a rank/quantile transform to a Gaussian is the blunt instrument that fixes any marginal but destroys spacing information. Winsorizing at a pre-registered percentile handles the handful of extreme values that dominate a squared loss.
+
+\textbf{Binning} converts a numeric feature into categories. It buys a linear model a piecewise-constant fit to a nonlinear effect (and, in credit scoring, a monotone weight-of-evidence transform that regulators can read), and it costs resolution and adds boundary artifacts. For trees it is almost always pointless: a tree already bins, and it chooses the cut points against the loss rather than against a quantile grid. And the trap: \textbf{choosing bin edges by looking at the target} is supervised feature construction and must therefore be done inside the fold, or it leaks.
+
+\textbf{Interactions} are where linear models and trees genuinely differ. A linear model represents only what you hand it, so ratios (\texttt{price\_per\_sqft}, \texttt{debt\_to\_income}), products, and splines must be constructed explicitly---and the domain-meaningful ratio usually beats a mechanical polynomial expansion, which multiplies dimensionality and collinearity. A depth-$D$ tree can express interactions of order up to $D$ along a path, so a GBDT discovers low-order interactions on its own (Chapter~\ref{cml:chap:trees_ensembles}); it still benefits from an explicit ratio when the interaction is a smooth quotient, because approximating $a/b$ with axis-aligned splits is expensive.
+
+\textbf{Datetime and cyclical features.} Decompose a timestamp into hour, day-of-week, day-of-month, month, week-of-year, holiday and business-day flags. For a linear or distance-based model, encode cyclic quantities as $(\sin(2\pi h/24), \cos(2\pi h/24))$ so that hour 23 and hour 0 are adjacent; trees do not need it (they can split 23 from 0 directly, though the sine/cosine pair sometimes saves splits). The highest-value datetime features are usually elapsed times---time since last purchase, time since account creation, time to next scheduled event---and every one of them is a leakage surface: check the anchor, and check that the window does not extend past prediction time (Section~\ref{cml:sec:leakage}, Chapter~\ref{cml:chap:time_series}).
+
+\subsection{Text and Other Awkward Columns}
+
+Real tabular datasets contain columns that are not numbers or clean categories, and the handling is worth knowing because it comes up constantly in applied loops.
+
+\textbf{Free text} (product titles, support-ticket bodies, merchant descriptors). The cheap and often sufficient path is TF--IDF or character $n$-grams reduced by SVD to a few dozen dense columns and handed to the GBDT; the hashing vectorizer is the bounded-memory version. Sentence embeddings from a pretrained encoder are the stronger option when the text carries semantics the bag of words misses, at the cost of an inference dependency in the feature path ([NLP 3] for the representations). Two traps: the vectorizer's vocabulary and IDF weights are \emph{fitted state}, so they belong inside the fold like any other transform; and text fields frequently contain the answer---an internal note reading ``customer called to cancel'' is target leakage in prose.
+
+\textbf{High-cardinality identifiers} that are not really categorical (order IDs, session IDs). These usually carry nothing but ordering, and ordering can encode the label---if rows were exported grouped by outcome, the ID is a leak. Drop them, and if one shows up as important, treat it as an alarm (Section~\ref{cml:sec:leakage}).
+
+\textbf{Geospatial columns.} Latitude and longitude as raw floats give axis-aligned trees a poor deal; useful derivations are distances to meaningful points, geohash prefixes at a couple of resolutions as categoricals, and target-encoded regions with the usual out-of-fold discipline. Geography is also a group key: nearby rows are not independent, and a random split can put the same neighbourhood on both sides.
+
+\textbf{Lists and JSON blobs.} Explode into counts, presence indicators for frequent elements, and a few summary statistics; the temptation to flatten every key produces hundreds of near-empty columns and a maintenance burden that outlives the model.
+
+\subsection{Aggregation and Window Features}
+
+The features that carry most of the signal in behavioural models are aggregates: counts, sums, means, ratios, and recencies computed over a window of an entity's history. They are also the densest concentration of leakage risk in a real pipeline, so they deserve their own discipline.
+
+Build every aggregate as a triple---\textbf{(entity, window, statistic)}---and state all three explicitly: transactions per card in the trailing 1 hour / 24 hours / 7 days / 30 days; distinct merchants per device in 24 hours; ratio of the current amount to the trailing 30-day median; days since last login. Multiple window lengths are usually worth more than a cleverer statistic, because they let the model separate a burst from a trend.
+
+The rules that keep them honest:
+\begin{itemize}
+    \item \textbf{Anchor every window to the row's own timestamp}, never to the dataset's end. A trailing window ending at the event is legitimate; a whole-history average joined to every row is temporal leakage (Section~\ref{cml:sec:leakage}), and the query that produces it looks perfectly reasonable in isolation.
+    \item \textbf{Exclude the event itself} where its inclusion would encode the outcome---``number of chargebacks on this card'' must not count the chargeback being predicted.
+    \item \textbf{Respect availability latency.} An aggregate that a batch job refreshes nightly is not the same feature as one computed in the request path; if training uses the exact value and serving uses last night's, that gap is training--serving skew and will show up as a quiet metric loss ([DL 22]).
+    \item \textbf{Watch the cold start.} Every entity-level aggregate is undefined for a new entity, and new entities are often exactly the risky population. Decide whether ``no history'' means zero, missing, or a prior, and make sure the model can tell the three apart.
+    \item \textbf{Prefer relative to absolute} where the population drifts: a count of 40 logins means something different in January than in July, while a ratio to the entity's own trailing baseline is more stable under drift.
+\end{itemize}
+
+Time-series-specific window construction (lags, rolling statistics, seasonal features, and the backtesting that validates them) is Chapter~\ref{cml:chap:time_series}; the feature-store machinery for materializing these consistently across training and serving is [DL 22]. What belongs here is the habit: an aggregate without a stated window anchor is a bug report waiting to be filed.
+
+\subsection{Scaling: Who Actually Needs It}
+
+Scaling matters exactly when the algorithm's objective or geometry is not invariant to units:
+
+\begin{itemize}
+    \item \textbf{Needs it.} Anything gradient-descent-trained (badly conditioned features make the loss surface an elongated valley); \emph{regularized} linear models, because a single penalty $\lambda$ applied to coefficients on different scales penalizes them unequally---an unscaled ridge silently regularizes the feature measured in dollars far harder than the one measured in millions of dollars; distance and kernel methods (kNN, SVM with RBF, $k$-means), where an unscaled large-range feature dominates the metric; PCA and anything else that maximizes variance; and neural networks.
+    \item \textbf{Does not need it.} Decision trees and every ensemble of them, which are invariant to monotone transforms per feature; and unregularized OLS, whose fitted values are unchanged (coefficients just rescale).
+\end{itemize}
+
+Which scaler: \texttt{StandardScaler} ($z$-scores) is the default; \texttt{MinMaxScaler} when a bounded range is required (some NN inputs, images) but is highly outlier-sensitive since one extreme value compresses everything else; \texttt{RobustScaler} (median and IQR) when heavy tails are expected. And the invariant that connects this back to Section~\ref{cml:sec:leakage}: the scaler's statistics are \emph{fit on training folds only}, always.
+
+\subsection{Missing Data}
+
+Start with the taxonomy, because it determines what is legitimate.
+
+\begin{itemize}
+    \item \textbf{MCAR} (missing completely at random): missingness is independent of everything---a sensor dropped packets, a random subset of forms was lost. Deletion is unbiased, merely wasteful. Genuinely rare.
+    \item \textbf{MAR} (missing at random): missingness depends on \emph{observed} variables---income is missing more often for younger users, and age is recorded. Conditional on the observed covariates the missingness is ignorable, so model-based imputation (MICE, kNN, or an iterative regressor) is principled.
+    \item \textbf{MNAR} (missing not at random): missingness depends on the \emph{unobserved} value itself---high earners decline to state income; the failing device stops reporting its diagnostics. No imputation recovers what was never recorded, and every imputation biases the estimate toward the observed regime. The honest move is to \emph{model the missingness}: add an indicator and let the model use it.
+\end{itemize}
+
+Methods, ordered by how often they are the right answer in a tabular production system:
+
+\textbf{1. Native handling plus an indicator.} XGBoost and LightGBM learn a \emph{default direction} per split by trying both and keeping the better one (Chapter~\ref{cml:chap:trees_ensembles}), so missingness becomes a first-class routing decision rather than a value to invent. Adding an explicit \texttt{is\_missing} flag preserves the information even for models that impute. In real tabular data missingness is usually informative---MNAR is the common case, not the exception---and this combination frequently beats a clever imputer.
+
+\textbf{2. Simple imputation (median, mode, a constant) plus an indicator.} Necessary for models that cannot take NaN. Median imputation shrinks the feature's variance and distorts its correlations, which is tolerable when accompanied by the indicator and fatal when the imputed value is silently treated as an observation.
+
+\textbf{3. Model-based imputation} (kNN, iterative/MICE). Better under MAR, expensive, and a leakage surface twice over: it is a stateful transform (fit inside the fold only) and, if the imputer is allowed to use the target, it is target leakage outright.
+
+\textbf{4. Deletion.} Listwise deletion is defensible only under MCAR and only when the loss of rows is small; dropping a \emph{column} at a high missingness rate is often the right call, but check first whether the missingness pattern is itself the signal.
+
+\begin{warningbox}
+Two missing-data mistakes are near-automatic red flags. \textbf{Imputing before the split}: the median is computed from rows that include the test set, which is class-2 contamination---mild for a median, severe for an iterative imputer that fits a model per column. And \textbf{treating a missingness pattern as noise when it is the label}: \texttt{account\_closed\_date IS NULL} is the churn label; an imputer that fills it in has not removed the leak, it has laundered it. The related production trap is that the missingness \emph{rate} shifts when an upstream system changes---a feature that was 2\% missing in training and 60\% missing after a logging change will silently move every prediction, which is why missingness rate belongs in drift monitoring ([DL 22]).
+\end{warningbox}
+
+\subsection{How Many Features, and Which to Keep}
+
+More features is not free, and the costs are not only statistical.
+
+\textbf{Statistically}, a GBDT tolerates junk columns well---it simply stops splitting on them---which is one reason trees beat MLPs on tables (Chapter~\ref{cml:chap:trees_ensembles}). But noise features still consume split candidates, dilute importance measures, and, in the small-$n$ regime, provide more chances for a spurious column to look predictive.
+
+\textbf{Operationally}, every feature is a dependency: a table that can break, a job that can be late, a definition that can silently change, a value that must be retrievable inside the latency budget. A 300-feature model is a 300-way availability contract, and in production the p99 is usually dominated by feature fetching rather than by model compute ([DL 22]).
+
+The pruning method that actually works is \textbf{ablation against a budget}: rank features by a defensible importance (permutation on held-out data, or grouped permutation under correlation---Section~\ref{cml:sec:interpretability}), retrain with the top $k$ for a few values of $k$, and plot metric against $k$. The curve is typically flat well before the full set, and the honest choice is the smallest $k$ within noise of the best. Two constraints on how you do it: the selection must happen \emph{inside} the fold or on a separate selection split, or you have reintroduced class-2 contamination; and correlated clusters must be pruned as clusters, since dropping features one at a time from a redundant group will tell you that none of them matters.
+
+%==============================================================================
 \section{Imbalanced Learning}
-% TODO Phase C3
+\label{cml:sec:imbalance}
+%==============================================================================
 
-\section{Model Selection and Cross-Validation Failure Modes}
-% TODO Phase C3
+Class imbalance is the topic where the gap between folklore and practice is widest. The folklore answer---``the classes are imbalanced, so I resample''---has been the reflexive opening for a decade and is, in 2026, usually wrong. The practitioner's answer starts somewhere else entirely.
 
-\section{Interpretability: SHAP and Its Traps}
-% TODO Phase C3
+\begin{keyinsight}[The Decision Order]
+Imbalance is not a modeling problem; it is a \emph{decision} problem wearing a modeling costume. Work in this order and most of the difficulty evaporates:
+\begin{enumerate}
+    \item \textbf{Fix the metric} to one that is informative at your prevalence (PR-AUC, precision at fixed recall, recall at a fixed alert budget)---never accuracy. [DL 23] owns the metric catalog.
+    \item \textbf{Fix the decision rule}: derive the operating threshold from the cost matrix or the review capacity, on a \emph{calibrated} model. This is free, reversible, and does not touch training.
+    \item \textbf{Reweight the loss} (class weights, \texttt{scale\_pos\_weight}) if the optimizer needs help finding the minority region at all.
+    \item \textbf{Resample only with a reason}---compute budget, or a genuinely tiny minority count---and know what it costs you.
+    \item \textbf{Recalibrate} whatever you distorted in steps 3--4, before anyone reads a probability.
+\end{enumerate}
+A candidate who reaches step 4 first, or who never mentions step 2, has told you they have not shipped one of these.
+\end{keyinsight}
 
+\subsection{What Imbalance Actually Breaks}
+
+Separate three effects that get conflated:
+
+\textbf{(a) Accuracy becomes meaningless.} At 0.1\% prevalence, ``always negative'' is 99.9\% accurate. This is a metric problem and it is fixed by changing the metric, not the data.
+
+\textbf{(b) The default threshold is wrong.} A model trained on natural prevalence outputs small probabilities; thresholding at 0.5 predicts the majority class almost everywhere. This is a decision-rule problem, and it is the one that resampling accidentally fixes---badly---by inflating probabilities until 0.5 happens to sit near a useful operating point.
+
+\textbf{(c) The minority sample is too small to learn from.} This is the only genuine data problem, and it depends on the \emph{absolute count}, not the ratio: 0.1\% of 100M transactions is 100{,}000 positives, which is plenty; 0.1\% of 5{,}000 rows is five positives, which no resampling technique can rescue---SMOTE will happily interpolate among five points and produce a confident model of nothing. Ask for the absolute positive count before saying anything else.
+
+\subsection{The Metric Arithmetic}
+
+The reason PR-AUC and ROC-AUC diverge under heavy imbalance is one line of arithmetic, and interviewers want the numbers.
+
+\begin{mathresult}{Why ROC Looks Fine While Precision Is 7\%}
+Prevalence $\pi = 0.001$; one million scored transactions, so 1{,}000 positives and 999{,}000 negatives. Take an operating point with $\text{TPR} = 0.80$ and $\text{FPR} = 0.01$---a perfectly respectable-looking point on an ROC curve.
+\begin{align}
+\text{TP} &= 0.80 \times 1{,}000 = 800, \qquad \text{FP} = 0.01 \times 999{,}000 = 9{,}990 \\
+\text{Precision} &= \frac{800}{800 + 9{,}990} = 7.4\%.
+\end{align}
+Nine out of ten alerts are false. To reach 50\% precision at the same recall you need $\text{FP} \le 800$, i.e.\ $\text{FPR} \le 800/999{,}000 = 0.08\%$---a \textbf{12$\times$} reduction in false-positive rate, which moves the ROC curve by a sliver near the origin and moves the product from unusable to shippable.
+
+The structural reason: both ROC axes are normalized \emph{within} class ($\text{TPR} = \text{TP}/P$, $\text{FPR} = \text{FP}/N$), so ROC-AUC is invariant to prevalence and gives the vast negative class no weight in the denominator that matters. Precision mixes the classes ($\text{TP}/(\text{TP}+\text{FP})$), so the PR curve is prevalence-dependent---its no-skill baseline is $\pi$ itself. A PR-AUC of 0.35 at $\pi = 0.001$ is a 350$\times$ lift over random, and reporting it next to the baseline is the only way the number means anything.
+\end{mathresult}
+
+The operational metric usually beats both: review queues have capacity, so \textbf{precision and recall at the top $k$ alerts per day} is what the fraud team lives with, and it is the number to negotiate before modeling. Definitions and the fuller metric catalog are [DL 23]; what this chapter owns is that the metric choice comes first and the arithmetic above is why.
+
+\subsection{Thresholding: The Cheapest Correct Tool}
+
+\begin{mathresult}{The Cost-Optimal Threshold}
+With cost $C_{\text{FP}}$ for a false alarm and $C_{\text{FN}}$ for a miss, and a calibrated $p = P(y=1 \mid x)$, the expected cost of alerting is $(1-p)\,C_{\text{FP}}$ and of not alerting is $p\,C_{\text{FN}}$. Alert when
+\begin{equation}
+p \;>\; \tau^\star \;=\; \frac{C_{\text{FP}}}{C_{\text{FP}} + C_{\text{FN}}}.
+\end{equation}
+Worked: a manual review costs \$5, a missed fraud costs \$200, so $\tau^\star = 5/205 = 2.4\%$---not 50\%. If instead the constraint is capacity (500 reviews/day out of 2M transactions), the threshold is simply the score quantile that emits 500 alerts, and the cost matrix becomes a sanity check rather than the rule.
+\end{mathresult}
+
+Two consequences worth stating. The threshold is a \emph{deployment} parameter, tunable after training, revisable weekly as costs change, and requiring no retraining---which is exactly why it should be the first tool you reach for. And it only means anything on a calibrated model: $\tau^\star = 0.024$ is a statement about probabilities, so the scores must be probabilities (calibration mechanics: Chapter~\ref{cml:chap:probabilistic_foundations} and [DL 23]).
+
+\subsection{Class Weights, Resampling, and SMOTE}
+
+\textbf{Class weights} multiply each example's loss by a per-class constant: scikit-learn's \texttt{balanced} setting uses $n/(K n_c)$, and XGBoost's \texttt{scale\_pos\_weight} is conventionally $N_{\text{neg}}/N_{\text{pos}}$. Weighting by $w$ is equivalent, for the expected loss, to duplicating those rows $w$ times: it is oversampling done in the objective, with no memory cost and no synthetic data. It helps when the minority region is genuinely underserved by the fit; it does nothing that thresholding cannot do for a well-fit model; and it distorts predicted probabilities exactly as oversampling does.
+
+\textbf{Random undersampling} discards majority rows. It throws away information, and at very large scale that is often fine and even desirable---dropping 90\% of negatives from a 500M-row training set costs almost nothing in a regime where negatives are highly redundant, and buys a 10$\times$ faster experiment loop. The disciplined version is \textbf{undersampling plus ensembling} (EasyEnsemble-style): train several models on disjoint majority subsets against the same minority set and average, recovering the discarded information through the ensemble.
+
+\textbf{Random oversampling} duplicates minority rows; with a high-capacity learner this is an invitation to memorize the duplicated points.
+
+\textbf{SMOTE} synthesizes new minority points by interpolating between a minority example and one of its $k$ nearest minority neighbours. It sounds principled, and it has four honest problems:
+\begin{enumerate}
+    \item \textbf{Interpolation must be meaningful.} Halfway between two one-hot categories is a value that does not exist; halfway between two ZIP codes is a number. SMOTE-NC patches the categorical case awkwardly, and for anything where the convex hull is not in the data manifold the synthetic points are simply wrong.
+    \item \textbf{High dimensions break the neighbourhood.} Nearest neighbours become unstable as dimension grows, so interpolation joins points from \emph{different} modes of the minority class and fills the gap between them with fictional positives.
+    \item \textbf{It amplifies label noise.} A single mislabeled minority point in the middle of the majority region spawns a family of synthetic positives around itself and blurs the boundary in exactly the worst place. Borderline-SMOTE and ADASYN concentrate synthesis near the boundary, which helps sometimes and amplifies boundary noise the rest of the time.
+    \item \textbf{The evidence is unkind.} The most careful systematic evaluation (Elor \& Averbuch-Elor, ``To SMOTE, or Not to SMOTE?'', 2022) finds that with a strong learner---a tuned GBDT or a calibrated logistic model---and a \emph{properly tuned threshold}, balancing methods do not improve AUC or PR-AUC. Where SMOTE appears to help, the evaluation was usually accuracy or $F_1$ at a fixed 0.5 threshold, which means the reported gain is the thresholding effect, obtained by distorting the training distribution instead of by moving a number after training.
+\end{enumerate}
+
+\textbf{And the procedural rule:} resampling happens \emph{inside} the cross-validation fold, on training rows only. SMOTE applied before the split builds synthetic test points from training neighbours, which is class-2 contamination with a metric bonus attached (Section~\ref{cml:sec:leakage}).
+
+\begin{warningbox}
+\textbf{Resampling breaks calibration, and this is not a small effect.} Training on data whose prevalence is $\pi_s \neq \pi$ shifts every predicted probability. Under case-control sampling that keeps negatives with probability $r$, the sampled and true conditional odds are related exactly by
+\begin{equation*}
+\frac{P(y=1\mid x)}{P(y=0 \mid x)} \;=\; r \cdot \frac{P_s(y=1\mid x)}{P_s(y=0\mid x)},
+\qquad\text{i.e.}\qquad \operatorname{logit} p \;=\; \operatorname{logit} p_s + \log r .
+\end{equation*}
+Balancing a 1:1000 problem to 1:1 means $r = 0.001$ and a shift of $\log r \approx -6.9$ in log-odds: a model reporting $p_s = 0.5$ is really saying $p \approx 0.001$. For logistic regression this correction is exact and touches only the intercept, which is why case-control sampling is standard in epidemiology; for a GBDT or any nonlinear model it is only approximate. The reliable fix is to \textbf{refit a calibrator (Platt or isotonic) on a held-out set at the natural prevalence}. Class weights do the same damage by the same mechanism. If the score only ranks, you may not care; if it gates money, sets a price, or feeds an expected-value calculation, uncalibrated is broken (Chapter~\ref{cml:chap:probabilistic_foundations}).
+\end{warningbox}
+
+Table~\ref{cml:tab:imbalance_tools} is the summary verdict on the toolkit, ordered the way the decision should be made rather than the way the literature is organized.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Imbalance: what earns its place and what is cargo cult}
+\label{cml:tab:imbalance_tools}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Tool} & \textbf{Verdict} & \textbf{Why} \\
+\midrule
+Changing the metric & \textbf{Always first} & Accuracy is uninformative at low prevalence; the metric determines everything downstream \\
+Threshold from costs or capacity & \textbf{Always} & Free, reversible, post-training, and fixes the symptom people blame on imbalance \\
+Class weights / \texttt{scale\_pos\_weight} & \textbf{Often useful} & Helps the fit reach the minority region; distorts probabilities, so recalibrate \\
+Undersampling the majority & \textbf{Situationally useful} & Legitimate for training economics at huge scale; combine with ensembling to recover the discarded rows \\
+Calibration after reweighting & \textbf{Mandatory if scores are used} & Resampling shifts log-odds by $\log r$; thresholds and expected-value math break otherwise \\
+Random oversampling & \textbf{Rarely} & Equivalent to weighting, but invites memorization of duplicated rows \\
+SMOTE and variants & \textbf{Usually cargo cult} & No gain with a strong learner and a tuned threshold; off-manifold points, unstable neighbourhoods, amplified label noise \\
+Anomaly detection instead & \textbf{At the extreme} & Below $\sim10^{-4}$ prevalence with few labels, the supervised framing stops being the right one \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Where Classification Stops}
+
+Below roughly $10^{-4}$--$10^{-5}$ prevalence, with few labeled positives and adversarial non-stationarity, supervised classification degrades into fitting a handful of examples of last quarter's attack. The framing shifts: \textbf{anomaly detection} (isolation forest, one-class SVM, autoencoder reconstruction error, density estimates) models the normal class and flags deviation; \textbf{rules} encode the known patterns cheaply and generate the labels; \textbf{PU learning} handles the fact that unlabeled does not mean negative. Real industrial systems are hybrids: rules for what is known, a supervised model for what is labeled, anomaly detection for what is novel, and a human review queue that manufactures tomorrow's labels---which is also why the label distribution is endogenous to the system, and why offline metrics on reviewer-generated labels flatter the model that produced the queue.
+
+%==============================================================================
+\section{Model Selection and Cross-Validation}
+\label{cml:sec:cv}
+%==============================================================================
+
+Cross-validation is the instrument every applied claim rests on, which is why its failure modes are worth more interview time than its mechanics.
+
+\subsection{Mechanics, Briefly}
+
+$k$-fold CV partitions the data into $k$ folds, trains on $k-1$ and evaluates on the held-out one, and averages. The choice of $k$ is a bias--variance trade on the \emph{estimator}: small $k$ means each model trains on less data, so the estimate is pessimistically biased for the model you will actually ship; large $k$ reduces that bias but the training sets overlap more, the fold estimates are more correlated, and cost grows linearly. $k = 5$ or $10$ is the standard compromise for a reason.
+
+\textbf{Stratification} preserves the class ratio in each fold. It is mandatory for classification whenever the data is small or imbalanced---with 40 positives in 5 folds, an unstratified split can hand a fold zero positives, making its metric undefined or absurd---and harmless otherwise.
+
+\textbf{Leave-one-out} ($k=n$) has the least bias with respect to training-set size and high variance, since the $n$ training sets are nearly identical and the estimate is an average of $n$ highly correlated terms. It is rarely worth $n$ refits, with one important exception:
+
+\begin{mathresult}{LOOCV Is Free for Linear Smoothers}
+For any linear smoother $\hat{\bm y} = \bm H \bm y$ (OLS, ridge, splines), the leave-one-out residual is obtainable from a \emph{single} fit:
+\begin{equation}
+\text{LOOCV} \;=\; \frac{1}{n}\sum_{i=1}^n \left(\frac{y_i - \hat y_i}{1 - h_{ii}}\right)^{\!2},
+\end{equation}
+where $h_{ii}$ is the $i$-th diagonal of the hat matrix (the PRESS statistic). Generalized cross-validation replaces $h_{ii}$ with the average $\tr(\bm H)/n$, which is cheaper and more stable. This is why ridge tuning via \texttt{RidgeCV} costs almost nothing, and it is the standard follow-up when someone says ``LOO is too expensive.''
+\end{mathresult}
+
+\textbf{Repeated $k$-fold} (several shuffles) averages away the arbitrariness of one partition, which matters more than people expect on small data.
+
+\subsection{The Variance of a CV Estimate}
+
+The number every notebook prints---mean $\pm$ standard deviation over folds---systematically understates uncertainty, because the fold estimates are \emph{not independent}: their training sets share most of their rows. There is in fact no unbiased estimator of the variance of $k$-fold cross-validation (Bengio \& Grandvalet, 2004), and treating the naive fold standard error as if it were one is how teams convince themselves that a 0.3-point difference is real.
+
+Get the scale right with a floor: even ignoring the correlation, a validation fold of 2{,}000 rows at 90\% accuracy has a binomial standard error of $\sqrt{0.9 \times 0.1/2000} \approx 0.7$ percentage points. A ``win'' of half a point on that fold is nothing. The practical protocol: compare models on \emph{identical} folds and look at the paired per-fold differences rather than at two independent means; use repeated CV when the decision is close; and prefer the \textbf{1-SE rule}---among configurations within one standard error of the best, take the simplest---which both regularizes the selection and blunts the winner's curse below.
+
+\subsection{Comparing Two Models Honestly}
+
+Most model-selection decisions are a comparison, and comparisons have their own hygiene. Evaluate both models on \emph{identical} folds and analyze the per-fold \emph{differences}: pairing removes the fold-to-fold variance that otherwise swamps the effect, and the difference is the quantity you care about. Report the distribution of differences, not two means with overlapping error bars.
+
+Then keep three caveats in view. Resampled comparisons violate the independence that a naive paired $t$-test assumes, because the training sets overlap---so treat the resulting p-value as a heuristic and prefer a decision rule with a margin (``B wins on 9 of 10 folds by at least half a point'') over a significance ritual; the corrected resampled $t$-test and $5\times2$ CV exist for this and are worth naming. The comparison must also be like-for-like: the same features, the same preprocessing discipline, the same tuning budget---a model given 500 trials against one given 20 has won a compute contest, not a modeling one. And any difference small enough to need statistics is small enough that the tie-breakers should be operational: training time, serving latency, interpretability, maintenance surface, and how gracefully each degrades under drift.
+
+The final word belongs to the online test. An offline win is a hypothesis about production; the readout that decides is an experiment, with its own statistics (Chapter~\ref{cml:chap:experimentation_causal}) and the standing possibility that a model that looks better offline moves no business metric at all.
+
+\subsection{The Failure-Mode Catalog}
+
+Table~\ref{cml:tab:cv_failures} is the interview meat of this section: seven ways a correctly coded cross-validation loop still produces a number you should not believe. The first row is the one candidates miss most often, and the fourth is the one that connects this section back to leakage.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Cross-validation failure modes and their fixes}
+\label{cml:tab:cv_failures}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Failure} & \textbf{Mechanism} & \textbf{Fix} \\
+\midrule
+Selection on the reporting folds & Hyperparameters chosen by the same folds that produce the reported number; the CV score becomes a training score for the tuning procedure & Nested CV, or a locked test set touched once \\
+Temporal data, shuffled folds & Trains on the future to predict the past; shared period-level structure across folds & Rolling-origin / expanding-window splits; purge and embargo when label windows overlap \\
+Grouped data, ungrouped folds & The same entity in train and validation; memorized identity scored as generalization & \texttt{GroupKFold} / \texttt{StratifiedGroupKFold}; hash-based entity split \\
+Preprocessing outside the fold & Stateful transforms see validation rows (Section~\ref{cml:sec:leakage}) & Cross-validate the pipeline, not the model \\
+Large search spaces & The max of many noisy estimates is biased upward---the winner's curse & Fewer, better-motivated configurations; 1-SE rule; confirm the winner on untouched data \\
+Repeated test-set use & Each look spends independence; the leaderboard is fit by hand & One locked holdout; a fresh temporal holdout for the final claim \\
+Shift between CV data and deployment & CV estimates in-distribution error only; it cannot see next quarter & Temporal holdout, shadow deployment, drift monitoring ([DL 22]) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Nested Cross-Validation}
+
+The bias in row one of that table is the subtlest and the most asked. Tuning is itself a fitting procedure: choosing the best of 200 configurations \emph{by their CV scores} makes the winning CV score an optimistically biased estimate of that configuration's performance, for the same reason that the maximum of 200 noisy draws exceeds their mean. On small data with a large grid, the optimism routinely reaches several accuracy points---enough to reverse a published comparison, which is exactly what Cawley \& Talbot (2010) documented across the model-selection literature.
+
+\textbf{Nested CV separates the two jobs.} An \emph{outer} $k_{\text{out}}$-fold loop provides the estimate; inside each outer training portion, an \emph{inner} $k_{\text{in}}$-fold loop selects hyperparameters using only that portion; the selected configuration is refit on the outer training portion and scored once on the untouched outer fold. Cost is $k_{\text{out}} \times k_{\text{in}} \times |\text{grid}|$ fits.
+
+The clarification interviewers listen for: \textbf{nested CV estimates the performance of the whole \emph{procedure}, tuning included---it does not select a model for you.} Different outer folds may pick different hyperparameters, and that is expected, not a bug; the final model is chosen afterward by a single inner-style CV on all the data.
+
+When it is worth it: small data, many configurations, and a number that other people will act on (a paper, a clinical claim, a vendor comparison). When it is overkill: large data with a genuinely clean held-out test set used once---a single split estimates the same thing more cheaply, and the honest statement ``I tuned on validation and touched test once'' is a perfectly good protocol.
+
+\subsection{Choosing the Split}
+
+Table~\ref{cml:tab:split_choice} names the conditions under which each splitter stops being a preference and becomes mandatory.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Which split, and when it is mandatory}
+\label{cml:tab:split_choice}
+\begin{tabularx}{\textwidth}{lXX}
+\toprule
+\textbf{Split} & \textbf{Use when} & \textbf{Mandatory when} \\
+\midrule
+Random $k$-fold & i.i.d.\ rows, one row per entity, no time structure & Rarely---this is the default that is usually wrong in production data \\
+Stratified & Classification & Small data or imbalanced classes; otherwise a fold may hold no positives \\
+Group & Repeated entities (users, patients, merchants, queries, documents) & The serving population contains entities unseen in training \\
+Stratified group & Both of the above & Imbalanced classification with repeated entities---the common medical and fraud case \\
+Time-series (rolling origin / expanding window) & Any time-ordered data, or any drift & Always, when the deployment is ``train on the past, score the future'' \\
+Purged and embargoed time-series & Overlapping label windows (a 30-day outcome label) & Labels whose windows straddle the split boundary \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The meta-rule that generates every row: \textbf{the validation split must simulate the deployment gap.} Write down what the model will be asked at serving time---new entity or known entity, future period or same period, new market or same market---and build the split so the validation set stands in that same relationship to the training set. When two of these apply at once (a churn model scoring known users in a future month), the temporal axis usually dominates and the group axis becomes optional; when the model must generalize to new entities in a future month, you need both, and you should say so.
+
+\subsection{Sizing the Splits}
+
+``How big should the test set be'' has an arithmetic answer: big enough that the quantity you will make a decision on has an error bar smaller than the difference you care about. For a proportion metric, the standard error is $\sqrt{m(1-m)/n_{\text{test}}}$, so an accuracy near 0.9 needs about 3{,}600 rows for a $\pm 0.5$ percentage-point standard error and about 90{,}000 for $\pm 0.1$. For a rare-event metric the binding constraint is the \emph{positive} count, not the row count: at 0.1\% prevalence, a test set of 100{,}000 rows contains about 100 positives, so recall is estimated to roughly $\pm 4$ points and precision-at-$k$ for small $k$ is barely estimable at all. Size the split by positives when the classes are skewed.
+
+Two consequences follow. On large data, the classic 60/20/20 ritual wastes training rows for no gain---if 1\% of 50M rows already gives every metric a negligible error bar, take 1\% and train on the rest. On small data the opposite holds: a single split is too noisy to decide anything, cross-validation is the estimator, and the ``test set'' is a locked temporal or grouped holdout you touch once at the end, understood to be a weak check rather than a precise measurement.
+
+\subsection{Hyperparameter Search and the Final Model}
+
+\textbf{Grid versus random.} With $d$ hyperparameters of which only a few matter---the empirically universal case---a grid with $g$ values per dimension spends $g^d$ trials but explores only $g$ distinct values of the important dimension, wasting the rest on the ones that do not matter. Random search with $n$ trials explores $n$ distinct values in \emph{every} dimension (Bergstra \& Bengio, 2012). The quotable arithmetic: if the top 5\% of the configuration space is ``good enough,'' then $n$ random draws hit it with probability $1 - 0.95^{\,n}$, so \textbf{60 random trials give roughly 95\%} confidence of landing in the top 5\%---independent of dimension. Successive halving and Hyperband improve on this by reallocating budget from bad configurations early; Bayesian optimization (GP or TPE surrogates) earns its complexity when each trial is genuinely expensive.
+
+\textbf{Early stopping inside CV.} Early stopping needs a stopping set, and the stopping set is a form of selection. Two defensible protocols: carve a stopping slice out of \emph{each fold's training portion}, so the validation fold stays untouched (clean, slightly more expensive); or stop on the validation fold and accept mild optimism, then confirm the final model on an untouched holdout. What is not defensible is stopping on the fold you then report, and calling that number an unbiased estimate.
+
+\textbf{The final-model protocol.} Refit on all available data with the selected hyperparameters, because more data helps and the tuning is done. Two caveats: the number of boosting rounds chosen by early stopping was chosen for a smaller training set, so scale it up by roughly the data ratio or retain a small stopping slice; and \textbf{report the cross-validated or holdout estimate as the performance claim, never the refit model's training score}. Version the entire pipeline, not the model object---the encoders and imputers carry fitted state and are part of what you are promising. Then state the expected gap to production and why: distribution shift, feature-availability differences, and the fact that CV measured in-distribution error only.
+
+\subsection{What Cross-Validation Cannot Tell You}
+
+Even a perfectly executed CV protocol answers one narrow question: how well does this procedure perform on data drawn like the data I already have. It is silent on everything that actually decides whether a model is worth shipping.
+
+\begin{itemize}
+    \item \textbf{Distribution shift.} CV measures in-distribution error. Next quarter's population, a competitor's launch, a pricing change, an adversary adapting---none of it is in the folds. The partial mitigation is a temporal holdout and drift monitoring ([DL 22]); the real answer is that the estimate has a shelf life.
+    \item \textbf{Feedback effects.} A model that changes what users see changes the data it will next be trained on---review queues manufacture labels, recommenders shape engagement, risk models select who gets approved. CV cannot see a loop it is not part of.
+    \item \textbf{The business metric.} Offline AUC is a proxy for a decision quality that is itself a proxy for revenue or retention. The gap between them is measured only online (Chapter~\ref{cml:chap:experimentation_causal}).
+    \item \textbf{Serving reality.} Latency budgets, feature availability, upstream job timing, and fallback behaviour are invisible to an offline loop and are frequently what decides the launch.
+\end{itemize}
+
+The honest framing to bring to a review: cross-validation is how you avoid shipping something bad, not how you find out whether something is good. The second question is an experiment.
+
+%==============================================================================
+\section{Interpretability and Its Traps}
+\label{cml:sec:interpretability}
+%==============================================================================
+
+Every model ships with an explanation attached, whether or not anyone checked it. The Staff-level skill is not producing SHAP plots---any library does that---it is knowing precisely what each method measures, which of its numbers are artifacts, and where the line sits between ``the model uses this'' and ``this causes that.''
+
+\subsection{The Importance Zoo}
+
+Table~\ref{cml:tab:importance_zoo} is the map: six methods, what each actually measures, and the trap that makes its output misleading if you read it as ``how much this feature matters.''
+
+\begin{table}[H]
+\centering
+\small
+\caption{Attribution methods: what each measures and its principal trap}
+\label{cml:tab:importance_zoo}
+\begin{tabularx}{\textwidth}{lXXX}
+\toprule
+\textbf{Method} & \textbf{What it measures} & \textbf{Cost} & \textbf{Principal trap} \\
+\midrule
+Impurity (MDI) & Total split-gain credited to a feature, on \emph{training} data & Free & Biased toward high-cardinality and continuous features; rewards memorization \\
+Permutation & Metric drop when one column is shuffled on held-out data & $O(d)$ scoring passes & Evaluates off-manifold rows; correlated features dilute each other \\
+Drop-column & Metric drop when the model is refit without the feature & $O(d)$ retrains & Correlated substitutes make both features look useless \\
+SHAP (TreeSHAP) & Per-prediction additive attribution, exact for trees & Polynomial per row & Correlation splits credit; interventional vs.\ conditional disagree; never causal \\
+PDP / ICE & Average (PDP) or per-row (ICE) prediction as one feature is swept & Cheap & PDP assumes independence and sweeps into impossible regions; averages hide sign flips \\
+Global surrogate & A simple model fit to the complex model's predictions & Cheap & Faithful only where the surrogate fits; a comforting fiction elsewhere \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+MDI's pathologies are covered where they arise, in Chapter~\ref{cml:chap:trees_ensembles}. What this chapter owns is the two traps that survive every fix.
+
+\subsection{Permutation Importance Off the Manifold}
+
+Permutation importance shuffles column $j$ on held-out data and measures how much the metric falls. It is model-agnostic, computed out-of-sample, and correctly indifferent to cardinality---and it has a failure mode that is structural rather than cosmetic.
+
+Shuffling one column of a correlated pair produces rows that could not exist: \texttt{height = 150\,cm} with \texttt{weight = 110\,kg}, \texttt{tenure\_days = 3} with \texttt{lifetime\_orders = 400}. The model is then evaluated on inputs drawn from a distribution it never saw, in a region where its behaviour was never constrained by data. The resulting metric drop measures the model's extrapolation behaviour as much as the feature's usefulness, and it can come out anywhere---including \emph{negative} importance, where shuffling a feature improves the score.
+
+The correlation problem is more fundamental than the off-manifold problem, because it also afflicts the methods that fix off-manifold evaluation. If $x_1$ and $x_2$ are nearly identical and the model uses them interchangeably, permuting either alone costs little (the other carries the signal), so both look unimportant, and their joint importance is invisible. \textbf{Drop-column retraining} makes it worse, not better: retrain without $x_1$ and the model substitutes $x_2$ with no loss, so $x_1$'s importance is zero---and symmetrically for $x_2$. Two features that jointly matter enormously each measure as irrelevant.
+
+The available fixes, honestly labeled: \textbf{grouped permutation} (shuffle the correlated cluster together, and report importance for the cluster rather than for its members); \textbf{conditional permutation} (resample $x_j$ from its conditional distribution given the others, which stays on-manifold but changes the question to ``given everything else, does this add anything''); and \textbf{cluster-then-attribute} (hierarchically cluster features by correlation, keep one representative per cluster or attribute at the cluster level). None recovers a unique per-feature answer, because under strong correlation \textbf{there is no unique per-feature answer to recover}---the data does not identify one.
+
+\subsection{SHAP: Additivity, and What It Does Not Buy}
+
+SHAP attributes a single prediction to features by averaging each feature's marginal contribution over all orders in which features could be revealed. Its appeal is one equation:
+
+\begin{mathresult}{The Additivity (Efficiency) Property}
+\begin{equation}
+f(x) \;=\; \phi_0 \;+\; \sum_{j=1}^{d} \phi_j(x), \qquad \phi_0 = \E[f(X)] \text{ over the background set.}
+\end{equation}
+The attributions \emph{exactly} decompose this prediction's deviation from a baseline---so they sum, aggregate across a dataset, and audit. With the symmetry, dummy, and consistency axioms, the Shapley values are the unique attribution satisfying all four. TreeSHAP computes them exactly for tree ensembles in polynomial time (mechanics: Chapter~\ref{cml:chap:trees_ensembles}); global importance is the mean $|\phi_j|$ across rows.
+\end{mathresult}
+
+Additivity is a guarantee about \emph{arithmetic}, not about truth. Five traps follow, and they are the differentiating content:
+
+\textbf{1. Correlated features split credit arbitrarily.} With two near-duplicate features the Shapley value gives each roughly half the credit, halving both---so a genuinely dominant signal, represented twice, can rank below a mediocre singleton. Which of the two gets the larger share depends on which one the trees happened to split on, which depends on the random seed.
+
+\textbf{2. Interventional versus conditional---two different questions.} The value function must decide what to do with the features not in the coalition. \emph{Interventional} (marginal) SHAP replaces them with values drawn from the background set independently, which breaks the feature dependence and evaluates the model off-manifold; it is ``true to the model.'' \emph{Conditional} (observational) SHAP replaces them with draws from their conditional distribution, staying on-manifold; it is ``true to the data,'' and it will assign nonzero credit to a feature the model \emph{never uses}, purely because that feature is correlated with one the model does use. There is no setting that gives you both, so the answer to ``which SHAP did you compute'' has to be a sentence, not a shrug. (In tree libraries this is often a single flag whose default has changed between versions---check it.)
+
+\textbf{3. The background set is a modeling choice.} $\phi_0$ is the expectation over whichever background you chose, and every $\phi_j$ is a deviation from it. Explaining a declined loan against ``all applicants'' and against ``applicants in this credit band'' yields different attributions, both correct, answering different questions. Choose the background to match the counterfactual the audience has in mind, and say which you chose.
+
+\textbf{4. Explanations are unstable across retrains.} Two models with statistically indistinguishable accuracy can distribute credit very differently when features are correlated---the Rashomon effect. If your explanations feed regulatory reason codes, that instability is a compliance problem, and stability must be measured (rank correlation of attributions across seeds and retrains) rather than assumed.
+
+\textbf{5. Bar plots hide interactions and sign flips.} Mean $|\phi_j|$ collapses a feature that helps one segment and hurts another into a mid-table row. Beeswarm plots restore direction and spread; dependence plots restore the interaction structure.
+
+\begin{keyinsight}[SHAP Answers ``Why Did the Model Say This,'' Never ``What If We Change It'']
+A SHAP value is a statement about a fitted function $f$, and $f$ encodes whatever associations---confounded, selected, mediated---were present in the training data. High $\phi$ for \texttt{discount\_rate} means the model's output moves with the discount, which is exactly what you would see if discounts were \emph{targeted at} users already likely to convert. The canonical cautionary case is Caruana et al.'s pneumonia model, which learned that asthmatic patients had \emph{lower} mortality risk. The model was right about the data---asthmatics were rushed to intensive care and did better---and the causal reading of it would have sent asthmatics home. Attribution is a hypothesis generator; the answer to ``should we change $X$'' is an experiment (Chapter~\ref{cml:chap:experimentation_causal}), or, when randomization is impossible, an observational design with a stated identifying assumption.
+\end{keyinsight}
+
+\subsection{Which Method Answers Which Question}
+
+The methods are not interchangeable, and most confusion dissolves once the question is stated precisely.
+
+\begin{itemize}
+    \item \textbf{``Why did the model output this value for this row?''} $\Rightarrow$ local SHAP. The additivity property makes the answer auditable: for a churn prediction of $0.31$ with a background mean of $0.12$, the attributions sum exactly to $0.19$---say, $+0.11$ from 14 days since last login, $+0.06$ from a downgraded plan, $-0.02$ from tenure, and small terms elsewhere. That decomposition is a faithful account of the function, and it is exactly what a reason-code system needs.
+    \item \textbf{``Which features is the model relying on overall?''} $\Rightarrow$ mean $|\phi|$ or permutation importance on held-out data, with correlated features grouped.
+    \item \textbf{``How does the prediction change with this feature?''} $\Rightarrow$ PDP for the average shape, ICE for heterogeneity, ALE when features are correlated.
+    \item \textbf{``Would the model be worse without this feature?''} $\Rightarrow$ drop-column retraining---the only method that answers this one, and useless under redundancy.
+    \item \textbf{``What happens to the outcome if we change this feature?''} $\Rightarrow$ \textbf{none of them.} This is a causal question and needs an experiment or an observational design (Chapter~\ref{cml:chap:experimentation_causal}).
+    \item \textbf{``Is something wrong with my model or data?''} $\Rightarrow$ any of them, used as an alarm rather than a measurement---which is how a single dominant feature becomes a leakage investigation (Section~\ref{cml:sec:leakage}).
+\end{itemize}
+
+\subsection{Partial Dependence, ICE, and Interpretability by Construction}
+
+A \textbf{PDP} sweeps one feature across its range, averaging the model's prediction over the observed distribution of the others. It assumes the swept feature is independent of the rest---sweeping \texttt{square\_footage} to 4{,}000 while holding a studio apartment's other features fixed evaluates the model on a house that does not exist---and the averaging hides heterogeneity, so a positive effect on half the population and a negative effect on the other half plots as a flat line. \textbf{ICE} curves (one line per row) expose exactly that. \textbf{ALE} plots accumulate \emph{local} effects within small intervals of the feature and avoid the independence assumption, which makes them the correlation-robust alternative worth naming.
+
+When the explanation has to hold up to a person who is affected by the decision, post-hoc attribution is the wrong instrument and \textbf{interpretability by construction} is the right one: \emph{monotonic constraints} in a GBDT guarantee direction by refusing violating splits (Chapter~\ref{cml:chap:trees_ensembles}); \emph{scorecards} (weight-of-evidence binning plus logistic regression) remain the credit-industry standard because each applicant's decision decomposes into a handful of readable points; \emph{GAMs and EBMs} (Explainable Boosting Machines---boosted shape functions per feature plus a controlled number of pairwise interactions) reach close to GBDT accuracy on many tabular problems while yielding an exact, plottable shape function per feature. Regulated settings force the question: adverse-action notices under fair-lending rules, and high-risk classifications under the EU AI Act, require a defensible per-decision explanation, and ``we ran SHAP on a GBDT'' is a weaker answer than ``the model is additive by construction.''
+
+Finally, ask \emph{who the explanation is for}. Debugging your own model tolerates unstable attributions, because you are generating hypotheses and testing them. Regulatory reason codes need stability and a defensible mapping from attribution to human-readable reason. End-user explanations need to be \emph{actionable}---which drags you straight back to causality, since telling a user to change a feature is a causal claim, and only a causal analysis licenses it.
+
+\begin{warningbox}
+\textbf{Three rules for reporting an explanation.} (1) Say which method and which variant produced it---interventional or conditional SHAP, permutation on which dataset, what background set---because the same model yields materially different pictures under different choices. (2) Report correlated features as groups, or state that credit is split arbitrarily within a group; a ranked bar chart of individually diluted importances is a misleading artifact presented as a finding. (3) Never let an attribution appear next to a recommendation to change the feature. In practice the third rule is the one that gets broken, because the slide that shows the top-ten SHAP bars is the slide where someone asks what to do about them---so answer that question with an experiment (Chapter~\ref{cml:chap:experimentation_causal}) before it is asked.
+\end{warningbox}
+
+%==============================================================================
+\section{The Applied Checklist}
+\label{cml:sec:applied_checklist}
+%==============================================================================
+
+The material in this chapter composes into one protocol. It is worth being able to recite, because a large fraction of applied interviews are some disguised version of ``walk me through how you would build this,'' and the ordering is the answer.
+
+\textbf{1. Define the decision before the model.} What action does the prediction drive, who takes it, at what moment, and what does a mistake in each direction cost? This determines the label, the prediction time, the metric, and the threshold---four choices that are expensive to revisit and that most projects make implicitly.
+
+\textbf{2. Fix the prediction time and write down the information set.} Everything downstream follows from ``what is knowable at this instant.'' This is where leakage is prevented rather than detected.
+
+\textbf{3. Choose the metric and the operating point together.} A ranking metric for model selection, a decision metric at the operating point for the business, and the baseline alongside any prevalence-dependent number.
+
+\textbf{4. Design the split to simulate the deployment gap} before writing a training loop: temporal if the deployment is temporal, grouped if the serving population is new entities, purged and embargoed if labels mature, stratified if the classes are thin.
+
+\textbf{5. Build features under the point-in-time contract}, with anchored windows, stated availability, and a fallback for unseen entities. Prefer features you can compute the same way at serving time.
+
+\textbf{6. Put every stateful transform in the pipeline} and cross-validate the pipeline. Target encoding out of fold; resampling inside the fold; imputers and scalers fit on training rows only.
+
+\textbf{7. Establish a baseline before a model.} The current rules engine, the last model, or a logistic regression on ten obvious features. A GBDT that cannot beat a rules engine has told you something important about the features.
+
+\textbf{8. Tune with a budget and a protocol.} Random or successive-halving search, early stopping on a set that is not the reporting set, the 1-SE rule for the final pick, and a count of how many times the test set has been touched.
+
+\textbf{9. Audit before you celebrate.} The detection playbook of Section~\ref{cml:sec:leakage}, run in full whenever the number is better than the domain prior: single-feature dominance, ablation, fit-scope, point-in-time, split integrity, adversarial validation, honest replay.
+
+\textbf{10. Calibrate if the score is a probability to anyone}, and check it on a held-out set at natural prevalence---especially after any reweighting or resampling.
+
+\textbf{11. Explain the model to the audience that needs it}, with the right method for their question and an explicit refusal to give causal readings to attributions.
+
+\textbf{12. Ship behind a gate and measure online.} Shadow scoring, offline--online parity, an experiment for the business readout (Chapter~\ref{cml:chap:experimentation_causal}), and monitoring for drift, feature availability, missingness rates, and calibration ([DL 22]).
+
+\begin{keyinsight}[The Two Sentences That Carry This Chapter]
+If you remember nothing else: \textbf{ask of every feature what was knowable at prediction time, and never let a transform see data it will not have}. The first sentence prevents target, temporal, and label-derived leakage; the second prevents contamination, and forces the split, the pipeline, and the encoder discipline into their correct shapes. Everything else in this chapter is the elaboration of those two habits under specific conditions.
+\end{keyinsight}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C3
+\label{cml:sec:applied_craft_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: Your churn model has 0.99 AUC offline and 0.62 in production. Walk me through it.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Lead with the differential, not with a fix. Two families explain an offline--online gap: \textbf{leakage} (the offline number was never real) and \textbf{skew/drift} (the number was real then, and the world or the serving path changed). The magnitude decides which to chase first: 0.99 is not a plausible churn AUC under any circumstance---churn models live at 0.75--0.85---so this is leakage until proven otherwise, and I would not spend the first hour on drift.
+
+Then run the playbook, cheapest first. \textbf{(1) Single-feature dominance}: look at importance as an alarm, and train a model on the top feature alone; if one column reproduces most of the 0.99, that is the whole story. \textbf{(2) Ablate}: retrain without the suspect and see where the metric lands---if it falls to 0.81, that is the honest baseline. \textbf{(3) The point-in-time audit}, which is the step I would actually insist on: one row per feature, giving the value's timestamp, the prediction timestamp, and whether the value is retrievable at serving. For churn the classic hits are \texttt{account\_closed\_date} (populated only by the event we predict), \texttt{total\_charges} (stops accumulating at departure), a support-ticket count that includes the cancellation ticket, and any current-value dimension attribute joined onto historical rows---the warehouse stores the present, and joining ``current plan tier'' to an eleven-month-old event fabricates knowledge. \textbf{(4) Split integrity}: is the split temporal or shuffled; are users repeated across folds; are there duplicate rows. \textbf{(5) The confirming experiment}: rebuild with a strict as-of cutoff and backtest on the following period. If the backtest says 0.64 and matches production, the diagnosis is closed.
+
+Only if all of that comes back clean do I move to the skew branch: compare the serving feature vector against the training vector for the same entity (log them and diff), check feature-availability and null rates at serving, check the score distribution online versus offline, and check drift in the population ([DL 22]). A 37-point gap is essentially never drift.
+
+\redflags
+\begin{itemize}
+    \item ``Retrain on fresh data''---answering before diagnosing, and the one fix that cannot help if the training set itself is contaminated.
+    \item Treating 0.99 as a plausible number; having no domain prior for what a churn AUC should be.
+    \item Jumping to drift or model complexity without a single leakage check.
+    \item Naming leakage but having no procedure---no ablation, no timestamp audit, no backtest.
+\end{itemize}
+
+\interviewtest{Whether you own a debugging \emph{procedure} for the most consequential failure in applied ML, and whether your first instinct on a too-good number is suspicion rather than celebration. The interviewer is listening for the point-in-time question and for an ordered playbook rather than a list of possible causes.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names leakage, checks feature importance, proposes dropping the suspicious feature.
+    \item \badgeLsix{L6} Gives the leakage-vs-skew differential with a magnitude argument, runs an ordered playbook, names concrete churn-specific leaks, and settles it with a point-in-time backtest.
+    \item \badgeLseven{L7} Adds the prevention layer---feature timestamps as a schema requirement, point-in-time joins as the default, logging serving features and training on the logs---plus the organizational move: what to tell the stakeholders who were promised 0.99, and how to make this class of failure impossible rather than merely detected.
+\end{itemize}
+
+\followups{``Which specific churn features would you audit first, and why?'' ``The audit is clean and the gap is still 20 points---now what?'' ``How would you have caught this before launch?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You want to target-encode a 50K-cardinality \texttt{merchant\_id}. Give me the exact construction, and tell me where it leaks if you get it wrong.}
+
+\badgeLsix{L6} \quad \badgetype{Mathematical} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Start with the failure, because it motivates every piece. Naive encoding replaces each merchant with the mean target over all training rows for that merchant---including the row being encoded. For a merchant with a single transaction, $\bar y_c = y_i$: the feature \emph{is} the label. Trees find that instantly, training metrics look superb, and the model collapses in validation and again in production.
+
+The construction has two ingredients. \textbf{Shrinkage}: encode with the empirical-Bayes posterior mean
+\begin{equation*}
+\hat t_c = \frac{n_c \bar y_c + m \bar y}{n_c + m},
+\end{equation*}
+so a merchant with thousands of transactions is trusted and one with two is pulled to the global rate; $m$ is the prior weight, tuned, typically 5--100. \textbf{Out-of-fold computation}: split the training data into $K$ inner folds; encode each fold's rows with statistics computed from the other $K-1$ folds, so no row's own label ever reaches its own feature.
+
+Then the four rules that make it survive contact with a real pipeline: the encoder that ships is fit on the \emph{entire} training set and applied to validation, test, and serving rows (those rows contributed no labels, so this is not leakage); the whole procedure lives \emph{inside} the outer CV fold, because encoding once on all data before the split is contamination of the worst kind---the transform carries labels; the inner split must respect the same structure as the outer one (group-aware if the outer split is group-aware, time-aware if it is temporal, or you have moved the leak rather than removed it); and unseen or ultra-rare merchants fall back to the prior by construction, which matters because new merchants appear daily.
+
+Alternatives worth naming with their trade-offs: CatBoost's ordered target statistics do this natively by encoding each row from a random prefix of the data (Chapter~\ref{cml:chap:trees_ensembles}); the hashing trick bounds memory and handles unbounded cardinality without touching the target at all, at the cost of interpretability; frequency encoding is target-free and often surprisingly strong; and for a linear model, hashing plus L2 is the ads-scale standard, since a 50K-column one-hot with a sparse solver is also viable but fragile to new levels.
+
+\redflags
+\begin{itemize}
+    \item Computing the mean on the full training set and calling it done---the definitional failure of this question.
+    \item Smoothing but not going out-of-fold, or going out-of-fold but not smoothing (the singleton-category problem needs both).
+    \item Fitting the encoder before the train/test split, i.e.\ ``I encode, then I cross-validate.''
+    \item No answer for merchants unseen at serving time.
+\end{itemize}
+
+\interviewtest{Whether you can specify a leakage-safe transform precisely enough to implement it, including the fold discipline and the shrinkage. This is the most concrete leakage question there is: the mechanism is small enough that vagueness has nowhere to hide.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Smoothing formula plus out-of-fold computation, and knows why naive encoding leaks.
+    \item \badgeLsix{L6} Adds the ship-the-full-fit-encoder rule, nests the whole thing inside CV, matches the inner split to the outer split's structure, and handles unseen levels.
+    \item \badgeLseven{L7} Puts the encoder in the serving path---where the map lives, how it is refreshed, what happens on cold-start merchants and on merchant churn---and compares against hashing/CatBoost with a cost and interpretability argument.
+\end{itemize}
+
+\followups{``What exactly does $m$ trade off, and how would you choose it?'' ``Your outer split is by month---what does the inner split look like?'' ``Now the same feature for a logistic regression: what changes?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Here is a pipeline. \texttt{StandardScaler} on the full dataframe, then median imputation, then \texttt{SelectKBest(k=100)} on all rows, then SMOTE to balance, then a 5-fold CV that reports 0.94 AUC. Find the bugs and rank them by damage.}
+
+\badgeLfive{L5} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Every stateful step is fit on data that includes the evaluation rows, so all four are train--test contamination---but they are not equally bad, and ranking them is the point.
+
+\textbf{Worst: \texttt{SelectKBest} on all rows.} Feature selection looks at the labels of the rows it will later be evaluated on, so the ``held-out'' folds helped choose the features that predict them. This one alone can manufacture a strong metric out of pure noise: the standard demonstration is 50 samples, 5{,}000 random predictors, screen for the 100 most correlated with $y$, then cross-validate---reported error near 3\% where the truth is 50\% (\emph{ESL} \S7.10.2). With $k = 100$ out of a wide feature set, this is likely the bulk of the 0.94.
+
+\textbf{Second: SMOTE before the split.} Synthetic minority points are interpolations of training rows and then land in the validation folds, so the model is graded on constructed near-copies of what it memorized. It also inflates the apparent minority count everywhere.
+
+\textbf{Third: imputation before the split.} A global median is mild; an iterative or kNN imputer is not, because it fits a model per column across the whole dataset.
+
+\textbf{Mildest: the scaler.} A mean and standard deviation computed over a few extra percent of rows shifts almost nothing. It is still wrong and still must be fixed, but claiming it explains the inflated metric would be a mistake.
+
+The fix is structural, not a set of reminders: put every step in a pipeline object and cross-validate the pipeline, so each fold refits scaler, imputer, selector, and resampler on its own training portion---and note that resampling belongs in an imbalance-aware pipeline that applies it to training rows only, never to the validation fold. Then rerun and expect a materially lower, honest number. I would also ask two questions the snippet does not answer: is the split supposed to be temporal or grouped, and is SMOTE needed at all rather than class weights plus a tuned threshold.
+
+\redflags
+\begin{itemize}
+    \item ``Looks fine''---the single most damaging answer available in an applied loop.
+    \item Spotting the scaler (the most-cited example) but missing feature selection (the most damaging one).
+    \item Fixing it by manually recomputing statistics per fold rather than by using a pipeline---correct once, wrong the next time somebody edits it.
+    \item Not noticing that SMOTE must never touch validation rows.
+\end{itemize}
+
+\interviewtest{Whether you can read a pipeline for fit-scope violations and calibrate severity. Ranking by damage is what separates a memorized rule (``don't preprocess before splitting'') from an understanding of why each step leaks and how much.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Identifies all four, proposes a pipeline.
+    \item \badgeLsix{L6} Ranks them with the feature-selection arithmetic, explains the SMOTE-in-validation mechanism, and asks whether the split type is right in the first place.
+    \item \badgeLseven{L7} Turns it into prevention: cross-validate pipelines by convention, a review checklist, and a CI check that fails a training job when a transform is fit outside a fold.
+\end{itemize}
+
+\followups{``How much of the 0.94 do you expect to survive?'' ``Which of these is still wrong even with a single train/test split?'' ``Where would you put early stopping in the fixed pipeline?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: When is random $k$-fold cross-validation invalid, and what do you use instead?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Random $k$-fold assumes the rows are exchangeable and that the validation set stands in the same relationship to the training set as production will. Three situations break that.
+
+\textbf{Time structure.} If the data is time-ordered or the deployment is ``train on the past, score the future,'' shuffled folds train on the future to predict the past and share period-level structure (a promotion, an outage, a fraud campaign) across the split. Use rolling-origin or expanding-window splits, and when labels have a maturation window---a 30-day churn label---add purging (drop training rows whose label window overlaps validation) and an embargo gap.
+
+\textbf{Repeated entities.} If a user, patient, merchant, session, or query contributes many rows, random folds put the same entity on both sides, and the model is credited for memorizing identity. Use \texttt{GroupKFold}, or split on a hash of the entity ID; \texttt{StratifiedGroupKFold} when the classes are also imbalanced. Duplicates and near-duplicates are the same failure with a different key, so deduplicate before splitting.
+
+\textbf{Small or imbalanced classification} does not invalidate random folds, but unstratified folds can contain zero positives---use stratification.
+
+The generative rule behind all of it: \textbf{the split must simulate the deployment gap.} Write down what production will actually ask---new entity or known entity, future period or same period---and construct the split so validation stands in that relationship to training. That rule also tells you when grouping is \emph{wrong}: if the model will always score users it has already seen, a user-disjoint split understates production performance and will make you reject a good model. And when several conditions apply at once, the temporal axis usually dominates.
+
+\redflags
+\begin{itemize}
+    \item Reciting ``use TimeSeriesSplit for time series'' with no notion of why, or applying grouping reflexively without asking what production scores.
+    \item Missing group leakage entirely---the failure that has invalidated published results.
+    \item Believing stratification fixes temporal or group problems.
+\end{itemize}
+
+\interviewtest{Whether validation design is a modeling decision for you or a default import. The tell is whether you derive the split from the deployment question rather than matching a data type to a splitter name.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names temporal and group cases with the right splitters, plus stratification for imbalance.
+    \item \badgeLsix{L6} Adds purge/embargo for overlapping label windows, the deployment-gap rule, and the case where grouping is over-conservative.
+    \item \badgeLseven{L7} Discusses combining axes (time-ordered and entity-disjoint), what to do when the entity distribution itself shifts, and how the validation design connects to the retraining cadence.
+\end{itemize}
+
+\followups{``Your labels mature over 30 days---exactly how does that change the split?'' ``The model scores both existing and brand-new users. Design the evaluation.'' ``How would you detect group leakage if you did not know the group key?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Fraud is 0.1\% of transactions. Walk me through building the classifier.}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+I would deliberately not start with the imbalance. First: \textbf{what is the absolute positive count?} 0.1\% of 200M transactions is 200{,}000 frauds, which is a large dataset with a skewed ratio; 0.1\% of 20{,}000 rows is twenty frauds, which is a fundamentally different problem where I would be arguing for rules plus anomaly detection. Second: \textbf{what decision does the score drive}---auto-decline, step-up authentication, or a manual review queue with a fixed daily capacity? That determines the metric.
+
+Then, in order. \textbf{Metric}: not accuracy, not raw ROC-AUC. PR-AUC reported against its $\pi = 0.001$ baseline, plus the operational metric---precision at the top $k$ alerts per day, or recall at a fixed false-positive rate. The arithmetic that justifies this: at TPR 0.8 and FPR 1\%, one million transactions yields 800 true and 9{,}990 false alerts, so precision is 7.4\% while the ROC point looks respectable; getting to 50\% precision needs a 12$\times$ cut in FPR that barely moves ROC-AUC. \textbf{Validation}: strictly temporal, because fraud is adversarial and non-stationary, and grouped by card or account so the same entity is not on both sides. \textbf{Model}: a GBDT baseline on transaction, velocity, and entity-history features---with every aggregate anchored point-in-time, since velocity features are the single richest leakage surface here. \textbf{Class handling}: \texttt{scale\_pos\_weight} if the fit needs it, and I would test with and without, because with 200K positives it usually does not. \textbf{Threshold}: from the cost matrix---\$5 review versus \$200 chargeback gives $\tau^\star = 5/205 = 2.4\%$---or from review capacity, taking the score quantile that emits the affordable number of alerts. \textbf{Calibration}: if I weighted or resampled anything, recalibrate on a held-out set at natural prevalence, because the threshold is a statement about probabilities. \textbf{Only then} would I consider resampling, and mostly for training-time economics (undersampling negatives to make the experiment loop fast), not for accuracy.
+
+Closing the loop: the labels arrive late (chargebacks mature over 30--90 days), so the recent period is partially unlabeled and naive evaluation on it understates fraud---the label maturation window has to be respected in both the split and the retraining cadence. And the review queue generates the labels, so the label distribution is endogenous: a model that stops surfacing a fraud pattern stops generating labels for it, which is an argument for a small random-sample review stream.
+
+\redflags
+\begin{itemize}
+    \item Opening with SMOTE, or with any resampling technique, before naming a metric.
+    \item Reporting accuracy, or reporting ROC-AUC alone at this prevalence.
+    \item A random train/test split on adversarial time-series data.
+    \item No threshold discussion---leaving the decision at 0.5.
+    \item Ignoring that velocity/aggregate features must be computed as of the transaction time.
+\end{itemize}
+
+\interviewtest{Whether you sequence an applied problem correctly: absolute counts and the decision first, metric second, threshold third, and data manipulation last if at all. Interviewers plant ``0.1\%'' specifically to see whether you reach for SMOTE.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Right metric, temporal split, class weights, threshold from costs.
+    \item \badgeLsix{L6} Asks for the absolute positive count and the decision first, gives the precision arithmetic, calibrates after any reweighting, and names the point-in-time discipline on velocity features.
+    \item \badgeLseven{L7} Handles label maturation and label endogeneity, plans the retraining cadence against adversarial drift, budgets a random review stream for unbiased labels, and connects the threshold to a business review that revisits costs.
+\end{itemize}
+
+\followups{``The chargeback label takes 60 days---how do you evaluate last month?'' ``Review capacity is halved. What changes?'' ``How do you know the model is not just re-learning the rule engine?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your teammate added SMOTE and offline $F_1$ improved, but the production fraud model got worse. Explain.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+There are three distinct mechanisms, and a good answer separates them.
+
+\textbf{1. The offline gain was probably a thresholding artifact.} $F_1$ at a fixed 0.5 threshold on a heavily imbalanced problem is dominated by where the threshold sits, and SMOTE moves the score distribution upward until 0.5 lands somewhere useful. Tuning the threshold on the original model would very likely have produced the same or a better $F_1$ without touching the data---which is what the systematic evaluations find: with a strong learner and a tuned threshold, balancing does not improve ranking metrics (Elor \& Averbuch-Elor, 2022).
+
+\textbf{2. Calibration was destroyed.} Training at a synthetic 1:1 prevalence when the truth is 1:1000 shifts the log-odds by $\log r \approx -6.9$. Every downstream consumer that thresholded on a probability, computed an expected loss, or fed the score into a rules engine is now operating at a completely different point than intended. If the production decision rule was tuned on the old score distribution, it broke silently at deployment.
+
+\textbf{3. The synthetic points may be nonsense.} Interpolating between two transactions with one-hot merchant categories, country codes, and device IDs produces feature vectors that no transaction can have; in high dimension nearest neighbours are unstable, so the interpolation often joins two different fraud modes and fills the space between them with fictional positives; and a single mislabeled minority point spawns a family of synthetic positives that blur the decision boundary exactly where it matters.
+
+I would also check the mechanical bug that frequently accompanies this change: was SMOTE applied \emph{before} the split or outside the CV fold? That places synthetic near-copies of training rows into validation and inflates the offline metric on its own.
+
+The fix: revert to natural prevalence, use class weights only if the fit demonstrably needs them, tune the threshold from the cost matrix on a calibrated model, and report PR-AUC with its baseline plus precision at the operating point rather than $F_1$ at 0.5.
+
+\redflags
+\begin{itemize}
+    \item ``SMOTE is bad''---a slogan, not a mechanism.
+    \item Not knowing that resampling shifts predicted probabilities.
+    \item Missing that $F_1$ at a fixed threshold is what made the change look good.
+    \item Proposing a different resampler (ADASYN, borderline-SMOTE) as the fix rather than questioning whether resampling was needed.
+\end{itemize}
+
+\interviewtest{Whether you can separate a metric artifact, a calibration consequence, and a data-quality consequence, and whether your practice is 2026-current rather than 2015-current. The calibration mechanism is the discriminating piece---many candidates know SMOTE has ``issues'' but cannot say that it moves the probabilities.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Off-manifold synthetic points and a note that the metric may be misleading.
+    \item \badgeLsix{L6} All three mechanisms, the log-odds shift with a number, and the check for SMOTE outside the fold.
+    \item \badgeLseven{L7} Frames the recovery---revert, recalibrate, re-threshold---and the process fix: metrics with baselines, calibration in the release checklist, and thresholds owned as a deployment parameter rather than a training artifact.
+\end{itemize}
+
+\followups{``Write the prior-correction formula for undersampling.'' ``When \emph{would} you undersample?'' ``How do you monitor calibration in production?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What is nested cross-validation, and when do you actually need it?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The problem it solves: tuning is a fitting procedure. If you evaluate 200 configurations on the same folds and report the best score, that score is the maximum of 200 noisy estimates and is optimistically biased---the folds that selected the winner cannot also provide an unbiased estimate of it. On small data with a large grid the optimism reaches several accuracy points, which is enough to reverse a comparison (Cawley \& Talbot, 2010).
+
+The mechanics: an \textbf{outer} loop of $k_{\text{out}}$ folds provides the estimate; within each outer training portion, an \textbf{inner} CV selects hyperparameters using only that portion; the chosen configuration is refit on the outer training portion and scored once on the untouched outer fold. The outer scores are averaged. Cost is $k_{\text{out}} \times k_{\text{in}} \times |\text{grid}|$ fits---$5 \times 5 \times 100 = 2{,}500$ for a modest search.
+
+The point that most candidates miss: \textbf{nested CV estimates the performance of the \emph{procedure}, not of a particular model.} Different outer folds may select different hyperparameters, and that is expected---you are measuring ``what happens when I run my whole tuning pipeline on data like this.'' It does not hand you a final model; you still select one afterward with a single CV on all the data, and the nested estimate is the number you quote for it.
+
+When it earns its cost: small data, a large search space, and a claim other people will act on---a paper, a clinical or regulatory submission, a vendor bake-off. When it is overkill: plenty of data and a genuinely clean holdout used once. With 10M rows, a train/validation/test split is cheaper, simpler, and estimates the same thing; ``I tuned on validation and touched test once'' is a fully respectable protocol, and it is what most production teams should do. The cheaper middle ground when the compute is unavailable: apply the 1-SE rule to blunt selection optimism, cut the search space, and reserve a fresh temporal holdout for the final number.
+
+\redflags
+\begin{itemize}
+    \item Reciting ``inner loop and outer loop'' without being able to say which does which.
+    \item Not being able to explain why plain CV is biased after tuning.
+    \item Claiming nested CV produces the final model, or that it is always required.
+\end{itemize}
+
+\interviewtest{Whether you understand selection bias as a statistical mechanism rather than a procedure to recite. The ``it estimates the procedure, not the model'' point is the standard depth probe.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct mechanics and the reason plain CV is optimistic after tuning.
+    \item \badgeLsix{L6} Adds that the estimate is of the procedure, the cost accounting, and a clear when-not-to-use with the alternative protocol.
+    \item \badgeLseven{L7} Quantifies the bias regime (small $n$, large grid, noisy metric), connects it to the winner's curse and repeated test-set use, and proposes cheaper mitigations when the compute is not available.
+\end{itemize}
+
+\followups{``Different outer folds pick different hyperparameters---is that a problem?'' ``How does early stopping fit into the inner loop?'' ``How would you get an honest estimate without nesting?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Two features are highly correlated. What happens to permutation importance and to SHAP?}
+
+\badgeLsix{L6} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Both dilute, by related mechanisms, and neither has a clean fix---because with strong correlation there is no unique per-feature answer for a method to find.
+
+\textbf{Permutation importance} has two problems here. \emph{Dilution}: shuffling $x_1$ costs little because $x_2$ still carries the signal, so both features measure as unimportant even though the pair is decisive. \emph{Off-manifold evaluation}: shuffling one member of a correlated pair creates rows that cannot exist---\texttt{tenure\_days = 3} with \texttt{lifetime\_orders = 400}---so the metric drop partly measures the model's extrapolation behaviour in a region no data ever constrained, and can even come out negative.
+
+\textbf{SHAP} splits credit between the two, roughly halving each, with the split determined by which feature the trees happened to use---so it is seed-dependent and moves across retrains (the Rashomon effect). It also faces a choice that changes the answer: \emph{interventional} SHAP breaks the dependence and evaluates off-manifold, staying ``true to the model''; \emph{conditional} SHAP respects the joint distribution and stays ``true to the data,'' but then assigns nonzero credit to a feature the model \emph{never uses}, purely by correlation with one it does. Both are defensible; you have to say which you computed.
+
+\textbf{Drop-column retraining} is often proposed as the gold standard and is worse here: retrain without $x_1$, the model substitutes $x_2$, the metric is unchanged, so $x_1$ scores zero---and symmetrically. Two jointly essential features each measure as irrelevant.
+
+What I would actually do: cluster features by correlation and report importance at the \emph{cluster} level; use grouped permutation (shuffle the cluster together) to get the pair's joint importance; use conditional permutation if the question is genuinely ``does this add anything beyond the others''; and be explicit with the audience that the model is indifferent between the two, which is a fact about the data rather than a defect of the attribution method.
+
+\redflags
+\begin{itemize}
+    \item ``SHAP handles correlation correctly because of the axioms''---additivity is arithmetic, not identifiability.
+    \item Proposing drop-column as the fix without noticing that substitution makes it worse.
+    \item No mention of off-manifold evaluation for permutation.
+    \item Treating the diluted importances as evidence that the features do not matter.
+\end{itemize}
+
+\interviewtest{Whether you can reason about attribution methods from their definitions instead of ranking them by reputation, and whether you recognize that the ambiguity is in the data.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Notes credit-splitting in both and proposes grouping or dropping one feature.
+    \item \badgeLsix{L6} Adds off-manifold evaluation, the interventional/conditional distinction, and the drop-column substitution failure.
+    \item \badgeLseven{L7} States the identifiability point outright, describes the cluster-then-attribute workflow, and raises stability measurement when explanations feed regulatory reason codes.
+\end{itemize}
+
+\followups{``Which SHAP variant does your library default to?'' ``How would you measure explanation stability?'' ``The PM wants one number per feature anyway---what do you give them?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: A PM sees that \texttt{discount\_rate} has the highest SHAP value in the conversion model and asks whether we should raise discounts. What do you say?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+The answer is no, and the reason has to be given in one sentence the PM can carry: \textbf{SHAP explains the model, not the world.} A high attribution means the model's output moves with \texttt{discount\_rate} in the historical data; it says nothing about what happens if we intervene on it.
+
+The mechanism, concretely. Discounts are not randomly assigned---they were targeted, by a previous campaign or a rules engine, at users the business already believed would respond, or offered in contexts (cart abandonment, seasonal sales) that themselves predict conversion. The model faithfully learned that association. Raising discounts across the board changes the assignment mechanism, which is precisely the thing that made the association exist. The canonical illustration of how badly this can go is the pneumonia model that learned asthmatic patients had \emph{lower} mortality risk---true in the data, because asthmatics were rushed to intensive care, and lethal as a decision rule.
+
+Then give the PM a path rather than only a refusal. The direct answer is an experiment: randomize discount depth over a slice of traffic, measure incremental conversion and margin, and note that the decision-relevant quantity is not conversion but \emph{incremental} conversion---targeting by conversion probability buys the users who would have converted anyway, which is the uplift argument (Chapter~\ref{cml:chap:experimentation_causal}). If a full experiment is not possible, an encouragement design or a discontinuity in an existing discount rule may identify the effect observationally, with the identifying assumption stated out loud. And there is a cheap intermediate: use the SHAP finding as a hypothesis to prioritize which experiment to run first, which is the legitimate role of an attribution.
+
+I would also flag the pricing-specific risk: even a positive experimental result on conversion can be margin-negative, and discounts have long-run effects (reference-price erosion, discount-trained buyers) that a two-week test will not capture---so the readout needs a margin guardrail and a holdback.
+
+\redflags
+\begin{itemize}
+    \item Any causal reading of an attribution: ``yes, SHAP shows discounts drive conversion.''
+    \item Saying only ``correlation is not causation'' with no mechanism and no alternative path.
+    \item Proposing to fix it by adding features or a different explainer---confounding is not an explainer problem.
+    \item Missing that the decision needs incremental effect, not conversion probability.
+\end{itemize}
+
+\interviewtest{Whether you hold the prediction/causation boundary firmly under pressure from a stakeholder, and whether you can convert a refusal into a plan. This question is asked because the wrong answer is expensive and common.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Explanation is not causation, with the confounding mechanism named.
+    \item \badgeLsix{L6} Adds the concrete targeting story, the experiment as the answer, and the uplift-versus-outcome distinction.
+    \item \badgeLseven{L7} Designs the readout (margin guardrails, long-run holdback), offers an observational fallback with its assumption, and frames SHAP's legitimate role as experiment prioritization.
+\end{itemize}
+
+\followups{``Design the experiment.'' ``No experiment is possible---what observational design would you try?'' ``What would make you believe a SHAP value \emph{is} close to a causal effect?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: A key feature is missing for 30\% of rows. What do you do?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+First diagnose \emph{why} it is missing, because the mechanism decides what is legitimate. \textbf{MCAR}---a random logging failure---means deletion is unbiased and merely wasteful. \textbf{MAR}---missing more often for a subgroup that I observe, say younger users---means model-based imputation conditional on the observed covariates is principled. \textbf{MNAR}---missing because of the unobserved value itself, like high earners declining to state income---means no imputation recovers the information, and the honest move is to model the missingness rather than to paper over it. In tabular production data, MNAR is the common case, not the exception.
+
+The practical default for a GBDT is therefore: \textbf{do nothing clever.} XGBoost and LightGBM learn a default direction per split by trying both and keeping the better one, so missingness becomes a routing decision fit against the loss (Chapter~\ref{cml:chap:trees_ensembles}); add an explicit \texttt{is\_missing} indicator so the pattern is available as signal. For a model that cannot accept NaN, median or constant imputation \emph{plus} the indicator is the baseline; iterative or kNN imputation is better under MAR and costs more, and must be fit inside the fold like any stateful transform.
+
+Two checks before any of that. \textbf{Is the missingness itself the label?} \texttt{account\_closed\_date IS NULL} is the churn outcome; imputing it launders a leak rather than removing it, so I would compare the missingness rate across classes first. \textbf{Is 30\% the training-time rate or the serving-time rate?} If an upstream change makes the feature 60\% missing next quarter, every prediction moves, which is why missingness rate belongs in drift monitoring ([DL 22]). And if the feature is missing at serving in a way it was not in training, that is training--serving skew, not a missing-data problem.
+
+Finally, the option people forget: if the feature is both highly missing and highly valuable, the best move may be to fix the data pipeline rather than model around it.
+
+\redflags
+\begin{itemize}
+    \item ``Impute with the mean'' as a reflex, with no mechanism discussion and no indicator.
+    \item Imputing before the train/test split.
+    \item Claiming missing values must always be imputed---not true for GBDTs, which handle them natively and often better.
+    \item Dropping 30\% of rows without checking whether the missingness is informative.
+\end{itemize}
+
+\interviewtest{Whether you know the MCAR/MAR/MNAR taxonomy and, more importantly, whether you use it to choose an action instead of reciting it. The native-handling and informative-missingness points are what distinguish an applied answer from a textbook one.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} The taxonomy with an example each, indicator plus native handling, and fit-inside-the-fold.
+    \item \badgeLsix{L6} Adds the missingness-as-label check, the serving-time-rate question, and honest trade-offs between imputers.
+    \item \badgeLseven{L7} Treats it as a data-quality problem with an owner: instrument the rate, monitor it as drift, and weigh fixing the pipeline against modeling around it.
+\end{itemize}
+
+\followups{``Give me an MNAR example from your own domain.'' ``How would you validate an imputation strategy?'' ``The feature is 0\% missing in training and 40\% missing in production---what happened?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: 100M transactions a day, 0.1\% fraud, and a review team that can handle 500 alerts a day. What precision and recall can you promise?}
+
+\badgeLsix{L6} \quad \badgetype{Estimation} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Set up the arithmetic before promising anything. 100M transactions a day at $\pi = 0.001$ means \textbf{100{,}000 frauds a day}. The review team can look at 500. So even a \emph{perfect} model, whose top 500 scores are all fraud, achieves recall of $500/100{,}000 = 0.5\%$. That number is the headline: manual review cannot be the primary control at this volume, and any conversation about recall targets has to start there.
+
+What the review queue can promise is precision. Ranking by score and taking the top 500 out of 100M is the $5\times10^{-6}$ quantile---extremely deep in the tail, where a good model concentrates its most confident frauds---so precision at 500 alerts of 50--80\% is realistic, and it is the metric to negotiate. The right framing for the business: the queue is a high-precision recovery channel worth roughly $500 \times \text{precision} \times \text{average fraud value}$ per day, not a coverage mechanism.
+
+Coverage has to come from automation. Split the score into bands: auto-decline above a high threshold, where the cost of a false decline (lost sale plus customer friction, say \$40) against a missed fraud (\$200) gives $\tau^\star = 40/240 = 17\%$ calibrated probability; step-up authentication in a middle band, where the cost of friction is much lower and therefore the threshold is much lower; manual review for the top 500 of what remains; allow the rest. Now recall is set by the auto-decline and step-up bands, and the review queue is the exception path.
+
+The estimates I would state explicitly as assumptions and then measure: the score distribution in the extreme tail (this is where PR-AUC is nearly uninformative and precision-at-$k$ is everything), the calibration of the probabilities the thresholds rely on, and the fraud value distribution, which is heavy-tailed enough that ranking by $p \times \text{amount}$ (expected loss) rather than by $p$ typically recovers substantially more money at the same alert budget.
+
+\redflags
+\begin{itemize}
+    \item Promising a recall number without computing that 500 alerts is 0.5\% of the positives.
+    \item Optimizing a global metric when the operating point is a fixed capacity---PR-AUC over the whole curve is nearly irrelevant here.
+    \item Thresholding on an uncalibrated score while quoting a cost-derived threshold.
+    \item Missing that expected-loss ranking beats probability ranking when values are heavy-tailed.
+\end{itemize}
+
+\interviewtest{Whether you convert a capacity constraint into arithmetic before making promises, and whether you know that a fixed-$k$ operating point changes which metric matters. The ``perfect model still gets 0.5\% recall'' calculation is the moment the interviewer is waiting for.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Does the arithmetic and reports precision-at-500 as the metric.
+    \item \badgeLsix{L6} Adds the banded decision architecture with cost-derived thresholds and the calibration requirement.
+    \item \badgeLseven{L7} Ranks by expected loss, states which quantities are assumptions to be measured, and negotiates the metric and the capacity with the business rather than accepting both as fixed.
+\end{itemize}
+
+\followups{``The team doubles to 1{,}000 reviews---what improves?'' ``How do you estimate precision that deep in the tail with any confidence?'' ``How does the review queue bias your next training set?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Design the offline evaluation protocol for a churn model that will be retrained weekly and must survive an audit.}
+
+\badgeLseven{L7} \quad \badgetype{System Design} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+I would design it as three artifacts: a split policy, a leakage-proof feature contract, and a promotion gate.
+
+\textbf{Split policy.} The deployment question is ``train on everything up to Sunday, score the active base on Monday, observe churn over the next 30 days,'' so the evaluation must be a rolling-origin backtest with that exact shape: train through week $w$, predict week $w{+}1$, wait out the 30-day label window, score. Because labels mature over 30 days, training rows whose label window overlaps the validation period are purged and an embargo gap is left after each validation block. I would report the metric across many origins rather than one---the variance across weeks is itself a deliverable, since a model whose weekly AUC ranges 0.74--0.86 needs a different alerting policy than one that sits at 0.80 every week. Grouping by user is unnecessary here---production genuinely rescores known users---and I would say so explicitly rather than silently omitting it, because the reviewer will ask.
+
+\textbf{Feature contract.} Every feature carries three pieces of metadata: the timestamp of the value, the source system, and a serving-availability guarantee (available at scoring time, with what latency). Features are materialized through point-in-time joins so that a training row for week $w$ contains only values that existed at the end of week $w$ ([DL 22] for the store and join mechanics). Every stateful transform---scaler, imputer, target encoder---lives inside the training pipeline and is fit per fold; the encoder that ships is fit on the full training window and versioned with the model. A feature that cannot state its as-of semantics does not enter the model.
+
+\textbf{Promotion gate}, run automatically per retrain: a locked, never-tuned-on temporal holdout (the most recent complete label window) evaluated once; a leakage tripwire that fails the build if any single feature's solo AUC exceeds a threshold or if the metric jumps more than a set amount week over week (Twyman's law as CI---Section~\ref{cml:sec:pathologies}); a calibration check (reliability curve and expected calibration error) because the churn score gates retention spend; a stability check on the feature distributions and missingness rates versus last week; and a shadow-scoring comparison of offline and online score distributions before traffic moves. Anything that trips is a human review, not an automatic rollback of the metric threshold.
+
+\textbf{For the audit trail}: version the whole pipeline (code, feature definitions, encoder state, hyperparameters, training window) so any past prediction can be reproduced; log the serving feature vectors so training data and serving data can be diffed; keep the backtest reports per retrain. And the honest caveat I would put in writing: this measures in-distribution performance under a stationarity assumption, so the true readout is the online experiment and the holdback (Chapter~\ref{cml:chap:experimentation_causal}).
+
+\redflags
+\begin{itemize}
+    \item A single train/test split for a weekly-retrained system.
+    \item No handling of the 30-day label maturation window.
+    \item Automation with no leakage tripwire---weekly retrains mean a leak introduced by a pipeline change ships automatically.
+    \item No versioning story, so an audited prediction cannot be reproduced.
+    \item Grouping by user reflexively without asking what production scores.
+\end{itemize}
+
+\interviewtest{Whether you can turn leakage discipline into a system that keeps working when you are not watching. At Staff level the deliverable is not a clean experiment but a pipeline in which the unclean experiment cannot ship.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Temporal backtest, pipeline-based preprocessing, a held-out final evaluation.
+    \item \badgeLsix{L6} Adds rolling origins with purge and embargo, the feature contract with as-of metadata, and calibration plus drift checks in the gate.
+    \item \badgeLseven{L7} Automates the tripwires, versions the pipeline for reproducibility, diffs serving against training features, reports across-origin variance as a first-class output, and states the limits of any offline number against the online readout.
+\end{itemize}
+
+\followups{``What exactly does your leakage tripwire compute?'' ``A feature's source table gets backfilled retroactively---what breaks?'' ``How would you evaluate the most recent two weeks, whose labels are immature?''}
+\end{interviewq}

@@ -2,21 +2,815 @@
 \label{cml:chap:time_series}
 
 \begin{tldr}
-Placeholder — this chapter is written per docs/coverage-spec.md, seeded by the author's own conventional-ML document when it arrives (Phase C3).
+Time series is a minority topic in a generic ML loop and a mainstay at fintech, demand- and capacity-forecasting platforms, and marketplaces---and it is the one area where more candidates fail on \emph{validation} than on modeling. This is deliberately the shortest chapter in the volume, organized around what actually gets tested. The vocabulary: trend/seasonality/cycle/noise, additive vs.\ multiplicative, STL, ACF/PACF signatures, weak stationarity and differencing, and the spurious-regression trap. The three baselines---naive, seasonal naive, drift---that a strong candidate names before any model and reports next to every result. The evaluation stack through \textbf{MASE} and pinball loss, which is the metric question separating people who have shipped forecasts from people who have read about them. Exponential smoothing and ARIMA at working depth, with ETS as the honest strong baseline. Then the applied core: the gradient-boosting recipe---lag and rolling features whose windows end \emph{before} the prediction origin, the global-model pattern that won M5, rolling-origin backtesting with an embargo, recursive vs.\ direct multi-horizon, quantile-loss GBMs, and \textbf{the trees-cannot-extrapolate problem}, the favorite probe of the whole area. It closes with an honest page on when deep sequence models earn their complexity. Architecture detail lives elsewhere: recurrent and attention sequence models are [NLP 4]; state-space models and Mamba are [DL 14]; the general metric catalog is [DL 23]. The general leakage taxonomy is Chapter~\ref{cml:chap:applied_craft}; the \emph{temporal} instances of it are owned here. GBDT internals are Chapter~\ref{cml:chap:trees_ensembles}.
 \end{tldr}
 
-\section{Foundations and Stationarity}
-% TODO Phase C3
+%==============================================================================
+\section{Foundations: Components, Stationarity, Spurious Regression}
+\label{cml:sec:ts_foundations}
+%==============================================================================
 
-\section{Classical Models}
-% TODO Phase C3
+\subsection{Decomposition: Trend, Seasonality, Cycle, Noise}
 
+The standard mental model is that an observed series $y_t$ is a superposition of four things, and every classical method is a different opinion about how to separate them.
+
+\begin{itemize}
+    \item \textbf{Trend} $T_t$: the slow, non-periodic level change. Not necessarily linear---a piecewise-linear trend with changepoints is usually a better description of a real business series than a single slope.
+    \item \textbf{Seasonality} $S_t$: variation at a \emph{fixed, known} period $m$. Daily retail data has $m=7$ (day-of-week) and $m=365.25$ (annual) simultaneously; hourly traffic has $m=24$ and $m=168$. Multiple seasonalities are the norm, not the exception.
+    \item \textbf{Cycle} $C_t$: variation at a period that is neither fixed nor known---business cycles, hype cycles. The distinction from seasonality matters because you can encode seasonality as a calendar feature and you cannot encode a cycle at all; a cycle has to be learned from the autocorrelation structure or fed in as an exogenous regressor.
+    \item \textbf{Remainder} $R_t$: what is left. Usually autocorrelated, usually heteroscedastic, rarely the i.i.d.\ Gaussian noise your model assumes.
+\end{itemize}
+
+\textbf{Additive vs.\ multiplicative.} An additive decomposition writes $y_t = T_t + S_t + R_t$; a multiplicative one writes $y_t = T_t \times S_t \times R_t$. The diagnostic is one glance at a plot: if the seasonal swing gets \emph{wider as the level rises}---December is $+30\%$ rather than $+3{,}000$ units---the structure is multiplicative. The standard fix is not a different model but a different target: $\log y_t = \log T_t + \log S_t + \log R_t$ turns a multiplicative decomposition into an additive one, which is why so much forecasting is done on $\log(1+y)$. Two consequences worth stating unprompted: logs also stabilize variance (they are the $\lambda=0$ member of the Box--Cox family), and they require care on the way back, because $\E[e^X] = e^{\E[X] + \sigma^2/2}$ for Gaussian $X$---back-transforming a log-scale point forecast gives you a \emph{median}, not a mean, and if you are summing forecasts up a product hierarchy you need means. Either apply the $e^{\sigma^2/2}$ correction (or a Duan smearing estimate) or fit on the original scale with a Poisson/Tweedie objective.
+
+\textbf{STL} (Seasonal-Trend decomposition using Loess; Cleveland et al., 1990) is the decomposition worth naming. It estimates trend and seasonality by iterated local regression, and its two properties that matter in interviews are that the seasonal component is \emph{allowed to evolve} over time (unlike classical fixed-average decomposition) and that it can be made robust to outliers, so a Black Friday spike does not poison the seasonal profile for every other Friday. Practical uses of STL beyond plotting: STL-decompose, forecast the seasonally adjusted series with any method, then add the seasonal component back (``STL + ETS''); and STL-remainder thresholding as a cheap, seasonality-aware anomaly detector.
+
+\subsection{Autocorrelation: Reading ACF and PACF}
+
+The autocorrelation function is the correlation of the series with its own lags,
+\begin{equation}
+\rho_k = \frac{\Cov(y_t, y_{t-k})}{\Var(y_t)} = \frac{\gamma_k}{\gamma_0},
+\end{equation}
+and the \emph{partial} autocorrelation $\phi_{kk}$ is the correlation between $y_t$ and $y_{t-k}$ \emph{after regressing out} the intervening lags $y_{t-1}, \ldots, y_{t-k+1}$. The distinction is the whole point: if $y_t$ depends only on $y_{t-1}$, then $y_t$ and $y_{t-2}$ are still correlated (through $y_{t-1}$), so the ACF at lag 2 is nonzero---but the \emph{partial} correlation is zero, because once you know $y_{t-1}$, $y_{t-2}$ tells you nothing more.
+
+That single sentence generates the identification table interviewers actually want.
+
+\begin{table}[H]\centering
+\caption{ACF/PACF signatures. ``Cuts off'' means drops to within the $\pm 1.96/\sqrt{T}$ significance band and stays there; ``tails off'' means decays geometrically or as a damped sine.}
+\label{cml:tab:ts_acf_pacf}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.155\textwidth} >{\raggedright\arraybackslash}p{0.20\textwidth} >{\raggedright\arraybackslash}p{0.185\textwidth} X@{}}
+\toprule
+\textbf{Process} & \textbf{ACF} & \textbf{PACF} & \textbf{What you say} \\
+\midrule
+AR($p$) & Tails off & Cuts off after lag $p$ & ``PACF cuts off at $p$, so AR($p$).'' \\
+MA($q$) & Cuts off after lag $q$ & Tails off & ``ACF cuts off at $q$, so MA($q$).'' \\
+ARMA($p,q$) & Tails off & Tails off & Neither cuts off; pick orders by AICc. \\
+White noise & Inside band at all lags & Inside band at all lags & Nothing left to model; stop. \\
+Unit root & Decays very slowly & Spike $\approx 1$ at lag 1 & Difference first, then re-plot. \\
+Seasonal, period $m$ & Spikes at $m, 2m, \ldots$ & Spike at $m$, maybe $2m$ & Seasonal terms; try $(1-B^m)$. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The mnemonic that survives interview pressure: \textbf{the letter that cuts off names the model}---\underline{P}ACF cuts off $\Rightarrow$ \underline{A}R (the ``opposite'' pairing), ACF cuts off $\Rightarrow$ MA. Two numerical anchors make the answer sound lived-in. First, for AR(1), $\rho_k = \phi^k$ exactly, so the ACF is a clean geometric decay and the PACF has one spike. Second, for MA(1) with $y_t = \varepsilon_t + \theta\varepsilon_{t-1}$, we have $\gamma_0 = \sigma^2(1+\theta^2)$, $\gamma_1 = \theta\sigma^2$, and $\gamma_k = 0$ for $k \ge 2$, so
+\begin{equation}
+\rho_1 = \frac{\theta}{1+\theta^2}, \qquad |\rho_1| \le \tfrac{1}{2},
+\end{equation}
+with equality at $\theta = \pm 1$: \emph{no} MA(1) process can have a lag-1 autocorrelation above one half in magnitude. If you see $\rho_1 = 0.8$, it is not MA(1), and saying so is a nice one-line demonstration that you can compute with these objects rather than recognize their pictures.
+
+\subsection{Stationarity}
+
+\begin{mathresult}{Weak (Covariance) Stationarity}
+A process $\{y_t\}$ is weakly stationary if its first two moments do not move in time:
+\begin{align}
+\E[y_t] &= \mu \quad \text{for all } t, \\
+\Var(y_t) &= \gamma_0 < \infty \quad \text{for all } t, \\
+\Cov(y_t, y_{t+k}) &= \gamma_k \quad \text{depends on } k \text{ only, not on } t.
+\end{align}
+\emph{Strict} stationarity asks the entire joint distribution of $(y_{t_1},\ldots,y_{t_n})$ to be invariant to time shifts; weak stationarity asks only this of the mean and autocovariance. Strict plus finite variance implies weak; the converse holds only for Gaussian processes.
+\end{mathresult}
+
+\textbf{Why models want it.} An ARMA model has \emph{constant} coefficients. Fitting constant coefficients is only coherent if the thing being modeled has constant properties: if $\mu$ drifts, a single estimated intercept is wrong everywhere, and if $\gamma_k$ depends on $t$, then the sample autocorrelation---which pools all time points to estimate one number per lag---is estimating an average of quantities that are not equal, so the ACF you read off the plot is meaningless. Stationarity plus ergodicity is exactly the license to use \emph{one long realization} to estimate ensemble moments you can never sample twice. It is also what makes the forecast function extrapolate honestly: for a stationary process the $h$-step forecast reverts to $\mu$ and the forecast variance converges to $\gamma_0$, so the model tells you when it has run out of information instead of confidently extending a line.
+
+\textbf{Testing, at name-drop depth.} The \textbf{augmented Dickey--Fuller (ADF)} test has null hypothesis \emph{``there is a unit root''} (non-stationary); rejecting it is evidence of stationarity. \textbf{KPSS} inverts the null---it tests \emph{stationarity} as $H_0$---so the two are usually run together, and the informative outcomes are agreement. The honest interview position is that these tests have low power against near-unit-root alternatives and that nobody chooses a differencing order by $p$-value alone in production; \texttt{auto.arima}-style routines use a KPSS-based rule to pick $d$ and then select the rest by AICc, and a plot of the series plus its ACF settles the question faster than either test.
+
+\textbf{Transformations to get there.} In rough order of what to try: (1) \textbf{log or Box--Cox} to stabilize variance (handles the multiplicative case and heteroscedastic count data); (2) \textbf{first differencing} $\nabla y_t = y_t - y_{t-1}$ to remove a stochastic (or linear) trend---this is the ``I'' in ARIMA; (3) \textbf{seasonal differencing} $\nabla_m y_t = y_t - y_{t-m}$ to remove seasonality; (4) \textbf{deterministic detrending}, regressing on $t$ or on a spline basis and modeling the residual. Two cautions worth volunteering. Differencing and detrending are \emph{not} interchangeable: differencing is right for a stochastic trend (a random walk, where shocks are permanent), detrending is right for a deterministic trend plus stationary noise (where shocks die out), and applying the wrong one leaves structure behind or manufactures it. And \textbf{over-differencing is a real failure mode}: differencing a series that was already stationary inflates the variance and introduces a non-invertible MA unit root, which shows up as a large negative $\rho_1$ near $-0.5$. In practice $d \in \{0,1\}$ and $D \in \{0,1\}$ cover almost everything; $d=2$ is rare and $d=3$ is a bug.
+
+\subsection{The Spurious-Regression Trap}
+
+\begin{warningbox}
+\textbf{Two trending series will always look related.} Take two \emph{independent} random walks---no relationship whatsoever---and regress one on the other. Granger and Newbold (1974) showed by simulation that the $t$-statistic on the slope exceeds the nominal 5\% critical value roughly three quarters of the time, and $R^2$ is routinely large. Nothing is wrong with the arithmetic; the problem is that OLS standard errors assume stationary, weakly dependent errors, and the residuals from a regression of one integrated series on another are themselves integrated, so the usual variance formula understates the true sampling variability by an enormous factor. The tell is the residual diagnostic: a Durbin--Watson statistic near zero (equivalently, residual $\rho_1$ near 1) next to a high $R^2$ is the fingerprint of a spurious regression.
+\end{warningbox}
+
+This is the classical trap and it generalizes far past ARIMA. Any two features that both trend---cumulative user count and cumulative revenue, ad spend and organic traffic during a growth year, a stock price and a macro index---will show a strong ``relationship'' that is a shared time index and nothing else. The remedies:
+
+\begin{itemize}
+    \item \textbf{Model the changes, not the levels.} Regress $\nabla y_t$ on $\nabla x_t$. If the relationship survives differencing, it is about co-movement rather than co-trending.
+    \item \textbf{Test for cointegration before believing a levels regression.} If $y_t$ and $x_t$ are each $I(1)$ but some linear combination $y_t - \beta x_t$ is stationary, the levels relationship is real and the right model is an error-correction model. Engle--Granger's two-step procedure and the Johansen test are the names; this is standard equipment at fintechs and essentially unknown elsewhere.
+    \item \textbf{Include time explicitly} as a control (or de-trend both series) so that ``both went up'' cannot be credited to the covariate---the time-series analogue of the confounding-control discussion in Chapter~\ref{cml:chap:experimentation_causal}.
+    \item \textbf{Backtest out of time.} A spurious relationship is unstable; it is precisely the thing a rolling-origin backtest (Section~\ref{cml:sec:ts_gbm}) exposes and an in-sample $R^2$ hides.
+\end{itemize}
+
+%==============================================================================
+\section{Baselines You Must Beat and Report}
+\label{cml:sec:ts_baselines}
+%==============================================================================
+
+\begin{keyinsight}[Name the Baselines Before You Name a Model]
+Forecasting is the one ML subfield where the trivial baseline is genuinely hard to beat, and interviewers use that fact as a filter. A candidate who opens ``I would start by computing seasonal-naive error on a rolling-origin backtest and report every subsequent model as a ratio to it'' has already signalled more forecasting experience than a candidate who opens with LightGBM hyperparameters. Report the baseline permanently, not once: it belongs in the dashboard next to the model, because the day the model starts losing to seasonal naive is the day you find out something broke.
+\end{keyinsight}
+
+Three baselines, all defined at forecast origin $T$ for horizon $h = 1, 2, \ldots, H$:
+
+\begin{itemize}
+    \item \textbf{Naive (random walk):} $\hat{y}_{T+h} = y_T$. The last observation, flat forever. This is the \emph{optimal} forecast when the series is a random walk---which is close to true for many financial prices, which is why beating naive on a price series is so hard and why a candidate who claims to have done it should expect scrutiny.
+    \item \textbf{Seasonal naive:} $\hat{y}_{T+h} = y_{T+h-m(k+1)}$, where $m$ is the seasonal period and $k = \lfloor (h-1)/m \rfloor$---in words, ``the value from the same point in the last complete cycle.'' For daily retail with $m=7$, next Tuesday's forecast is last Tuesday's actual. This is the default denominator for MASE on seasonal data and the baseline that a surprising number of production models fail to beat.
+    \item \textbf{Drift:} $\hat{y}_{T+h} = y_T + h \cdot \dfrac{y_T - y_1}{T-1}$. Equivalent to drawing a straight line through the first and last observations and extending it. This is naive-plus-trend, and it is the baseline that catches the trees-cannot-extrapolate failure (Section~\ref{cml:sec:ts_gbm}): a GBM that flatlines will lose to \emph{drift} on a growing series while still looking fine against naive.
+\end{itemize}
+
+Two refinements that make the answer look senior. First, \textbf{combine them}: seasonal naive with drift ($\hat{y}_{T+h} = y_{T+h-m(k+1)} + h \bar{\nabla}_m y$) is a stronger baseline for series that both trend and cycle. Second, \textbf{the baseline defines the business case}. If a global GBM buys 4\% over seasonal naive, the honest framing is not ``MASE 0.96'' but ``4\% less forecast error, worth \$X of avoided safety stock, at the cost of a pipeline someone has to own.'' Staff-level candidates connect the metric delta to that sentence; the accuracy number alone is a mid-level answer.
+
+%==============================================================================
+\section{Forecast Evaluation}
+\label{cml:sec:ts_evaluation}
+%==============================================================================
+
+The general regression-metric catalog is [DL 23]; this section covers what is specific to forecasting, which is (a) that series live on wildly different scales so you need a \emph{scaled} error to aggregate, (b) that percentage errors misbehave exactly where demand data lives, and (c) that error is a function of horizon, not a scalar.
+
+\subsection{Scale-Dependent Errors and the Percentage Trap}
+
+$\text{MAE} = \frac{1}{n}\sum |e_t|$ and $\text{RMSE} = \sqrt{\frac{1}{n}\sum e_t^2}$ are the honest defaults \emph{within a single series}. The choice between them is a statement about what you are estimating, and it is a good quick probe: minimizing MAE gives you the conditional \textbf{median}, minimizing squared error gives you the conditional \textbf{mean}. For intermittent demand---many zero days, occasional spikes---the median is often literally zero, so an MAE-optimized model that predicts all zeros can be ``best'' by its own metric while being useless for inventory. If you plan to \emph{sum} forecasts up a product hierarchy you want means, so you want squared error (or a Poisson/Tweedie objective), because medians do not add.
+
+Neither MAE nor RMSE can be averaged across series of different scales: a store selling 10{,}000 units contributes 100$\times$ the MAE of a store selling 100, so ``mean MAE over 5{,}000 SKUs'' is a ranking of SKU volume wearing a metric costume.
+
+The instinctive fix is percentage error, and it is a trap.
+
+\begin{warningbox}
+\textbf{MAPE breaks exactly where demand data lives.} $\text{MAPE} = \frac{100}{n}\sum_t \left|\frac{y_t - \hat{y}_t}{y_t}\right|$ has two failures, and the second is the one candidates get backwards.
+
+\textbf{(1) Zeros.} $y_t = 0$ makes the term infinite (or a division error), and intermittent retail, ad impressions on new inventory, and rare-event counts are full of zeros. Near-zeros are just as bad: an actual of 1 against a forecast of 3 contributes 200\%, drowning a thousand well-forecast large days.
+
+\textbf{(2) Asymmetry, and its direction.} For a \emph{fixed} actual $y$, MAPE is symmetric in the forecast---over and under by the same amount cost the same. The asymmetry is in the achievable range: under-forecasting is bounded ($\hat{y} \to 0$ caps the term at 100\%) while over-forecasting is unbounded. So minimizing MAPE \textbf{systematically biases forecasts low}. Concretely, let demand be 10 or 1000 with equal probability. Forecasting 10 gives MAPE $= \tfrac{1}{2}(0) + \tfrac{1}{2}(990/1000) = 49.5\%$; forecasting 1000 gives $\tfrac{1}{2}(990/10) + \tfrac{1}{2}(0) = 4950\%$; forecasting the mean 505 gives $\approx 2500\%$. MAE is indifferent among all three (495 in every case). A MAPE-driven team quietly ships an under-forecasting model and then wonders why they are always out of stock.
+\end{warningbox}
+
+\textbf{sMAPE} is the standard patch, $\text{sMAPE} = \frac{100}{n}\sum_t \frac{2|y_t - \hat{y}_t|}{|y_t| + |\hat{y}_t|}$, which is bounded in $[0, 200\%]$ and finite unless \emph{both} actual and forecast are zero. It is worth knowing that the name is a lie: sMAPE is not symmetric either, and its bias runs the \emph{other} way. With $y = 100$: forecasting 110 gives $2(10)/210 = 9.52\%$, forecasting 90 gives $2(10)/190 = 10.53\%$. Under-forecasting is punished harder, so sMAPE nudges forecasts up. It is also unstable near zero and can be negative-adjacent in odd implementations that drop the absolute values. Use it if a competition demands it; do not build a business on it.
+
+\subsection{MASE: The Metric That Signals Experience}
+
+\begin{mathresult}{Mean Absolute Scaled Error (Hyndman \& Koehler, 2006)}
+Scale each error by the in-sample mean absolute error of the (seasonal) naive method on the \emph{training} data. For a series with seasonal period $m$ and $T$ training observations,
+\begin{equation}
+\text{MASE} = \frac{\frac{1}{n}\sum_{t \in \text{test}} |y_t - \hat{y}_t|}{\dfrac{1}{T-m}\displaystyle\sum_{t=m+1}^{T} |y_t - y_{t-m}|},
+\end{equation}
+with $m = 1$ (the plain naive method, $|y_t - y_{t-1}|$) for non-seasonal data. Interpretation is the whole point:
+\begin{itemize}
+    \item $\text{MASE} = 1$: your model is exactly as accurate as one-step seasonal naive was in-sample.
+    \item $\text{MASE} < 1$: better than the naive benchmark. $\text{MASE} = 0.8$ means 20\% less absolute error.
+    \item $\text{MASE} > 1$: you are shipping something worse than copying last week. Fix or delete.
+\end{itemize}
+It is scale-free (so it averages across thousands of series), defined whenever the training series has at least one non-constant seasonal difference (so zeros are fine), and symmetric in over- vs.\ under-forecasting.
+\end{mathresult}
+
+Three details that turn a definition into a demonstration of use. First, the denominator is computed \textbf{on the training window}, not the test window---so it is a fixed constant per series, and every candidate model is divided by the same number, which is what makes MASE comparable across models \emph{and} across horizons. Computing it on the test set is the common implementation bug and makes the metric move when the test period is quiet. Second, \textbf{aggregate the ratio, not the parts}: report the mean (or, better, the median, since MASE is right-skewed) of per-series MASE. Third, the squared-error sibling is \textbf{RMSSE}, and M5 scored on \textbf{WRMSSE}---RMSSE weighted by each series' dollar contribution---which is the right idea in general: scale-free error, business-weighted. If you are asked ``how would you report accuracy across 5{,}000 SKUs,'' the complete answer is ``per-series MASE (or RMSSE), aggregated with revenue weights, plus the seasonal-naive baseline printed next to it, broken out by horizon.''
+
+\subsection{Quantile Forecasts and Pinball Loss}
+
+Point forecasts are rarely what the business consumes. Inventory wants a service level; capacity planning wants a $p99$; finance wants a range. The right object is a set of quantiles, and the right loss is the \textbf{pinball} (quantile, check) loss.
+
+\begin{mathresult}{Pinball Loss at Level $\tau$}
+For target $y$ and predicted $\tau$-quantile $q$,
+\begin{equation}
+L_\tau(y, q) = \begin{cases} \tau\,(y - q) & \text{if } y \ge q \quad (\text{under-forecast}) \\[2pt] (1-\tau)\,(q - y) & \text{if } y < q \quad (\text{over-forecast}) \end{cases}
+\end{equation}
+equivalently $L_\tau = \max\big(\tau(y-q),\,(\tau-1)(y-q)\big)$, which is the form most libraries implement. This loss is minimized in expectation exactly at the $\tau$-quantile of $p(y)$, which is what licenses the whole approach. The asymmetry is the mechanism: at $\tau = 0.9$, an actual of 120 against $q = 100$ costs $0.9 \times 20 = 18$, while an actual of 80 against the same $q=100$ costs $0.1 \times 20 = 2$. Under-forecasting is nine times more expensive, so the minimizer sits high---precisely where a 90\% service level should be. At $\tau = 0.5$ the loss is $\tfrac12|y-q|$, i.e.\ MAE, recovering the median.
+\end{mathresult}
+
+The practical stack: train one GBM per quantile with the quantile objective (LightGBM's \texttt{objective} \texttt{= "quantile"} with \texttt{alpha} $= \tau$), or use a model with a native distributional head. Then \textbf{validate coverage empirically}: over your backtest, the fraction of actuals falling below the $\tau$ forecast should be $\approx \tau$. Nominal coverage is a claim; empirical coverage is a measurement, and they differ badly in practice because the residual distribution is heteroscedastic and fat-tailed. Two additional facts to have ready: \textbf{quantile crossing} (independently trained $q_{0.1}$ and $q_{0.9}$ can cross at some $x$; fix by sorting the predicted quantiles post hoc, or by fitting monotone-in-$\tau$ jointly), and \textbf{conformal prediction on residuals} as the distribution-free alternative that gives finite-sample marginal coverage---in the time-series case you want a rolling/adaptive variant, since the exchangeability assumption conformal normally rests on is exactly what a time series violates. The uncertainty-quantification machinery itself is Chapter~\ref{cml:chap:probabilistic_foundations}.
+
+\subsection{How Error Grows with Horizon}
+
+\begin{mathresult}{Forecast Error Variance vs.\ Horizon}
+\textbf{Random walk} ($y_t = y_{t-1} + \varepsilon_t$, $\Var(\varepsilon) = \sigma^2$): the $h$-step error is $\sum_{j=1}^{h}\varepsilon_{T+j}$, so
+\begin{equation}
+\Var(e_h) = h\sigma^2, \qquad \text{sd}(e_h) = \sigma\sqrt{h} \;\longrightarrow\; \infty.
+\end{equation}
+Intervals widen forever as $\sqrt{h}$: 4 steps out is twice as uncertain as 1 step, 16 steps out is four times.
+
+\textbf{Stationary AR(1)} ($y_t = \mu + \phi(y_{t-1}-\mu) + \varepsilon_t$, $|\phi| < 1$): the error is $\sum_{j=0}^{h-1}\phi^j \varepsilon_{T+h-j}$, so
+\begin{equation}
+\Var(e_h) = \sigma^2\,\frac{1 - \phi^{2h}}{1-\phi^2} \;\longrightarrow\; \frac{\sigma^2}{1-\phi^2} = \gamma_0 .
+\end{equation}
+Error grows and then \emph{saturates} at the unconditional variance---the model correctly announces that beyond a few multiples of the memory length it knows nothing but the mean. With $\phi = 0.9, \sigma = 1$: sd goes $1.00, 1.35, 1.57, \ldots$ and stops at $\sqrt{1/0.19} = 2.29$.
+\end{mathresult}
+
+The operational consequences are what get tested. \textbf{Always report error as a curve over $h$, never as one scalar}, because a single averaged MASE hides the fact that $h=1$ is excellent and $h=28$ is worse than seasonal naive---and the business only cares about the horizon that matches its lead time. A \emph{non-monotone} error-vs-horizon curve is a bug signal, not a discovery: the usual causes are a leaking feature that happens to be available at some horizons, a seasonal period that aliases with your horizon grid, or a test window too short to average out one bad event. And when you compare recursive and direct multi-horizon strategies (Section~\ref{cml:sec:ts_gbm}), this curve is the comparison: recursive typically wins at short $h$ and degrades faster, direct is flatter and often worse at $h=1$.
+
+%==============================================================================
+\section{Classical Models at Working Depth}
+\label{cml:sec:ts_classical}
+%==============================================================================
+
+You will not be asked to derive the Kalman filter. You will be asked what the pieces do, why the assumptions exist, and whether you know that a well-fit ETS is a serious opponent. That is the depth this section targets.
+
+\subsection{Exponential Smoothing: SES $\to$ Holt $\to$ Holt--Winters $\to$ ETS}
+
+\textbf{Simple exponential smoothing (SES)} is one line: the forecast is an exponentially weighted average of the past,
+\begin{equation}
+\hat{y}_{T+1|T} = \alpha y_T + (1-\alpha)\hat{y}_{T|T-1} = \sum_{j=0}^{T-1}\alpha(1-\alpha)^j y_{T-j} + (1-\alpha)^T \ell_0,
+\end{equation}
+equivalently the \emph{component form} $\ell_t = \alpha y_t + (1-\alpha)\ell_{t-1}$ with a flat forecast function $\hat{y}_{t+h|t} = \ell_t$ for all $h$. The smoothing parameter $\alpha \in (0,1)$ is fit by minimizing SSE (or maximizing the state-space likelihood), not hand-set. The useful intuition is that the weights $\alpha(1-\alpha)^j$ have mean lag $(1-\alpha)/\alpha$: $\alpha = 0.2$ means the forecast is centered about 4 periods back, $\alpha = 0.8$ means it is essentially the last observation. SES has no trend and no seasonality, so its forecast is a horizontal line---which is why it is only ever the right model for a level-ish series with no structure left in it.
+
+\textbf{Holt} adds a trend state:
+\begin{align}
+\ell_t &= \alpha y_t + (1-\alpha)(\ell_{t-1} + b_{t-1}), \\
+b_t &= \beta^*(\ell_t - \ell_{t-1}) + (1-\beta^*) b_{t-1}, \\
+\hat{y}_{t+h|t} &= \ell_t + h\,b_t .
+\end{align}
+The forecast is now a straight line with the currently estimated slope, and \emph{that is a problem}: a locally estimated slope extended 52 weeks is how forecasting systems produce absurd numbers. The standard, near-mandatory fix is the \textbf{damped} variant, $\hat{y}_{t+h|t} = \ell_t + (\phi + \phi^2 + \cdots + \phi^h) b_t$ with $0 < \phi < 1$, whose forecast flattens to the asymptote $\ell_t + \phi b_t/(1-\phi)$. Damped trend is one of the most reliably strong methods in the entire M-competition record, and naming it is a cheap credibility signal.
+
+\textbf{Holt--Winters} adds a seasonal state of period $m$. In additive form:
+\begin{align}
+\ell_t &= \alpha (y_t - s_{t-m}) + (1-\alpha)(\ell_{t-1} + b_{t-1}), \\
+b_t &= \beta^*(\ell_t - \ell_{t-1}) + (1-\beta^*)b_{t-1}, \\
+s_t &= \gamma (y_t - \ell_{t-1} - b_{t-1}) + (1-\gamma)s_{t-m}, \\
+\hat{y}_{t+h|t} &= \ell_t + h b_t + s_{t+h-m(k+1)}, \quad k = \lfloor (h-1)/m \rfloor .
+\end{align}
+The multiplicative form replaces the seasonal additions with multiplications ($\ell_t = \alpha(y_t/s_{t-m}) + \cdots$, $\hat{y} = (\ell_t + hb_t)s_{t+h-m(k+1)}$) and is the right choice when seasonal amplitude scales with the level---which, for retail, it almost always does. Note the structural limit: \emph{one} seasonal period. Daily data with both weekly and annual seasonality does not fit; that is what TBATS, Fourier terms in a dynamic regression, or the feature-based GBM approach exist for.
+
+\textbf{ETS} is the modern packaging. The taxonomy names each model by its (\underline{E}rror, \underline{T}rend, \underline{S}easonal) components: error additive or multiplicative; trend none, additive, or multiplicative, with the latter two optionally damped; seasonality none, additive, or multiplicative. That is $2 \times 5 \times 3 = 30$ models, and every one is a state-space model, which buys three things exponential smoothing by itself does not have: a proper likelihood, automatic model selection by AICc over the whole family, and analytically derived prediction intervals. ETS(A,N,N) \emph{is} SES; ETS(A,A,N) is Holt; ETS(A,A$_d$,A) is damped Holt--Winters additive.
+
+\begin{keyinsight}[ETS Is the Honest Strong Baseline]
+An auto-selected ETS on a clean seasonal series, fit in milliseconds with no feature engineering, no hyperparameter search, and no leakage surface, is a genuinely hard opponent. It is not a straw man you set up to knock down---in the M-competitions, simple exponential-smoothing variants and their combinations repeatedly finished ahead of far more elaborate methods. The correct professional stance, and the one that reads as senior in an interview, is: run ETS (and seasonal naive) first, report them forever, and make the more complex model justify itself against them on a rolling-origin backtest.
+\end{keyinsight}
+
+The families overlap without containing each other, which is a nice detail to have ready: SES is equivalent to ARIMA(0,1,1), Holt to ARIMA(0,2,2), damped Holt to ARIMA(1,1,2)---but every \emph{multiplicative}-error or multiplicative-seasonal ETS model is nonlinear and has no ARIMA counterpart, and every stationary ARIMA model has no ETS counterpart.
+
+\subsection{ARIMA}
+
+ARIMA$(p,d,q)$ is three ideas stacked, and being able to say what each one \emph{models}---not just what it computes---is the whole question.
+
+\begin{itemize}
+    \item \textbf{AR($p$)}: regress $y_t$ on its own last $p$ values. This models \emph{persistence}: a shock today changes the level and then decays geometrically. It is the component that produces mean reversion (or, at the boundary, a random walk).
+    \item \textbf{I($d$)}: difference $d$ times before modeling. This is not a model of anything; it is the transformation that makes the AR/MA machinery legal on a trending series, and it is why the forecasts come back on the original scale by cumulative summation.
+    \item \textbf{MA($q$)}: regress $y_t$ on the last $q$ \emph{forecast errors}, not on past $y$. This models a shock with a \emph{short, finite echo}: a stock-out depresses sales this week and next and is then completely gone. AR shocks decay forever; MA shocks stop dead after $q$ periods.
+\end{itemize}
+
+In backshift notation, with $B y_t = y_{t-1}$:
+\begin{equation}
+\underbrace{\left(1 - \sum_{i=1}^{p}\phi_i B^i\right)}_{\text{AR}} \underbrace{(1-B)^d}_{\text{I}} y_t = c + \underbrace{\left(1 + \sum_{j=1}^{q}\theta_j B^j\right)}_{\text{MA}} \varepsilon_t .
+\end{equation}
+
+\begin{mathresult}{AR(1) Is Mean Reversion with Memory $\phi$}
+Write $y_t = c + \phi y_{t-1} + \varepsilon_t$ in deviation form, $y_t - \mu = \phi(y_{t-1}-\mu) + \varepsilon_t$ with $\mu = c/(1-\phi)$. Then everything follows by induction:
+\begin{equation}
+\hat{y}_{T+h|T} = \mu + \phi^h (y_T - \mu), \qquad \rho_k = \phi^k, \qquad \Var(y_t) = \frac{\sigma^2}{1-\phi^2}.
+\end{equation}
+The forecast is the current deviation from the mean, shrunk geometrically. The natural unit is the \textbf{half-life} $\;h_{1/2} = \ln(0.5)/\ln\phi$: with $\phi = 0.9$ a shock is half gone after $6.6$ periods and $\phi^{10} = 0.35$, so ten steps out the forecast has travelled 65\% of the way back to the mean. $\phi = 0.5$ gives a half-life of exactly 1; $\phi = 0.99$ gives 69. As $\phi \to 1$ the half-life diverges, the variance blows up, and the process becomes a random walk with permanent shocks---which is precisely the non-stationary case that the I term exists to difference away. Negative $\phi$ gives alternating-sign decay (over-correction), which is what you see in over-differenced series.
+\end{mathresult}
+
+\textbf{Order selection.} For a \emph{pure} AR or MA process, read $p$ or $q$ off the PACF/ACF cut-off (Table~\ref{cml:tab:ts_acf_pacf}). For anything mixed, both plots tail off and eyeballing is guesswork, so use information criteria---AICc, which is AIC with the small-sample correction and is the default in \texttt{auto.arima} (Hyndman--Khandakar), which runs a stepwise search over $(p,q,P,Q)$ with $d$ fixed first by a unit-root rule. The trap worth knowing: \textbf{AIC is not comparable across different $d$}, because differencing changes the data the likelihood is computed on. Choose $d$ by stationarity testing/plots, then compare AICc only \emph{within} that $d$. Always finish with a residual check---the residuals should look like white noise (flat ACF; Ljung--Box $p$-value not small), and an in-sample fit statistic is not evidence of forecast skill.
+
+\textbf{SARIMA$(p,d,q)(P,D,Q)_m$} multiplies a seasonal polynomial in $B^m$ onto each of the three components. The elegance is the parameter count: SARIMA$(1,1,1)(1,1,1)_{12}$ has four coefficients, yet expanding the product of the polynomials produces terms at lags 1, 12, 13, 24, 25, $\ldots$---the seasonal-times-nonseasonal cross terms are what let a handful of parameters describe ``last month matters, and so does the same month last year, and so does their interaction.'' Practical ceilings to state honestly: ARIMA is univariate, wants a few hundred observations and several full seasonal cycles, handles exactly one seasonal period, and must be fit and monitored \emph{per series}, which is why nobody runs 42{,}000 SARIMA models in production when one global GBM will do (Section~\ref{cml:sec:ts_gbm}).
+
+\subsection{Exogenous Regressors}
+
+Real forecasts have drivers: price, promotion, marketing spend, weather, holidays, competitor actions. Two formulations, and the difference matters.
+
+\textbf{Regression with ARIMA errors} (the form you should prefer, and what R's \texttt{xreg} actually fits) writes $y_t = \beta^{\top} x_t + n_t$ where the \emph{noise} $n_t$ follows an ARIMA process. The $\beta$ are ordinary regression coefficients with their usual interpretation---the effect of a price change holding the autocorrelated background constant---and the ARIMA part exists to make the standard errors honest rather than to explain the driver. \textbf{ARIMAX} in the strict sense puts lagged $y$ on the right-hand side alongside $x$, which makes $\beta$ a conditional-on-history effect and much harder to interpret; if a candidate uses the two terms interchangeably, this is the distinction to draw. Delayed and decaying effects (advertising) are handled with \emph{distributed lags} or a transfer-function/adstock term.
+
+Three operational points. (1) If you difference $y$, you must difference $x$ as well, or you are back in the spurious-regression regime. (2) \textbf{You cannot forecast with a regressor you will not have.} To produce $\hat{y}_{T+h}$ you need $x_{T+h}$, so only variables that are \emph{known in advance} (calendar, planned promotions, contracted volume, published price changes) are free; anything else must itself be forecast, and its forecast error propagates into yours. This is the single most common way an offline model that ``uses weather'' becomes unshippable---and, if you train on \emph{realized} weather and serve on \emph{forecast} weather, it is also a leakage bug, not just an availability problem (Section~\ref{cml:sec:ts_gbm}). (3) Long or multiple seasonality is best injected here as \textbf{Fourier terms}: $K$ sine/cosine pairs at period $m$ give a smooth seasonal shape with $2K$ parameters instead of $m-1$ dummies, which is how you put annual seasonality into a daily model without 364 indicator columns.
+
+\subsection{Prophet-Style Decomposable Models}
+
+Prophet (Taylor \& Letham, 2017) fits a generalized additive model in time,
+\begin{equation}
+y(t) = g(t) + s(t) + h(t) + \varepsilon_t,
+\end{equation}
+with $g$ a piecewise-linear (or saturating-logistic) trend whose changepoints are selected automatically under a sparsity-inducing Laplace prior on the rate changes, $s$ a Fourier-series seasonality supporting several periods at once, and $h$ a set of holiday indicators with configurable windows around each event. It is fit in Stan (MAP by default), and its genuine virtues are real: it tolerates missing timestamps and irregular sampling, it is robust to outliers, it gives directly interpretable component plots that a non-technical stakeholder can read, and it produces something usable from a series and a holiday list with no tuning. That combination is why it spread---it turned forecasting into a task an analyst could do.
+
+\begin{warningbox}
+\textbf{``Prophet handles everything automatically'' is a red-flag answer.} Prophet is a curve-fitting GAM \emph{in $t$}: it has no autoregressive term at all, so it does not use yesterday's observation except through the fitted curve---exactly the information that a lag feature or an ARIMA AR term exploits. Its trend extrapolation is driven by automatically selected changepoints and is correspondingly high-variance out of sample, and its default uncertainty intervals are widely reported to be poorly calibrated (the trend-changepoint simulation dominates them, and the seasonal component contributes no uncertainty at all). Repeated public benchmarks, including reruns on M-competition data, place default Prophet below auto-ETS and auto-ARIMA on many series and well below a tuned global GBM. Correct positioning: an excellent \emph{decomposition and EDA tool} and a reasonable quick baseline for a handful of business series with strong holiday effects---not the answer to ``forecast 5{,}000 SKUs.''
+\end{warningbox}
+
+%==============================================================================
 \section{The GBM Recipe}
-% TODO Phase C3
+\label{cml:sec:ts_gbm}
+%==============================================================================
 
+This is the applied core of the chapter and the part of it that actually gets built at work. The move is to convert forecasting into supervised tabular regression---one row per (series, prediction origin), features that are functions of the past, target $y_{t+h}$---and then hand the result to LightGBM. Everything hard about it is in the words \emph{functions of the past}.
+
+\subsection{The Feature Recipe}
+
+\textbf{Lags.} The workhorse. For a target at $t+h$ forecast from origin $t$, the legal lags are $y_t$, $y_{t-1}$, $y_{t-2}$, and so on, plus the seasonal ones $y_{t-m+1}$, $y_{t-2m+1}$, and so on. In a table indexed by the \emph{target} date, the shortest legal lag is $h$:
+\begin{center}
+\texttt{lag\_k = y.shift(k)} \quad is usable for a horizon-$h$ model only if \texttt{k >= h}.
+\end{center}
+This single line catches the most common bug in the area. Somebody builds \texttt{lag\_1 \ldots lag\_7}, gets a superb backtest, and ships a model for a 28-day-ahead plan---at which point \texttt{lag\_1} does not exist, because the last known actual is 28 days old. Either restrict the feature set to lags $\ge h$ (direct strategy) or commit to feeding the model its own predictions (recursive strategy); that choice is the multi-horizon discussion below, but the feature table must reflect it.
+
+\textbf{Rolling-window statistics.} Mean, median, std, min, max, and zero-fraction over windows of 7, 28, and 91 periods, plus exponentially weighted means at a couple of half-lives. These give the tree a level, a volatility, and a recent-trend proxy without asking it to extrapolate. Two non-negotiables: the window must \textbf{end at or before the prediction origin}, and it must be \textbf{shifted by the horizon}. In pandas the correct idiom is \texttt{y.shift(h).rolling(w).mean()}---shift \emph{then} roll; \texttt{rolling(w, center=True)} is a leak, and \texttt{rolling(w).mean()} without the shift is a leak for every $h > 1$. Ratios of windows (7-day mean over 91-day mean) encode momentum in a scale-free way and are usually stronger features than either level alone.
+
+\textbf{Calendar and cyclical features.} Day-of-week, day-of-month, week-of-year, month, quarter, is-weekend, days-since-series-start, and paycheck/month-boundary proximity. One nuance worth having: \textbf{cyclical $\sin/\cos$ encodings matter far less for trees than candidates think}. A tree splits on order, so integer day-of-week (or a native categorical) already lets it isolate any contiguous group, and a categorical split can isolate any subset; the $\sin(2\pi k/K), \cos(2\pi k/K)$ pair exists to tell \emph{linear models and neural networks} that Sunday is adjacent to Monday. Reciting Fourier encodings for a LightGBM model without knowing why is a small tell; knowing the distinction is a small win.
+
+\textbf{Holiday and event flags.} Not a single indicator---a \emph{window}. Demand shifts before and after, so encode signed days-to-nearest-holiday and per-holiday indicators over a $[-7, +7]$ band. Handle moving holidays explicitly (Easter, Ramadan, Lunar New Year, and any US retail calendar anchored to Thanksgiving) because they break week-of-year alignment across years. Regionalize (a global \texttt{is\_holiday} flag on a multi-country panel is nearly noise). And give one-off events---lockdowns, outages, a viral moment, a pricing error---their own indicator columns, or the model will fold them into the annual seasonal profile and confidently predict a repeat.
+
+\textbf{Known-in-advance covariates.} Planned price, promotion calendars, published events, scheduled marketing flights, contracted volume, store openings. These are the highest-value features in the whole recipe because they are the only ones that let the model anticipate rather than extrapolate---\emph{and} because they are genuinely available at prediction time. Anything not known in advance (weather, competitor price, macro prints) can only enter as a forecast, and must therefore be \emph{trained} on the forecast that would have been available, not the realized value.
+
+\textbf{Target transforms.} $\log(1+y)$ for multiplicative, heteroscedastic, or long-tailed series (remember the retransformation bias from Section~\ref{cml:sec:ts_foundations}); per-series scaling---divide by the series' own mean computed on the \emph{training window only}---so that a global model is not dominated by high-volume series; a Poisson or Tweedie objective for count and intermittent demand, where a squared-error model on many zero days is badly misspecified (Croston's method is the classical name for intermittent demand and is worth a mention). And, crucially for the extrapolation problem below, consider making the target a \emph{difference} or a \emph{ratio to a baseline} rather than the level.
+
+\subsection{The Global-Model Pattern}
+
+The naive approach to 5{,}000 SKUs is 5{,}000 models. The pattern that actually wins is \textbf{one model trained across all series at once}, with the series identity supplied as features.
+
+\begin{keyinsight}[The M5 Lesson: One Global GBM, Not $N$ Local Ones]
+Pool every series into a single training table---one row per (series, date)---and give the model: the series ID as a categorical, the hierarchy attributes (item, department, category, store, region), per-series aggregate statistics computed on the training window (mean level, zero-rate, coefficient of variation, weeks since launch), and the usual lag/rolling/calendar block. This buys three things at once: \textbf{statistical strength} (the seasonal profile is estimated from thousands of series instead of one), \textbf{cold start} (a new SKU with no history inherits behaviour from its category and store through the attribute features), and \textbf{operations} (one artifact to train, monitor, and roll back instead of thousands). The M5 competition---Walmart hierarchical daily sales, 3{,}049 products across 10 stores, 42{,}840 series once every aggregation level is counted, roughly five years of history and a 28-day horizon, scored on WRMSSE---was dominated at the top of the leaderboard by exactly this: LightGBM global models with lag/rolling/calendar/price features. Pure deep-learning entries did not win.
+\end{keyinsight}
+
+Three practical caveats that separate a rehearsed answer from an experienced one. \textbf{Scale first}: without per-series normalization (or sample weights), the loss is dominated by the highest-volume series and the model quietly ignores the long tail that constitutes most of the catalogue. \textbf{Heterogeneity has limits}: pooling helps when series share structure; mixing weekly B2B contracts with hourly web traffic in one model does not. The standard remedy is to cluster series (by frequency, seasonality strength, intermittency, scale) and fit one global model per cluster. \textbf{Hierarchies must reconcile}: SKU forecasts have to sum to store forecasts and store to region, because the business plans off the aggregates. Bottom-up, top-down, and middle-out are the simple schemes; \textbf{MinT} (minimum-trace optimal reconciliation, Wickramasuriya et al.) is the principled one, projecting the base forecasts onto the coherent subspace in a way that also reduces error. Naming reconciliation unprompted on a hierarchical-forecasting question is a strong signal.
+
+\subsection{Leakage Discipline: ``Was This Knowable at Prediction Time?''}
+
+\begin{keyinsight}[The One Question That Governs Every Temporal Feature]
+For every column in the training table, ask: \emph{at the moment this row's prediction would have been made, would this exact value have been sitting in a system I could query?} Not ``does this value refer to the past''---plenty of leaked features refer to the past and were only \emph{computed} later. The operational form of the question is: could I reconstruct this feature from a snapshot of the warehouse taken at the prediction origin? If the answer needs a ``well, basically'', it is a leak. The general taxonomy of leakage is Chapter~\ref{cml:chap:applied_craft}; the temporal instances below are the ones this chapter owns.
+\end{keyinsight}
+
+\begin{table}[H]\centering
+\caption{Temporal leakage instances, in rough order of how often they appear in real code.}
+\label{cml:tab:ts_leakage}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.24\textwidth} X X@{}}
+\toprule
+\textbf{Instance} & \textbf{Why it leaks} & \textbf{Fix} \\
+\midrule
+Shuffled / random $k$-fold & Training folds hold rows from after the validation fold & Rolling-origin backtest (below) \\
+Centered rolling window & \texttt{center=True} averages $w/2$ future points into a ``past'' statistic & Trailing windows only \\
+Rolling stat not shifted by $h$ & The window ends at $t$, but at origin $t-h$ nothing past $t-h$ was known & \texttt{y.shift(h)} \texttt{.rolling(w).mean()} \\
+Scaler / imputer fit on all data & Test-period mean and variance flow into training features & Fit on the training window, apply forward \\
+Target encoding over the full history & Future labels enter the encoding of a past row & Expanding, out-of-fold, or time-blocked encoding \\
+Realized exogenous values & You train on actual weather but will serve on forecast weather & Train on the vintage forecast, or drop the feature \\
+Revised / restated data & Warehouse holds the corrected value; at origin you had the first print & Point-in-time (``as-of'') tables and vintage joins \\
+Mutable entity attributes & A SKU's category or a user's segment was overwritten last month & Slowly-changing-dimension history, joined as-of \\
+No gap before the test window & Training rows near the boundary have targets inside the test period & Embargo of at least $h$ periods \\
+Survivorship in series selection & Only series alive today are in the panel; failures were dropped & Include delisted/dead series with their true end dates \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The revised-data row deserves emphasis because it is the fintech-specific one and the hardest to detect: macroeconomic series are revised for years, earnings are restated, fraud labels arrive weeks after the transaction, and a shipment's ``delivered'' timestamp gets backfilled. A model trained on today's warehouse snapshot has been given a corrected view of history that it will never see again. The engineering answer is a \textbf{point-in-time feature store}: every fact carries both an event time and a knowledge (ingestion) time, and feature computation joins \texttt{as of} the prediction origin. If you have built one, this is the story to tell; if you have not, knowing the phrase and the reason is most of the credit.
+
+\subsection{Validation: Rolling-Origin Backtesting}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+\foreach \row/\yb/\a/\b/\c in {1/2.70/4.6/5.2/6.7, 2/1.80/6.1/6.7/8.2, 3/0.90/7.6/8.2/9.7, 4/0.00/9.1/9.7/11.2}{
+  \node[anchor=east, font=\scriptsize] at (-0.12,{\yb+0.23}) {Fold \row};
+  \fill[lightblue, draw=deepblue!70, line width=0.4pt] (0,\yb) rectangle (\a,{\yb+0.46});
+  \fill[gray!22, draw=gray!65, line width=0.4pt] (\a,\yb) rectangle (\b,{\yb+0.46});
+  \fill[lightgreen, draw=deepgreen!70, line width=0.4pt] (\b,\yb) rectangle (\c,{\yb+0.46});
+}
+\node[font=\scriptsize] at (2.3,3.36) {train (expanding)};
+\node[font=\scriptsize] at (5.95,3.36) {test ($h$ steps)};
+\node[font=\scriptsize, anchor=south] at (4.9,3.80) {gap / embargo};
+\draw[gray!65, line width=0.3pt] (4.9,3.78) -- (4.9,3.20);
+\draw[->, gray!70, line width=0.5pt] (0,-0.32) -- (11.5,-0.32);
+\node[font=\scriptsize, anchor=west] at (11.55,-0.32) {time};
+\end{tikzpicture}
+\caption{Rolling-origin (expanding-window) backtesting. Each fold trains on everything up to a cut, skips an embargo gap of at least the horizon $h$, then scores on the next $h$ steps; the origin then rolls forward and the process repeats. The test windows are disjoint and always in the future of their own training set. A \emph{sliding}-window variant fixes the training length instead of growing it, which is preferable when the process is non-stationary and old regimes actively mislead; expanding is preferable when data is scarce. Report per-fold error and the error-vs-horizon curve, not just the pooled average.}
+\label{cml:fig:ts_rolling_origin}
+\end{figure}
+
+\textbf{Why random $k$-fold is invalid} has three distinct mechanisms, and a complete answer names all three rather than saying ``because of leakage.''
+
+\begin{enumerate}
+    \item \textbf{Direct lookahead.} Training folds contain rows from after the validation fold. Any feature that touches other rows---a rolling statistic, a target encoding, a fitted scaler, an imputation mean---then carries future information into a past prediction. This is a bug you can point at in code.
+    \item \textbf{Autocorrelation makes the folds non-independent even with no explicit leak.} $y_{t-1}$ and $y_{t+1}$ are in the training folds and are strongly correlated with $y_t$, so predicting a held-out $y_t$ is \emph{interpolation between known neighbours}. That is a fundamentally easier task than the one production faces, which is extrapolation past the end of the data. Cross-validation is estimating the wrong quantity, not merely estimating it noisily.
+    \item \textbf{Regime mismatch.} $k$-fold averages performance over all historical regimes; production always operates in the newest one. A shuffled estimate cannot see model decay, cannot produce an error-vs-horizon curve, and cannot tell you how often to retrain---all of which are the actual decisions the evaluation exists to inform.
+\end{enumerate}
+
+The optimism this produces is large and the shape of the story is always the same: a shuffled-CV number that looks like a breakthrough, a rolling-origin backtest that gives back most of the gain, and a production number at or slightly below the backtest. A classification-flavoured version---0.95 AUC in shuffled CV, 0.78 in a proper time-blocked backtest, 0.74 in the first month live---is the canonical retelling, and the specific numbers vary while the ordering never does. If you have a real instance of this, it is one of the best debugging stories to have ready.
+
+\textbf{The gap (embargo)} exists because the boundary between train and test is not a point when your rows have width. A training row at origin $t$ has target $y_{t+h}$; if $t$ is within $h$ of the cut, that target lies inside the test window, so the model has literally been trained on a test label. Remove training rows whose \emph{targets} fall after the cut---an embargo of at least $h$. Widen it further if features use long windows that could straddle the boundary, if labels are defined over a forward window (``churned within 30 days''), or if data arrives with a known reporting lag. The purged-and-embargoed cross-validation of López de Prado is the formalization, and it is standard vocabulary in quant finance.
+
+Two more backtest hygiene rules. \textbf{Use several folds, not one holdout}: a single test window is one draw from a very autocorrelated process, and a model that happens to fit one quiet quarter tells you nothing. \textbf{Refit exactly as you will in production}: if you plan to retrain weekly, the backtest should refit at each origin; if hyperparameters or early-stopping rounds are chosen once, choose them inside the earliest fold and freeze them, or you have tuned on the future through the back door.
+
+\subsection{Multi-Horizon: Recursive vs.\ Direct}
+
+To produce $\hat{y}_{T+1}, \ldots, \hat{y}_{T+H}$ from a supervised model there are two strategies and a family of hybrids.
+
+\textbf{Recursive (iterated).} Train one one-step model, predict $\hat{y}_{T+1}$, append it to the feature history as if it were an observation, predict $\hat{y}_{T+2}$, and so on. \emph{Pros}: a single model; every training row is usable; the learned dynamics are consistent across the whole path; short lags (which carry the most signal) are available at every step. \emph{Cons}: errors compound---each step's error enters the next step's inputs---and, more subtly, there is a \textbf{train/serve mismatch}: the model was fit on \emph{true} lag values and is served \emph{predicted} ones, whose distribution is smoother and lower-variance. That mismatch, not just error accumulation, is why recursive forecasts often degrade faster than the compounding arithmetic alone predicts. Mitigations: train with noise injected into the lag features, or with a scheduled-sampling-style mixture of true and predicted lags.
+
+\textbf{Direct.} Train $H$ separate models, one per horizon, each mapping features known at origin $t$ to $y_{t+h}$. \emph{Pros}: no compounding and no train/serve mismatch, since each model is trained on exactly the inputs it will see; each horizon can use its own feature set and its own hyperparameters. \emph{Cons}: $H$ models to train, tune, monitor, and store; each sees fewer usable rows (you need $y_{t+h}$ observed); no shared structure across horizons unless you add it; and the resulting forecast path can be \emph{jagged}---nothing forces $\hat{y}_{T+7}$ and $\hat{y}_{T+8}$ to be mutually consistent, which stakeholders notice immediately.
+
+\textbf{In between.} \emph{Multi-output} models predict all $H$ horizons from one fitted model (native in most neural forecasters, and available in GBMs by stacking $H$ outputs or one model with horizon as a feature). \emph{Horizon-as-a-feature} is the pragmatic middle: one model, with $h$ passed in as a numeric feature and the lag block restricted to lags $\ge \max h$, which shares structure while remaining direct in spirit. \emph{DirRec} updates the feature set at each step but trains a fresh model per horizon. The empirically strong answer, and the one the M5 leaderboard reflects, is usually to \textbf{blend}: recursive tends to win at short horizons, direct is flatter over long ones, and an average of the two beats either. The comparison to show is the error-vs-horizon curve (Section~\ref{cml:sec:ts_evaluation}), not a single pooled number.
+
+\subsection{The Trees-Cannot-Extrapolate Problem}
+
+\begin{keyinsight}[A Tree's Prediction Is Bounded by Its Training Leaves]
+A decision tree is piecewise constant: it partitions feature space at a finite set of thresholds and predicts a constant---an average of training targets---in each cell. Beyond the outermost threshold on any feature, the prediction \emph{does not change}, because there is no split out there to change it. A boosted ensemble is a sum of such functions and inherits the property exactly. So on a series with a genuine upward trend, a GBM predicting the level will rise along with the data and then \textbf{flatline at roughly the largest value it saw in training}, forever. It is not a tuning failure, a data-volume failure, or a regularization failure; it is the hypothesis class. This is the standard trap and the single most-asked time-series question about ML models (Chapter~\ref{cml:chap:trees_ensembles}).
+\end{keyinsight}
+
+Diagnosis is easy once you know to look: plot the forecast against the actuals over a long horizon and against the \textbf{drift} baseline (Section~\ref{cml:sec:ts_baselines}). A flat line just under the recent maximum, losing to drift while beating naive, is the signature. A second tell is the feature importance: a raw time index $t$ or a cumulative counter near the top is a warning, because every future value of it falls in the last bin the tree ever saw---such a feature is not merely useless out of sample, it is actively misleading in-sample.
+
+Four fixes, in the order you should offer them:
+
+\begin{enumerate}
+    \item \textbf{Make the target stationary.} Model $\nabla y_t = y_t - y_{t-1}$, or the seasonal difference $y_t - y_{t-m}$, or the log-ratio $\log(y_t / y_{t-m})$, and integrate the predicted deltas back up. Now the target lives inside its training range even as the level grows without bound. This is the first thing to say, and it is what most production forecasting stacks actually do.
+    \item \textbf{Predict a ratio to a baseline.} Target $y_t / b_t$ where $b_t$ is a trailing mean, a seasonal-naive value, or an ETS forecast. The GBM learns a multiplicative correction and the baseline carries the level. Equivalent in spirit to (1), often better behaved for multiplicative series.
+    \item \textbf{Hybrid: trend model plus GBM on residuals.} Fit a linear (or damped-Holt, or Prophet) trend, then boost on what it leaves behind, and sum the two. The linear part extrapolates; the trees model the seasonal, calendar, and covariate structure they are good at. This is a clean, defensible architecture and the one to name if asked ``how would you keep the trend and the tree.''
+    \item \textbf{Use a model with non-constant leaves.} LightGBM's \texttt{linear\_tree} fits a linear model inside each leaf, giving nonzero slope in the boundary region; a monotonic constraint on the time feature is a cruder version of the same idea.
+\end{enumerate}
+
+Two closing points that generalize. The ceiling applies to \emph{any} feature that drifts out of its training range, not just the target---a cumulative counter, a price after two years of inflation, a user-tenure field---so ``does this feature's distribution move monotonically over time?'' is a design-review question, not only a debugging one. And the mirror image is a real advantage: because trees cannot extrapolate, they also cannot produce the absurd 10$\times$ forecasts that an unconstrained linear extrapolation will, which is why the hybrid keeps the linear part small and bounded.
+
+\subsection{Probabilistic Forecasts with Quantile GBMs}
+
+The production recipe for uncertainty on top of a GBM is direct: train the same feature table three or five times with the quantile objective at $\tau \in \{0.1, 0.5, 0.9\}$ (or the nine-level M5 uncertainty grid running from $0.005$ to $0.995$), and serve the resulting band. It costs one training run per quantile and nothing at inference beyond the extra models.
+
+What separates a strong answer: (1) the quantile GBM's intervals are \emph{conditional}---they widen for volatile SKUs and narrow for stable ones---which is the whole reason to prefer them over a single global residual quantile; (2) \textbf{coverage must be measured on the backtest} and reported as a calibration table (nominal 80\% band achieving 71\% empirical coverage is a common and actionable finding, usually fixed by widening with a conformal-style residual adjustment rather than by re-tuning the model); (3) fix quantile crossing by sorting; (4) if you need a full predictive distribution rather than a few quantiles, the alternatives are a distributional GBM head (NGBoost-style), a parametric assumption fit on residuals, or empirical bootstrap of the backtest residuals by horizon---and the horizon dependence matters, because residual spread grows with $h$ (Section~\ref{cml:sec:ts_evaluation}), so a single pooled residual distribution will be too wide at $h=1$ and far too narrow at $h=H$.
+
+%==============================================================================
 \section{When Deep Learning}
-% TODO Phase C3
+\label{cml:sec:ts_deep_learning}
+%==============================================================================
 
+Architecture detail is not this volume's job---recurrent and attention sequence models are [NLP 4], state-space models and Mamba are [DL 14]. What this chapter owns is the judgment call, and the judgment call has a well-documented empirical record behind it that too few candidates can cite.
+
+\textbf{The record.} In the M4 competition (2018, 100{,}000 series) the winner was Slawek Smyl's \emph{hybrid}: exponential smoothing for level and seasonality, a dilated LSTM for the shared cross-series component---and second place was FFORMA, a gradient-boosted meta-model that learns \emph{combination weights} over classical statistical methods. The organizers' widely quoted headline was that the pure machine-learning submissions all finished below the simple statistical combination benchmark. In M5 (2020, Walmart hierarchical retail) the top of the leaderboard was LightGBM global models. And in the long-horizon academic benchmarks, Zeng et al.\ (2023) showed that a \emph{single linear layer} (DLinear) outperformed the then-current transformer forecasters, which triggered a real correction in the literature: better baselines, better protocols, and then genuinely stronger transformer designs (PatchTST, iTransformer) that reclaimed the ground on those benchmarks. The correct summary is not ``deep learning does not work'' but ``deep learning works where its assumptions are met, and the field's published margins were, for several years, an artifact of weak baselines.''
+
+\textbf{When DL earns its complexity.} Many related series (thousands and up), so a global network has enough data to learn shared representations rather than memorize; rich exogenous and multimodal covariates (prices, promos, text descriptions, images, upstream signals) that a network can fuse and a per-series ETS cannot; long horizons with several interacting seasonalities; high-cardinality categorical hierarchies where learned embeddings genuinely beat one-hot or target encoding; and a requirement for a coherent \emph{probabilistic} global model rather than a set of independent quantile regressions. The names to have: \textbf{DeepAR} (autoregressive RNN with a parametric likelihood head, the workhorse), \textbf{N-BEATS} and \textbf{N-HiTS} (deep basis expansion, strong on pure univariate benchmarks), \textbf{TFT} (Temporal Fusion Transformer---variable selection, static covariate encoders, attention, native quantile outputs, and by far the most interpretable of the family), \textbf{PatchTST}/\textbf{iTransformer} for long-horizon multivariate, and the 2025-era pretrained forecasters \textbf{TimesFM}, \textbf{Chronos}, \textbf{Moirai}, and \textbf{TimeGPT} for zero-shot and few-shot use.
+
+\textbf{The honest note on foundation models.} Zero-shot forecasters are a real convenience---respectable accuracy on a new series with no training pipeline at all, which makes them a strong cold-start and long-tail option and an excellent quick baseline. Two cautions belong in any answer that mentions them: their pretraining corpora contain many of the public benchmark series, so published zero-shot numbers deserve an out-of-corpus check before you believe them; and they consume none of your business's known-in-advance covariates unless you fine-tune, which is exactly where most of the lift in a commercial forecasting problem lives.
+
+\textbf{When classical and GBM still win.} Few series. Short history---under two or three complete seasonal cycles there is nothing for a network to learn that seasonal naive does not already encode. Strong, simple, stable seasonality. Interpretability, audit, or regulatory constraints where you must explain why a number moved. Tight operational budgets, small teams, and CPU-only serving. And any situation where the forecast must reconcile exactly up a hierarchy and be defended line by line to a planner.
+
+\begin{table}[H]\centering
+\caption{Method selection. Read it as a starting point that a backtest is allowed to overturn, never as a substitute for running the baselines.}
+\label{cml:tab:ts_method_choice}
+\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.30\textwidth} >{\raggedright\arraybackslash}p{0.22\textwidth} X@{}}
+\toprule
+\textbf{Situation} & \textbf{Start with} & \textbf{Why} \\
+\midrule
+1--50 series, $\ge 3$ seasonal cycles, few covariates & Auto-ETS or auto-ARIMA & Fast, no leakage surface, hard to beat; intervals come free \\
+1--50 series, strong holiday/event structure & ETS or dynamic regression with Fourier and holiday terms & Events must enter as regressors; Prophet is acceptable as a quick decomposition \\
+Many related series (hundreds to $10^5$) with rich known-in-advance covariates & Global LightGBM & The M5 configuration: pooling plus features beats per-series models \\
+Any series with $< 2$ seasonal cycles of history & Seasonal naive, or a global model borrowing from sibling series & Nothing to fit; cold start is an attribute problem, not a modeling one \\
+The same, \emph{plus} multimodal covariates, long horizons, and a coherent probabilistic requirement, with the GBM plateaued & Global DL (DeepAR, TFT, N-HiTS) & Enough data to learn shared representations; native distributional heads \\
+Brand-new series, no pipeline, need a number today & Pretrained zero-shot forecaster & Reasonable accuracy with no training; verify against seasonal naive \\
+Intermittent / lumpy demand with many zeros & Croston, or a Tweedie/Poisson GBM & Squared error on a zero-inflated target is misspecified \\
+Regulated, audited, or contested forecasts & Classical model with explicit regressors & Every movement must be attributable to a named driver \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+%==============================================================================
 \section{Interview Questions}
-% TODO Phase C3
+\label{cml:sec:ts_interview}
+%==============================================================================
 
+\begin{interviewq}
+\textbf{Q: Forecast daily demand for 5{,}000 SKUs across 20 warehouses, 28 days ahead. Walk me through your approach.}
+
+\badgeLsix{L6} \quad \badgetype{System Design} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Start with the problem definition, not the model. \textbf{What decision does the forecast drive} (replenishment order quantities at a 28-day lead time), \textbf{what horizon and granularity} (daily, SKU $\times$ warehouse, 28 days, refreshed weekly), \textbf{what loss} (asymmetric---stockouts and overstock cost different amounts, which argues for quantiles at a service level rather than a point forecast), and \textbf{what is known in advance} (promotion calendar, price plan, store closures, holiday calendar).
+
+Then baselines. Seasonal naive at $m=7$ and $m=364$, drift, and auto-ETS on the top few hundred series by revenue. These are the denominators for everything that follows and they go on the dashboard permanently.
+
+Then the model. One \textbf{global LightGBM} over all $5{,}000 \times 20$ series: lag features at lags $\ge 28$ plus seasonal lags at 364; trailing rolling mean/std/zero-rate over 7/28/91 windows, all built with \texttt{shift(28)} first; calendar features and signed days-to-holiday with regional holiday sets; price and promotion as known-in-advance covariates; series ID, item, category, department, warehouse, and region as categoricals; per-series training-window statistics for cold start. Target on $\log(1+y)$ or, better for the extrapolation reason, on a ratio to a trailing baseline. Objective: Tweedie or Poisson given the zero-heavy long tail, plus quantile models at $\tau \in \{0.5, 0.9, 0.95\}$ for the service-level band.
+
+Then validation: \textbf{rolling-origin backtest}, four to six 28-day test windows, a 28-day embargo before each, refit at each origin exactly as production will; report per-series MASE and RMSSE aggregated with revenue weights, the error-vs-horizon curve, and empirical coverage of the quantile bands.
+
+Then the operational layer: hierarchy reconciliation (bottom-up as the default, MinT if the aggregates matter), cold-start SKUs handled by attribute-based borrowing plus a category-level seasonal profile, an override/holdback mechanism for known one-off events, and monitoring that alerts when rolling MASE crosses 1.0 against seasonal naive. Escalate to a global neural forecaster only if the backtest shows the GBM plateauing while covariate richness keeps growing.
+
+\redflags
+\begin{itemize}
+    \item Opening with an architecture (``I'd use an LSTM'') before naming a baseline or asking what the forecast is for.
+    \item 5{,}000 separate ARIMA models, or 5{,}000 separate anything, with no mention of pooling.
+    \item A feature list containing \texttt{lag\_1} for a 28-day-ahead forecast.
+    \item Random train/test split, or a single holdout window presented as validation.
+    \item A point forecast only, when the decision is an inventory quantity that obviously needs a service level.
+\end{itemize}
+
+\interviewtest{Whether you have actually built a forecasting system. The tells are all structural: baselines first, features that respect the prediction origin, rolling-origin validation with an embargo, a scaled metric, and an answer to ``what happens to a SKU launched yesterday.''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Global GBM with lag/rolling/calendar features, rolling-origin backtest, MASE against seasonal naive.
+    \item \badgeLsix{L6} Ties the loss to the decision (quantiles at a service level, asymmetric cost), gets the $\ge h$ lag constraint and the embargo right unprompted, handles cold start and intermittency, reports error by horizon.
+    \item \badgeLseven{L7} Owns the whole system: point-in-time feature store, hierarchy reconciliation, retraining cadence justified by the observed decay curve, human-override paths for known events, and a stated policy for when the model is switched off in favour of the baseline.
+\end{itemize}
+
+\followups{``How do you forecast a SKU launched yesterday?'' ``The planners say the forecast is always low in December---diagnose.'' ``What would make you move to a neural forecaster?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Why can't you use standard $k$-fold cross-validation on time series, exactly---and what do you use instead?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Three separate reasons, and ``leakage'' by itself only covers the first.
+
+\textbf{(1) Direct lookahead.} With random folds, the training set contains rows from after the validation rows. Every feature computed across rows---rolling statistics, target encodings, fitted scalers, imputation means---then carries future information backwards. This is a concrete bug you can point at.
+
+\textbf{(2) Autocorrelation destroys fold independence even with no coding bug.} $y_{t-1}$ and $y_{t+1}$ sit in the training folds and are highly correlated with the held-out $y_t$, so the model is \emph{interpolating between known neighbours}. That is a strictly easier problem than the one production faces, which is extrapolating past the end of the series. $k$-fold is not a noisy estimate of the right quantity; it is an accurate estimate of the wrong one.
+
+\textbf{(3) Regime mismatch.} $k$-fold averages over every historical regime, while production always runs in the newest one. It cannot show model decay, cannot produce an error-vs-horizon curve, and therefore cannot inform retraining cadence.
+
+\textbf{What you use instead:} rolling-origin (walk-forward) backtesting---train on everything up to a cut, leave a gap, score the next $h$ steps, roll forward, repeat over several folds (Figure~\ref{cml:fig:ts_rolling_origin}). Expanding window when data is scarce, sliding window when the process is non-stationary and old regimes mislead. The \textbf{gap} is required whenever a training row's target lands after the cut: with horizon $h$ the embargo is at least $h$, and wider if features use long windows or labels are defined over a forward window. Refit inside the loop exactly as production will, and report per-fold error rather than one pooled number. For panels of many series you split on \emph{time}, never on series---holding out series tests generalization to new series, which is a different (and also useful) question.
+
+\redflags
+\begin{itemize}
+    \item ``Shuffle with a fixed random seed so it's reproducible''---reproducibility is not the problem.
+    \item Naming only lookahead and missing the autocorrelation/interpolation argument.
+    \item A single train/test split by date, presented as sufficient, with no discussion of multiple origins or the gap.
+    \item Holding out random \emph{series} instead of a time period and calling it a temporal split.
+\end{itemize}
+
+\interviewtest{Whether you understand that the validation scheme must mimic the deployment scheme. Everyone can say ``don't shuffle time series''; the depth probe is why an embargo is needed at all, and the answer requires you to notice that a training row has \emph{width}---a feature window behind it and a label window ahead of it.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names lookahead, proposes rolling-origin backtesting, splits on time.
+    \item \badgeLsix{L6} Gives all three mechanisms, derives the embargo length from the horizon and the label window, distinguishes expanding from sliding and says when each, insists on multiple folds and refitting in the loop.
+    \item \badgeLseven{L7} Connects it to production: the backtest is the retraining-cadence experiment; quantifies the optimism from a real project; notes that hyperparameter and early-stopping choices must also be made inside the loop or the future leaks in through tuning.
+\end{itemize}
+
+\followups{``How wide should the embargo be if your label is `churned within 60 days'?'' ``When is a sliding window better than expanding?'' ``Does purged CV change anything if all your features are pure lags?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your GBM forecast flatlines just under the recent maximum while demand keeps growing. What is happening and how do you fix it?}
+
+\badgeLfive{L5} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+\textbf{This is the hypothesis class, not a bug.} A decision tree is piecewise constant: it splits feature space at a finite set of thresholds and predicts a constant---an average of training targets---in each cell. Past the outermost threshold there are no more splits, so the prediction stops changing. A boosted ensemble is a sum of piecewise-constant functions and inherits the property exactly, so \emph{no} amount of extra trees, depth, data, or tuning will make a GBM predict a value outside the range it saw in training. On a trending series it tracks the trend while the trend is inside the training range and then flatlines forever.
+
+Confirm it in one plot: forecast versus actuals versus the \textbf{drift} baseline. A flat line beating naive and losing to drift is the signature. A second tell is a raw time index or cumulative counter high in the feature importances---every future value of such a feature lands in the last bin the model ever saw.
+
+Fixes, in the order I would offer them:
+\begin{enumerate}
+    \item \textbf{Model a stationary target.} Predict $\nabla y_t$, or $y_t - y_{t-m}$, or $\log(y_t/y_{t-m})$, and integrate back. The target now stays inside its training range no matter how high the level climbs. This is what most production stacks do.
+    \item \textbf{Predict a ratio to a baseline}---$y_t / b_t$ with $b_t$ a trailing mean or a seasonal-naive value---so the baseline carries the level and the GBM learns the correction.
+    \item \textbf{Hybrid.} Fit a linear or damped-trend model, boost on its residuals, and add. The linear part extrapolates; the trees do the seasonality, calendar, and covariate work they are good at.
+    \item \textbf{Non-constant leaves.} LightGBM's \texttt{linear\_tree} fits a linear model per leaf; a monotone constraint on a trend feature is a blunter version.
+\end{enumerate}
+
+Generalize before finishing: the same ceiling applies to any feature whose distribution drifts out of the training range---cumulative counters, prices under inflation, tenure fields---so this is a design-review question, not only a debugging one.
+
+\redflags
+\begin{itemize}
+    \item ``Add more trees / increase depth / more data.'' None of these touch the mechanism.
+    \item ``Add the timestamp as a feature so it learns the trend.'' This is the failure mode, not the fix.
+    \item Not knowing that random forests and every other tree ensemble share the property.
+    \item Jumping straight to ``switch to an LSTM'' without proposing differencing---an enormous complexity increase to solve a target-transform problem.
+\end{itemize}
+
+\interviewtest{Whether you reason about a model's hypothesis class rather than its hyperparameters. The follow-up ``why exactly can't it extrapolate?'' separates people who memorized the fact from people who can say ``piecewise constant, no split beyond the last threshold.''}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} States the piecewise-constant reason and proposes differencing the target.
+    \item \badgeLsix{L6} Offers the ratio-to-baseline and hybrid options with their trade-offs, gives the drift-baseline diagnostic, and warns about drifting \emph{features}, not just the drifting target.
+    \item \badgeLseven{L7} Notes the mirror-image benefit (trees never produce runaway extrapolations, which is why the hybrid keeps the linear part bounded), discusses reintegration of differenced forecasts and how error accumulates over the cumulative sum, and ties the choice back to what the business will do with a long-horizon number.
+\end{itemize}
+
+\followups{``If you difference the target, how do you build prediction intervals on the reintegrated level?'' ``Would a random forest behave differently?'' ``What if the trend is in a covariate rather than the target?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Your backtest MASE is 0.72 and everyone is thrilled. In production the forecasts are terrible. Give me your differential diagnosis.}
+
+\badgeLsix{L6} \quad \badgetype{Debugging} \quad \badgefreq{\freqhigh}
+
+\stronganswer
+
+Work the list in order of prior probability, and make each hypothesis testable.
+
+\textbf{1. Temporal leakage in features (most likely).} Audit every column against ``would this exact value have been in the warehouse at the prediction origin?'' The usual offenders: a centered rolling window; a rolling statistic not shifted by the horizon, so the model trained with knowledge up to $t$ but serves with knowledge up to $t-h$; a scaler or target encoding fit over the full history; and exogenous features trained on \emph{realized} values (weather, competitor price) that are only forecasts at serve time. Test: recompute the feature table from a warehouse snapshot dated at the origin and re-run the backtest; if the number collapses, you have found it.
+
+\textbf{2. Revised data.} Your backtest used today's corrected history; production sees first prints. Macro revisions, restated financials, backfilled delivery timestamps, and late-arriving labels all do this. Test: compare a feature's value as stored today with its value in an old snapshot. Fix: point-in-time joins.
+
+\textbf{3. Validation scheme mismatch.} Was it really rolling-origin with an embargo, refit at each fold, or did someone tune hyperparameters and early-stopping rounds across all folds? Tuning on the future leaks just as effectively as a bad feature.
+
+\textbf{4. Train/serve skew that is not leakage.} Different code paths compute features offline and online; a join that is left-outer offline and inner online; a timezone or business-day calendar mismatch; missing values imputed differently. Test: log production features and score them offline---the same model on the same rows must reproduce the same predictions.
+
+\textbf{5. The world changed.} A promotion regime, a competitor, a pricing change, a pandemic. Test: is the \emph{baseline} also degraded? If seasonal naive got worse by a similar factor, the series changed and the model is innocent; if only the model degraded, it is yours.
+
+\textbf{6. Recursive degradation.} If the model is recursive, offline evaluation may have used true lags while production feeds predicted ones. Re-run the backtest with fully simulated recursion.
+
+\textbf{7. Aggregation and metric mismatch.} MASE 0.72 as a mean over 5{,}000 series can be driven by the easy long tail while the revenue-heavy head is worse than baseline. Recompute weighted by revenue and by horizon before believing the headline.
+
+The organizing principle: \textbf{always compare against the baseline in both environments.} Baseline fine offline and online while the model degrades means the bug is yours; both degrading means the world moved.
+
+\redflags
+\begin{itemize}
+    \item Jumping straight to retraining or hyperparameter tuning without a hypothesis.
+    \item ``Concept drift'' offered as a first answer with no test that distinguishes it from leakage.
+    \item Not checking whether the baseline degraded too.
+    \item No mention of point-in-time data or feature parity between offline and online paths.
+\end{itemize}
+
+\interviewtest{Structured debugging under ambiguity---the staff signal here is whether your hypotheses are ordered by prior probability and each attached to a cheap discriminating test, rather than listed as a flat set of possibilities.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names leakage and a bad split, proposes auditing features and re-running with a proper backtest.
+    \item \badgeLsix{L6} Produces the ordered differential with a test per hypothesis, separates leakage from train/serve skew from genuine drift, and uses the baseline-in-both-environments discriminator.
+    \item \badgeLseven{L7} Talks about prevention: point-in-time feature store, one shared feature-computation path, backtest harness in CI that refuses to score a feature table it cannot rebuild from a dated snapshot, and a launch policy that shadow-runs before switching traffic.
+\end{itemize}
+
+\followups{``Design a test that would have caught the centered-window bug in CI.'' ``How would you tell leakage from drift in one plot?'' ``What do you do in the meantime---roll back to what?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: You need one accuracy number across 5{,}000 SKUs of wildly different volume. Which metric, and why not MAPE?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{MASE}, aggregated with business weights, plus the baseline printed next to it.
+
+MAE and RMSE are not comparable across scales---a SKU selling 10{,}000 units contributes a hundred times the MAE of one selling 100, so a mean over SKUs ranks volume, not accuracy. MAPE fixes the scale but breaks in two ways. It is undefined at $y_t = 0$ and explodes near zero, which is fatal for retail where zero-sales days are common. And its range is asymmetric: under-forecasting is capped at 100\% while over-forecasting is unbounded, so \textbf{minimizing MAPE biases forecasts low}. Concretely, with demand equal to 10 or 1000 with equal probability, forecasting 10 gives MAPE 49.5\% and forecasting 1000 gives 4950\%, while MAE is 495 either way---MAPE will happily push you to the low forecast and out of stock. sMAPE is bounded but is not actually symmetric either and leans the other way: against an actual of 100, a forecast of 110 scores 9.52\% and a forecast of 90 scores 10.53\%.
+
+MASE divides each series' test MAE by the in-sample MAE of the seasonal naive method on that series' \emph{training} window:
+\[
+\text{MASE} = \frac{\frac{1}{n}\sum_{\text{test}}|y_t - \hat{y}_t|}{\frac{1}{T-m}\sum_{t=m+1}^{T}|y_t - y_{t-m}|}.
+\]
+It is scale-free, defined with zeros present, symmetric in error direction, and---the part that makes it an interview differentiator---\textbf{interpretable}: 1.0 is exactly seasonal naive, 0.8 is 20\% better than seasonal naive, above 1.0 means delete the model. Because the denominator is a fixed training-set constant per series, it is comparable across models and across horizons. Use RMSSE if you want to penalize large errors (M5's WRMSSE is exactly RMSSE weighted by dollar contribution). Report the median as well as the mean because the distribution is right-skewed, and break out by horizon.
+
+\redflags
+\begin{itemize}
+    \item MAPE on a series with zeros, or MAPE with no mention of its bias direction.
+    \item Averaging MAE across differently scaled series.
+    \item Computing the MASE denominator on the test window instead of the training window.
+    \item A single scalar with no baseline next to it and no horizon breakdown.
+\end{itemize}
+
+\interviewtest{Whether metric choice is reasoned from the data's properties (zeros, scale spread, cost asymmetry) rather than recited. The MAPE-bias direction is the specific detail most candidates get backwards.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} MASE with the correct definition and the ``1.0 equals naive'' reading; MAPE's zeros problem.
+    \item \badgeLsix{L6} Gets the asymmetry direction right with a worked number, knows the denominator is in-sample, uses business weights and reports by horizon.
+    \item \badgeLseven{L7} Connects the metric to the decision---asymmetric stockout vs.\ holding cost means the point metric is the wrong object entirely and pinball loss at the service-level quantile is what should be optimized and reported.
+\end{itemize}
+
+\followups{``What if over- and under-forecasting cost different amounts?'' ``Why median rather than mean MASE?'' ``How would you report accuracy to a VP in one chart?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: What is stationarity, and why do ARIMA-type models want it?}
+
+\badgeLfive{L5} \quad \badgetype{Conceptual} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Weak (covariance) stationarity}: the mean is constant in time, the variance is constant and finite, and $\Cov(y_t, y_{t+k})$ depends only on the lag $k$, not on $t$. Strict stationarity asks the whole joint distribution to be shift-invariant; weak stationarity asks it only of the first two moments, which is all a linear model uses.
+
+Why the models want it: an ARMA model has \emph{constant} coefficients, and fitting constant coefficients to a process whose moments move is incoherent. If the mean drifts, one estimated intercept is wrong everywhere. If the autocovariance depends on $t$, then the sample ACF---which pools all time points to produce one number per lag---is averaging quantities that are not equal, so the plot you would use to identify the model is meaningless. Stationarity plus ergodicity is precisely the license to use one long realization to estimate ensemble moments you can never resample. It also makes the forecast honest: for a stationary process the $h$-step forecast reverts to the mean and its error variance saturates at the unconditional variance, so the model announces when it has run out of information instead of extending a line forever.
+
+Getting there: log or Box--Cox for variance, first differencing $\nabla y_t$ for a stochastic trend, seasonal differencing $\nabla_m y_t$ for seasonality, deterministic detrending for a deterministic trend. Differencing and detrending are not interchangeable---differencing is right when shocks are permanent (random walk), detrending when they die out around a fixed line. ADF (null: unit root) and KPSS (null: stationarity) are the tests, both weak against near-unit-root alternatives; in practice $d$ is chosen by a unit-root rule and a plot, and $d \in \{0,1\}$ covers nearly everything. Over-differencing is a real cost: it inflates variance and injects a non-invertible MA unit root, visible as $\rho_1$ near $-0.5$.
+
+Close with the trap: two independent random walks regressed on each other produce a significant slope roughly three quarters of the time and a large $R^2$, with residual autocorrelation near one. That is \textbf{spurious regression}, and it is why you difference before regressing trending series on each other, or establish cointegration first.
+
+\redflags
+\begin{itemize}
+    \item ``The data doesn't change over time''---too vague to be checkable, and wrong (stationary series change constantly).
+    \item Confusing stationarity with i.i.d.\ data; a stationary series can be strongly autocorrelated.
+    \item Fitting ARIMA to an obviously trending series and reporting in-sample $R^2$ as forecast skill.
+    \item Treating ADF as a decisive oracle rather than a weak test.
+\end{itemize}
+
+\interviewtest{Whether you know why an assumption exists rather than that it exists. The good version connects constant moments to the estimability of the ACF and the sanity of the forecast function; the weak version recites the three bullet points.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct three-part definition, differencing as the fix, ADF named.
+    \item \badgeLsix{L6} Explains why constant moments make the sample ACF meaningful, distinguishes stochastic from deterministic trend, warns about over-differencing.
+    \item \badgeLseven{L7} Brings up spurious regression and cointegration, notes that GBM feature pipelines need the same discipline (a non-stationary raw level as a feature is the extrapolation trap), and observes that stationarity is a modeling convenience rather than a property real business series possess.
+\end{itemize}
+
+\followups{``How do you tell a deterministic from a stochastic trend?'' ``Do GBMs need stationarity?'' ``What is cointegration and when would you use it?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Recursive or direct multi-step forecasting---which do you pick and why?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+\textbf{Recursive}: one one-step model, fed its own predictions to walk forward. Single artifact, every training row usable, consistent dynamics across the path, and the short lags that carry the most signal remain available at every step. Two costs: errors compound, and---the subtler one---there is a \textbf{train/serve mismatch}, because the model was fit on true lag values and is served predicted ones, whose distribution is smoother and less variable than what it trained on. That mismatch, not just error accumulation, is why recursive paths often degrade faster than the arithmetic of compounding suggests. Mitigate by injecting noise into lag features during training, or by mixing true and predicted lags scheduled-sampling style.
+
+\textbf{Direct}: $H$ models, one per horizon, each mapping origin-time features to $y_{t+h}$. No compounding, no train/serve mismatch (each model sees exactly its serving inputs), and per-horizon feature sets and hyperparameters. Costs: $H$ artifacts to train, tune, monitor, and roll back; fewer usable rows per model; no sharing across horizons; and forecast paths that can be jagged because nothing ties $\hat{y}_{T+7}$ to $\hat{y}_{T+8}$.
+
+\textbf{How I choose.} Short horizons and strong short-lag signal favour recursive. Long horizons, a hard train/serve parity requirement, or per-horizon covariate availability favour direct. If $H$ is large, the pragmatic middle is \emph{one} model with $h$ as a feature and lags restricted to $\ge H$, which shares structure but remains direct in spirit; multi-output models do the same thing natively in neural forecasters. In practice I would run both on the same rolling-origin backtest and compare the \textbf{error-vs-horizon curves}, not the pooled averages, because the expected shape is recursive winning at small $h$ and crossing over; the blend of the two typically beats either, which is what the M5 leaderboard reflected.
+
+\redflags
+\begin{itemize}
+    \item Naming only error accumulation and missing the train/serve distribution mismatch.
+    \item Claiming direct is strictly better without pricing $H$ models in operations.
+    \item Building a recursive model and evaluating it with true lags at every step---the evaluation must simulate the recursion.
+    \item Comparing the two on a single pooled metric that averages over all horizons.
+\end{itemize}
+
+\interviewtest{Whether you can reason about a modeling choice that is simultaneously statistical (error propagation), distributional (train/serve mismatch), and operational ($H$ artifacts). Staff candidates price all three.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Correct definitions and the compounding-vs-many-models trade-off.
+    \item \badgeLsix{L6} Adds the train/serve mismatch and its mitigations, the horizon-as-a-feature middle ground, and evaluation by error-vs-horizon curve.
+    \item \badgeLseven{L7} Discusses blending, the operational cost of $H$ models under a retraining schedule, coherence of the forecast path as a stakeholder-facing property, and when a native multi-output model changes the calculus.
+\end{itemize}
+
+\followups{``How do you make a direct forecast path smooth?'' ``What breaks if a covariate is available at $h=1$ but not $h=28$?'' ``How would you evaluate a recursive model honestly?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: Build me a forecast with uncertainty bands the business will actually trust.}
+
+\badgeLsix{L6} \quad \badgetype{First Principles} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+Start from the decision. A band is only useful if it answers a question someone is acting on---``how much stock covers 95\% of weeks'' or ``what is the worst-case capacity we must provision.'' That fixes the quantile levels before any modeling.
+
+Then produce them by optimizing the \textbf{pinball loss}: for level $\tau$, $L_\tau(y,q) = \tau(y-q)$ when $y \ge q$ and $(1-\tau)(q-y)$ otherwise, whose expected-loss minimizer is exactly the $\tau$-quantile of the predictive distribution. In a GBM stack that means one model per $\tau$ with the quantile objective; the asymmetry does the work---at $\tau = 0.9$ an under-forecast of 20 costs 18 and an over-forecast of 20 costs 2, so the fit sits high. The resulting intervals are \emph{conditional}: wide for volatile SKUs, narrow for stable ones, which is the entire advantage over adding a single global residual quantile to a point forecast.
+
+Then the part that earns the trust: \textbf{validate coverage empirically on the rolling-origin backtest, by horizon}. Count the fraction of actuals below each predicted quantile and report it against nominal. Nominal 80\% delivering 71\% is common and is the actual finding you take to stakeholders. Fix under-coverage with a conformal-style residual adjustment---calibrate on a held-out recent window and widen by the empirical residual quantile---rather than by re-tuning the model. Sort predicted quantiles to eliminate crossing. And be explicit that residual spread grows with horizon, so calibration must be per-horizon; a single pooled residual distribution is too wide at $h=1$ and far too narrow at $h=H$.
+
+Finally, name what the bands do not cover: they are conditional on the covariates you supplied and on the world behaving as it did in the backtest window. A promotion nobody told you about, a supply shock, or a competitor exit is outside the band by construction. Saying this out loud is what makes a forecasting team credible after the first miss.
+
+\redflags
+\begin{itemize}
+    \item Reporting a Gaussian $\pm 1.96\sigma$ band from in-sample residuals with no coverage check.
+    \item Treating nominal coverage as achieved coverage.
+    \item One residual distribution pooled across all horizons.
+    \item Presenting bands with no statement of what they exclude.
+\end{itemize}
+
+\interviewtest{Whether you distinguish a \emph{claimed} interval from a \emph{measured} one, and whether you can connect the quantile level back to a business decision instead of defaulting to 95\%.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Quantile GBM with pinball loss, correct interpretation of $\tau$.
+    \item \badgeLsix{L6} Empirical coverage validation by horizon, conformal-style widening, quantile-crossing fix, quantile levels chosen from the decision.
+    \item \badgeLseven{L7} Frames the whole thing as a decision problem (newsvendor: the optimal service level is the critical ratio of understock to understock-plus-overstock cost), and states the model's blind spots to stakeholders before they are discovered.
+\end{itemize}
+
+\followups{``Why is conformal awkward on time series?'' ``What service level should inventory use, and how would you derive it?'' ``How do you aggregate quantiles up a product hierarchy?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: When would you reach for a deep sequence model instead of ETS or a global GBM?}
+
+\badgeLsix{L6} \quad \badgetype{Trade-off} \quad \badgefreq{\freqmed}
+
+\stronganswer
+
+When the data supplies what a network needs and the classical stack has visibly plateaued. Concretely: \textbf{many related series} (thousands and up) so a global network can learn shared structure instead of memorizing; \textbf{rich or multimodal covariates}---prices, promotions, text, images, upstream demand signals---that a network can fuse and a per-series ETS cannot represent at all; \textbf{long horizons with several interacting seasonalities}; \textbf{high-cardinality hierarchies} where learned embeddings genuinely beat one-hot or target encoding; and a need for a coherent \textbf{probabilistic} global model rather than a rack of independent quantile regressions. The names: DeepAR for the autoregressive probabilistic workhorse, N-BEATS/N-HiTS for univariate depth, TFT when you also need per-feature interpretability and native quantiles, PatchTST/iTransformer for long-horizon multivariate, and TimesFM/Chronos/Moirai/TimeGPT for zero-shot cold start. Architecture detail is [NLP 4] for recurrent and attention models and [DL 14] for state-space models.
+
+When they do not earn it: few series, less than two or three seasonal cycles of history, simple stable seasonality, or hard interpretability, audit, latency, or headcount constraints. And I would cite the record rather than assert a preference: M4 was won by a \emph{hybrid} of exponential smoothing and an RNN, with a gradient-boosted combination of statistical methods second and the pure-ML entries below the simple statistical benchmark; M5 was won by LightGBM global models; and Zeng et al.\ (2023) showed a single linear layer beating the transformer forecasters of the day on long-horizon benchmarks, which prompted better baselines and then genuinely stronger designs. The lesson is not that deep learning fails---it is that published margins in this field have repeatedly been artifacts of weak baselines, so the decision belongs to your rolling-origin backtest against seasonal naive, ETS, and a global GBM, in that order.
+
+\redflags
+\begin{itemize}
+    \item ``Deep learning is state of the art for time series'' with no baseline comparison.
+    \item Proposing an LSTM or transformer for a few hundred data points.
+    \item Naming architectures without naming a single condition under which they help.
+    \item Quoting zero-shot foundation-model benchmark numbers without noting that those series are often in the pretraining corpora.
+\end{itemize}
+
+\interviewtest{Calibration. This is a question about whether you can decline to use the impressive tool, and whether your reasons are data-shaped (series count, history length, covariate richness) rather than fashion-shaped.}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} Names the ``many related series plus rich covariates'' condition and insists on baselines.
+    \item \badgeLsix{L6} Adds the M4/M5/DLinear record with the right conclusions, names architectures with the condition each addresses, and prices the operational cost.
+    \item \badgeLseven{L7} Treats it as a portfolio decision---start global GBM, instrument the plateau, run the DL model in shadow against the same backtest, and define in advance the margin that would justify the added serving and on-call cost; also flags the foundation-model contamination caveat.
+\end{itemize}
+
+\followups{``What would you shadow-run first?'' ``How much lift would justify the extra ops burden?'' ``When is a hybrid better than either?''}
+\end{interviewq}
+
+\begin{interviewq}
+\textbf{Q: I show you an ACF that decays geometrically and a PACF with one big spike at lag 1 and nothing after. What model, and what does the parameter mean?}
+
+\badgeLfive{L5} \quad \badgetype{Mathematical} \quad \badgefreq{\freqlow}
+
+\stronganswer
+
+\textbf{AR(1).} The PACF cutting off at lag $p$ identifies AR($p$); the ACF cutting off at lag $q$ identifies MA($q$); both tailing off means ARMA and the orders come from AICc rather than from the plots. The mechanism behind the rule is worth one sentence: the PACF at lag $k$ is the correlation between $y_t$ and $y_{t-k}$ after removing the intervening lags, so for AR(1) it is zero past lag 1 even though the ACF is not---$y_t$ and $y_{t-2}$ are correlated only \emph{through} $y_{t-1}$.
+
+For $y_t = c + \phi y_{t-1} + \varepsilon_t$ with $|\phi| < 1$, write it in deviation form around $\mu = c/(1-\phi)$. Then $\rho_k = \phi^k$, $\Var(y_t) = \sigma^2/(1-\phi^2)$, and the $h$-step forecast is
+\[
+\hat{y}_{T+h|T} = \mu + \phi^h\,(y_T - \mu),
+\]
+i.e.\ \textbf{mean reversion with memory $\phi$}. The interpretable unit is the half-life $\ln(0.5)/\ln\phi$: at $\phi = 0.9$ a shock is half gone in $6.6$ periods and $\phi^{10} = 0.35$, so ten steps out the forecast has travelled 65\% of the way back to the mean. As $\phi \to 1$ the half-life diverges and the process becomes a random walk with permanent shocks---the non-stationary case that differencing exists to handle. Negative $\phi$ gives alternating-sign decay, which is what an over-differenced series looks like.
+
+One sanity check to volunteer: if instead the ACF had cut off at lag 1 with $\rho_1 = 0.8$, it would \emph{not} be MA(1), because MA(1) has $\rho_1 = \theta/(1+\theta^2)$, which cannot exceed $0.5$ in magnitude.
+
+\redflags
+\begin{itemize}
+    \item Swapping the rule (``ACF cuts off means AR'').
+    \item Reading orders off the plots for a mixed ARMA process where both tail off.
+    \item Not checking stationarity first---a slowly decaying, near-linear ACF with a lag-1 PACF spike near 1 is a unit root, and the answer is ``difference it,'' not ``AR(1).''
+    \item Unable to say what $\phi$ means in time units.
+\end{itemize}
+
+\interviewtest{Whether the identification rules are backed by the definition of partial autocorrelation rather than memorized, and whether you can turn a coefficient into a business-legible statement (``shocks half-decay in about seven days'').}
+
+\goodgreat
+\begin{itemize}
+    \item \badgeLfive{L5} AR(1), correct rule, $\rho_k = \phi^k$.
+    \item \badgeLsix{L6} Explains the rule from the definition of PACF, gives the half-life and the mean-reversion forecast, checks for the unit-root confound first.
+    \item \badgeLseven{L7} Adds the MA(1) $|\rho_1| \le 1/2$ bound, notes that AIC is not comparable across different differencing orders, and finishes on residual diagnostics (Ljung--Box) rather than on in-sample fit.
+\end{itemize}
+
+\followups{``What if the PACF spikes at lags 1 and 7?'' ``How would you handle two seasonal periods?'' ``What is the half-life if $\phi = 0.5$?''}
+\end{interviewq}

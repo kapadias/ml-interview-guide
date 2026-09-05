@@ -2,14 +2,14 @@
 
 <!-- GENERATED FILE - do not edit by hand. Regenerate with `make index`. -->
 
-All **543 questions** across the four volumes, so you can find a question without knowing which volume it lives in.
+All **609 questions** across the four volumes, so you can find a question without knowing which volume it lives in.
 
 | Volume | Questions | Breadth | Depth | Coding | Design | Behavioral |
 |---|---|---|---|---|---|---|
 | Volume I — Deep Learning Essentials | 301 | 75 | 153 | 16 | 50 | 7 |
 | Volume II — NLP Essentials | 128 | 63 | 36 | 0 | 29 | 0 |
 | Volume III — Search & Recommendation Essentials | 92 | 26 | 42 | 0 | 21 | 3 |
-| Volume IV — Conventional ML Essentials | 22 | 10 | 9 | 0 | 3 | 0 |
+| Volume IV — Conventional ML Essentials | 88 | 27 | 42 | 10 | 9 | 0 |
 
 ## Volume I — Deep Learning Essentials
 
@@ -690,6 +690,21 @@ All **543 questions** across the four volumes, so you can find a question withou
 
 ## Volume IV — Conventional ML Essentials
 
+### [CML 1] Supervised Learning Core
+
+- `L5` `Mathematical` *** — Why does L1 regularization produce sparse solutions and L2 does not?
+- `L5` `Mathematical` *** — Derive the normal equations for linear regression. When would you not use the closed form?
+- `L5` `First Principles` *** — Derive logistic regression's loss from maximum likelihood, give its gradient, and explain why we do not just use squared error
+- `L6` `Mathematical` ** — Derive the SVM: margin, primal, dual, and the kernel trick. What exactly is a support vector?
+- `L6` `Conceptual` ** — Generative versus discriminative---define them, and use Naive Bayes and logistic regression to explain the trade-off
+- `L5` `Debugging` ** — Your logistic regression's weights blew up to `pm 10^6` and training accuracy is exactly 1.0. What happened, and what do you do?
+- `L5` `Conceptual` ** — What does `C` do in an SVM? What about `gamma` in an RBF kernel?
+- `L5` `Conceptual` ** — Why does `k`-NN degrade in high dimensions? Quantify it
+- `L6` `Trade-off` *** — When would you deploy logistic regression instead of gradient boosting in 2026?
+- `L6` `Debugging` ** — You fit a linear model on 150 rows and 200 features. The coefficients flip sign between refits and two features have VIF over 40. Walk me through it
+- `L6` `Architecture Design` * — You need to model weekly support tickets per account. The target is a non-negative integer, most accounts have zero or one, a few have hundreds, and accounts have very different sizes. Design the model
+- `L7` `System Design` * — Design the model layer for an ad click-through-rate system: `10^9` events per day, `10^8` hashed sparse features, hourly retraining, sub-millisecond scoring, and the score is multiplied by a bid
+
 ### [CML 2] Trees and Ensembles
 
 - `L5` `Mathematical` *** — Derive the optimal leaf weight and the split-gain formula in XGBoost
@@ -705,6 +720,49 @@ All **543 questions** across the four volumes, so you can find a question withou
 - `L6` `Debugging` ** — Your random forest's impurity-based feature importance says session_id_hash is the top feature. The PM wants to build product strategy around the ranking. What do you tell them?
 - `L7` `System Design` * — Design the serving story for a GBDT fraud model: p99 model latency under 2,ms at 20K QPS, with a compliance requirement that risk never decreases as chargeback count increases
 
+### [CML 3] Unsupervised Learning
+
+- `L5` `Mathematical` *** — Derive PCA from first principles. Whiteboard it
+- `L5` `First Principles` *** — Why does k-means converge, and what does it converge to? And why do you need k-means++?
+- `L6` `Mathematical` *** — Derive the EM updates for a Gaussian mixture model, and explain why the likelihood increases monotonically
+- `L5` `Trade-off` *** — How do you choose `k`? Your teammate says the elbow plot shows 8 clusters
+- `L6` `Debugging` *** — Your t-SNE plot of user embeddings shows five clean, well-separated clusters. What can you conclude?
+- `L5` `Conceptual` *** — When does k-means fail, and what do you use instead?
+- `L5` `Mathematical` ** — What is the relationship between PCA and SVD, and why do libraries use the SVD?
+- `L6` `Mathematical` ** — How is k-means a special case of a Gaussian mixture model?
+- `L6` `Trade-off` ** — You have 10K-dimensional sparse features and want to reduce them for a downstream classifier. PCA, or something else?
+- `L6` `Debugging` * — Your GMM's training log-likelihood spikes toward infinity and one component's weight collapses. What happened and what do you do?
+- `L7` `System Design` * — Design a weekly user-segmentation system: 80M users, roughly 200 behavioural features, output consumed by marketing and by a personalization service
+
+### [CML 4] Probabilistic Foundations
+
+- `L5` `First Principles` *** — MLE, MAP, and fully Bayesian---define each, and tell me where regularization comes from
+- `L5` `Mathematical` ** — Show that ridge regression is MAP estimation. What is `lambda` in terms of the model?
+- `L5` `Mathematical` ** — Why is the MLE of the Gaussian variance biased? Does it matter?
+- `L5` `Debugging` *** — Training RMSE 0.31, validation RMSE 0.94, and the two learning curves are still far apart at 200K rows. Diagnose it and name the knobs, on the model of your choice
+- `L6` `Debugging` *** — Our fraud model has 0.92 AUC, but the risk team says the probabilities are useless---their auto-decline rule fires at 0.9 and almost nothing crosses it. What is wrong, and how do you fix it?
+- `L6` `Mathematical` ** — Prove that log loss is a proper scoring rule. Why should I care?
+- `L5` `Conceptual` ** — Which classical models give you calibrated probabilities out of the box, and which do not?
+- `L5` `Conceptual` ** — Confidence interval versus prediction interval---define both, and tell me which one the product manager actually wanted
+- `L6` `First Principles` ** — I want prediction sets with a coverage guarantee and no distributional assumptions. Build it, then tell me when the guarantee is worthless
+- `L6` `Trade-off` * — Logistics wants a P90 delivery-time estimate per order, not a point prediction. What do you build, and why is your loss function correct?
+- `L7` `System Design` ** — We are launching an automated credit-limit model. Design the uncertainty layer: what we estimate, how, and what we monitor
+
+### [CML 5] The Applied Craft
+
+- `L6` `Debugging` *** — Your churn model has 0.99 AUC offline and 0.62 in production. Walk me through it
+- `L6` `Mathematical` *** — You want to target-encode a 50K-cardinality merchant_id. Give me the exact construction, and tell me where it leaks if you get it wrong
+- `L5` `Debugging` *** — Here is a pipeline. StandardScaler on the full dataframe, then median imputation, then SelectKBest(k=100) on all rows, then SMOTE to balance, then a 5-fold CV that reports 0.94 AUC. Find the bugs and rank them by damage
+- `L5` `Conceptual` *** — When is random `k`-fold cross-validation invalid, and what do you use instead?
+- `L6` `Trade-off` *** — Fraud is 0.1% of transactions. Walk me through building the classifier
+- `L6` `Debugging` ** — Your teammate added SMOTE and offline `F_1` improved, but the production fraud model got worse. Explain
+- `L6` `Conceptual` ** — What is nested cross-validation, and when do you actually need it?
+- `L6` `Conceptual` ** — Two features are highly correlated. What happens to permutation importance and to SHAP?
+- `L6` `Trade-off` ** — A PM sees that discount_rate has the highest SHAP value in the conversion model and asks whether we should raise discounts. What do you say?
+- `L5` `Conceptual` ** — A key feature is missing for 30% of rows. What do you do?
+- `L6` `Estimation` ** — 100M transactions a day, 0.1% fraud, and a review team that can handle 500 alerts a day. What precision and recall can you promise?
+- `L7` `System Design` * — Design the offline evaluation protocol for a churn model that will be retrained weekly and must survive an audit
+
 ### [CML 6] Experimentation and Causal Inference
 
 - `L5` `Estimation` *** — We want to detect a 1% relative lift on a 2% click-through rate. How many users do we need, and how long should we run?
@@ -717,4 +775,30 @@ All **543 questions** across the four volumes, so you can find a question withou
 - `L7` `Architecture Design` ** — We cannot randomize prices. How would you estimate price elasticity from historical data?
 - `L5` `Conceptual` ** — What assumption does difference-in-differences require, and how would you probe it?
 - `L7` `Architecture Design` ** — Design the experimentation platform for a 200-engineer organization
+
+### [CML 7] Time Series Essentials
+
+- `L6` `System Design` *** — Forecast daily demand for 5{,}000 SKUs across 20 warehouses, 28 days ahead. Walk me through your approach
+- `L5` `Conceptual` *** — Why can't you use standard `k`-fold cross-validation on time series, exactly---and what do you use instead?
+- `L5` `Debugging` *** — Your GBM forecast flatlines just under the recent maximum while demand keeps growing. What is happening and how do you fix it?
+- `L6` `Debugging` *** — Your backtest MASE is 0.72 and everyone is thrilled. In production the forecasts are terrible. Give me your differential diagnosis
+- `L5` `Mathematical` ** — You need one accuracy number across 5{,}000 SKUs of wildly different volume. Which metric, and why not MAPE?
+- `L5` `Conceptual` ** — What is stationarity, and why do ARIMA-type models want it?
+- `L6` `Trade-off` ** — Recursive or direct multi-step forecasting---which do you pick and why?
+- `L6` `First Principles` ** — Build me a forecast with uncertainty bands the business will actually trust
+- `L6` `Trade-off` ** — When would you reach for a deep sequence model instead of ETS or a global GBM?
+- `L5` `Mathematical` * — I show you an ACF that decays geometrically and a PACF with one big spike at lag 1 and nothing after. What model, and what does the parameter mean?
+
+### [CML 8] The From-Scratch Coding Canon
+
+- `L5` `Coding` *** — Implement k-means with k-means++ initialization. Handle empty clusters and give me a real convergence criterion
+- `L5` `Coding` *** — Implement logistic regression trained by minibatch SGD, derive the gradient, and convince me the gradient is right
+- `L6` `Coding` *** — Given a node's samples and labels, find the split that maximizes impurity decrease. What is the complexity of your approach?
+- `L6` `Coding` ** — Implement gradient boosting for binary classification with stumps. Then tell me where the leaf values come from
+- `L6` `Coding` ** — Implement PCA. Use power iteration rather than calling an eigensolver, and return the top `k` components
+- `L5` `Coding` *** — Implement k-nearest-neighbors classification. Make the query as fast as you can without a tree
+- `L6` `Coding` ** — Now build a kd-tree and use it for nearest-neighbor search. When does it stop helping?
+- `L5` `Coding` ** — Implement linear regression two ways: the closed form and gradient descent. Which would a library use?
+- `L5` `Coding` ** — Implement AUC from scratch. What do you do about ties?
+- `L6` `Coding` ** — Write a cross-validation harness without sklearn, and use it to compare two models. Where does leakage sneak in?
 
