@@ -61,7 +61,39 @@ D to avoid carrying a stale duplicate of the shared style. Re-running
 The repository README quotes question counts from before Phases B–D. Refresh it
 from the generated index rather than by hand.
 
-## 4. Content items noticed but out of scope when found
+## 4. Resolved since this file was written
+
+- Volumes I and II now use style/essentials.sty (604 duplicated preamble
+  lines removed, verified rendering-neutral against baseline page counts).
+- The README counts are refreshed.
+- The question indexes are generated; `make verify` fails on a stale one.
+- DL ch3's figures were rebuilt, and a program-wide visual audit followed.
+
+## 5. The figure audit, and what it says about the quality gates
+
+All 108 tikz/pgfplots figures were rendered and inspected. **43 were
+defective** - text painted out by neighbouring nodes, edges drawn through
+the labels they pass, figures overflowing the text block, legends covering
+their own data, curves whose formula contradicted the caption.
+
+Not one produced a LaTeX warning. Builds exited 0, drift sentinels passed,
+undefined references were zero and page counts were stable for the entire
+time content was missing from the PDFs. Every automated gate in this repo
+is blind to this class of defect.
+
+Two lessons worth carrying:
+
+- The recurring cause was a single TikZ idiom. `below left/right ... of
+  <diamond>` anchors on a corner that sits inside the shape, so sibling
+  subtrees overlap by construction - which is why the same failure appeared
+  independently in five chapters by different authors. Trees are now
+  explicit leaf grids. Prefer a `matrix` or explicit columns over relative
+  placement whenever node text can grow.
+- There is no cheap automated check for this. An overfull-hbox count
+  catches the text-block overflows (3 of 43) and nothing else. If figures
+  change, render the page and look at it.
+
+## 6. Content items noticed but out of scope when found
 
 - Figure quality in DL ch3: the loss-taxonomy figure has several overlapping
   level-2 boxes and the selection decision tree has label collisions in its top
