@@ -80,6 +80,12 @@ def parse():
                     print(f"WARNING: malformed interviewq in {path}", file=sys.stderr)
                     continue
                 ty = typ.group(1).strip()
+                if ty not in ROUND_OF_TYPE:
+                    # Silently bucketing an unknown type is how badge drift went
+                    # unnoticed for three phases. Say so.
+                    print(f"WARNING: unknown badge type {ty!r} in {path} "
+                          f"(bucketed as Depth); add it to ROUND_OF_TYPE or "
+                          f"normalize the badge", file=sys.stderr)
                 qs.append({
                     "text": tidy(qt.group(1)),
                     "level": LEVEL_NAME[lvl.group(1)],

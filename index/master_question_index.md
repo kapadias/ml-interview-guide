@@ -2,13 +2,13 @@
 
 <!-- GENERATED FILE - do not edit by hand. Regenerate with `make index`. -->
 
-All **609 questions** across the four volumes, so you can find a question without knowing which volume it lives in.
+All **610 questions** across the four volumes, so you can find a question without knowing which volume it lives in.
 
 | Volume | Questions | Breadth | Depth | Coding | Design | Behavioral |
 |---|---|---|---|---|---|---|
 | Volume I — Deep Learning Essentials | 301 | 75 | 153 | 16 | 50 | 7 |
-| Volume II — NLP Essentials | 128 | 63 | 36 | 0 | 29 | 0 |
-| Volume III — Search & Recommendation Essentials | 92 | 26 | 42 | 0 | 21 | 3 |
+| Volume II — NLP Essentials | 129 | 63 | 36 | 0 | 30 | 0 |
+| Volume III — Search & Recommendation Essentials | 92 | 25 | 45 | 0 | 22 | 0 |
 | Volume IV — Conventional ML Essentials | 88 | 27 | 42 | 10 | 9 | 0 |
 
 ## Volume I — Deep Learning Essentials
@@ -427,7 +427,7 @@ All **609 questions** across the four volumes, so you can find a question withou
 - `L5` `Conceptual` ** — How do n-gram language models relate to modern neural language models? What did each generation preserve and what did it change?
 - `L6` `Mathematical` ** — What is the partition function in a CRF? Why is it computationally challenging, and how is it computed efficiently?
 - `L5` `Conceptual` * — Explain the noisy channel model for machine translation. Why was it eventually replaced by neural MT?
-- `L5` `Applied` ** — You are building a named entity recognizer for a new domain (e.g., legal documents) with only 500 labeled sentences. Walk me through your approach
+- `L5` `System Design` ** — You are building a named entity recognizer for a new domain (e.g., legal documents) with only 500 labeled sentences. Walk me through your approach
 
 ### [NLP 3] Word Representations and Embeddings
 
@@ -511,12 +511,13 @@ All **609 questions** across the four volumes, so you can find a question withou
 - `L5` `System Design` *** — Design a RAG system for a customer support chatbot that answers questions using your company's knowledge base. Walk through the key components and design decisions
 - `L5` `Trade-off` *** — Compare BM25 vs. dense retrieval. When would you use each? When would you combine them?
 - `L5` `System Design` *** — What chunking strategies exist for RAG? How do you choose chunk size?
-- `L5` `Evaluation` *** — How would you evaluate a RAG system end-to-end? What metrics would you track?
+- `L5` `Conceptual` *** — How would you evaluate a RAG system end-to-end? What metrics would you track?
 - `L6` `Conceptual` ** — What is HyDE (Hypothetical Document Embeddings)? When would it help and when would it fail?
 - `L6` `System Design` ** — How do you handle the ``lost in the middle'' problem in RAG?
 - `L5` `Trade-off` *** — When should you use RAG vs. fine-tuning vs. long context?
 - `L5` `Conceptual` *** — Explain the bi-encoder vs. cross-encoder tradeoff in retrieval. How would you use both in a production system?
 - `L6` `Debugging` ** — Your RAG system is returning correct documents but the LLM's answers are still wrong. What would you investigate?
+- `L6` `Debugging` *** — Your RAG system answers factual lookup questions well but fails on questions that require combining facts across documents---``which customers on the legacy plan have an open P1 ticket?'' or ``did the Q3 pricing change contradict the renewal terms?'' Retrieval looks healthy: every returned chunk is on topic. Diagnose it
 - `L6` `System Design` ** — How would you scale a RAG system to handle 10 million documents and 1000 queries per second?
 
 ### [NLP 10] Evaluation, Metrics, and Decoding
@@ -631,16 +632,16 @@ All **609 questions** across the four volumes, so you can find a question withou
 ### [SR 5] Learning to Rank
 
 - `L5` `Conceptual` ** — Compare pointwise, pairwise, and listwise learning to rank. When is each the right choice?
-- `L6` `Communication` *** — Explain LambdaRank to a strong engineer who knows GBDT but has never done ranking
+- `L6` `Conceptual` *** — Explain LambdaRank to a strong engineer who knows GBDT but has never done ranking
 - `L6` `Debugging` *** — Your click-trained ranker keeps favoring the items that have historically sat at position 1---better new items never rise. Diagnose and fix
-- `L5` `Applied` ** — Walk me through constructing an LTR training set from a marketplace's search logs: labels, negatives, and splits
+- `L5` `System Design` ** — Walk me through constructing an LTR training set from a marketplace's search logs: labels, negatives, and splits
 - `L5` `Trade-off` ** — When would you insist on a pointwise objective even though the product is a ranked list?
 - `L6` `Trade-off` *** — GBDT or neural network for your L2 ranker? Decide for (a) a commerce search engine with rich engineered features, (b) a feed ranker over user history and item IDs
-- `L6` `Applied` ** — How would you estimate position-bias propensities without degrading the user experience?
+- `L6` `System Design` ** — How would you estimate position-bias propensities without degrading the user experience?
 - `L6` `Debugging` ** — Your new LTR model improves overall NDCG but tail-query relevance regresses. Why, and what do you change?
-- `L6` `Judgment Call` ** — Editorial judgments say document A beats B for this query; click data says B massively outperforms A. Which do you trust, and what do you do?
+- `L6` `Trade-off` ** — Editorial judgments say document A beats B for this query; click data says B massively outperforms A. Which do you trust, and what do you do?
 - `L7` `System Design` ** — Design the end-to-end unbiased-LTR loop for a search product---logging through training through evaluation---and tell me where it silently breaks
-- `L7` `Depth` * — Your IPS-weighted training runs are unstable---a few examples dominate the gradient and validation NDCG oscillates. What is happening and what are your options?
+- `L7` `Debugging` * — Your IPS-weighted training runs are unstable---a few examples dominate the gradient and validation NDCG oscillates. What is happening and what are your options?
 
 ### [SR 6] Recommendation Systems
 
@@ -664,16 +665,16 @@ All **609 questions** across the four volumes, so you can find a question withou
 
 ### [SR 7] Search and RecSys Evaluation
 
-- `L5` `Metric Derivation` *** — Derive NDCG from first principles, then compute NDCG@3 for a ranking with grades `(3, 0, 2)`, exponential gain, given the ideal available grades are `(3, 2, 0)`
+- `L5` `Mathematical` *** — Derive NDCG from first principles, then compute NDCG@3 for a ranking with grades `(3, 0, 2)`, exponential gain, given the ideal available grades are `(3, 2, 0)`
 - `L5` `Conceptual` ** — You have binary judgments only. When do Precision@`k`, Recall@`k`, MRR, and MAP each answer the right question---and construct a case where two of them disagree about which of two systems is better
 - `L6` `Debugging` *** — Your reranker improved offline NDCG@10 by 3% on the judgment set, but the A/B test shows flat CTR. Walk me through your investigation
 - `L6` `Trade-off` ** — Interleaving vs. A/B testing for a ranking change---how does team-draft interleaving work, why is it more sensitive, and when would it mislead you?
 - `L6` `Debugging` ** — You replace a lexical retriever with a dense retriever. Offline NDCG on the existing judgment set drops. Is the new system worse?
-- `L6` `Protocol Design` ** — A colleague evaluates a new sequential recommender with a random 80/20 interaction split and HR@10 against 100 sampled negatives, and reports a 12% win. What is wrong, and what protocol do you require before believing it?
-- `L6` `Judgment Call` ** — Your new recommender lifts NDCG and short-term engagement, but intra-list diversity drops, catalog coverage falls, and exposure Gini rises 6 points. Do you ship it---and how should the evaluation have been set up so this is not a debate?
+- `L6` `Debugging` ** — A colleague evaluates a new sequential recommender with a random 80/20 interaction split and HR@10 against 100 sampled negatives, and reports a 12% win. What is wrong, and what protocol do you require before believing it?
+- `L6` `Trade-off` ** — Your new recommender lifts NDCG and short-term engagement, but intra-list diversity drops, catalog coverage falls, and exposure Gini rises 6 points. Do you ship it---and how should the evaluation have been set up so this is not a debate?
 - `L7` `First Principles` ** — Without launching it, estimate what CTR a new ranking policy would achieve, using only logs from the current system. Derive the estimator, its requirements, and its failure modes
-- `L6` `Program Design` ** — You want to replace most crowd relevance labeling with an LLM judge. Design the program so the labels are trustworthy---and tell me what stays human
-- `L7` `Program Design` * — You own relevance for a search org of several teams. Design the evaluation program: what gets measured, at what layer, on what cadence---and how does a change get to ship?
+- `L6` `System Design` ** — You want to replace most crowd relevance labeling with an LLM judge. Design the program so the labels are trustworthy---and tell me what stays human
+- `L7` `System Design` * — You own relevance for a search org of several teams. Design the evaluation program: what gets measured, at what layer, on what cadence---and how does a change get to ship?
 
 ### [SR 8] Production Retrieval and RAG Integration
 
