@@ -2,11 +2,11 @@
 
 <!-- GENERATED FILE - do not edit by hand. Regenerate with `make index`. -->
 
-All **610 questions** across the four volumes, so you can find a question without knowing which volume it lives in.
+All **608 questions** across the four volumes, so you can find a question without knowing which volume it lives in.
 
 | Volume | Questions | Breadth | Depth | Coding | Design | Behavioral |
 |---|---|---|---|---|---|---|
-| Volume I — Deep Learning Essentials | 301 | 75 | 153 | 16 | 50 | 7 |
+| Volume I — Deep Learning Essentials | 299 | 74 | 152 | 16 | 50 | 7 |
 | Volume II — NLP Essentials | 129 | 63 | 36 | 0 | 30 | 0 |
 | Volume III — Search & Recommendation Essentials | 92 | 25 | 45 | 0 | 22 | 0 |
 | Volume IV — Conventional ML Essentials | 88 | 27 | 42 | 10 | 9 | 0 |
@@ -161,11 +161,6 @@ All **610 questions** across the four volumes, so you can find a question withou
 - `L7` `Conceptual` * — Flow matching vs denoising diffusion---what changed and why is it considered the next evolution?
 - `L5` `Conceptual` *** — How does Stable Diffusion work end-to-end? Walk through the architecture from text prompt to generated image
 - `L6` `First Principles` ** — Explain the WGAN loss and why Wasserstein distance solves GAN training instability
-
-### [DL 12] Recommendation Systems
-
-- `L5` `Conceptual` *** — How do you handle the cold start problem for new users and new items?
-- `L5` `Trade-off` *** — Two-tower vs. interaction-based models for candidate generation---when would you use each?
 
 ### [DL 13] Graph Neural Networks
 
