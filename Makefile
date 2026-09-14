@@ -47,3 +47,25 @@ drill-pdf: drill/questions.json
 
 drill-web: drill/questions.json
 	python3 tools/render_drill_web.py
+
+# The Coupang Search & Discovery loop: a targeted cut of the corpus for one
+# four-round interview. Sources are coupang/*.md and coupang/depth_new_*.json;
+# everything else regenerates.
+.PHONY: coupang coupang-pdf coupang-web coupang-test
+coupang: coupang-test coupang-pdf coupang-web
+
+coupang-test:
+	python3 coupang/test_coding.py
+
+coupang/deck.json: drill/questions.json coupang/depth_new_*.json \
+                   coupang/coding_meta.json coupang/coding_a.py coupang/coding_b.py \
+                   
+	python3 tools/build_coding.py
+	python3 tools/build_coupang.py
+
+coupang-pdf: coupang/deck.json coupang/brief.md coupang/project.md
+	python3 tools/render_coupang_pdf.py
+	cd coupang && $(ENGINE) coupang.tex
+
+coupang-web: coupang/deck.json coupang/brief.md coupang/project.md
+	python3 tools/render_coupang_web.py

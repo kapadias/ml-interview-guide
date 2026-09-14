@@ -71,6 +71,13 @@ def main():
         base[a["id"]] = a
 
     qs = list(base.values())
+    seen = {}
+    for q in qs:
+        k = " ".join(q["question"].lower().split())
+        if k in seen:
+            sys.exit("ids %s and %s ask the same question: %s"
+                     % (seen[k], q["id"], q["question"][:70]))
+        seen[k] = q["id"]
     for q in qs:
         missing = [f for f in REQUIRED if not q.get(f)]
         if missing:
