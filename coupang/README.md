@@ -7,7 +7,7 @@ deep-dive**, and **DS&A coding**, at the Staff / L6 bar.
 | Part | What it is | Count |
 |---|---|---|
 | `brief.md` | What the org is, what each round tests, the 15 leadership principles | — |
-| `deepdive.md` | The set-piece ML-depth question, worked end to end, 11 diagrams | — |
+| `deepdive.md` | The set-piece ML-depth question, worked end to end, 15 diagrams | — |
 | ML depth | The search funnel front to back: query understanding, retrieval, ranking, evaluation | 44 |
 | ML breadth | Foundations, embeddings, tabular, evaluation, production craft | 34 |
 | `project.md` | Narrative spine, the numbers to know cold, the interrogation bank, LP mapping | — |
@@ -28,14 +28,25 @@ another candidate, along with her scorecard. `deepdive.md` works it end to end:
 > "durable lightweight winter boots for toddlers" — and rank to optimise CVR.
 > 10M products, 200 QPS, 100 ms, six months of logs.
 
-Her scorecard on the previous candidate said he was stronger on ranking than on
-"the retrieval side — like contrastive learning, embedding models, or softmax,"
-and recommended an in-depth ML round to assess exactly that. So the retrieval-
-training section is the long one: the contrastive objective, where positives and
-negatives come from, in-batch sampling bias and the logQ correction, the
-zero-engagement items that are never sampled as negatives at all, hard-negative
-refresh, false-negative filtering, distillation, and how to evaluate a retriever
-offline without fooling yourself.
+Both halves get equal weight, because the scorecard note about the previous
+candidate being thinner on retrieval was about that candidate, not a prediction
+about this one. What it is still good for is the vocabulary she probes with on
+the retrieval side — "contrastive learning, embedding models, or softmax" is her
+list — which says where she puts the bar when she digs.
+
+**Retrieval:** the contrastive objective, positives and their position bias,
+in-batch sampling bias and the logQ correction, the zero-engagement items that
+are never sampled as negatives at all, hard-negative refresh, false-negative
+filtering, distillation, embedding geometry, and honest offline evaluation.
+
+**Ranking:** why "optimise CVR" is a trap, pointwise vs pairwise vs listwise and
+why the expected-value objective rules out a pure LambdaMART score, negative-
+downsampling recalibration, propensity estimation three ways, ESMM, delayed
+feedback, how L1 is actually trained, point-in-time correctness and
+log-and-train, and exploration for cold listings.
+
+**The seam:** how each stage is trained on the other's output, and why a
+6-point recall win shows up as a flat A/B.
 
 Diagrams are pure ASCII on purpose. They render identically in the PDF and the
 page, they cannot silently break the way TikZ does, and they are what you would

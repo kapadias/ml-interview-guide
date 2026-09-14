@@ -14,32 +14,36 @@ verbatim.
 
 ## What is actually being tested
 
-The scorecard from the previous candidate is the most useful thing you have:
+The question has two halves and you own both of them. Retrieval and ranking are
+named in the prompt, they have different objectives, and a Staff answer holds
+the whole funnel — including the seam between them, which is where most of the
+interesting failures live.
 
-> *"Candidate is much more comfortable and experienced with ranking models than
-> with the retrieval side — like contrastive learning, embedding models, or
-> softmax … likely due to less exposure to retrieval model training."*
-> *"We should schedule an in-depth ML tech round to properly assess that type of
-> hands-on experience."*
+The scorecard from the other candidate is still worth having, but for a narrower
+reason than it first appears. It was written about someone else, and it is not a
+prediction about you. What it does tell you is **the vocabulary Siwen probes
+with on the retrieval side** — "contrastive learning, embedding models, or
+softmax" is her list, not a generic one — which is a genuine signal about where
+she considers the bar to be when she digs. It is a reason to be fluent there.
+It is not a reason to under-weight ranking.
 
-So this round exists to probe **retrieval model training**. The design prompt is
-the frame; the assessment is whether you can train a two-tower retriever and
-defend every choice inside it — the contrastive objective, where positives and
-negatives come from, the sampled-softmax correction, the temperature, the
-embedding geometry, how you evaluate it offline without fooling yourself.
+So: plan for roughly equal time on both, and let her steer. The two halves fail
+differently and you should be able to say how.
 
-Two consequences for how you run the room. **Do not spend your best minutes on
-ranking.** Ranking is where most candidates are strong and where the answer is
-relatively standard; it will not differentiate you. And **volunteer the
-retrieval-training depth before you are asked for it** — when you reach the
-dense arm, say "let me go into how I would actually train this" and go.
+**Retrieval** is judged on recall, is trained contrastively over sampled
+negatives, and is where candidates most often turn out to be thin — most people
+have consumed an embedding model without ever having trained one.
 
-The question also has three details that are there deliberately. *Ambiguous,
-long-tail* tells you behavioural features are absent and lexical retrieval will
-under-recall. *Optimise CVR* is a trap worth stepping around carefully — a pure
-CVR objective has a specific pathology. *Six months of logs* tells you that you
-have training data and are expected to use it, and it is also a hint about how
-much: enough for a retrieval model, and just about enough for a fresh ranker.
+**Ranking** is judged on order, is trained on logged feedback that is biased by
+the very system that produced it, and is where *this particular prompt* hides a
+trap: "optimise CVR" has a specific pathology, and stepping around it carefully
+is worth as much as anything you will say about negatives.
+
+The seam between them is its own topic and almost nobody raises it unprompted:
+the ranker is trained on whatever candidate distribution the retriever produced,
+so changing retrieval silently invalidates the ranker. There is a section on
+this at the end, and bringing it up yourself is the clearest signal in the whole
+answer that you have shipped one of these.
 
 ## The first five minutes: what to ask
 
@@ -97,16 +101,19 @@ to defer things.
 
 | Minutes | What | Why |
 |---|---|---|
-| 0–5 | Clarify, state assumptions, derive the numbers above | Establishes the constraints are real |
+| 0–5 | Clarify, state assumptions, derive the numbers | Establishes the constraints are real |
 | 5–10 | Whole-system diagram and the latency budget | Gives her a map; everything later hangs off it |
-| 10–15 | Query understanding for the tail example | Shows you understand why the query is hard |
-| 15–40 | **Retrieval, and how you train it** | The 25 minutes that decide the round |
-| 40–52 | Ranking for CVR, multi-task, calibration | Where you are already strong; be efficient |
-| 52–60 | Evaluation, experimentation, what you would build first | Staff signal: sequencing under constraint |
+| 10–14 | Query understanding for the tail example | Shows you understand why the query is hard |
+| 14–32 | **Retrieval, and how you train it** | Objective, negatives, geometry, evaluation |
+| 32–50 | **Ranking: the objective, the label bias, the model** | Equal weight. The CVR trap lives here. |
+| 50–55 | The seam: how the two stages break each other | The part almost nobody raises unprompted |
+| 55–60 | Evaluation, experimentation, what you would build first | Staff signal: sequencing under constraint |
 
-If she interrupts and steers, follow her — but know where you were, and say
-"I'll come back to negatives" rather than losing the thread. The one block to
-protect is 15–40.
+Two blocks of eighteen minutes, not one of twenty-five. If she interrupts and
+steers, follow her — but know where you were, and say "let me come back to
+negatives" rather than losing the thread. If she spends the whole hour on one
+half, that is her choice and you should have the depth to fill it; the budget
+above is what to do when she leaves it to you.
 
 # The system
 
@@ -273,7 +280,7 @@ query rewrites for the tail, distilled into a small model or baked into a table.
 Not in the 8 ms online path. Say this unprompted; it is a question she will
 otherwise ask.
 
-# Retrieval: the twenty-five minutes that decide the round
+# Retrieval: half the answer
 
 ## The architecture, and the asymmetry that defines it
 
@@ -629,7 +636,9 @@ strictly better than RRF because the right blend is query-dependent — identifi
 queries want the lexical arm, tail paraphrase queries want the dense arm — and a
 model can condition on that where a fixed constant cannot.
 
-# Ranking: "optimise CVR" is a trap, and saying so is the point
+# Ranking: the other half
+
+## "Optimise CVR" is a trap, and saying so is the point
 
 Do not accept the objective as stated. A ranker trained to maximise conversion
 probability and nothing else has three specific pathologies, and naming them is
@@ -671,6 +680,105 @@ pCVR ordering but make the relevance gate a hard constraint and add GMV per
 session as a guardrail that cannot regress. That is a reasonable position and it
 shows you can take direction without abandoning judgement.
 
+## What you are actually training on
+
+Before any model choice, two properties of the training set decide how good the
+ranker can be, and both are consequences of the fact that the data came from the
+ranker you already have.
+
+**The label.** Impressions are free, clicks are plentiful, conversions are
+scarce. The natural move is graded relevance — impression 0, click 1,
+add-to-cart 2, purchase 3, returned purchase back to 0 — and that is what a
+listwise objective wants. But if you are building the expected-value score in
+Figure 8 you need *separate calibrated heads*, not one graded label, so the
+label design is downstream of the objective decision below. Decide the objective
+first.
+
+**The candidate distribution is your own output.** A ranker's training examples
+are impressions, and an impression is something that survived retrieval *and*
+that this ranker placed high enough to be seen. So the model is trained on the
+consequences of its own decisions. Items it wrongly buries generate no data, so
+it never learns it was wrong about them, and the error is stable rather than
+self-correcting. This is the ranking counterpart of the retrieval evaluation bias
+and the reason the exploration section below is not optional.
+
+**Negative downsampling breaks calibration, and you must correct it.** You have
+perhaps a hundred impressions per click, so you will downsample negatives to
+keep training tractable. That shifts the base rate, and a model trained on the
+downsampled data over-predicts. With negatives kept at rate `w`, recover the
+true probability with
+
+```Figure 9. Recalibrating after negative downsampling.
+                        p
+      q  =  ---------------------------          w = negative keep rate
+              p  +  (1 - p) / w                  p = model output on the
+                                                     downsampled data
+      Example: w = 0.1, p = 0.5  ->  q = 0.5 / (0.5 + 5) = 0.09
+```
+
+Forget this and every downstream multiplication by price is wrong by a constant
+factor you did not choose. It is a two-line fix and a very common production bug.
+
+## The objective: pointwise, pairwise, listwise — and the constraint most people miss
+
+Three families, and the usual answer is "listwise, obviously." For this question
+that answer is wrong, and being able to say why is worth real credit.
+
+**Pointwise** predicts a number per item independently — pCTR, pCVR — and you
+sort by it. Trained with binary cross-entropy. It does not optimise order
+directly, and it has no idea that position 1 matters more than position 20. Its
+one enormous advantage: the output is a **calibrated probability**.
+
+**Pairwise** — RankNet, BPR — optimises the probability that the better item is
+scored above the worse one. Closer to the thing you care about, but it treats
+every inversion as equally bad, so it will happily spend capacity fixing a swap
+at positions 50 and 51 that no user will ever see.
+
+**Listwise** — LambdaRank and its GBDT form, LambdaMART — fixes exactly that.
+
+```Figure 10. Why LambdaRank exists, and what the lambda is.
+
+  NDCG depends only on the ORDER, so it is a step function of the scores:
+  zero gradient almost everywhere, a jump when two items swap. You cannot
+  descend it.
+
+  LambdaRank's move: skip the loss, write the gradient directly.
+
+     lambda_ij  =  ( pairwise logistic gradient for the pair i,j )
+                   x  | delta NDCG from swapping i and j |
+
+     gradient for item i  =  sum of lambda_ij over all pairs i is in
+
+  The |delta NDCG| factor is the whole idea: a swap at ranks 1-2 is worth
+  far more than one at 50-51, because the positional discount says so. So
+  the model concentrates capacity at the top of the list.
+
+  LambdaMART = these gradients plugged into gradient boosting.
+```
+
+**Now the constraint.** The expected-value score in Figure 8 multiplies pCTR by
+pCVR by price. That multiplication is only meaningful if those are
+*probabilities*. LambdaMART emits a relevance score with no probabilistic
+interpretation at all — you cannot multiply it by a hundred dollars and get
+expected revenue. So a pure listwise ranker is incompatible with the objective
+this question asks for.
+
+How I would resolve it, and this is the answer I would defend:
+
+- **Train the probability heads pointwise** with BCE — pCTR, pCVR, pReturn —
+  because the EV combination requires calibration, and calibrate them post-hoc.
+- **Train a separate listwise relevance model** if you want one, and let its
+  score enter the EV formula as the relevance gate `g(pRel)`, not as the score.
+- **Add a list-context re-ranking layer on the final top-k**, after the
+  pointwise scores. This is where listwise thinking legitimately belongs: a
+  small model that sees the whole slate — DLCM, PRM, Seq2Slate in the
+  literature — and adjusts for the fact that an item's appeal depends on what it
+  is sitting next to. Three near-identical boots compete with each other; a
+  pointwise model cannot see that and a slate model can.
+
+That layering also matches the latency budget: the expensive list-context model
+only ever runs over the ~50 items you are about to show.
+
 ## The CVR model has a data problem before it has a model problem
 
 ### Sample selection bias, and ESMM
@@ -686,7 +794,7 @@ precisely where you need precision.
 
 ESMM removes both problems by never training CVR directly:
 
-```Figure 9. ESMM. The CVR tower has no loss of its own.
+```Figure 11. ESMM. The CVR tower has no loss of its own.
 
             IMPRESSION SPACE  (every impression is labelled)
                             |
@@ -728,14 +836,59 @@ window is a small fraction of your training period.
 The failure if you ignore it: your model systematically under-predicts CVR on
 exactly the most recent data, which is the data most representative of now.
 
-### Position bias
+### Position bias, and how you actually estimate the propensities
 
-Your labels come from a ranked list, so a click at rank 1 and a click at rank 20
-are not equivalent evidence. Estimate propensities — ideally by harvesting the
-position variation you already have across A/B tests rather than by randomising
-live traffic — and train with inverse-propensity weighting.
+Your labels came out of a ranked list, so a click at rank 1 and a click at rank
+20 are not equivalent evidence. Rank 1 gets examined regardless. Train on raw
+clicks and you learn the ranking you already had — the model's strongest
+discovered feature becomes "where did the old ranker put this," and good new
+items can never rise. It is a self-fulfilling loop and it is the reason a ranker
+can look excellent offline and never improve anything.
 
-On mobile this matters more than on web, for reasons in the next section.
+The standard correction is inverse propensity scoring: weight each example by
+one over the probability that the user examined that position. The interesting
+part is where the propensities come from, and there are three answers with very
+different costs.
+
+**RandPair — swap two positions at random on a slice of traffic.** Unbiased and
+simple. It is also the one that hurts, because you are deliberately showing
+worse results. I would run it on a fraction of a percent as a calibration
+reference, not as the production mechanism.
+
+**Intervention harvesting — free, and the one I would build.** You are already
+running A/B tests, and different rankers put the same query-item pair at
+different positions. That is randomisation you have already paid for. Mine the
+existing experiment logs for pairs that appeared at multiple positions and take
+the click-rate ratio across positions. Zero additional user cost, and at 200 QPS
+over six months there is plenty of it.
+
+**Jointly estimate propensity and relevance from clicks** — regression-EM, or a
+dual-tower examination model where one tower sees only position and layout
+features and the other sees query-item features. No randomisation at all. The
+catch is identifiability: without genuine position variation in the logs the
+examination tower simply absorbs relevance and you have learned nothing. Check
+it, do not assume it.
+
+Three refinements worth naming, because they are where the textbook answer stops
+and production begins.
+
+**Position is not one number on a grid.** A mobile app shows a two-column grid,
+so examination depends on row, column, device, and whether the item was above
+the fold on that screen size. Condition the propensity on layout, not on a rank
+index. Getting this wrong on mobile is worse than not correcting at all, because
+the correction is confidently wrong.
+
+**Trust bias is separate from examination bias.** Users click top-ranked results
+partly *because* they are top-ranked — they trust the ranking — not only because
+they looked. IPS on examination alone does not remove that, and the fix is a
+click model that has a separate trust term per position.
+
+**IPS has a variance problem.** Small propensities produce enormous weights, a
+handful of examples dominate the gradient, and validation metrics oscillate.
+Clip the weights, which trades a little bias for a lot of variance; or use
+self-normalised IPS; or go doubly robust, combining IPS with a learned reward
+model so you are only exposed to variance where the reward model is wrong.
+Always report effective sample size alongside anything IPS-weighted.
 
 ### Calibration
 
@@ -750,7 +903,7 @@ aggregate calibration hides the segments where it is broken.
 
 ## The ranking model
 
-```Figure 10. Multi-task L2 ranker.
+```Figure 12. Multi-task L2 ranker.
    features: query x item x user x context   (~200 for commerce)
                           |
                 +---------v----------+
@@ -794,6 +947,103 @@ can learn a distinct regime instead of reading "no data" as "bad." Then bucket
 your eval by query frequency and check the tail decile specifically, because
 aggregate NDCG will look fine while the tail falls off a cliff.
 
+## The L1/L2 split: how you train the cheap model
+
+Everyone draws the two-stage ranker and almost nobody says how L1 is trained,
+which is a shame because the answer is interesting and it mirrors retrieval.
+
+L1's job is **not** to rank well. Its job is to not throw away anything L2 would
+have wanted. So do not train it on clicks — train it to **imitate L2**. Score a
+large sample of candidates with L2 offline, and fit L1 to reproduce L2's
+ordering, or at minimum L2's top-k membership. That is distillation, and it is
+the right objective because it is literally the thing L1 is for.
+
+Which means the metric for L1 is **recall of L2's top-k**, not NDCG. If L1 keeps
+98% of what L2 would have put in the top 100, L1 is doing its job regardless of
+how it orders them. Reporting NDCG for L1 is the same category error as
+reporting NDCG for retrieval.
+
+Keep it genuinely cheap: a small tree ensemble or a linear model over a feature
+subset that avoids anything requiring a remote fetch. The moment L1 needs the
+same features as L2, it has stopped being a filter and you have paid for two L2s.
+
+## Features, freshness, and the skew that eats rankers
+
+Four groups, and roughly two hundred of them for a commerce ranker. **Query-item
+match**: BM25 per field, dense cosine, each retrieval arm's rank and score,
+category agreement, attribute overlap. **Item**: price percentile within
+category, rating, review count, seller quality, delivery speed, stock, image
+count, age. **Query**: frequency bucket, predicted category, length, intent
+class. **User and context**: history embedding, price sensitivity, device,
+surface, hour, session depth.
+
+Three failure modes matter more than the feature list.
+
+**Point-in-time correctness.** The single largest source of leakage in ranking
+is computing a feature using data from after the impression. A "30-day item CTR"
+computed at training time from a table built today includes clicks that happened
+*after* the impression you are training on — including the click you are trying
+to predict. The model learns a feature it cannot have at serving time and
+offline metrics look wonderful. Your feature store must support as-of joins, and
+you must test them.
+
+**Log the features, do not recompute them.** The robust fix for training-serving
+skew is to log the exact feature vector the model scored at request time, and
+train on those logged values. Then skew is impossible by construction: whatever
+was wrong at serving is equally wrong at training, so the model learns around it.
+
+```Figure 13. Log-and-train removes skew by construction.
+   RECOMPUTE (fragile)              LOG-AND-TRAIN (robust)
+   serving:  features_online        serving:  features_online --+
+   training: features_offline                                   |
+             (different code,                 log them ---------+
+              different data cutoff)                            |
+                     |                                          v
+             skew you discover                       training reads exactly
+             three months later                      what serving computed
+```
+The cost is storage — you are logging a 200-float vector per impression — and at
+this volume that is real but affordable, and you can sample it.
+
+**Behavioural features dominate and are empty on the tail.** Historical CTR and
+CVR for a query-item pair will top your feature importance chart and be missing
+for exactly the long-tail queries in the prompt. Train with explicit missingness
+rather than imputing zero, so the model can learn a separate regime instead of
+reading "no data" as "bad." Then report NDCG by query-frequency decile and make
+the tail deciles a shipping gate, not a diagnostic you run after someone
+complains.
+
+## Exploration: how a new listing ever gets ranked at all
+
+This is the closed loop from earlier, and it is a real business problem in a
+marketplace, not an ML nicety. A new product has no behavioural features, so the
+ranker scores it low, so it gets no impressions, so it never acquires the
+features that would let it rank. Sellers notice.
+
+Three mechanisms, cheapest first.
+
+**Reserve exposure.** Give new or low-impression items a small guaranteed share
+of slots — one slot in the first grid, or a fixed fraction of traffic. Blunt,
+trivially implementable, easy to measure, and it works.
+
+**Score by an optimistic bound rather than the mean.** The model's uncertainty
+about a cold item is large; UCB-style, add a term proportional to that
+uncertainty so unexplored items get a chance in proportion to how little you
+know. Thompson sampling from the posterior is the cleaner version. This is
+strictly better than a reserved slot because the exploration is targeted, and
+strictly harder because you need a calibrated uncertainty estimate.
+
+**Lean on content features.** The same argument as cold-start retrieval: a
+ranker whose features are mostly behavioural cannot score a new item at all,
+while one with strong content and embedding features can make a reasonable guess
+on day zero. ID-feature dropout during training applies here exactly as it does
+in the item tower.
+
+The metric to instrument: **time-to-first-hundred-impressions for a new
+listing**, and the conversion rate of items in their first week versus steady
+state. If new items convert *better* than established ones, your ranker is
+under-exploring and you are leaving money on the table.
+
 # The metrics, in full
 
 She asked about CVR; have the whole board ready, and know which one you would
@@ -833,7 +1083,7 @@ separately because it is the thing this system is being built to fix.**
 She specified a mobile app search bar. Being able to say precisely how the web
 version differs is cheap signal that you have built both.
 
-```Figure 11. The same query, two surfaces.
+```Figure 14. The same query, two surfaces.
 
    MOBILE APP                        WEB
    +----------------+                +--------------------------------+
@@ -895,12 +1145,72 @@ ranker itself, only if a surface-interaction analysis says the shared model is
 leaving real value behind. And evaluate per surface always, because a shared
 aggregate metric will hide a mobile regression under a web win.
 
+# The seam: how retrieval and ranking break each other
+
+Raise this yourself. It is the part of the question that requires having owned
+both halves, almost nobody brings it up unprompted, and it is the most direct
+evidence you can give that you have shipped one of these rather than read about
+it.
+
+```Figure 15. The coupling. Each stage is trained on the other's output.
+                        +---------------------+
+                        |     RETRIEVER       |
+                        |  trained on clicks  |
+                        +----------+----------+
+                                   | produces the
+                                   v candidate distribution
+                        +---------------------+
+                        |      RANKER         |
+                        |  trained on THOSE   |
+                        |  candidates only    |
+                        +----------+----------+
+                                   | decides what is
+                                   v shown, hence clicked
+                        +---------------------+
+                        |    CLICK LOGS       |
+                        +----------+----------+
+                                   |
+                                   +--> back to both models
+
+   Change either box and the other one's training data is now stale.
+```
+
+**Ranker trained on retriever v1, served with retriever v2.** The ranker has
+never seen the newly-surfaced items; they are out of distribution and it scores
+them conservatively, precisely because they are unfamiliar. So a genuine 6-point
+recall win shows up as a flat A/B. The fix is sequencing, not modelling: ship the
+retrieval change to a slice, log the new candidate distribution, retrain the
+ranker on it, and only then read the experiment. If you tell her this before she
+constructs the scenario as a gotcha, you have answered the hardest follow-up in
+the round in advance.
+
+**Retriever trained on positives that the ranker chose to show.** The retriever's
+positives are clicks, and clicks only happen on items the ranker put on screen.
+So the retriever is being taught to find what the current ranker likes. Two
+tightly coupled models, each learning the other's bias. Mitigations: mine
+positives from deeper ranks and from reformulated sessions, keep an exploration
+slice whose logs are used preferentially for training, and use propensity
+weighting on both sides rather than only the ranker.
+
+**Each stage's metric is blind to the other's failure.** Retrieval recall
+improves while ranking gets worse, aggregate CTR is flat, and each team reports a
+win. The only honest end-to-end offline measure is NDCG computed over the full
+pipeline against a judgement set that was *not* pooled from the current system.
+Measure stage metrics for diagnosis and pipeline metrics for decisions.
+
+**The practical policy I would state.** Never change retrieval and ranking in the
+same experiment — you cannot attribute the result. Retrain the ranker on a
+cadence that is a multiple of the retriever's, always downstream of it. And keep
+a small always-on randomised slice whose logs are the unbiased sample everything
+else gets calibrated against; it costs a fraction of a percent of traffic and it
+is the only thing that stops the whole loop drifting somewhere nobody chose.
+
 # The follow-up tree
 
 Everything below is a push she can make. Rehearse the answers out loud; the
 failure mode in this round is hesitation, not being wrong.
 
-## On retrieval training — expect the most pressure here
+## On retrieval training
 
 **"Why not just use a cross-encoder for retrieval?"** Cost. A cross-encoder is
 about a millisecond per pair, and 10M pairs per query is three hours. The
@@ -1009,7 +1319,71 @@ and easy to measure. Retrieval only once you have shown that ranking-side
 personalisation has saturated, because a personalised retrieval arm multiplies
 your index cost and makes caching much harder.
 
-## On ranking and CVR
+## On ranking
+
+**"Pointwise, pairwise or listwise?"** All three, in different places, and the
+constraint is calibration. The expected-value score multiplies probabilities by
+price, so pCTR and pCVR must be pointwise and calibrated — a LambdaMART score
+cannot be multiplied by a hundred dollars. Listwise belongs in a relevance model
+feeding the gate, and in a list-context re-ranking layer over the final fifty.
+
+**"Walk me through LambdaRank."** NDCG is a step function of the ordering so it
+has no usable gradient. LambdaRank skips defining a loss and writes the gradient
+directly: the pairwise logistic gradient multiplied by the change in NDCG you
+would get from swapping that pair. The multiplier is the whole idea — it makes a
+swap at ranks 1 and 2 worth far more than one at 50 and 51. Plug those gradients
+into gradient boosting and you have LambdaMART.
+
+**"You downsampled negatives 100:1. What did that break?"** Calibration. The
+model now predicts in the downsampled base rate, so every probability is inflated
+and every multiplication by price is wrong by a constant. Correct it analytically
+with the keep rate, then verify on a reliability diagram — do not trust the
+formula without checking it.
+
+**"How do you train L1?"** By distilling L2, not on clicks. Its job is to not
+discard anything L2 would have wanted, so the objective is to reproduce L2's
+ordering and the metric is recall of L2's top-k. Reporting NDCG for L1 is the
+same mistake as reporting NDCG for retrieval.
+
+**"Your top feature is 30-day item CTR. What could be wrong with it?"** Two
+things. Point-in-time correctness — if it is computed from a table built today it
+contains clicks that happened after the impression, including the one you are
+predicting, and that is leakage that makes offline metrics look wonderful. And
+coverage: it is empty on exactly the tail queries this system is being built for,
+so train with explicit missingness rather than imputing zero.
+
+**"How do you stop the ranker from being a self-fulfilling prophecy?"** Two
+levers. Propensity-weight the training labels so a click at rank 1 is not treated
+as the same evidence as a click at rank 20. And explore: reserved exposure for
+cold items, or an optimism bonus proportional to the model's uncertainty. Without
+exploration, items the ranker buries generate no data and the error never
+corrects.
+
+**"A new seller lists a product. When does it first rank?"** Instrument it —
+time-to-first-hundred-impressions is a real metric with a real owner. Without
+exploration the honest answer is "possibly never," which in a marketplace is a
+supply problem, not an ML problem.
+
+**"Would you use one model for CTR and CVR or two?"** ESMM, which is neither: two
+supervised heads on the full impression space, CTR and CTCVR, with CVR learned
+implicitly as the ratio and never given a loss of its own. That removes the
+sample selection bias and gives the CVR tower a representation trained on far
+more data.
+
+**"MMoE or shared-bottom?"** Shared-bottom first, and measure each head against a
+single-task model trained alone. A drop is negative transfer and that is your
+signal to escalate to MMoE, then PLE. Escalating without the measurement gets you
+four times the parameters and no gain. And task loss weighting usually dominates
+the architecture choice anyway.
+
+**"Your pCVR is well-ranked but badly calibrated. Does it matter?"** It does the
+moment you multiply it by price. A systematic 3x over-confidence produces a
+completely wrong expected-value ordering while AUC looks fine. Fix with a
+post-hoc monotone map on held-out data, refit on a schedule, and report
+calibration per price decile and per category because the aggregate hides the
+broken segments.
+
+## On CVR specifically
 
 **"Why not just train on purchases?"** Sixty million purchases across ten million
 products is far too sparse, especially on the tail, which is what the question
@@ -1103,21 +1477,24 @@ rest is worth funding.
 
 # The whiteboard, in order
 
-What to draw, when, and the numbers to have on the board. Practise this until
-the first two come out without thinking.
+What to draw, when, and the numbers to have on the board. Practise the first
+three until they come out without thinking.
 
-1. **The funnel** (Figure 1), minute 5. Label each box with its millisecond
-   budget as you draw it.
-2. **The query decomposition** (Figure 3), minute 10. Take the prompt's example
-   apart and say why BM25 fails on it. This buys you the transition into
-   retrieval.
-3. **The two towers** (Figure 4), minute 15. Draw them *different sizes* and say
-   why.
-4. **The loss** (Figure 5), minute 20. Write it out. This is the moment the
-   round is actually assessing.
-5. **The logQ correction** (Figure 6), minute 25. One line under the loss.
-6. **The training pipeline** (Figure 7), minute 30, if there is room.
-7. **ESMM** (Figure 9), minute 45, only if she goes to CVR.
+| Minute | Draw | Say while drawing |
+|---|---|---|
+| 5 | **The funnel** (Fig 1) | Label each box with its millisecond budget |
+| 10 | **Query decomposition** (Fig 3) | Why BM25 fails on the prompt's own example |
+| 15 | **The two towers** (Fig 4) | Draw them *different sizes*, and say why |
+| 20 | **The loss** (Fig 5) | Write it out; this is the retrieval assessment |
+| 24 | **logQ correction** (Fig 6) | One line under the loss |
+| 32 | **The EV objective** (Fig 8) | The pivot from retrieval to ranking |
+| 38 | **LambdaRank's lambda** (Fig 10) | And why you still need calibrated pointwise heads |
+| 44 | **ESMM** (Fig 11) | Only if she pushes on CVR data |
+| 50 | **The seam** (Fig 15) | Raise it yourself; it is the highest-signal moment |
+
+Figures 7, 9, 12, 13 and 14 are worth knowing but not worth board time unless
+she asks — the training pipeline, the downsampling correction, log-and-train,
+the multi-task head, and the mobile/web comparison.
 
 Numbers to have in your head, not on a slide:
 
@@ -1126,15 +1503,29 @@ Numbers to have in your head, not on a slide:
 - 6 months at 200 QPS = **~3B searches, ~1.2B clicks, ~60M purchases**
 - Cross-encoder over 50 candidates = **~10–15 ms** on a T4-class GPU
 - Clicked impressions are **1–5%** of all impressions — the CVR data problem
+- ~**100 impressions per click**, which is why you downsample negatives
 - Temperature **~0.05**; batch size **thousands**; embedding dim **256**
 
-# Eight things that would lose this round
+# Ten things that would lose this round
+
+**On retrieval**
 
 - Drawing two identically-sized towers, and not knowing why they differ.
 - Saying "in-batch negatives" and stopping, without the sampling bias.
-- Accepting "optimise CVR" without naming the cheap-item pathology.
-- Spending fifteen minutes on sharding a 10M-item index that fits in RAM.
 - Quoting Recall@10 as the retrieval metric.
 - Claiming offline recall against logged clicks is an unbiased evaluation.
-- Proposing an LLM in the online path without costing it against 100 ms.
-- Treating mobile and web as the same problem with a different stylesheet.
+
+**On ranking**
+
+- Accepting "optimise CVR" without naming the cheap-item pathology.
+- Answering "listwise, obviously" without noticing that the expected-value
+  objective needs calibrated probabilities a LambdaMART score cannot give you.
+- Training on raw clicks with no propensity correction, then wondering why the
+  model's best feature is the old ranker's output.
+- Having no answer for how a brand-new listing ever gets its first impression.
+
+**On both**
+
+- Spending fifteen minutes on sharding a 10M-item index that fits in RAM.
+- Treating retrieval and ranking as two independent problems, and having nothing
+  to say when a recall win produces a flat A/B.
