@@ -20,7 +20,13 @@ _UNI = {
 
 
 def inline(t, where=""):
-    """Escape a span of body text, honouring **bold**, *italic* and `code`."""
+    """Escape a span of body text, honouring **bold**, *italic*, `code` and
+    inline $math$ -- without the math split, a \\langle inside $...$ gets
+    escaped to \\textbackslash{}langle and renders as literal soup."""
+    chunks = re.split(r"(\$[^$]*\$)", t)
+    if len(chunks) > 1:
+        return "".join(c if i % 2 else inline(c, where)
+                       for i, c in enumerate(chunks))
     parts = re.split(r"(`[^`]*`)", t)
     out = []
     for i, p in enumerate(parts):
@@ -68,6 +74,58 @@ def convert(md, where=""):
 
         if not s:
             flush(); i += 1; continue
+
+        if s.startswith("@fig:"):
+            flush()
+            name, _, cap = s[5:].partition(" ")
+            out.append(r"\begin{center}\includegraphics[width=\linewidth]"
+                       r"{figures/%s.pdf}\end{center}" % name.strip())
+            if cap.strip():
+                out.append(r"\nopagebreak{\footnotesize\color{muted}%s\par}\medskip"
+                           % inline(cap.strip(), where))
+            i += 1; continue
+
+        if s.startswith("@decide"):
+            flush()
+            title = s[len("@decide"):].strip()
+            rows, i = [], i + 1
+            while i < len(lines) and not lines[i].strip().startswith("@end"):
+                # Keys may be short phrases ("drop it if", "fallback"), not just words.
+                m = re.match(r"^\s*-\s*([\w][\w ]{0,13})\s*:\s+(.*)$", lines[i])
+                if m:
+                    rows.append([m.group(1), m.group(2)])
+                elif lines[i].strip() and rows:
+                    rows[-1][1] += " " + lines[i].strip()
+                i += 1
+            i += 1
+            out.append(r"\begin{decide}{%s}" % inline(title, where))
+            for k, v in rows:
+                out.append(r"\drow{%s}{%s}" % (inline(k.upper(), where),
+                                                inline(v, where)))
+            out.append(r"\end{decide}")
+            continue
+
+        m = re.match(r"^!(say|trap|push|num)\s+(.*)$", s)
+        if m:
+            flush()
+            kind, body = m.group(1), m.group(2)
+            i += 1
+            while i < len(lines) and lines[i].strip() and \
+                    not re.match(r"^!(say|trap|push|num)\s|^@|^#|^\||^>|^```|^\s*[-*] ", lines[i]):
+                body += " " + lines[i].strip(); i += 1
+            out.append(r"\begin{callout%s}%s\end{callout%s}"
+                       % (kind, inline(body, where), kind))
+            continue
+
+        if s == "$$":
+            flush()
+            i += 1
+            block = []
+            while i < len(lines) and lines[i].strip() != "$$":
+                block.append(lines[i]); i += 1
+            i += 1
+            out.append(r"\begin{mathbox}\[" + "\n".join(block) + r"\]\end{mathbox}")
+            continue
 
         if s.startswith("```"):
             flush()

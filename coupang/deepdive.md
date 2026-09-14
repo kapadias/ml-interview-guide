@@ -87,8 +87,9 @@ are real to you rather than decorative.
 | Clicks at ~40% of searches | | ~1.2B click events |
 | Purchases at ~2% of searches | | ~60M purchase events |
 
-The conclusion to state: **this is not a scale problem, it is a quality
-problem.** 10M products and 200 QPS fit comfortably on a handful of machines.
+!say This is not a scale problem, it is a quality problem. Ten million products and two hundred queries a second fit comfortably on a handful of machines. What is hard is recall on ambiguous tail queries and an honest CVR objective.
+
+10M products and 200 QPS fit comfortably on a handful of machines.
 Nothing here forces a distributed index or exotic infrastructure, and a
 candidate who spends twenty minutes on sharding has misread the question. What
 is hard is recall on ambiguous tail queries and an honest CVR objective.
@@ -121,45 +122,15 @@ Draw this first and leave it on the board. Everything afterwards is a zoom into
 one box, and having the map up means you can say "I'm here" instead of
 re-explaining context.
 
-```Figure 1. The funnel, with the latency each stage gets.
-  "durable lightweight winter boots for toddlers"
-                      |
-        +-------------v--------------+
-        |   QUERY UNDERSTANDING      |  ~8 ms
-        |  normalise / spell / seg   |
-        |  attributes / intent / cat |
-        +-------------+--------------+
-                      |
-     structured query { text, category prior, attrs, constraints }
-                      |
-      +---------------+----------------+
-      |               |                |
-+-----v-----+  +------v------+  +------v------+
-|  LEXICAL  |  |    DENSE    |  |  BEHAVIOUR  |  RETRIEVAL
-|  BM25F    |  |  two-tower  |  |  q -> item  |  ~25 ms
-|  inverted |  |  + HNSW     |  |  from logs  |  (parallel)
-+-----+-----+  +------+------+  +------+------+
-      |               |                |
-      +-------+-------+--------+-------+
-              |  FUSION (RRF)  |           ~2 ms
-              +-------+--------+
-                      |  ~1000 candidates
-        +-------------v--------------+
-        |   L1 RANKER  (cheap GBDT)  |  ~8 ms
-        +-------------+--------------+
-                      |  top 100-200
-        +-------------v--------------+
-        |   L2 RANKER  (multi-task)  |  ~22 ms
-        |   pCTR | pCVR | pRel       |
-        +-------------+--------------+
-                      |  top ~50
-        +-------------v--------------+
-        |  POLICY: dedup, diversity, |  ~5 ms
-        |  business rules, blending  |
-        +-------------+--------------+
-                      |
-               ~24 products to the phone
-```
+@fig:funnel Figure 1. The funnel. Each stage sees roughly ten times fewer items and costs ten times more per item, which is why every stage takes about the same wall-clock.
+
+@decide How many retrieval arms?
+- chose: Lexical + dense + behavioural, fused
+- over: Dense only, which is what the prompt's wording tempts you into
+- why: they fail on disjoint query populations. Dense dies on part numbers and rare identifiers; lexical dies on the paraphrase in the prompt; behavioural is empty on the tail and unbeatable on the head.
+- cost: three indexes to keep in sync, and a fusion layer that has to be learned rather than constant
+- drop it if: the dense arm's unique contribution -- clicked items only it retrieved -- turns out to be small. Measure, do not assume.
+@end
 
 Three things to say while you draw it.
 
@@ -187,40 +158,43 @@ merge, and network between services will eat 15–25 ms before any model runs.
 
 **Option A — all-CPU, no cross-encoder.**
 
-```Figure 2. Budget A. Safe, ships on commodity hardware, ~78 ms p99.
-  QU        |========|                       8
-  retrieval |=========================|      25   (3 arms in parallel)
-  fusion    |==|                             2
-  L1        |========|                       8
-  L2 (GBDT) |======================|         22
-  policy    |=====|                          5
-  overhead  |==================|            18   fan-out, merge, serde
-            +------------------------------------+
-            0        25        50        75   100 ms
-                                        ^ 78
-```
+@fig:latency Figure 2. Three ways to spend 100 ms. A already leaves only 12 ms of headroom, which is why the cross-encoder does not fit in the blocking path at all.
 
-Twenty-two milliseconds of headroom. This is what I would ship first.
+Twelve milliseconds of headroom, and everything runs on commodity CPU. This is
+what I would ship first.
 
-**Option B — add a cross-encoder reranker over the top 50.** A 6-layer
-MiniLM-class cross-encoder at 128 tokens, batch 50, runs in roughly 10–15 ms on
-a T4-class GPU. That is ~93 ms p99 and it is affordable on paper. The reason I
-would not do this first is that the p99 is now hostage to GPU queueing: under
-load, batch formation and admission control dominate, and the tail of a GPU
-service is much worse behaved than its median.
+**Option B — put a cross-encoder reranker over the top 50.** A 6-layer
+MiniLM-class model at 128 tokens, batch 50, runs in roughly 10–15 ms on a
+T4-class GPU. That is ~103 ms and it is over budget before you have accounted
+for anything going wrong. And the way it goes wrong is specific: under load, GPU
+batch formation and admission control dominate, and the tail of a GPU service is
+far worse behaved than its median — so the number you actually measure at p99
+will be worse than 103.
 
-**Option C — adaptive depth, which is the answer I would actually defend.**
-Spend the expensive stage only where it pays. Head queries are already well
-served by the behavioural arm and a GBDT; tail queries are where the
-cross-encoder earns its cost. So route on the query-understanding confidence
-and the query-frequency bucket: head and torso take path A, tail takes path B.
+**Option C — progressive ranking, which is the answer I would defend.**
 
-This is not just a cost argument. **Caching the head does not help your p99** —
-p99 *is* the tail — so the common instinct to solve a latency problem with a
-query cache improves the median and leaves the SLO exactly where it was. To move
-p99 you have to make the slow path faster or the expensive path rarer. Adaptive
-depth does the second, and it puts the extra compute on the queries the question
-is about.
+The tempting move is to make the expensive path rare: route tail queries through
+the cross-encoder and head queries around it. **That does not work, and knowing
+why is the point.** p99 *is* the tail. If 30% of queries take 103 ms, then p99 is
+103 ms — making the expensive path rare only helps if "rare" means under one
+percent, and by then it is not doing enough work to matter.
+
+The same reasoning kills the other reflex. **Caching the head does not help your
+p99 either**, for exactly the same reason: the cached queries are the fast ones,
+and p99 is measured on the slow ones. A query cache is a cost and median-latency
+win, not an SLO win, and saying so unprompted is a small but real signal.
+
+What does work is taking the expensive model off the blocking path. On a mobile
+grid the first screen is four to six items. Serve those from the cheap path
+inside budget, then run the cross-encoder over the remaining candidates during
+the user's dwell time and deliver the reordered result with the next scroll
+page. The blocking p99 stays at 88 ms; the cross-encoder still improves the
+session. It costs you a more complicated client contract and a reordering that
+must be stable enough not to feel like the page is shuffling under the user.
+
+There is still a role for adaptive depth, but on the retrieval side rather than
+the ranking side: give tail queries a larger `ef_search` and deeper candidate
+sets, since that cost sits inside the parallel arms where there is slack.
 
 One policy to state without being asked: **never degrade by silently dropping a
 retrieval arm on timeout.** That converts a latency problem into an invisible
@@ -233,18 +207,21 @@ and emit a metric every time you do, so the degradation is measurable.
 Take the query in the prompt apart on the board, because it demonstrates the
 problem better than any description of it.
 
-```Figure 3. "durable lightweight winter boots for toddlers"
-  durable        -> quality attribute, soft, no catalogue field
-  lightweight    -> physical attribute, sometimes in specs, often only in text
-  winter         -> season / use-case, maps to insulation, waterproofing
-  boots          -> HEAD NOUN -> category, the one hard constraint
-  for toddlers   -> audience -> age range 1-3 -> size band, a real filter
+| Token | What it is | Binds to |
+|---|---|---|
+| durable | quality attribute, soft | no catalogue field at all |
+| lightweight | physical attribute | sometimes in specs, usually only in free text |
+| winter | season / use-case | insulation, waterproofing |
+| **boots** | **head noun** | **category — the one hard constraint** |
+| for toddlers | audience | age 1–3, so a size band — a real filter |
 
-  hard constraints  : category = boots, audience = toddler
-  soft preferences  : durable, lightweight, winter-appropriate
-  BM25 sees         : 6 tokens, all of which appear in thousands of listings
-                      and none of which co-occur in many
-```
+**Hard constraints:** category = boots, audience = toddler.
+**Soft preferences:** durable, lightweight, winter-appropriate.
+**What BM25 sees:** six tokens, each appearing in thousands of listings and
+almost never co-occurring.
+
+
+!trap Read the example query back to her before you answer. "Durable lightweight winter boots for toddlers" is not decoration -- it was chosen so that lexical retrieval fails, and demonstrating that you noticed is worth more than any architecture you propose in the next five minutes.
 
 Now the point: **BM25 will return either nothing or garbage here.** Require all
 six terms and you get near-zero results because no title contains them all.
@@ -273,7 +250,7 @@ months of logs is exactly what this needs.
 large share of sessions. Precompute their entire understanding offline, review
 them, and serve from a lookup. That gives you editorial control where the
 traffic is, costs nothing at serving time, and leaves the live model path for
-the tail — which is also where you can afford more latency under Option C.
+the tail — which is also where you can afford deeper retrieval, per Option C.
 
 **Where an LLM belongs here.** Offline, generating attribute annotations and
 query rewrites for the tail, distilled into a small model or baked into a table.
@@ -284,29 +261,7 @@ otherwise ask.
 
 ## The architecture, and the asymmetry that defines it
 
-```Figure 4. Two-tower retriever. The towers are deliberately not the same size.
-    QUERY TOWER (online, ~5 ms)      ITEM TOWER (offline, nightly batch)
-   +------------------------+       +-----------------------------+
-   | "durable lightweight   |       | title + brand + category    |
-   |  winter boots for      |       | + attributes + bullets      |
-   |  toddlers"             |       | + (optionally) image        |
-   +-----------+------------+       +--------------+--------------+
-               |                                   |
-   +-----------v------------+       +--------------v--------------+
-   | SMALL encoder          |       | LARGE encoder               |
-   | 4-6 layers, distilled, |       | 12+ layers. No online       |
-   | must fit the budget    |       | latency constraint at all.  |
-   +-----------+------------+       +--------------+--------------+
-               |                                   |
-          f(q) in R^256                       g(d) in R^256
-               |                                   |
-               +-------------+     +---------------+
-                             |     |
-                    s(q,d) = <f(q), g(d)>
-                             |
-              train: contrastive over sampled negatives
-              serve: ANN over 10M precomputed g(d)
-```
+@fig:two-tower Figure 4. The two towers are deliberately different sizes. The item tower can be large precisely because nobody is waiting for it -- that is free capacity most candidates leave on the table by drawing two identical boxes.
 
 State the asymmetry explicitly, because most candidates draw two identical
 boxes. **The item tower runs offline over 10M products once a night; the query
@@ -359,18 +314,25 @@ Retrieval is trained as a classification problem over the corpus: given the
 query, pick the right item out of everything. The full softmax over 10M items is
 intractable, so you sample.
 
-```Figure 5. Sampled softmax / InfoNCE, for one query q with positive d+.
-                       exp( s(q, d+) / T )
-  L  =  - log  -----------------------------------------
-                sum over  d in {d+} U N  of  exp( s(q,d) / T )
+$$
+\mathcal{L} \;=\; -\log
+\frac{\exp\!\big(s(q,d^{+})/\tau\big)}
+     {\sum_{d \in \{d^{+}\}\cup N} \exp\!\big(s(q,d)/\tau\big)}
+$$
 
-  where  s(q,d) = <f(q), g(d)>     T = temperature
-         N      = the sampled negatives for this query
-```
+where $s(q,d)=\langle f(q), g(d)\rangle$, $\tau$ is the temperature, and $N$ is
+the sampled negative set for this query. It is a cross-entropy over a sampled
+candidate set: push the positive up, push everything else down, with $\tau$
+setting how sharply.
 
-Say what this is doing: it is a cross-entropy over a sampled candidate set,
-pushing the positive up and everything else down, with the temperature setting
-how sharply. Three things follow.
+@decide Which contrastive objective?
+- chose: Sampled softmax / InfoNCE over the candidate set
+- over: Triplet loss with a margin, or BPR
+- why: the softmax normalises over many negatives at once, so the gradient is informed by the whole candidate set and directly optimises the ranking you serve. Triplet sees one negative at a time, needs margin tuning and semi-hard mining, and collapses if you get either wrong.
+- cost: large batches to get enough negatives, and a temperature that genuinely needs tuning
+@end
+
+Three things follow.
 
 **This is the right loss and triplet loss is not.** A triplet loss with a margin
 looks at one negative at a time and gives you a gradient that says "be further
@@ -410,22 +372,21 @@ that is precisely backwards.
 
 The fix is the **logQ correction**, also called sampling-bias correction:
 
-```Figure 6. logQ correction. Subtract the log sampling probability from
-every logit before the softmax.
+$$
+s'(q,d) \;=\; s(q,d) \;-\; \log p(d)
+$$
 
-    corrected logit:   s'(q,d) = s(q,d) - log p(d)
-
-    p(d) = probability that item d is drawn as a sampled negative
-         ~ its frequency in the training stream
-
-    estimate p(d) online with a streaming counter: track the average
-    gap (in steps) between consecutive occurrences of d, p(d) ~ 1/gap
-```
+$p(d)$ is the probability that item $d$ is drawn as a sampled negative, which is
+essentially its frequency in the training stream. Estimate it online with a
+streaming counter: track the average gap in steps between consecutive
+occurrences of $d$, and take $p(d)\approx 1/\text{gap}$.
 
 The intuition to say out loud: an item that shows up as a negative ten times as
 often should be penalised a tenth as hard each time. Without it, the retriever
 has a systematic anti-popularity bias. This is the correction from the YouTube
 two-tower work, and naming it is worth doing.
+
+@fig:negatives Figure 6b. Where each negative source can reach. In-batch negatives are drawn from the click stream, so they can only ever be items that appear as a positive somewhere in the batch. At 10M products with a long tail, that leaves most of the corpus untouched.
 
 ### The negatives that are never sampled at all
 
@@ -437,6 +398,13 @@ clicks in six months. Those items are never negatives for anyone. The model has
 therefore never been trained to push them down, their embeddings sit wherever
 initialisation and the item-text encoder put them, and they can surface
 spuriously in ANN results for unrelated queries.
+
+@decide Where do negatives come from?
+- chose: In-batch with the logQ correction, plus mined hard negatives refreshed from the current model, plus uniform draws from the full index
+- over: In-batch only, which is the default in every tutorial
+- why: in-batch alone is biased toward popular items and structurally cannot reach the zero-engagement tail; hard negatives teach the distinctions that matter; uniform draws are the only source that covers the whole corpus
+- cost: a mining pipeline, a cross-encoder to filter false negatives, and a ratio to tune
+@end
 
 The fix is **mixed negative sampling**: in-batch negatives plus a set of
 negatives drawn uniformly from the full item index. The uniform ones are easy
@@ -492,7 +460,7 @@ clicks cannot provide. In my experience this buys more than doubling the
 embedding dimension or adding layers.
 
 And it closes the loop nicely: you need the cross-encoder anyway for
-false-negative filtering and for Option C's reranker, so you get three uses out
+false-negative filtering and for the progressive reranker, so you get three uses out
 of training it once.
 
 ## Embedding geometry
@@ -504,6 +472,13 @@ lives on the unit sphere so magnitude cannot encode popularity. That is what you
 want for a relevance retriever; popularity belongs in the ranker where it can be
 traded off explicitly. Leaving embeddings unnormalised lets magnitude carry a
 quality prior, which helps in pure recsys retrieval and hurts here.
+
+@decide Normalise the embeddings?
+- chose: L2-normalise both towers, cosine similarity, temperature in the loss
+- over: Unnormalised dot product, where magnitude carries a popularity prior
+- why: popularity belongs in the ranker where it can be traded off explicitly, not smuggled into the retrieval score where you cannot see it
+- cost: you need the temperature, since cosine lives in [-1, 1] and the softmax is otherwise nearly flat
+@end
 
 **Whatever you choose, serve it the same way.** Training with unnormalised dot
 product and then serving a cosine index silently discards the magnitude the
@@ -518,44 +493,21 @@ cheap 64-d first pass and rescore with the full 256 without training twice.
 
 ## Putting the training loop together
 
-```Figure 7. The retrieval training pipeline.
-  6 months of logs
-        |
-        v
-  +-----------------+   queries with clicks / ATC / purchases,
-  | build pairs     |   weighted by action, position-debiased,
-  +--------+--------+   session-attributed for tail queries
-           |
-           v
-  +-----------------+   BM25 top-k not clicked  +  ANN top-k from the
-  | mine negatives  |   CURRENT model (refresh every 1-2 epochs)
-  +--------+--------+
-           |
-           v
-  +-----------------+   cross-encoder scores every mined negative;
-  | denoise         |   drop any scoring above the positive
-  +--------+--------+
-           |
-           v
-  +-----------------+   in-batch (logQ corrected)
-  | assemble batch  |   + mined hard  + uniform from full index
-  +--------+--------+
-           |
-           v
-  +-----------------+   InfoNCE, T ~ 0.05, large batch,
-  | train two-tower |   cross-device negative sharing
-  +--------+--------+   + KL distillation from the cross-encoder
-           |
-           v
-  +-----------------+   item tower over 10M products, nightly
-  | embed corpus    |   incremental for new/changed items
-  +--------+--------+
-           |
-           v
-  +-----------------+   HNSW, int8, rebuilt nightly, hot-swapped
-  | build ANN index |
-  +-----------------+
-```
+1. **Build pairs** from six months of logs — clicks, add-to-cart and purchases,
+   weighted by action, position-debiased, session-attributed for tail queries.
+2. **Mine negatives** — BM25 top-k not clicked, plus ANN top-k from the *current*
+   model, refreshed every one to two epochs.
+3. **Denoise** — score every mined negative with the cross-encoder teacher and
+   drop anything scoring above the positive.
+4. **Assemble the batch** — in-batch negatives with the logQ correction, plus the
+   mined hard negatives, plus uniform draws from the full index.
+5. **Train** — InfoNCE at $\tau\approx 0.05$, large batch, cross-device negative
+   sharing, with KL distillation from the cross-encoder.
+6. **Embed the corpus** — item tower over 10M products nightly, incremental for
+   new and changed listings.
+7. **Build the index** — HNSW over int8 vectors, rebuilt nightly and hot-swapped,
+   with the model version pinned into the index metadata.
+
 
 Two operational points that signal you have run one of these.
 
@@ -574,6 +526,8 @@ full item-tower pass is a few GPU-hours, so nightly is comfortable.
 Recall@K against held-out clicked or purchased items, where K is the candidate
 count the ranker actually receives — Recall@1000, not Recall@10. Measuring
 retrieval at 10 is measuring the ranker.
+
+!push "Your Recall@1000 is up six points. Ship it?" -- No, not on that evidence. The held-out positives came from the incumbent's own impressions, so a retriever that finds better items the old one never showed gets no credit and can score worse while being better.
 
 **Now the trap, and I would raise it before she does.** Your held-out positives
 are items the *current* system retrieved and displayed. A new retriever that
@@ -605,6 +559,13 @@ product metric. For the query in the prompt, that is the outcome that matters.
 
 For 10M x 256 the answer is HNSW and I would say so quickly — this is not the
 interesting part of the question and spending time here is a mistake.
+
+@decide Which ANN index?
+- chose: HNSW over int8-quantised vectors, no product quantisation
+- over: IVF-PQ
+- why: at 10M x 256 the whole thing is about 5 GB and fits in RAM on one machine. PQ trades recall for memory you do not need; reach for it at a billion vectors, not ten million.
+- cost: higher memory than IVF-PQ, and a graph that must be rebuilt rather than updated in place
+@end
 
 `M = 32`, `efConstruction = 200`, `efSearch` tuned to hit a recall target
 against exact search. Int8 scalar quantisation of the vectors: 2.6 GB of vectors
@@ -640,6 +601,8 @@ model can condition on that where a fixed constant cannot.
 
 ## "Optimise CVR" is a trap, and saying so is the point
 
+!trap "Optimise CVR" is the trap in this question. Taken literally it produces a ranker that sorts by cheapness, goes blind on the exact tail queries the prompt is about, and compounds through the exposure loop. Name the pathology, then propose expected value.
+
 Do not accept the objective as stated. A ranker trained to maximise conversion
 probability and nothing else has three specific pathologies, and naming them is
 worth more than any architecture you could propose.
@@ -658,23 +621,31 @@ the prompt.
 concentrates on safe converting items sees only those items converting, and the
 loop tightens.
 
+@decide What does the ranker actually optimise?
+- chose: Expected value -- pCTR x pCVR x value -- with a hard relevance gate and a returns penalty
+- over: Pure pCVR, which is what the question literally asks for
+- why: conversion probability is highest for low-commitment purchases, so a pure pCVR ranker sorts by cheapness; it is also blind on tail queries where nothing converts, and it compounds through the exposure loop
+- cost: you now need calibrated probabilities and a business input for value, and you have to defend the deviation from the stated objective
+- fallback: if she wants CVR literally, keep pCVR ordering but make the relevance gate a hard constraint and GMV per session a guardrail that cannot regress
+@end
+
 So I would rank on **expected value with a relevance gate**:
 
-```Figure 8. The objective I would actually defend.
+$$
+\mathrm{score}(q,d) \;=\;
+p_{\mathrm{CTR}}\cdot p_{\mathrm{CVR}}\cdot \mathrm{value}(d)\cdot g(p_{\mathrm{rel}})
+\;-\; \lambda\, p_{\mathrm{return}}\cdot \mathrm{value}(d)
+$$
 
-  score(q, d) =  pCTR(q,d) * pCVR(q,d) * value(d) * g(pRel(q,d))
-                 - lambda * pReturn(q,d) * value(d)
+$\mathrm{value}(d)$ is margin, or price, or contribution -- a business input, not
+a model output, and worth asking which one they optimise. $g(p_{\mathrm{rel}})$
+is a relevance gate: hard-drop below a threshold, then a mild monotone boost.
+$p_{\mathrm{return}}$ matters because returns are negative revenue *and*
+negative trust, so a CVR objective that ignores them optimises for regret.
 
-  value(d)   = margin, or price, or contribution -- a business input,
-               not a model output. Ask which one they optimise.
-  g(pRel)    = a relevance gate: hard-drop below a threshold, then a
-               mild monotone boost. Prevents the cheap-and-irrelevant
-               failure without letting relevance dominate.
-  pReturn    = returns are negative revenue AND negative trust; a CVR
-               objective that ignores them optimises for regret.
-```
+!say CVR is the metric. Expected value is the objective. Those are different sentences and the difference is the whole answer.
 
-Say the framing plainly: **CVR is the metric, expected value is the objective.**
+
 Then offer the fallback if she pushes back and wants CVR literally: keep pure
 pCVR ordering but make the relevance gate a hard constraint and add GMV per
 session as a guardrail that cannot regress. That is a reasonable position and it
@@ -708,13 +679,14 @@ keep training tractable. That shifts the base rate, and a model trained on the
 downsampled data over-predicts. With negatives kept at rate `w`, recover the
 true probability with
 
-```Figure 9. Recalibrating after negative downsampling.
-                        p
-      q  =  ---------------------------          w = negative keep rate
-              p  +  (1 - p) / w                  p = model output on the
-                                                     downsampled data
-      Example: w = 0.1, p = 0.5  ->  q = 0.5 / (0.5 + 5) = 0.09
-```
+$$
+q \;=\; \frac{p}{\,p + (1-p)/w\,}
+$$
+
+$w$ is the negative keep rate and $p$ is the model's output on the downsampled
+data. At $w=0.1$ and $p=0.5$ the corrected probability is $0.09$ -- a factor of
+five. Forget this and every downstream multiplication by price is wrong by a
+constant you did not choose.
 
 Forget this and every downstream multiplication by price is wrong by a constant
 factor you did not choose. It is a two-line fix and a very common production bug.
@@ -736,25 +708,22 @@ at positions 50 and 51 that no user will ever see.
 
 **Listwise** — LambdaRank and its GBDT form, LambdaMART — fixes exactly that.
 
-```Figure 10. Why LambdaRank exists, and what the lambda is.
+$$
+\lambda_{ij} \;=\;
+\big(\text{pairwise logistic gradient for } (i,j)\big)
+\;\times\;
+\big|\Delta\mathrm{NDCG}_{ij}\big|
+$$
 
-  NDCG depends only on the ORDER, so it is a step function of the scores:
-  zero gradient almost everywhere, a jump when two items swap. You cannot
-  descend it.
+NDCG depends only on the ordering, so it is a step function of the scores: zero
+gradient almost everywhere, a jump when two items swap. LambdaRank's move is to
+skip defining a loss and write the gradient directly. Each item's gradient is
+the sum of $\lambda_{ij}$ over every pair it appears in, and the
+$|\Delta\mathrm{NDCG}|$ factor is the whole idea -- a swap at ranks 1 and 2 is
+worth far more than one at 50 and 51, so capacity concentrates at the top of the
+list. LambdaMART is these gradients plugged into gradient boosting.
 
-  LambdaRank's move: skip the loss, write the gradient directly.
-
-     lambda_ij  =  ( pairwise logistic gradient for the pair i,j )
-                   x  | delta NDCG from swapping i and j |
-
-     gradient for item i  =  sum of lambda_ij over all pairs i is in
-
-  The |delta NDCG| factor is the whole idea: a swap at ranks 1-2 is worth
-  far more than one at 50-51, because the positional discount says so. So
-  the model concentrates capacity at the top of the list.
-
-  LambdaMART = these gradients plugged into gradient boosting.
-```
+!push "Why not just use LambdaMART then?" -- Because a LambdaMART score is not a probability, and the expected-value objective multiplies by price. Calibration is the constraint, not accuracy.
 
 **Now the constraint.** The expected-value score in Figure 8 multiplies pCTR by
 pCVR by price. That multiplication is only meaningful if those are
@@ -762,6 +731,13 @@ pCVR by price. That multiplication is only meaningful if those are
 interpretation at all — you cannot multiply it by a hundred dollars and get
 expected revenue. So a pure listwise ranker is incompatible with the objective
 this question asks for.
+
+@decide Pointwise, pairwise or listwise?
+- chose: Pointwise BCE for the probability heads, listwise only for relevance and for a list-context layer on the final top-k
+- over: LambdaMART as the single ranker, which is the reflex answer
+- why: the expected-value score multiplies probabilities by price, and that is only meaningful if they are calibrated. A LambdaMART score has no probabilistic interpretation, so you cannot multiply it by a hundred dollars.
+- cost: pointwise does not optimise order directly, which is exactly why the list-context layer goes back on top
+@end
 
 How I would resolve it, and this is the answer I would defend:
 
@@ -794,25 +770,7 @@ precisely where you need precision.
 
 ESMM removes both problems by never training CVR directly:
 
-```Figure 11. ESMM. The CVR tower has no loss of its own.
-
-            IMPRESSION SPACE  (every impression is labelled)
-                            |
-         +------------------+-------------------+
-         |                                      |
-    +----v------+                       +-------v--------+
-    |   pCTR    |                       |     pCTCVR     |
-    |   tower   |                       |  = pCTR x pCVR |
-    | loss: BCE |                       |   loss: BCE    |
-    +----+------+                       +-------+--------+
-         |          shared embeddings           |
-         +------------------+-------------------+
-                            |
-                     +------v-------+
-                     |    pCVR      |  <- no direct loss.
-                     |    tower     |     Supervised only through
-                     +--------------+     the product above.
-```
+@fig:esmm Figure 11. ESMM. Both supervised tasks live on the full impression space, so the selection bias is gone and CVR is learned as the ratio. The cost: the product is numerically touchy when pCTR is small, and a miscalibrated CTR tower propagates straight through.
 
 Both supervised tasks are defined over all impressions, so the bias is gone, and
 the CVR tower inherits representations from the CTR task which has vastly more
@@ -903,24 +861,25 @@ aggregate calibration hides the segments where it is broken.
 
 ## The ranking model
 
-```Figure 12. Multi-task L2 ranker.
-   features: query x item x user x context   (~200 for commerce)
-                          |
-                +---------v----------+
-                |  shared bottom     |   escalate to MMoE / PLE only
-                |  (or MMoE / PLE)   |   when you MEASURE negative
-                +---------+----------+   transfer against single-task
-                          |
-        +---------+-------+-------+---------+
-        |         |               |         |
-    +---v---+ +---v---+       +---v---+ +---v----+
-    | pCTR  | | pCVR  |       | pRel  | | pReturn|
-    +---+---+ +---+---+       +---+---+ +---+----+
-        |         |               |         |
-        +---------+-------+-------+---------+
-                          |
-                    expected value (Figure 8)
-```
+| Head | Loss | Feeds |
+|---|---|---|
+| pCTR | BCE on clicks over all impressions | the EV product |
+| pCVR | none directly — learned through ESMM's product | the EV product |
+| pRel | listwise, or distilled from the cross-encoder | the relevance gate |
+| pReturn | BCE on returns among purchases | the penalty term |
+
+Shared bottom first. Escalate to MMoE and then PLE only when you have *measured*
+negative transfer — each head against a single-task model trained alone. Task
+loss weighting usually dominates the architecture choice anyway.
+
+
+@decide GBDT or neural for the L2?
+- chose: Both -- a neural model produces user-history and query-item embeddings offline, and those enter a LambdaMART/LightGBM ranker as features
+- over: Pure neural, or pure GBDT
+- why: 200 heterogeneous engineered features is tree territory -- scale-invariant, minutes to train on CPU, monotonic constraints available, legible importances. Representation learning over raw IDs and history sequences is not, and trees cannot do it.
+- cost: two training pipelines and an embedding-freshness dependency
+- but: multi-task goes neural first, because a GBDT does not do multi-task cleanly and ESMM needs shared representations
+@end
 
 **Which model.** For an L2 with ~200 engineered tabular features, LambdaMART on
 LightGBM is the strong default: minutes to train on CPU, scale-invariant,
@@ -992,16 +951,7 @@ skew is to log the exact feature vector the model scored at request time, and
 train on those logged values. Then skew is impossible by construction: whatever
 was wrong at serving is equally wrong at training, so the model learns around it.
 
-```Figure 13. Log-and-train removes skew by construction.
-   RECOMPUTE (fragile)              LOG-AND-TRAIN (robust)
-   serving:  features_online        serving:  features_online --+
-   training: features_offline                                   |
-             (different code,                 log them ---------+
-              different data cutoff)                            |
-                     |                                          v
-             skew you discover                       training reads exactly
-             three months later                      what serving computed
-```
+@fig:skew Figure 13. Logging the served feature vector removes training-serving skew by construction -- whatever was wrong at serving is equally wrong at training, so the model learns around it. The cost is storage: roughly 200 floats per impression, and you can sample.
 The cost is storage — you are logging a 200-float vector per impression — and at
 this volume that is real but affordable, and you can sample it.
 
@@ -1074,39 +1024,14 @@ actually ship on.
 | **System** | p50 / p99 latency | Latency is a quality metric — measure CVR against it |
 | | ECE, calibration ratio | Required if you multiply probabilities by price |
 
-The sentence to say: **I would ship on CVR per search session with GMV per
-session and return rate as guardrails, and report tail zero-result rate
-separately because it is the thing this system is being built to fix.**
+!say I would ship on CVR per search session, with GMV per session and return rate as guardrails that cannot regress, and report tail zero-result rate separately because it is the thing this system is being built to fix.
 
 # Mobile versus web
 
 She specified a mobile app search bar. Being able to say precisely how the web
 version differs is cheap signal that you have built both.
 
-```Figure 14. The same query, two surfaces.
-
-   MOBILE APP                        WEB
-   +----------------+                +--------------------------------+
-   | [search bar ]  |                | [ search bar              ]    |
-   +----------------+                +--------------------------------+
-   | +----+ +----+  |  above         | +---+ +---+ +---+ +---+ +---+  |
-   | | 1  | | 2  |  |  the           | | 1 | | 2 | | 3 | | 4 | | 5 |  |
-   | +----+ +----+  |  fold          | +---+ +---+ +---+ +---+ +---+  |
-   | +----+ +----+  |                | +---+ +---+ +---+ +---+ +---+  |
-   | | 3  | | 4  |  |                | | 6 | | 7 | | 8 | | 9 | |10 |  |
-   | +----+ +----+  |                | +---+ +---+ +---+ +---+ +---+  |
-   +- - - - - - - - +  fold          | +---+ +---+ +---+ +---+ +---+  |
-   | | 5  | | 6  |  |                | |11 | |12 | |13 | |14 | |15 |  |
-   |   infinite     |                | +---+ +---+ +---+ +---+ +---+  |
-   |   scroll       |                |        1  2  3  4  next        |
-   +----------------+                +--------------------------------+
-
-   4 items above the fold            15-20 items above the fold
-   steep position-bias curve         flatter curve, real comparison
-   short, typo-prone queries         longer, more precise queries
-   typeahead is load-bearing         typeahead is a convenience
-   variable cellular latency         stable latency
-```
+@fig:surfaces Figure 14. Four slots above the fold against fifteen to twenty. The consequence to state out loud: estimate propensities *per surface*, because one shared curve is confidently wrong on both.
 
 **Position bias is far steeper on mobile**, because four items are visible
 instead of twenty. Practically: you must estimate propensities *per surface* —
@@ -1137,6 +1062,13 @@ product identity, not just by listing, is a mobile requirement and a web nicety.
 client-side budget is tighter than the server-side one suggests. Prefetching the
 next scroll page and progressive image loading are part of the design.
 
+@decide One model for mobile and web, or two?
+- chose: One ranker with surface as a feature; separate propensity curves; separate diversity and dedup policy
+- over: Two complete stacks
+- why: the model can learn the surface interaction from one pipeline, but the position-bias curves are genuinely different objects and a shared curve is confidently wrong on both
+- cost: you must evaluate per surface always, or a mobile regression hides under a web win
+@end
+
 **How I would handle it in the model.** Surface as a feature first, not separate
 models — you keep one training pipeline and the model learns the interaction.
 Separate models only for the things that are genuinely different objects:
@@ -1147,33 +1079,14 @@ aggregate metric will hide a mobile regression under a web win.
 
 # The seam: how retrieval and ranking break each other
 
+!say The ranker is trained on whatever candidate distribution the retriever produced. So if I change retrieval, the ranker's training data is stale, and I would not read the experiment until I had retrained it on logs from the new candidates.
+
 Raise this yourself. It is the part of the question that requires having owned
 both halves, almost nobody brings it up unprompted, and it is the most direct
 evidence you can give that you have shipped one of these rather than read about
 it.
 
-```Figure 15. The coupling. Each stage is trained on the other's output.
-                        +---------------------+
-                        |     RETRIEVER       |
-                        |  trained on clicks  |
-                        +----------+----------+
-                                   | produces the
-                                   v candidate distribution
-                        +---------------------+
-                        |      RANKER         |
-                        |  trained on THOSE   |
-                        |  candidates only    |
-                        +----------+----------+
-                                   | decides what is
-                                   v shown, hence clicked
-                        +---------------------+
-                        |    CLICK LOGS       |
-                        +----------+----------+
-                                   |
-                                   +--> back to both models
-
-   Change either box and the other one's training data is now stale.
-```
+@fig:seam Figure 15. Change either box and the other one's training data is stale. A 6-point recall win reads as a flat A/B until the ranker has been retrained on the new candidate distribution. Never change both in one experiment.
 
 **Ranker trained on retriever v1, served with retriever v2.** The ranker has
 never seen the newly-surfaced items; they are out of distribution and it scores
@@ -1463,7 +1376,7 @@ queries. This is the single biggest expected move on the stated problem.
 
 **Q3 — make it good.** Train the cross-encoder. Use it three ways: false-negative
 filtering, distillation into the bi-encoder, and adaptive-depth reranking for
-tail queries under Option C. Add ANCE hard-negative refresh. Replace RRF with a
+positions 7+ off the blocking path, per Option C. Add ANCE hard-negative refresh. Replace RRF with a
 learned L1 fusion.
 
 **Q4 — the objective.** Multi-task ranker with ESMM, delayed-feedback handling,
@@ -1497,6 +1410,8 @@ she asks — the training pipeline, the downsampling correction, log-and-train,
 the multi-task head, and the mobile/web comparison.
 
 Numbers to have in your head, not on a slide:
+
+!num 10M x 256-d int8 = 2.6 GB of vectors plus ~2.6 GB of HNSW graph. 20 requests in flight at 200 QPS and 100 ms. Six months = ~3B searches, ~1.2B clicks, ~60M purchases. Cross-encoder over 50 candidates = 10-15 ms on a T4. Clicked impressions are 1-5% of all impressions. ~100 impressions per click. Temperature ~0.05, batch size in the thousands, embedding dim 256.
 
 - 10M x 256-d int8 = **2.6 GB** of vectors, plus ~2.6 GB of HNSW graph at M=32
 - **20 requests in flight** at 200 QPS and 100 ms

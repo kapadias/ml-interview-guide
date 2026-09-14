@@ -7,7 +7,8 @@ deep-dive**, and **DS&A coding**, at the Staff / L6 bar.
 | Part | What it is | Count |
 |---|---|---|
 | `brief.md` | What the org is, what each round tests, the 15 leadership principles | — |
-| `deepdive.md` | The set-piece ML-depth question, worked end to end, 15 diagrams | — |
+| `deepdive.md` | The set-piece ML-depth question, worked end to end | — |
+| `breadth_round.md` | Parth's round: breadth + hiring manager + team fit in one slot | — |
 | ML depth | The search funnel front to back: query understanding, retrieval, ranking, evaluation | 44 |
 | ML breadth | Foundations, embeddings, tabular, evaluation, production craft | 34 |
 | `project.md` | Narrative spine, the numbers to know cold, the interrogation bank, LP mapping | — |
@@ -48,9 +49,31 @@ log-and-train, and exploration for cold listings.
 **The seam:** how each stage is trained on the other's output, and why a
 6-point recall win shows up as a flat A/B.
 
-Diagrams are pure ASCII on purpose. They render identically in the PDF and the
-page, they cannot silently break the way TikZ does, and they are what you would
-actually draw on the whiteboard.
+## Figures, decision blocks, callouts
+
+Diagrams are hand-authored SVG in `tools/figures.py`, written once and rendered
+twice: inlined into the page with CSS custom properties so they follow the
+viewer's theme, and through cairosvg into PDFs for LaTeX. No TikZ, so no silent
+figure breakage, and `render()` fails loudly on an unresolved palette token or a
+dangling marker reference.
+
+Two markdown constructs carry the parts that are hard to practise from prose:
+
+    @decide Which contrastive objective?
+    - chose: Sampled softmax / InfoNCE over the candidate set
+    - over: Triplet loss with a margin, or BPR
+    - why: the softmax normalises over many negatives at once ...
+    - cost: large batches, and a temperature that needs tuning
+    @end
+
+    !say    what to actually say out loud
+    !trap   the trap in the question
+    !push   the follow-up she will make
+    !num    the numbers to have in your head
+
+Both render as styled blocks in the page and boxed environments in the PDF, so
+the justification for every major choice — and the alternative it was chosen
+over — is scannable rather than buried mid-paragraph.
 
 ## Where the content comes from
 

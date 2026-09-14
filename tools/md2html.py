@@ -3,7 +3,15 @@
 
 Same principle: raise on anything unrecognised rather than dropping it.
 """
-import html, re, sys
+import html, os, re, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def FIGSVG(name):
+    """Inline the figure with CSS custom properties so it follows the theme."""
+    import figures
+    return figures.render(name, figures.WEB)
 
 
 def inline(t):
@@ -33,6 +41,62 @@ def convert(md, where=""):
         s = lines[i].strip()
         if not s:
             flush(); i += 1; continue
+
+        if s.startswith("@fig:"):
+            flush()
+            name, _, cap = s[5:].partition(" ")
+            svg = FIGSVG(name.strip())
+            out.append('<figure class="dg">%s%s</figure>'
+                       % (svg, "<figcaption>%s</figcaption>" % inline(cap.strip())
+                          if cap.strip() else ""))
+            i += 1; continue
+
+        if s.startswith("@decide"):
+            flush()
+            title = s[len("@decide"):].strip()
+            rows, i = [], i + 1
+            while i < len(lines) and not lines[i].strip().startswith("@end"):
+                # Keys may be short phrases ("drop it if", "fallback"), not just words.
+                m = re.match(r"^\s*-\s*([\w][\w ]{0,13})\s*:\s+(.*)$", lines[i])
+                if m:
+                    rows.append([m.group(1), m.group(2)])
+                elif lines[i].strip() and rows:
+                    rows[-1][1] += " " + lines[i].strip()
+                i += 1
+            i += 1
+            body = "".join('<div class="drow"><span class="dk %s">%s</span>'
+                           '<span class="dv">%s</span></div>'
+                           % (k.lower().replace(" ", "-"),
+                              html.escape(k.upper()), inline(v))
+                           for k, v in rows)
+            out.append('<div class="decide"><div class="dt">%s</div>%s</div>'
+                       % (inline(title), body))
+            continue
+
+        m = re.match(r"^!(say|trap|push|num)\s+(.*)$", s)
+        if m:
+            flush()
+            kind, body = m.group(1), m.group(2)
+            i += 1
+            while i < len(lines) and lines[i].strip() and \
+                    not re.match(r"^!(say|trap|push|num)\s|^@|^#|^\||^>|^```|^\s*[-*] ", lines[i]):
+                body += " " + lines[i].strip(); i += 1
+            LBL = {"say": "Say this", "trap": "The trap",
+                   "push": "She pushes", "num": "Numbers"}
+            out.append('<div class="co %s"><span class="col">%s</span>%s</div>'
+                       % (kind, LBL[kind], inline(body)))
+            continue
+
+        if s == "$$":
+            flush()
+            i += 1
+            block = []
+            while i < len(lines) and lines[i].strip() != "$$":
+                block.append(lines[i]); i += 1
+            i += 1
+            out.append('<div class="mathbox">$$%s$$</div>'
+                       % html.escape("\n".join(block)))
+            continue
 
         if s.startswith("```"):
             flush()

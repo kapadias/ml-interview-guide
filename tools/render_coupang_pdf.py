@@ -26,6 +26,8 @@ PREAMBLE = r"""\documentclass[10pt,twoside]{book}
 \usepackage{microtype}
 \usepackage{needspace}
 \usepackage{tabularx}
+\usepackage{graphicx}
+\graphicspath{{./}}
 \newcolumntype{Y}{>{\raggedright\arraybackslash}X}
 \usepackage{tcolorbox}
 \usepackage{fvextra}
@@ -35,6 +37,7 @@ PREAMBLE = r"""\documentclass[10pt,twoside]{book}
 \definecolor{muted}{RGB}{94,107,102}
 \definecolor{flag}{RGB}{166,64,44}
 \definecolor{soft}{RGB}{233,241,238}
+\definecolor{rulec}{RGB}{201,212,207}
 \setlist[itemize]{leftmargin=1.1em, itemsep=1pt, topsep=2pt, parsep=0pt}
 \setlist[enumerate]{leftmargin=1.4em, itemsep=2pt, topsep=3pt, parsep=0pt}
 \titleformat{\chapter}[display]{\sffamily\huge\bfseries\color{accent}}{}{0pt}{}
@@ -48,6 +51,40 @@ PREAMBLE = r"""\documentclass[10pt,twoside]{book}
 \newcommand{\csection}[1]{\par\vspace{13pt}\noindent{\sffamily\large\bfseries\color{ink}\raggedright #1\par}\vspace{4pt}}
 \newcommand{\csubsection}[1]{\par\vspace{9pt}\noindent{\sffamily\normalsize\bfseries\color{accent}\raggedright #1\par}\vspace{2pt}}
 \newenvironment{callout}{\begin{tcolorbox}[colback=soft,colframe=accent,boxrule=0.5pt,left=7pt,right=7pt,top=5pt,bottom=5pt]}{\end{tcolorbox}}
+\definecolor{saybg}{RGB}{226,240,236}
+\definecolor{trapbg}{RGB}{248,229,223}
+\definecolor{pushbg}{RGB}{237,239,245}
+\definecolor{numbg}{RGB}{243,241,228}
+\definecolor{pushfg}{RGB}{58,74,110}
+\definecolor{numfg}{RGB}{122,98,26}
+% One macro for all four so the label, rule and spacing stay identical.
+\newtcolorbox{co@box}[3]{colback=#1,colframe=#2,boxrule=0pt,leftrule=2.6pt,
+  arc=2pt,left=8pt,right=8pt,top=5pt,bottom=5pt,
+  before upper={{\sffamily\bfseries\footnotesize\color{#2}#3\par\vspace{2pt}}}}
+\newenvironment{calloutsay}{\begin{co@box}{saybg}{accent}{SAY THIS}}{\end{co@box}}
+\newenvironment{callouttrap}{\begin{co@box}{trapbg}{flag}{THE TRAP}}{\end{co@box}}
+\newenvironment{calloutpush}{\begin{co@box}{pushbg}{pushfg}{SHE PUSHES}}{\end{co@box}}
+\newenvironment{calloutnum}{\begin{co@box}{numbg}{numfg}{NUMBERS}}{\end{co@box}}
+\newtcolorbox{mathboxtc}{colback=white,colframe=rulec,boxrule=0.6pt,arc=3pt,
+  left=6pt,right=6pt,top=2pt,bottom=2pt}
+\newenvironment{mathbox}{\begin{mathboxtc}}{\end{mathboxtc}}
+% No tabularx here: it scans for its own \end at expansion time, so splitting
+% one across \newenvironment's begin/end halves fails with \TX@get@body.
+\newenvironment{decide}[1]{%
+  \par\smallskip\noindent
+  \begin{tcolorbox}[colback=white,colframe=accent,boxrule=1pt,arc=3pt,
+    left=8pt,right=8pt,top=6pt,bottom=5pt,
+    title={\sffamily\bfseries\small #1},coltitle=white,colbacktitle=accent,
+    fonttitle=\sffamily]%
+  \small%
+}{\end{tcolorbox}\par\smallskip}
+\newcommand{\drow}[2]{%
+  \par\noindent
+  \begin{minipage}[t]{58pt}\raggedright\strut
+    {\sffamily\bfseries\scriptsize\color{accent}#1}\end{minipage}%
+  \hspace{6pt}%
+  \begin{minipage}[t]{\dimexpr\linewidth-64pt\relax}\strut #2\end{minipage}%
+  \par\vspace{3.5pt}}
 \newcommand{\qhead}[4]{%
   \par\vspace{15pt}\noindent
   {\sffamily\small\color{muted}#1 \textperiodcentered\ #2 \textperiodcentered\ #3}\par\vspace{1pt}
@@ -168,7 +205,7 @@ first level. Every answer below carries the follow-up that is actually coming.
 """
 
 BREADTH_INTRO = """
-Shorter answers. Two minutes, commit in the first sentence, stop. Breadth is
+The bank. Shorter answers. Two minutes, commit in the first sentence, stop. Breadth is
 scored on coverage and on not bluffing, and the fastest way to fail it is to
 keep talking past the point where you knew the answer.
 
@@ -203,6 +240,8 @@ def main():
     L.append(convert(open(os.path.join(C, "brief.md")).read(), "brief.md"))
     L.append(convert(open(os.path.join(C, "deepdive.md")).read(), "deepdive.md"))
     L += qa(deck["depth"], "The ML depth round", DEPTH_INTRO)
+    L.append(convert(open(os.path.join(C, "breadth_round.md")).read(),
+                     "breadth_round.md"))
     L += qa(deck["breadth"], "The ML breadth round", BREADTH_INTRO)
     L.append(convert(open(os.path.join(C, "project.md")).read(), "project.md"))
     L += coding(deck["coding"], CODING_INTRO)
