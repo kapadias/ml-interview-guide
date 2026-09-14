@@ -34,6 +34,21 @@ def convert(md, where=""):
         if not s:
             flush(); i += 1; continue
 
+        if s.startswith("```"):
+            flush()
+            cap = s[3:].strip()
+            i += 1
+            block = []
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                block.append(lines[i]); i += 1
+            i += 1
+            wide = max((len(x) for x in block), default=0) > 74
+            out.append('<pre class="fig%s"><code>%s</code></pre>'
+                       % (" wide" if wide else "", html.escape("\n".join(block))))
+            if cap:
+                out.append('<p class="figcap">%s</p>' % inline(cap))
+            continue
+
         if s.startswith("#"):
             flush()
             lvl = min(len(s) - len(s.lstrip("#")), 4)

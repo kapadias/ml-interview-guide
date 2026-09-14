@@ -69,6 +69,30 @@ def convert(md, where=""):
         if not s:
             flush(); i += 1; continue
 
+        if s.startswith("```"):
+            flush()
+            lang = s[3:].strip()
+            i += 1
+            block = []
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                block.append(lines[i]); i += 1
+            i += 1                                  # closing fence
+            # Diagrams must be pure ASCII: XeTeX silently drops a glyph the
+            # monospace font lacks, and box-drawing characters are exactly the
+            # ones Latin Modern Mono does not have.
+            bad = sorted({c for ln in block for c in ln if ord(c) > 126})
+            if bad:
+                raise SystemExit("md2tex: non-ASCII %s in a fenced block in %s "
+                                 "- diagrams must be pure ASCII" % (bad, where))
+            size = r"\footnotesize" if max((len(x) for x in block), default=0) > 74 else r"\small"
+            out.append(r"\begin{Verbatim}[fontsize=%s,xleftmargin=4pt,samepage=false]" % size)
+            out += block
+            out.append(r"\end{Verbatim}")
+            if lang:
+                out.append(r"\nopagebreak{\footnotesize\color{muted}%s\par}\medskip"
+                           % inline(lang, where))
+            continue
+
         if s.startswith("#"):
             flush()
             lvl = len(s) - len(s.lstrip("#"))
@@ -104,7 +128,9 @@ def convert(md, where=""):
             n = len(header)
             # Ragged X columns throughout: justified narrow columns produce
             # pages of underfull-hbox warnings and visibly bad word spacing.
-            out.append(r"{\small\setlength{\tabcolsep}{4pt}%")
+            # \noindent matters: a tabularx that starts a paragraph is pushed
+            # right by \parindent and overflows the margin by exactly that much.
+            out.append(r"\par\noindent{\small\setlength{\tabcolsep}{4pt}%")
             out.append(r"\begin{tabularx}{\linewidth}{%s}\hline" % ("Y" * n))
             out.append(" & ".join(r"\textbf{%s}" % inline(c, where) for c in header)
                        + r" \\ \hline")

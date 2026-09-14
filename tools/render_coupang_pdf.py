@@ -201,6 +201,7 @@ def main():
     deck = json.load(open(os.path.join(C, "deck.json")))
     L = [PREAMBLE]
     L.append(convert(open(os.path.join(C, "brief.md")).read(), "brief.md"))
+    L.append(convert(open(os.path.join(C, "deepdive.md")).read(), "deepdive.md"))
     L += qa(deck["depth"], "The ML depth round", DEPTH_INTRO)
     L += qa(deck["breadth"], "The ML breadth round", BREADTH_INTRO)
     L.append(convert(open(os.path.join(C, "project.md")).read(), "project.md"))

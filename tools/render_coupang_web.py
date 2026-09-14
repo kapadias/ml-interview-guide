@@ -24,6 +24,7 @@ def main():
     deck = json.load(open(os.path.join(C, "deck.json")))
     data = {
         "brief": convert(open(os.path.join(C, "brief.md")).read(), "brief.md"),
+        "deepdive": convert(open(os.path.join(C, "deepdive.md")).read(), "deepdive.md"),
         "project": convert(open(os.path.join(C, "project.md")).read(), "project.md"),
         "codingIntro": convert(CODING_INTRO, "coding intro"),
         "depth": slim(deck["depth"]),
