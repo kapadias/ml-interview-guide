@@ -494,10 +494,73 @@ def fig_losses():
                  "position-discounted list")
 
 
+def fig_positives():
+    """Claim: the positive's weight is computed, not chosen by taste."""
+    b = []
+    b.append(text(8, 18, "ONE (query, item) PAIR OVER SIX MONTHS", size=10,
+                  tone="muted", family=MONO, weight="600"))
+    b.append(f'<rect x="8" y="26" width="196" height="132" rx="7" '
+             f'fill="{{raise}}" stroke="{{rule}}"/>')
+    rows = [("412", "impressions", "faint", ""),
+            ("37", "clicks", "ink", "x 1.0"),
+            ("6", "add-to-cart", "ink", "x 1.9"),
+            ("3", "purchases", "ink", "x 2.6"),
+            ("0", "returns", "faint", "")]
+    for k, (n, lab, tone, mul) in enumerate(rows):
+        y = 48 + k * 22
+        b.append(text(24, y, n, size=12, tone=tone, family=MONO, weight="600",
+                      anchor="end"))
+        b.append(text(32, y, lab, size=11, tone=tone))
+        if mul:
+            b.append(text(196, y, mul, size=10.5, tone="accent", family=MONO,
+                          anchor="end", weight="600"))
+    b.append(text(8, 176, "mean rank 4.2", size=10.5, tone="flag", family=MONO,
+                  weight="600"))
+
+    b.append(text(232, 40, "CALIBRATED VALUES", size=9.5, tone="accent",
+                  family=MONO, weight="600"))
+    b.append(text(232, 56, "from a human-judged", size=10, tone="muted"))
+    b.append(text(232, 71, "sample, not from taste:", size=10, tone="muted"))
+    b.append(text(232, 90, "v(a) = logit P(rel | a)", size=10, tone="ink",
+                  family=MONO))
+    b.append(text(232, 105, "     - logit P(rel | impr)", size=10, tone="ink",
+                  family=MONO))
+    b.append(text(232, 128, "click 1.0   ATC 1.9", size=10, tone="accent",
+                  family=MONO, weight="600"))
+    b.append(text(232, 143, "purchase 2.6", size=10, tone="accent", family=MONO,
+                  weight="600"))
+    b.append(text(232, 164, "far flatter than intuition", size=10, tone="flag"))
+    b.append(text(232, 179, "says -- the click already", size=10, tone="flag"))
+    b.append(text(232, 194, "carries most of the signal", size=10, tone="flag"))
+
+    b.append(arrow(210, 92, 226, 92))
+    b.append(arrow(430, 92, 452, 92, tone="accent", marker="arrowA"))
+
+    b.append(f'<rect x="458" y="26" width="234" height="176" rx="7" '
+             f'fill="{{soft}}" stroke="{{accent}}" stroke-width="1.2"/>')
+    lines = [("raw  = 37(1.0)+6(1.9)+3(2.6)", "ink"),
+             ("     = 56.2", "muted"),
+             ("", "ink"),
+             ("log(1 + raw)      = 4.05", "ink"),
+             ("/ propensity(4.2) = 0.55", "ink"),
+             ("------------------------", "faint"),
+             ("w_pair            = 7.36", "accent"),
+             ("normalised to mean 1", "muted"),
+             ("w                 = 2.45", "accent")]
+    for k, (ln, tone) in enumerate(lines):
+        b.append(text(470, 50 + k * 17, ln, size=10, tone=tone, family=MONO,
+                      weight="600" if tone == "accent" else "400"))
+    return frame(700, 214, "".join(b),
+                 "Computing one positive's training weight from six months of "
+                 "events: action counts times values calibrated against human "
+                 "judgements, log-compressed, divided by examination propensity, "
+                 "then normalised")
+
+
 FIGURES = {
     "funnel": fig_funnel, "latency": fig_latency, "two-tower": fig_two_tower,
     "negatives": fig_negatives, "esmm": fig_esmm, "seam": fig_seam,
-    "surfaces": fig_surfaces, "skew": fig_skew, "losses": fig_losses,
+    "surfaces": fig_surfaces, "skew": fig_skew, "losses": fig_losses, "positives": fig_positives,
 }
 
 

@@ -280,33 +280,214 @@ cross-encoder can. So the two-tower's job is recall, and you accept that.
 ## Where the positives come from
 
 Six months of logs, and the choice of positive is a modelling decision, not a
-data-loading detail.
+data-loading detail. Three questions in order: which actions count, how much
+each is worth, and what the resulting table looks like.
 
-The graded options, weakest to strongest signal: impression, click, add to cart,
-purchase, purchase-without-return. The naive choice is clicks, because there are
-~1.2B of them. The problem is that a click in commerce is heavily driven by the
-thumbnail and the price, so a click-trained retriever learns attractiveness as
-much as relevance.
+### The action ladder
 
-What I would do: **train on clicks for coverage and weight by the downstream
-action.** A purchased item gets a much larger weight than a clicked one, a
-returned purchase gets weight zero or negative. This keeps the volume that a
-retriever needs while bending the objective toward genuine satisfaction. If she
-pushes on why not train on purchases only: ~60M purchase events across 10M
+| Action | Count, 6 months | Rate | What it is evidence of | Value $v(a)$ |
+|---|---|---|---|---|
+| Impression | ~62B | ~20 / search | the ranker's opinion, not the user's | baseline, 0 |
+| Click | ~1.2B | 0.4 / search | interest **given the thumbnail and price** | 1.0 |
+| Add to cart | ~180M | 0.06 / search | genuine consideration | 1.9 |
+| Purchase | ~60M | 0.02 / search | intent satisfied | 2.6 |
+| Purchase, returned | ~6M | 10% of purchases | relevant, but did not fit | 1.6 |
+
+The naive choice is clicks, because there are 1.2 billion of them. The problem
+is that a click in commerce is driven by the thumbnail and the price as much as
+by relevance, so a click-trained retriever learns attractiveness. The naive
+correction is to train on purchases only — but 60M events spread across 10M
 products is far too sparse for the tail, and the tail is the question.
 
-Two corrections I would apply to the positives:
+So: **train on clicks for coverage, and weight by the downstream action.**
 
-**Position debiasing on the positive side.** A click at rank 1 is much weaker
-evidence than a click at rank 20, because rank 1 gets examined regardless.
-Down-weight positives by examination propensity, or at minimum sample positives
-from deeper ranks at a higher rate.
+### How the values are derived, not chosen
 
-**Session-level positives for tail queries.** For a tail query with a handful of
-events, the click is noisy. But if the user reformulated and then purchased,
-attribute that purchase back to the original query. This is the single cheapest
-way to get usable tail training data out of six months of logs, and it directly
-addresses the question being asked.
+This is the part worth being precise about, because "a purchase is worth more"
+is not an answer — *how much* more is the answer, and picking it by taste is
+how you end up with a model nobody can debug.
+
+The weight should be monotone in **the posterior probability that this item is
+genuinely relevant to this query, given that this action happened.** That is
+measurable. Take a few thousand query-item pairs, stratified by which action
+they received, have humans judge relevance, and compute $P(\text{rel} \mid a)$
+per action. Then set the value to the log-odds, with impression as the baseline:
+
+$$
+v(a) \;=\; \mathrm{logit}\,P(\text{rel} \mid a) \;-\; \mathrm{logit}\,P(\text{rel} \mid \text{impression})
+$$
+
+normalised so a click is 1.0. A few thousand judgements is a day of annotation
+and it converts every weight in the pipeline from an opinion into a measurement.
+
+!trap The calibrated values come out far flatter than intuition. Most people reach for a purchase being ten times a click; the likelihood ratio says about two and a half. The click already carries most of the relevance evidence — the purchase adds price, availability and delivery, which are ranking concerns, not retrieval ones. Say this out loud; it is the kind of thing that only comes from having measured it.
+
+The returns row carries the same lesson and is worth volunteering. A returned
+purchase is **still good evidence of relevance** — the customer searched, found
+it, and bought it. The return usually means fit or quality, not the wrong
+product. So returns barely move the retriever and matter enormously to the
+ranker.
+
+!say Returns are a ranking signal, not a retrieval signal. The item was relevant; it just did not fit. I would penalise them heavily in the expected-value objective and almost not at all in the retriever's positives.
+
+### Scoring one pair
+
+@fig:positives Figure 4b. The weight for one (query, item) positive. Counts times calibrated values, log-compressed so a pair with ten thousand clicks does not get ten thousand times the weight of one with a single click, then divided by examination propensity, then normalised so the dataset mean is 1.
+
+$$
+w(q,d) \;=\; \frac{\log\!\big(1 + \sum_a n_a(q,d)\, v(a)\big)}{\hat{\pi}\big(\overline{\text{rank}}, \text{surface}\big)}
+$$
+
+Three choices inside that formula, each of which she can push on.
+
+**The log.** Without it, a pair with 10,000 clicks contributes 10,000 times the
+gradient of a pair with one, and your retriever becomes a popularity model.
+The log is the same saturation intuition as BM25's $k_1$, applied to training
+weight instead of term frequency.
+
+**The propensity divisor.** A click at rank 1 is weak evidence because rank 1 is
+examined regardless; a click at rank 20 is strong evidence because the user had
+to work for it. Dividing by $\hat{\pi}$ up-weights the deep clicks. **Clip it**
+— $\hat{\pi} \geq 0.05$ or so — because a propensity estimate near zero produces
+a weight that dominates the entire batch.
+
+**The normalisation.** Scale weights to mean 1 across the dataset so the loss
+magnitude, and therefore your learning rate, does not move when you change the
+value table.
+
+### Where the weight actually goes
+
+Two mechanically different options, and the choice matters more than it looks.
+
+@decide How do you apply the positive weight?
+- chose: Sample positives with probability proportional to $w$, capped, and then train unweighted
+- over: Keeping the batch uniform and multiplying each example's loss term by $w$
+- why: with in-batch negatives every positive is simultaneously a negative for the other queries in the batch. Loss-weighting only scales its role as a positive, so a heavily weighted pair is a loud positive and a normal-volume negative -- an asymmetry nobody intends. Sampling changes both roles consistently.
+- cost: sampling amplifies popularity, so the log compression and the cap are load-bearing, and you lose the ability to tune weights without rebuilding the sampler
+- fallback: sample for the bulk of the signal and loss-weight only the returns adjustment, which is small
+@end
+
+### Session-level attribution for the tail
+
+For a tail query with a handful of events, a single click is noise. But
+reformulation chains are signal, and this is the cheapest tail data you have.
+
+The rule I would write down, because "attribute the session" is not specific
+enough to implement:
+
+- A session is one user, events within a 30-minute gap.
+- If query $q_1$ produced no click, the user reformulated to $q_2$, and then
+  clicked or purchased item $d$ — attribute $d$ as a positive for **both**
+  $q_1$ and $q_2$.
+- Discount the inferred one: $q_1$ gets $0.5 \times w$, because the attribution
+  is an inference and $q_2$ is the observation.
+- Cap the chain at two reformulations. Beyond that the user has changed intent.
+- Require the two queries to share a token or exceed a similarity threshold,
+  or you will attribute "toddler boots" to "phone charger" in the same session.
+
+On this corpus that typically recovers training pairs for a meaningful slice of
+tail queries that otherwise have no positive at all — which is exactly the
+population the prompt is about.
+
+## The shape of the training data
+
+Two tables, and **they are different shapes on purpose**.
+
+### The event log — what you read from
+
+```
+search_event      search_id, user_id, ts, query_raw, query_norm,
+                  surface, locale, ranker_version, retriever_version
+impression_event  search_id, item_id, position(row,col), above_fold, ts
+action_event      search_id, item_id, action, ts, order_id
+```
+
+`ranker_version` and `retriever_version` are not bookkeeping — they are what
+makes intervention harvesting possible later, because they identify the natural
+position randomisation your A/B tests already produced.
+
+### The retriever's table — aggregated to the pair
+
+```
+retriever_pairs                                        ~180M rows
+  query_norm          string
+  item_id             int64
+  n_impr, n_click, n_atc, n_purchase, n_return   int
+  mean_position       float
+  propensity          float        -- clipped
+  weight              float        -- the formula above, normalised
+  query_freq_bucket   enum(head, torso, tail)
+  split               enum(train, val, test)
+```
+
+**Why aggregate.** The retriever has no user features — the query tower sees a
+string and nothing else — so per-event rows add no information, and they add
+popularity skew: a pair shown a million times would contribute a million
+gradient steps for a signal that is fully captured by its counts. Aggregating
+deduplicates it and costs nothing.
+
+Filters worth naming: drop pairs with zero clicks, drop queries with fewer than
+three distinct clicked items (no contrast to learn from), drop bot and scraper
+traffic by session-rate heuristics, and drop pairs whose item is no longer in
+the catalogue.
+
+### The ranker's table — per impression
+
+```
+ranker_impressions                                     ~62B, sampled to ~2B
+  search_id, item_id, position, surface, device, ts
+  feature_vector      float32[~200]   -- LOGGED at serve time, not recomputed
+  label_click, label_atc, label_purchase, label_return  bool
+  propensity          float
+  split               enum
+```
+
+The ranker *does* have user and context features, so it needs per-impression
+rows, and it needs the negatives that never got clicked — which the retriever's
+table has thrown away. The `feature_vector` is logged rather than recomputed,
+for the skew reason in Figure 13.
+
+!say The two tables are different shapes because the retriever has no user context. That is not an implementation detail — it is why the retriever can be trained on an aggregate a thousand times smaller than the ranker's.
+
+### The batch that comes out
+
+| Tensor | Shape | Notes |
+|---|---|---|
+| `query_ids` | `[4096, 16]` | queries are short; 16 tokens covers almost all |
+| `pos_item_ids` | `[4096, 96]` | title + brand + attributes |
+| `hard_neg_ids` | `[4096, 4, 96]` | 2 from BM25, 2 from the current ANN index |
+| `uni_neg_ids` | `[4096, 2, 96]` | uniform over the 10M index |
+| `weights` | `[4096]` | only if you loss-weight rather than sample |
+| `log_q` | `[4096, 4102]` | sampling log-prob per candidate, for the logQ correction |
+
+Candidates per query: 1 positive + 4095 in-batch + 4 mined + 2 uniform ≈ **4102**.
+
+!num Item-tower forward passes per step: 4096 positives + 4096 x 6 explicit negatives = 28,672. In-batch negatives are free; every mined or uniform negative is a full encoder pass. That factor of seven is the real cost of the negative strategy, and it is the number to quote if she asks what it costs.
+
+The mitigation, which is what ANCE does in practice: cache item embeddings from
+the last index refresh and reuse them for mined negatives, recomputing only on
+the refresh cadence. You trade a little staleness for most of the compute.
+
+### The negative sources, side by side
+
+| Source | Per positive | Cost per step | What it fixes | Fails if |
+|---|---|---|---|---|
+| **In-batch** | ~4095 | free — already encoded | general contrast, cheaply | used alone: popularity-biased, cannot reach the tail |
+| **Mined, BM25** | 2 | 2 encoder passes | keyword match vs intent match | not filtered — BM25's top-k is full of false negatives |
+| **Mined, ANN** | 2 | 2 passes + re-index | the model's *current* errors | not refreshed — they go stale once the model beats the miner |
+| **Uniform** | 2 | 2 passes | the zero-engagement tail | nothing: they are cheap and they are the only source that covers it |
+
+### Splits
+
+**Split by time, never randomly.** The last 14 days are test, the 14 before are
+validation, everything earlier is train. A random split leaks: the same
+(query, item) pair appears on both sides, and you will serve forward in time, so
+a random split measures a task you will never perform.
+
+Hold out a second, **query-disjoint** split as well — whole tail queries the
+model has never seen — because time-based splitting still lets a head query's
+embedding be learned from the training period and evaluated in the test period.
+That second split is the one that tells you about the tail.
 
 ## The objective
 
@@ -1240,6 +1421,40 @@ failure mode in this round is hesitation, not being wrong.
 
 ## On retrieval training
 
+**"How do you set the weight on a purchase versus a click?"** I measure it
+rather than pick it. Judge a few thousand query-item pairs stratified by action,
+compute the probability the pair is relevant given each action, and take the
+log-odds difference against impressions. It comes out far flatter than intuition
+— about 2.6 to 1, not 10 to 1 — because the click already carries most of the
+relevance evidence and the purchase mostly adds price and availability, which
+are ranking concerns.
+
+**"Do you treat a returned purchase as a negative?"** For the retriever, barely
+— the customer searched, found it and bought it, so it was relevant; the return
+is usually fit or quality. For the ranker it matters enormously, because a
+return is negative revenue and negative trust. Returns are a ranking signal, not
+a retrieval signal.
+
+**"Why aggregate to (query, item) instead of training per event?"** Because the
+retriever has no user features — the query tower sees a string. Per-event rows
+therefore add no information and add popularity skew, since a pair shown a
+million times would contribute a million gradient steps for a signal its counts
+already capture. The ranker is the opposite: it has user and context features,
+so it needs per-impression rows and the unclicked negatives the retriever's
+table discards.
+
+**"What does your negative strategy cost?"** In-batch negatives are free —
+already encoded. Every mined or uniform negative is a full item-tower forward
+pass, so six explicit negatives per positive turns 4,096 encoder passes per step
+into about 28,000. The mitigation is caching item embeddings from the last index
+refresh and recomputing only on the refresh cadence, which is what ANCE does.
+
+**"How do you split?"** By time, never randomly — the last two weeks are test,
+because you serve forward in time and a random split leaks the same pair to both
+sides. And a second, query-disjoint split of whole tail queries, because a
+time-based split still lets a head query's embedding be learned in the training
+period and evaluated in the test period.
+
 **"Why a softmax and not MSE?"** Because there is no target. A click is not a
 similarity of 1.0, so you would have to invent the label, and the model would
 learn whatever you invented. Beyond that, MSE optimises magnitudes nothing ever
@@ -1549,6 +1764,7 @@ three until they come out without thinking.
 | 5 | **The funnel** (Fig 1) | Label each box with its millisecond budget |
 | 10 | **Query decomposition** (Fig 3) | Why BM25 fails on the prompt's own example |
 | 15 | **The two towers** (Fig 4) | Draw them *different sizes*, and say why |
+| 18 | **The weight pipeline** (Fig 4b) | If she asks how positives are chosen — counts, calibrated values, propensity |
 | 20 | **The loss** (Fig 5) | Write it out; this is the retrieval assessment |
 | 22 | **What each loss sees** (Fig 5b) | Only if she asks why not triplet or MSE — four sketches, thirty seconds |
 | 24 | **logQ correction** (Fig 6) | One line under the loss |
