@@ -405,10 +405,99 @@ def fig_skew():
                  "served feature vector removes it by construction")
 
 
+def fig_losses():
+    """Claim: the loss families differ in what a single gradient step can see."""
+    b = []
+    W, PW, GAP = 700, 165, 8
+    xs = [8 + i * (PW + GAP) for i in range(4)]
+
+    def panel(x, title, sub, tone):
+        b.append(f'<rect x="{x}" y="8" width="{PW}" height="254" rx="7" '
+                 f'fill="{{surface}}" stroke="{{{tone}}}" stroke-width="1.2"/>')
+        b.append(f'<rect x="{x}" y="8" width="{PW}" height="30" rx="7" '
+                 f'fill="{{{tone}}}"/>')
+        b.append(f'<rect x="{x}" y="28" width="{PW}" height="10" fill="{{{tone}}}"/>')
+        b.append(f'<text x="{x + PW/2}" y="28" text-anchor="middle" '
+                 f'font-family="{FONT}" font-size="11.5" font-weight="700" '
+                 f'fill="#FFFFFF">{e(title)}</text>')
+        b.append(text(x + PW / 2, 54, sub, size=9.5, tone="muted", anchor="middle",
+                      family=MONO))
+
+    def node(cx, cy, label, tone="ink", r=15):
+        b.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{{soft}}" '
+                 f'stroke="{{{tone}}}" stroke-width="1.2"/>')
+        b.append(text(cx, cy + 4, label, size=10, tone=tone, anchor="middle",
+                      family=MONO, weight="600"))
+
+    def foot(x, lines, tone="muted"):
+        for k, ln in enumerate(lines):
+            b.append(text(x + 9, 214 + k * 15, ln, size=9.8, tone=tone))
+
+    # 1 -- regression
+    x = xs[0]; cx = x + PW / 2
+    panel(x, "REGRESSION", "MSE / Huber", "muted")
+    node(cx, 88, "q"); node(cx, 150, "d")
+    b.append(arrow(cx, 103, cx, 133, tone="muted"))
+    b.append(text(cx, 182, "target = 1.0", size=10, tone="flag", anchor="middle",
+                  family=MONO, weight="600"))
+    foot(x, ["one pair, and an", "ABSOLUTE target that", "does not exist for clicks"])
+
+    # 2 -- pairwise / triplet
+    x = xs[1]; cx = x + PW / 2
+    panel(x, "PAIRWISE", "triplet, BPR, RankNet", "muted")
+    node(cx, 88, "q")
+    node(cx - 38, 150, "d+", tone="accent"); node(cx + 38, 150, "d-", tone="flag")
+    b.append(arrow(cx - 8, 103, cx - 33, 133, tone="accent", marker="arrowA"))
+    b.append(arrow(cx + 8, 103, cx + 33, 133, tone="flag", marker="arrowF"))
+    b.append(f'<line x1="{cx-23}" y1="176" x2="{cx+23}" y2="176" '
+             f'stroke="{{ink}}" stroke-width="1"/>')
+    b.append(text(cx, 192, "fixed margin m", size=10, tone="ink", anchor="middle",
+                  family=MONO, weight="600"))
+    foot(x, ["ONE negative at a time,", "and an absolute margin", "in a space you scale"])
+
+    # 3 -- sampled softmax
+    x = xs[2]; cx = x + PW / 2
+    panel(x, "SAMPLED SOFTMAX", "InfoNCE / MNRL", "accent")
+    node(cx, 88, "q")
+    node(cx - 54, 150, "d+", tone="accent")
+    for dx in (-16, 20, 56):
+        node(cx + dx, 150, "d-", tone="muted", r=13)
+    b.append(arrow(cx - 10, 103, cx - 48, 134, tone="accent", marker="arrowA"))
+    for dx in (-16, 20, 56):
+        b.append(arrow(cx + dx * 0.32, 103, cx + dx * 0.92, 134, tone="muted"))
+    b.append(f'<rect x="{x+12}" y="170" width="{PW-24}" height="20" rx="4" '
+             f'fill="{{soft}}" stroke="{{accent}}"/>')
+    b.append(text(cx, 184, "normalised over ALL", size=9.5, tone="accent",
+                  anchor="middle", family=MONO, weight="600"))
+    foot(x, ["N negatives at once, and", "NO absolute target --", "only relative order"], tone="ink")
+
+    # 4 -- listwise, metric-weighted
+    x = xs[3]; cx = x + PW / 2
+    panel(x, "LISTWISE", "LambdaRank / ListNet", "muted")
+    for k in range(5):
+        wgt = [1.0, 0.63, 0.5, 0.43, 0.39][k]
+        bw = 78 * wgt
+        b.append(f'<rect x="{x+22}" y="{74 + k*21}" width="{bw}" height="14" rx="2" '
+                 f'fill="{{soft}}" stroke="{{accent}}" stroke-width="0.9"/>')
+        b.append(text(x + 14, 85 + k * 21, str(k + 1), size=9, tone="muted",
+                      family=MONO, anchor="middle"))
+        b.append(text(x + 106, 85 + k * 21, "%.2f" % wgt, size=8.5, tone="accent",
+                      family=MONO))
+    b.append(text(cx, 192, "position discount", size=10, tone="ink", anchor="middle",
+                  family=MONO, weight="600"))
+    foot(x, ["the WHOLE list, weighted", "by what a swap does to", "the metric you report"])
+
+    return frame(W, 272, "".join(b),
+                 "What one gradient step sees under four loss families: a single "
+                 "absolute target, one positive against one negative with a margin, "
+                 "one positive normalised against many negatives, and a whole "
+                 "position-discounted list")
+
+
 FIGURES = {
     "funnel": fig_funnel, "latency": fig_latency, "two-tower": fig_two_tower,
     "negatives": fig_negatives, "esmm": fig_esmm, "seam": fig_seam,
-    "surfaces": fig_surfaces, "skew": fig_skew,
+    "surfaces": fig_surfaces, "skew": fig_skew, "losses": fig_losses,
 }
 
 

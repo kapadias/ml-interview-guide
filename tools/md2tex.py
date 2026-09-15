@@ -78,8 +78,11 @@ def convert(md, where=""):
         if s.startswith("@fig:"):
             flush()
             name, _, cap = s[5:].partition(" ")
-            out.append(r"\begin{center}\includegraphics[width=\linewidth]"
-                       r"{figures/%s.pdf}\end{center}" % name.strip())
+            # center adds \topsep above and below; the figures already carry
+            # their own padding, so place them directly instead.
+            out.append(r"\par\vspace{6pt}\noindent"
+                       r"\includegraphics[width=\linewidth]{figures/%s.pdf}"
+                       r"\par\vspace{3pt}" % name.strip())
             if cap.strip():
                 out.append(r"\nopagebreak{\footnotesize\color{muted}%s\par}\medskip"
                            % inline(cap.strip(), where))

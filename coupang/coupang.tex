@@ -188,7 +188,7 @@ Her previous round was 15 minutes resume, 60 design, 15 Q\&A. Budget the design 
 Two blocks of eighteen minutes, not one of twenty-five. If she interrupts and steers, follow her --- but know where you were, and say ``let me come back to negatives'' rather than losing the thread. If she spends the whole hour on one half, that is her choice and you should have the depth to fill it; the budget above is what to do when she leaves it to you.\par
 \cchapter{The system}
 Draw this first and leave it on the board. Everything afterwards is a zoom into one box, and having the map up means you can say ``I'm here'' instead of re-explaining context.\par
-\begin{center}\includegraphics[width=\linewidth]{figures/funnel.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/funnel.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 1. The funnel. Each stage sees roughly ten times fewer items and costs ten times more per item, which is why every stage takes about the same wall-clock.\par}\medskip
 \begin{decide}{How many retrieval arms?}
 \drow{CHOSE}{Lexical + dense + behavioural, fused}
@@ -204,7 +204,7 @@ Three things to say while you draw it.\par
 \csection{The latency budget, and three ways to spend it}
 I am assuming 100 ms is end-to-end server-side p99, which is the harder reading. Fan-out costs are real and candidates routinely forget them: serialisation, merge, and network between services will eat 15--25 ms before any model runs.\par
 \textbf{Option A --- all-CPU, no cross-encoder.}\par
-\begin{center}\includegraphics[width=\linewidth]{figures/latency.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/latency.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 2. Three ways to spend 100 ms. A already leaves only 12 ms of headroom, which is why the cross-encoder does not fit in the blocking path at all.\par}\medskip
 Twelve milliseconds of headroom, and everything runs on commodity CPU. This is what I would ship first.\par
 \textbf{Option B --- put a cross-encoder reranker over the top 50.} A 6-layer MiniLM-class model at 128 tokens, batch 50, runs in roughly 10--15 ms on a T4-class GPU. That is \textasciitilde{}103 ms and it is over budget before you have accounted for anything going wrong. And the way it goes wrong is specific: under load, GPU batch formation and admission control dominate, and the tail of a GPU service is far worse behaved than its median --- so the number you actually measure at p99 will be worse than 103.\par
@@ -235,7 +235,7 @@ What I would build:\par
 \textbf{Where an LLM belongs here.} Offline, generating attribute annotations and query rewrites for the tail, distilled into a small model or baked into a table. Not in the 8 ms online path. Say this unprompted; it is a question she will otherwise ask.\par
 \cchapter{Retrieval: half the answer}
 \csection{The architecture, and the asymmetry that defines it}
-\begin{center}\includegraphics[width=\linewidth]{figures/two-tower.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/two-tower.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 4. The two towers are deliberately different sizes. The item tower can be large precisely because nobody is waiting for it -- that is free capacity most candidates leave on the table by drawing two identical boxes.\par}\medskip
 State the asymmetry explicitly, because most candidates draw two identical boxes. \textbf{The item tower runs offline over 10M products once a night; the query tower runs inside your latency budget on every request.} So you can afford a large item encoder and you cannot afford a large query encoder. That is free capacity most people leave on the table --- and it is the reason two-tower beats a single shared encoder in production even though sharing weights looks tidier.\par
 The other consequence of the architecture: query and item never interact before the dot product. That is what makes ANN possible, and it is also the ceiling on quality. No amount of training makes a two-tower model reason about the interaction between ``lightweight'' and a particular boot's spec sheet the way a cross-encoder can. So the two-tower's job is recall, and you accept that.\par
@@ -252,14 +252,64 @@ Retrieval is trained as a classification problem over the corpus: given the quer
 \frac{\exp\!\big(s(q,d^{+})/\tau\big)}
      {\sum_{d \in \{d^{+}\}\cup N} \exp\!\big(s(q,d)/\tau\big)}\]\end{mathbox}
 where $s(q,d)=\langle f(q), g(d)\rangle$, $\tau$ is the temperature, and $N$ is the sampled negative set for this query. It is a cross-entropy over a sampled candidate set: push the positive up, push everything else down, with $\tau$ setting how sharply.\par
-\begin{decide}{Which contrastive objective?}
-\drow{CHOSE}{Sampled softmax / InfoNCE over the candidate set}
-\drow{OVER}{Triplet loss with a margin, or BPR}
-\drow{WHY}{the softmax normalises over many negatives at once, so the gradient is informed by the whole candidate set and directly optimises the ranking you serve. Triplet sees one negative at a time, needs margin tuning and semi-hard mining, and collapses if you get either wrong.}
-\drow{COST}{large batches to get enough negatives, and a temperature that genuinely needs tuning}
+\csection{Which loss, and why not the others}
+This is worth being properly fluent on, because ``contrastive learning \ldots{} or softmax'' is two thirds of what her scorecard named. The families differ in one thing that explains everything else: \textbf{what a single gradient step is allowed to see.}\par
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/losses.pdf}\par\vspace{3pt}
+\nopagebreak{\footnotesize\color{muted}Figure 5b. One gradient step, four ways. Regression needs an absolute target that click data does not provide. Pairwise sees one negative and a margin measured in a space whose scale the model controls. Sampled softmax sees many negatives and has no absolute target at all --- only relative order. Listwise sees the whole list and weights each swap by what it does to the metric.\par}\medskip
+\csubsection{The one-question rule}
+Ask what the output is \textbf{consumed as}, and the loss follows:\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{The output is consumed as} & \textbf{Use} & \textbf{Because} \\ \hline
+An ordering over millions of items & \textbf{Sampled softmax / InfoNCE} & only relative order matters, and normalising over sampled negatives is the cheapest unbiased way to get it \\
+An ordering over a short list where position matters & \textbf{Listwise, metric-weighted} (LambdaRank) & you can afford to look at the whole list, and NDCG's discount should drive the gradient \\
+A probability you will multiply or threshold & \textbf{Pointwise BCE}, then calibrate & the expected-value product is meaningless unless the number is a probability \\
+A yes/no decision at a threshold & \textbf{Contrastive pair / triplet} & you need an absolute decision boundary in the metric, not a ranking \\
+A number with units & \textbf{Regression} (Huber over MSE, for outliers) & there is a real target and its magnitude is the answer \\
+A teacher's ordering & \textbf{Margin-MSE or KL} & the ordering is the signal; the teacher's absolute scale is not \\
+\hline\end{tabularx}}\par\medskip
+\csubsection{Why not MSE}
+Three reasons, and the first one ends the conversation.\par
+\textbf{There is no target.} A click is not a similarity of 1.0. To use MSE you would have to invent the label, and whatever you invented would be the thing the model learned. Retrieval supervision is ordinal by nature: this item beat that one for this query. MSE requires cardinal supervision you do not have.\par
+\textbf{It optimises the wrong quantity.} Even granting a target, retrieval only ever uses the \textit{order} of the scores. MSE spends capacity matching magnitudes that are never read, and the capacity comes out of the ordering you do care about.\par
+\textbf{Nothing forces the positive to win.} MSE has no normalisation across candidates. A model that outputs 0.3 for every pair has a respectable MSE against a mostly-negative dataset and precisely zero retrieval utility. The softmax's denominator is the entire point: the positive can only score well by \textit{beating the others}.\par
+There is a fourth, quieter one: the gradient is dominated by the easy mass. Almost every query-item pair in a 10M catalogue is trivially unrelated and already predicted near zero, so most of the MSE gradient is spent confirming things the model already knows.\par
+\csubsection{Why not triplet, and when it is actually right}
+Triplet is not a silly choice --- it is the previous generation's answer, and it still wins in one setting. But for retrieval the softmax dominates it on four axes.\par
+\textbf{One negative per step.} Triplet's gradient says ``be further from this one thing.'' The softmax's says ``beat all of these at once,'' which is a far lower variance estimate of the objective you actually serve.\par
+\textbf{The margin is absolute in a space you control.} With unnormalised embeddings the model can satisfy any margin by inflating norms and learning nothing about the geometry. That is why triplet effectively forces L2 normalisation --- and once you are on the unit sphere, distances live in a fixed narrow range and the margin becomes a very tight budget to tune. The softmax's temperature does the same job \textit{relatively}, so it is scale-free.\par
+\textbf{The hinge switches off.} Once a triplet satisfies the margin, its loss is exactly zero and it contributes no gradient. Late in training most of the batch contributes nothing, which is why semi-hard mining exists and why it is fiddly. The softmax is smooth: every negative always contributes something, weighted by how close it came.\par
+\textbf{Collapse.} With easy negatives, triplet can drive everything to a point and report a happy loss curve. The normalisation makes that much harder to achieve under a softmax.\par
+\begin{calloutpush}``So triplet is just worse?'' --- No. Triplet and contrastive-pair losses give you a \textit{calibrated distance} with a decision boundary; softmax gives you an ordering with no absolute meaning. If the product needs ``are these two things the same?'' as a yes/no at a threshold, you want the margin. That is verification, not retrieval.\end{calloutpush}
+And that case exists in this very system. \textbf{Catalogue deduplication} --- deciding whether two seller listings are the same physical product, which a marketplace has to do constantly and which feeds the slate policy's dedup step --- is a verification problem with a threshold. I would train that with a contrastive pair loss, not a softmax, and I would say so if she asks whether contrastive losses have any place here.\par
+\csubsection{Where MSE is actually the right answer}
+Two places, both inside this design, and naming them is the cleanest way to show you are not just reciting ``softmax good, MSE bad.''\par
+\textbf{Distilling the cross-encoder into the bi-encoder.} The teacher produces real scores, so regression is available. But regress the \textbf{margin}, not the raw score --- $s(q,d^{+}) - s(q,d^{-})$ for the student matched to the same difference for the teacher. The teacher's absolute scale is arbitrary, so fitting it forces the student to waste capacity on an offset that means nothing; the margin is what carries the ordering, and it is invariant to that scale. That is Margin-MSE, and it is the reason plain MSE distillation underperforms.\par
+The alternative is KL over the softmax of the candidate set, which transfers the whole distribution rather than pairwise gaps. Margin-MSE is simpler and robust; KL carries more information when your candidate sets are consistent. I would start with Margin-MSE.\par
+\textbf{Training L1 to imitate L2.} L1's job is to not discard anything L2 would have wanted, so it is a distillation problem, and regression onto L2's scores is a reasonable objective --- with the same caveat, that a ranking-aware distillation beats plain MSE because only the top-k ordering matters.\par
+\csubsection{The whole system, loss by loss}
+If she asks you to put it together --- and this is a good thing to volunteer --- every trained component in the design has a different loss, for a reason:\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Component} & \textbf{Loss} & \textbf{Why that one} \\ \hline
+Two-tower retriever & Sampled softmax + logQ correction & ordering over 10M, no calibration needed downstream \\
+Cross-encoder teacher & Listwise CE on graded labels & short candidate sets, graded judgements available \\
+Bi-encoder distillation & Margin-MSE, or KL over candidates & transfers ordering, invariant to teacher scale \\
+L1 ranker & Ranking distillation from L2 & measured on recall of L2's top-k, not NDCG \\
+pCTR, pCVR, pReturn & BCE, then post-hoc calibration & they get multiplied by price \\
+pRel gate & Listwise, or distilled from the cross-encoder & a gate, not a probability \\
+Slate re-ranking layer & Listwise over the final top-k & list context is the whole point \\
+Catalogue dedup & Contrastive pair with a margin & verification at a threshold \\
+Delivery-time feature & Huber regression & a real number with units, and outliers \\
+\hline\end{tabularx}}\par\medskip
+\begin{decide}{Which loss for the retriever?}
+\drow{CHOSE}{Sampled softmax / InfoNCE over the sampled candidate set, with the logQ correction}
+\drow{OVER}{Triplet with a margin, BPR/RankNet, and MSE regression}
+\drow{WHY}{retrieval consumes only the ordering, and the softmax is the only one of these that normalises over many candidates at once --- so the gradient estimates ``beat everything'' rather than ``beat this one thing'', and it needs no absolute target, which click data cannot provide anyway}
+\drow{COST}{large batches to get enough negatives, a temperature to tune, and an output with no probabilistic meaning}
+\drow{BUT}{keep a contrastive pair loss for catalogue dedup, which is verification at a threshold rather than ranking, and Margin-MSE for distilling the cross-encoder}
 \end{decide}
 Three things follow.\par
-\textbf{This is the right loss and triplet loss is not.} A triplet loss with a margin looks at one negative at a time and gives you a gradient that says ``be further from this one thing.'' The softmax normalises over many negatives at once, so the gradient is informed by the whole candidate set, and it directly optimises the ranking you actually serve. Triplet also needs careful margin tuning and semi-hard mining to avoid collapsing. If she asks about BPR, it is the pairwise recsys cousin of triplet and has the same limitation.\par
 \textbf{The number of negatives is the difficulty knob.} More negatives means a harder classification task and a better-conditioned gradient, which is why these models train at batch sizes in the thousands with cross-device negative sharing.\par
 \textbf{Temperature matters more than people expect.} With L2-normalised embeddings the score lives in [-1, 1], so without a small temperature the softmax is nearly uniform and there is almost no gradient. Typical values are 0.01--0.05. Push it too low and the gradient concentrates entirely on the single hardest negative, which is unstable and can collapse the representation. It can be learned --- CLIP learns log-temperature with a clamp --- and I would start at 0.05, tune it, and watch the positive-score distribution rather than only the loss.\par
 \csection{Negatives: where this model is actually won or lost}
@@ -271,7 +321,7 @@ The fix is the \textbf{logQ correction}, also called sampling-bias correction:\p
 \begin{mathbox}\[s'(q,d) \;=\; s(q,d) \;-\; \log p(d)\]\end{mathbox}
 $p(d)$ is the probability that item $d$ is drawn as a sampled negative, which is essentially its frequency in the training stream. Estimate it online with a streaming counter: track the average gap in steps between consecutive occurrences of $d$, and take $p(d)\approx 1/\text{gap}$.\par
 The intuition to say out loud: an item that shows up as a negative ten times as often should be penalised a tenth as hard each time. Without it, the retriever has a systematic anti-popularity bias. This is the correction from the YouTube two-tower work, and naming it is worth doing.\par
-\begin{center}\includegraphics[width=\linewidth]{figures/negatives.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/negatives.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 6b. Where each negative source can reach. In-batch negatives are drawn from the click stream, so they can only ever be items that appear as a positive somewhere in the batch. At 10M products with a long tail, that leaves most of the corpus untouched.\par}\medskip
 \csubsection{The negatives that are never sampled at all}
 Here is the part most candidates miss, and it matters enormously at 10M products. \textbf{In-batch negatives can only ever be items that appear as a positive somewhere in the batch} --- that is, items with engagement. In a 10M-product catalogue with a long tail, a large fraction of items have essentially zero clicks in six months. Those items are never negatives for anyone. The model has therefore never been trained to push them down, their embeddings sit wherever initialisation and the item-text encoder put them, and they can surface spuriously in ANN results for unrelated queries.\par
@@ -406,7 +456,7 @@ That layering also matches the latency budget: the expensive list-context model 
 Conversion is only observed after a click, so the natural CVR training set is clicked impressions. But at serving time you score every candidate, including ones that would never be clicked. Train on a selected subset, serve on the full distribution --- and the gap is exactly what your ranker is trying to change.\par
 On top of that, clicked impressions are perhaps 1--5\% of all impressions, so the CVR training set is one to two orders of magnitude smaller than the CTR one, precisely where you need precision.\par
 ESMM removes both problems by never training CVR directly:\par
-\begin{center}\includegraphics[width=\linewidth]{figures/esmm.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/esmm.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 11. ESMM. Both supervised tasks live on the full impression space, so the selection bias is gone and CVR is learned as the ratio. The cost: the product is numerically touchy when pCTR is small, and a miscalibrated CTR tower propagates straight through.\par}\medskip
 Both supervised tasks are defined over all impressions, so the bias is gone, and the CVR tower inherits representations from the CTR task which has vastly more data. The caveat to volunteer: the product is numerically touchy when pCTR is small, and a miscalibrated CTR tower propagates straight into CVR.\par
 \csubsection{Delayed feedback}
@@ -457,7 +507,7 @@ Four groups, and roughly two hundred of them for a commerce ranker. \textbf{Quer
 Three failure modes matter more than the feature list.\par
 \textbf{Point-in-time correctness.} The single largest source of leakage in ranking is computing a feature using data from after the impression. A ``30-day item CTR'' computed at training time from a table built today includes clicks that happened \textit{after} the impression you are training on --- including the click you are trying to predict. The model learns a feature it cannot have at serving time and offline metrics look wonderful. Your feature store must support as-of joins, and you must test them.\par
 \textbf{Log the features, do not recompute them.} The robust fix for training-serving skew is to log the exact feature vector the model scored at request time, and train on those logged values. Then skew is impossible by construction: whatever was wrong at serving is equally wrong at training, so the model learns around it.\par
-\begin{center}\includegraphics[width=\linewidth]{figures/skew.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/skew.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 13. Logging the served feature vector removes training-serving skew by construction -- whatever was wrong at serving is equally wrong at training, so the model learns around it. The cost is storage: roughly 200 floats per impression, and you can sample.\par}\medskip
 The cost is storage --- you are logging a 200-float vector per impression --- and at this volume that is real but affordable, and you can sample it.\par
 \textbf{Behavioural features dominate and are empty on the tail.} Historical CTR and CVR for a query-item pair will top your feature importance chart and be missing for exactly the long-tail queries in the prompt. Train with explicit missingness rather than imputing zero, so the model can learn a separate regime instead of reading ``no data'' as ``bad.'' Then report NDCG by query-frequency decile and make the tail deciles a shipping gate, not a diagnostic you run after someone complains.\par
@@ -499,7 +549,7 @@ She asked about CVR; have the whole board ready, and know which one you would ac
 \begin{calloutsay}I would ship on CVR per search session, with GMV per session and return rate as guardrails that cannot regress, and report tail zero-result rate separately because it is the thing this system is being built to fix.\end{calloutsay}
 \cchapter{Mobile versus web}
 She specified a mobile app search bar. Being able to say precisely how the web version differs is cheap signal that you have built both.\par
-\begin{center}\includegraphics[width=\linewidth]{figures/surfaces.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/surfaces.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 14. Four slots above the fold against fifteen to twenty. The consequence to state out loud: estimate propensities \textit{per surface}, because one shared curve is confidently wrong on both.\par}\medskip
 \textbf{Position bias is far steeper on mobile}, because four items are visible instead of twenty. Practically: you must estimate propensities \textit{per surface} --- one shared propensity curve is simply wrong --- and the value of getting rank 1 right is much higher on mobile. If you only fix one thing about your training labels, fix this.\par
 \textbf{Precision beats recall on mobile, and the reverse on web.} With four slots there is no room for a hedge; showing one wrong item costs a quarter of the visible page. On web, a broader candidate set lets the user do the comparison themselves, so slightly lower precision with better coverage is often the better trade. Concretely, I would run a tighter relevance gate and more aggressive deduplication on mobile.\par
@@ -516,7 +566,7 @@ She specified a mobile app search bar. Being able to say precisely how the web v
 \cchapter{The seam: how retrieval and ranking break each other}
 \begin{calloutsay}The ranker is trained on whatever candidate distribution the retriever produced. So if I change retrieval, the ranker's training data is stale, and I would not read the experiment until I had retrained it on logs from the new candidates.\end{calloutsay}
 Raise this yourself. It is the part of the question that requires having owned both halves, almost nobody brings it up unprompted, and it is the most direct evidence you can give that you have shipped one of these rather than read about it.\par
-\begin{center}\includegraphics[width=\linewidth]{figures/seam.pdf}\end{center}
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/seam.pdf}\par\vspace{3pt}
 \nopagebreak{\footnotesize\color{muted}Figure 15. Change either box and the other one's training data is stale. A 6-point recall win reads as a flat A/B until the ranker has been retrained on the new candidate distribution. Never change both in one experiment.\par}\medskip
 \textbf{Ranker trained on retriever v1, served with retriever v2.} The ranker has never seen the newly-surfaced items; they are out of distribution and it scores them conservatively, precisely because they are unfamiliar. So a genuine 6-point recall win shows up as a flat A/B. The fix is sequencing, not modelling: ship the retrieval change to a slice, log the new candidate distribution, retrain the ranker on it, and only then read the experiment. If you tell her this before she constructs the scenario as a gotcha, you have answered the hardest follow-up in the round in advance.\par
 \textbf{Retriever trained on positives that the ranker chose to show.} The retriever's positives are clicks, and clicks only happen on items the ranker put on screen. So the retriever is being taught to find what the current ranker likes. Two tightly coupled models, each learning the other's bias. Mitigations: mine positives from deeper ranks and from reformulated sessions, keep an exploration slice whose logs are used preferentially for training, and use propensity weighting on both sides rather than only the ranker.\par
@@ -525,6 +575,12 @@ Raise this yourself. It is the part of the question that requires having owned b
 \cchapter{The follow-up tree}
 Everything below is a push she can make. Rehearse the answers out loud; the failure mode in this round is hesitation, not being wrong.\par
 \csection{On retrieval training}
+\textbf{''Why a softmax and not MSE?''} Because there is no target. A click is not a similarity of 1.0, so you would have to invent the label, and the model would learn whatever you invented. Beyond that, MSE optimises magnitudes nothing ever reads, and it has no normalisation --- a model that outputs 0.3 for everything has a fine MSE and zero retrieval utility.\par
+\textbf{''Why not triplet loss?''} Four things. It sees one negative per step, so the gradient is a noisy estimate of ``beat everything.'' Its margin is an absolute quantity in a space whose scale the model controls, so unnormalised it can be satisfied by inflating norms. The hinge switches off once satisfied, so late in training most of the batch contributes no gradient --- hence semi-hard mining. And it collapses more readily. The softmax's temperature does the margin's job relatively rather than absolutely, and it is smooth.\par
+\textbf{''Is triplet ever right?''} Yes, for verification rather than retrieval. Contrastive and triplet losses give you a calibrated distance with a usable threshold; a softmax gives you an ordering with no absolute meaning. Catalogue deduplication --- is this seller's listing the same physical product as that one --- is exactly that, and it sits inside this system feeding the slate policy's dedup step. I would train it with a margin loss.\par
+\textbf{''Where would you use MSE in this design, then?''} Two places. Distilling the cross-encoder into the bi-encoder, but on the \textit{margin} rather than the raw score, because the teacher's absolute scale is arbitrary and only the ordering transfers. And training L1 to imitate L2, which is the same argument.\par
+\textbf{''BPR or RankNet instead?''} They are the pairwise cousins and share triplet's core limitation: one comparison at a time, and no notion that position 1 matters more than position 50. BPR is the right tool for implicit-feedback recsys with small candidate sets; for retrieval over 10M it is strictly dominated.\par
+\textbf{''When would you use a listwise loss on the retriever?''} I would not. Listwise losses need the whole list, and the retriever's ``list'' is the corpus. Listwise belongs where the candidate set is small enough to hold --- the reranker, and the slate layer.\par
 \textbf{''Why not just use a cross-encoder for retrieval?''} Cost. A cross-encoder is about a millisecond per pair, and 10M pairs per query is three hours. The two-tower exists so the item side can be precomputed and the query side reduced to one dot product against an index. You pay for it in expressiveness --- the towers never interact --- which is why the cross-encoder comes back as a reranker over 50 candidates.\par
 \textbf{''Should the two towers share weights?''} No, for two reasons. Query text and product text are different distributions --- three words of intent versus a hundred words of catalogue copy --- and a shared encoder has to compromise. And sharing throws away the asymmetry: the item tower can be large because it is offline, the query tower must be small because it is online. Sharing forces both to the smaller budget.\par
 \textbf{''How do you handle a brand new product with no interaction history?''} This is where the two-tower earns its keep: the item tower is content-based, so a new listing gets a usable embedding from its title and attributes the moment it is indexed. That is a strong argument against pure ID-embedding retrieval in a catalogue with churn.\par
@@ -583,6 +639,7 @@ What to draw, when, and the numbers to have on the board. Practise the first thr
 10 & \textbf{Query decomposition} (Fig 3) & Why BM25 fails on the prompt's own example \\
 15 & \textbf{The two towers} (Fig 4) & Draw them \textit{different sizes}, and say why \\
 20 & \textbf{The loss} (Fig 5) & Write it out; this is the retrieval assessment \\
+22 & \textbf{What each loss sees} (Fig 5b) & Only if she asks why not triplet or MSE --- four sketches, thirty seconds \\
 24 & \textbf{logQ correction} (Fig 6) & One line under the loss \\
 32 & \textbf{The EV objective} (Fig 8) & The pivot from retrieval to ranking \\
 38 & \textbf{LambdaRank's lambda} (Fig 10) & And why you still need calibrated pointwise heads \\

@@ -325,22 +325,137 @@ the sampled negative set for this query. It is a cross-entropy over a sampled
 candidate set: push the positive up, push everything else down, with $\tau$
 setting how sharply.
 
-@decide Which contrastive objective?
-- chose: Sampled softmax / InfoNCE over the candidate set
-- over: Triplet loss with a margin, or BPR
-- why: the softmax normalises over many negatives at once, so the gradient is informed by the whole candidate set and directly optimises the ranking you serve. Triplet sees one negative at a time, needs margin tuning and semi-hard mining, and collapses if you get either wrong.
-- cost: large batches to get enough negatives, and a temperature that genuinely needs tuning
+## Which loss, and why not the others
+
+This is worth being properly fluent on, because "contrastive learning … or
+softmax" is two thirds of what her scorecard named. The families differ in one
+thing that explains everything else: **what a single gradient step is allowed to
+see.**
+
+@fig:losses Figure 5b. One gradient step, four ways. Regression needs an absolute target that click data does not provide. Pairwise sees one negative and a margin measured in a space whose scale the model controls. Sampled softmax sees many negatives and has no absolute target at all — only relative order. Listwise sees the whole list and weights each swap by what it does to the metric.
+
+### The one-question rule
+
+Ask what the output is **consumed as**, and the loss follows:
+
+| The output is consumed as | Use | Because |
+|---|---|---|
+| An ordering over millions of items | **Sampled softmax / InfoNCE** | only relative order matters, and normalising over sampled negatives is the cheapest unbiased way to get it |
+| An ordering over a short list where position matters | **Listwise, metric-weighted** (LambdaRank) | you can afford to look at the whole list, and NDCG's discount should drive the gradient |
+| A probability you will multiply or threshold | **Pointwise BCE**, then calibrate | the expected-value product is meaningless unless the number is a probability |
+| A yes/no decision at a threshold | **Contrastive pair / triplet** | you need an absolute decision boundary in the metric, not a ranking |
+| A number with units | **Regression** (Huber over MSE, for outliers) | there is a real target and its magnitude is the answer |
+| A teacher's ordering | **Margin-MSE or KL** | the ordering is the signal; the teacher's absolute scale is not |
+
+### Why not MSE
+
+Three reasons, and the first one ends the conversation.
+
+**There is no target.** A click is not a similarity of 1.0. To use MSE you would
+have to invent the label, and whatever you invented would be the thing the model
+learned. Retrieval supervision is ordinal by nature: this item beat that one for
+this query. MSE requires cardinal supervision you do not have.
+
+**It optimises the wrong quantity.** Even granting a target, retrieval only ever
+uses the *order* of the scores. MSE spends capacity matching magnitudes that are
+never read, and the capacity comes out of the ordering you do care about.
+
+**Nothing forces the positive to win.** MSE has no normalisation across
+candidates. A model that outputs 0.3 for every pair has a respectable MSE
+against a mostly-negative dataset and precisely zero retrieval utility. The
+softmax's denominator is the entire point: the positive can only score well by
+*beating the others*.
+
+There is a fourth, quieter one: the gradient is dominated by the easy mass.
+Almost every query-item pair in a 10M catalogue is trivially unrelated and
+already predicted near zero, so most of the MSE gradient is spent confirming
+things the model already knows.
+
+### Why not triplet, and when it is actually right
+
+Triplet is not a silly choice — it is the previous generation's answer, and it
+still wins in one setting. But for retrieval the softmax dominates it on four
+axes.
+
+**One negative per step.** Triplet's gradient says "be further from this one
+thing." The softmax's says "beat all of these at once," which is a far lower
+variance estimate of the objective you actually serve.
+
+**The margin is absolute in a space you control.** With unnormalised embeddings
+the model can satisfy any margin by inflating norms and learning nothing about
+the geometry. That is why triplet effectively forces L2 normalisation — and once
+you are on the unit sphere, distances live in a fixed narrow range and the
+margin becomes a very tight budget to tune. The softmax's temperature does the
+same job *relatively*, so it is scale-free.
+
+**The hinge switches off.** Once a triplet satisfies the margin, its loss is
+exactly zero and it contributes no gradient. Late in training most of the batch
+contributes nothing, which is why semi-hard mining exists and why it is fiddly.
+The softmax is smooth: every negative always contributes something, weighted by
+how close it came.
+
+**Collapse.** With easy negatives, triplet can drive everything to a point and
+report a happy loss curve. The normalisation makes that much harder to achieve
+under a softmax.
+
+!push "So triplet is just worse?" — No. Triplet and contrastive-pair losses give you a *calibrated distance* with a decision boundary; softmax gives you an ordering with no absolute meaning. If the product needs "are these two things the same?" as a yes/no at a threshold, you want the margin. That is verification, not retrieval.
+
+And that case exists in this very system. **Catalogue deduplication** — deciding
+whether two seller listings are the same physical product, which a marketplace
+has to do constantly and which feeds the slate policy's dedup step — is a
+verification problem with a threshold. I would train that with a contrastive
+pair loss, not a softmax, and I would say so if she asks whether contrastive
+losses have any place here.
+
+### Where MSE is actually the right answer
+
+Two places, both inside this design, and naming them is the cleanest way to show
+you are not just reciting "softmax good, MSE bad."
+
+**Distilling the cross-encoder into the bi-encoder.** The teacher produces real
+scores, so regression is available. But regress the **margin**, not the raw
+score — $s(q,d^{+}) - s(q,d^{-})$ for the student matched to the same difference
+for the teacher. The teacher's absolute scale is arbitrary, so fitting it forces
+the student to waste capacity on an offset that means nothing; the margin is
+what carries the ordering, and it is invariant to that scale. That is Margin-MSE,
+and it is the reason plain MSE distillation underperforms.
+
+The alternative is KL over the softmax of the candidate set, which transfers the
+whole distribution rather than pairwise gaps. Margin-MSE is simpler and robust;
+KL carries more information when your candidate sets are consistent. I would
+start with Margin-MSE.
+
+**Training L1 to imitate L2.** L1's job is to not discard anything L2 would have
+wanted, so it is a distillation problem, and regression onto L2's scores is a
+reasonable objective — with the same caveat, that a ranking-aware distillation
+beats plain MSE because only the top-k ordering matters.
+
+### The whole system, loss by loss
+
+If she asks you to put it together — and this is a good thing to volunteer —
+every trained component in the design has a different loss, for a reason:
+
+| Component | Loss | Why that one |
+|---|---|---|
+| Two-tower retriever | Sampled softmax + logQ correction | ordering over 10M, no calibration needed downstream |
+| Cross-encoder teacher | Listwise CE on graded labels | short candidate sets, graded judgements available |
+| Bi-encoder distillation | Margin-MSE, or KL over candidates | transfers ordering, invariant to teacher scale |
+| L1 ranker | Ranking distillation from L2 | measured on recall of L2's top-k, not NDCG |
+| pCTR, pCVR, pReturn | BCE, then post-hoc calibration | they get multiplied by price |
+| pRel gate | Listwise, or distilled from the cross-encoder | a gate, not a probability |
+| Slate re-ranking layer | Listwise over the final top-k | list context is the whole point |
+| Catalogue dedup | Contrastive pair with a margin | verification at a threshold |
+| Delivery-time feature | Huber regression | a real number with units, and outliers |
+
+@decide Which loss for the retriever?
+- chose: Sampled softmax / InfoNCE over the sampled candidate set, with the logQ correction
+- over: Triplet with a margin, BPR/RankNet, and MSE regression
+- why: retrieval consumes only the ordering, and the softmax is the only one of these that normalises over many candidates at once — so the gradient estimates "beat everything" rather than "beat this one thing", and it needs no absolute target, which click data cannot provide anyway
+- cost: large batches to get enough negatives, a temperature to tune, and an output with no probabilistic meaning
+- but: keep a contrastive pair loss for catalogue dedup, which is verification at a threshold rather than ranking, and Margin-MSE for distilling the cross-encoder
 @end
 
 Three things follow.
-
-**This is the right loss and triplet loss is not.** A triplet loss with a margin
-looks at one negative at a time and gives you a gradient that says "be further
-from this one thing." The softmax normalises over many negatives at once, so the
-gradient is informed by the whole candidate set, and it directly optimises the
-ranking you actually serve. Triplet also needs careful margin tuning and
-semi-hard mining to avoid collapsing. If she asks about BPR, it is the pairwise
-recsys cousin of triplet and has the same limitation.
 
 **The number of negatives is the difficulty knob.** More negatives means a harder
 classification task and a better-conditioned gradient, which is why these models
@@ -1125,6 +1240,42 @@ failure mode in this round is hesitation, not being wrong.
 
 ## On retrieval training
 
+**"Why a softmax and not MSE?"** Because there is no target. A click is not a
+similarity of 1.0, so you would have to invent the label, and the model would
+learn whatever you invented. Beyond that, MSE optimises magnitudes nothing ever
+reads, and it has no normalisation — a model that outputs 0.3 for everything has
+a fine MSE and zero retrieval utility.
+
+**"Why not triplet loss?"** Four things. It sees one negative per step, so the
+gradient is a noisy estimate of "beat everything." Its margin is an absolute
+quantity in a space whose scale the model controls, so unnormalised it can be
+satisfied by inflating norms. The hinge switches off once satisfied, so late in
+training most of the batch contributes no gradient — hence semi-hard mining.
+And it collapses more readily. The softmax's temperature does the margin's job
+relatively rather than absolutely, and it is smooth.
+
+**"Is triplet ever right?"** Yes, for verification rather than retrieval.
+Contrastive and triplet losses give you a calibrated distance with a usable
+threshold; a softmax gives you an ordering with no absolute meaning. Catalogue
+deduplication — is this seller's listing the same physical product as that one —
+is exactly that, and it sits inside this system feeding the slate policy's dedup
+step. I would train it with a margin loss.
+
+**"Where would you use MSE in this design, then?"** Two places. Distilling the
+cross-encoder into the bi-encoder, but on the *margin* rather than the raw score,
+because the teacher's absolute scale is arbitrary and only the ordering
+transfers. And training L1 to imitate L2, which is the same argument.
+
+**"BPR or RankNet instead?"** They are the pairwise cousins and share triplet's
+core limitation: one comparison at a time, and no notion that position 1 matters
+more than position 50. BPR is the right tool for implicit-feedback recsys with
+small candidate sets; for retrieval over 10M it is strictly dominated.
+
+**"When would you use a listwise loss on the retriever?"** I would not. Listwise
+losses need the whole list, and the retriever's "list" is the corpus. Listwise
+belongs where the candidate set is small enough to hold — the reranker, and the
+slate layer.
+
 **"Why not just use a cross-encoder for retrieval?"** Cost. A cross-encoder is
 about a millisecond per pair, and 10M pairs per query is three hours. The
 two-tower exists so the item side can be precomputed and the query side reduced
@@ -1399,6 +1550,7 @@ three until they come out without thinking.
 | 10 | **Query decomposition** (Fig 3) | Why BM25 fails on the prompt's own example |
 | 15 | **The two towers** (Fig 4) | Draw them *different sizes*, and say why |
 | 20 | **The loss** (Fig 5) | Write it out; this is the retrieval assessment |
+| 22 | **What each loss sees** (Fig 5b) | Only if she asks why not triplet or MSE — four sketches, thirty seconds |
 | 24 | **logQ correction** (Fig 6) | One line under the loss |
 | 32 | **The EV objective** (Fig 8) | The pivot from retrieval to ranking |
 | 38 | **LambdaRank's lambda** (Fig 10) | And why you still need calibrated pointwise heads |
