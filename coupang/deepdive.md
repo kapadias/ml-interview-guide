@@ -891,6 +891,22 @@ so the effective weight varies per query in a way you did not choose.
 Start with **reciprocal rank fusion** — sum of 1/(k + rank) across arms, k ~ 60.
 Rank-based, so scale-free, and it is a strong baseline that needs no tuning.
 
+**What k is doing, because quoting 60 without knowing is a red flag.** It damps
+top-rank dominance. At k = 60 a rank-1 hit contributes 1/61 and a rank-10 hit
+contributes 1/70 — within 13% of each other — so an item both arms rank moderately
+beats an item one arm loves and the others never return. Set k = 0 and rank 1
+contributes 1.0 against rank 10's 0.1, and fusion becomes winner-take-all per
+arm. So: small k trusts each arm's top of list, large k trusts agreement between
+arms. That is the entire tuning story, which is why 60 rarely needs touching.
+An item missing from an arm simply contributes nothing from it, with no penalty
+term to choose.
+
+On this system I would start at 60 and only move it if the identifier queries
+regress — that is the population where the lexical arm's rank 1 is usually right
+and you do not want it outvoted by two mediocre dense hits. If it does, that is
+an argument for the learned fusion rather than for a hand-tuned k, because the
+correct k is query-dependent for the same reason the correct blend is.
+
 Then replace it with the L1 ranker, which takes each arm's rank and score as
 features along with query-understanding signals, and learns the fusion. That is
 strictly better than RRF because the right blend is query-dependent — identifier
@@ -1585,6 +1601,19 @@ ranking are coupled: after a retrieval change you must retrain the ranker on
 logs from the new candidate distribution before you can read the result. The
 other candidates are that the new recall is on items that were never going to
 convert, or that your offline positives were biased toward the incumbent.
+
+**"One of your three arms goes down in production. What does fusion degrade
+to?"** With RRF, gracefully and by construction: the dead arm contributes no
+terms, the surviving arms still produce a valid ranking, and the result set
+shrinks rather than scrambles. That is a concrete argument for shipping RRF
+before the learned fusion — a weighted sum over raw scores has to invent a value
+for the missing arm, and whatever it invents is wrong for every candidate that
+arm would have scored. The thing to say next is that the L1 learned fusion does
+*not* degrade as kindly, because it has rank and score features from an arm that
+is now absent, and "missing" at serving time for every candidate at once is a
+distribution it never saw in training. So I would train it with arm dropout —
+randomly zero out one arm's features during training — for exactly the same
+reason I would use ID dropout in the item tower.
 
 **"How would you prove the dense arm is earning its latency?"** Ablate it in an
 interleaving test, and separately measure its unique contribution — the fraction
