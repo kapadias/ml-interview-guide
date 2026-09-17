@@ -276,8 +276,8 @@ the dot product. That is what makes ANN possible, and it is also the ceiling on
 quality. No amount of training makes a two-tower model reason about the
 interaction between "lightweight" and a particular boot's spec sheet the way a
 cross-encoder can. So the two-tower's job is recall, and you accept that. That ceiling
-has a formal shape -- a dual encoder needs embedding dimension growing linearly
-with corpus size to express arbitrary rankings -- which is worth one sentence if
+has a formal shape — a dual encoder needs embedding dimension growing linearly
+with corpus size to express arbitrary rankings — which is worth one sentence if
 she pushes on generative retrieval. It is in the next-generation chapter, not in
 this design.
 
@@ -1502,11 +1502,11 @@ to one dot product against an index. You pay for it in expressiveness — the
 towers never interact — which is why the cross-encoder comes back as a reranker
 over 50 candidates.
 
-**"What about generative retrieval -- would you just have an LLM generate the
+**"What about generative retrieval — would you just have an LLM generate the
 product IDs?"** Not on this path. There is a 2026 DeepMind result (Rozonoyer et
-al., arXiv 2601.05588) proving the expressivity case for it -- a dual encoder
+al., arXiv 2601.05588) proving the expressivity case for it — a dual encoder
 needs embedding dimension linear in corpus size to express arbitrary rankings
-where an autoregressive ranker needs constant hidden dimension -- and its
+where an autoregressive ranker needs constant hidden dimension — and its
 headline benchmark is ESCI, which is product search. But it reports no latency
 numbers, beam search over 10M docIDs does not fit a 100 ms p99, and a
 marketplace's churn breaks the index-as-decoder property. What I would take from
@@ -1810,8 +1810,8 @@ Nothing in this chapter changes the system you just designed. It is here
 because this is a 2026 search interview at a company that reads the
 literature, the prompt is product search over a 10M-item catalogue, and there
 is a recent DeepMind result whose headline benchmark is *e-commerce product
-search*. If she asks "what about generative retrieval?" -- or worse, "why not
-just use an LLM?" -- the difference between a Staff answer and a Senior one is
+search*. If she asks "what about generative retrieval?" — or worse, "why not
+just use an LLM?" — the difference between a Staff answer and a Senior one is
 whether you can name the result, say what it actually proves, and then decline
 it on serving grounds without sounding like you have not read it.
 
@@ -1821,10 +1821,10 @@ of the v1 design.
 ## The result worth knowing
 
 **Autoregressive Ranking: Bridging the Gap Between Dual and Cross Encoders**
-(Rozonoyer et al., arXiv 2601.05588 -- DeepMind with UMass and UT Austin). The
+(Rozonoyer et al., arXiv 2601.05588 — DeepMind with UMass and UT Austin). The
 setup is pointwise autoregressive ranking: an LLM generates a document
 identifier token by token, and you rank by beam search over docIDs. No
-embedding table, no ANN index -- the decoder *is* the index. Two contributions,
+embedding table, no ANN index — the decoder *is* the index. Two contributions,
 and they are different kinds of thing.
 
 ### The theorem, which is the part that matters to your answer
@@ -1844,10 +1844,10 @@ and it is not data, it is the rank of a bilinear form, and the dimension you
 need scales with how much ranking structure you are asking a single dot product
 to carry.
 
-!say The two-tower's ceiling is not a training problem, it is a capacity one -- there is a recent DeepMind result showing a dual encoder needs embedding dimension growing linearly in corpus size to express arbitrary rankings, where an autoregressive ranker needs constant hidden dimension. That is the formal version of why I put the cross-encoder back in as a reranker rather than trying to train a better bi-encoder.
+!say The two-tower's ceiling is not a training problem, it is a capacity one — there is a recent DeepMind result showing a dual encoder needs embedding dimension growing linearly in corpus size to express arbitrary rankings, where an autoregressive ranker needs constant hidden dimension. That is the formal version of why I put the cross-encoder back in as a reranker rather than trying to train a better bi-encoder.
 
 It also sharpens the dimension answer. "256 is enough" is not a universal claim
--- it is a claim that the *head and torso* of this catalogue do not need more,
+— it is a claim that the *head and torso* of this catalogue do not need more,
 which is exactly why the tail is the hard half of the prompt. If she pushes on
 dimension, that is a better second sentence than Matryoshka.
 
@@ -1856,8 +1856,8 @@ dimension, that is a better second sentence than Matryoshka.
 The second contribution is a loss. Their observation: the standard next-token
 prediction objective is **rank-agnostic**. It is a top-1 objective, and
 fine-tuning an LLM for ranking with it optimises for emitting the single best
-docID while saying nothing about the order of everything below. SToICaL --
-Simple Token-Item Calibrated Loss -- adds item-level reweighting plus
+docID while saying nothing about the order of everything below. SToICaL —
+Simple Token-Item Calibrated Loss — adds item-level reweighting plus
 prefix-tree marginalisation, so probability mass is spread across the valid
 docID tokens in proportion to graded relevance rather than piled onto one.
 
@@ -1865,13 +1865,13 @@ You have already made this argument in this answer, one level down. It is the
 distillation argument: the binary click label carries one bit, the
 cross-encoder teacher's score distribution carries the whole ordering, and the
 ordering is what a retriever actually needs. SToICaL is the same move applied
-to a generative model -- replace a rank-agnostic objective with a
+to a generative model — replace a rank-agnostic objective with a
 rank-calibrated one. Saying so out loud is the connection that makes it sound
 like you read the paper rather than the press release.
 
 ### What they actually measured, and the caveats to volunteer
 
-Two datasets: WordNet, and **ESCI -- the Amazon Shopping Queries set**. That
+Two datasets: WordNet, and **ESCI — the Amazon Shopping Queries set**. That
 second one is the reason this is worth a minute of her time and not zero: it is
 graded relevance over real product search, which is this prompt's domain. The
 reported gains are on suppressing invalid docID generation and on ranking
@@ -1898,14 +1898,14 @@ conservatism.
   forward pass and an index insert. In a generative ranker the item inventory
   lives in the decoder's weights, so a new product is either a finetune or a
   docID the model has never learned to emit.
-- **You lose the filters.** Search has hard constraints -- in stock, ships
+- **You lose the filters.** Search has hard constraints — in stock, ships
   here, category. The ANN path has in-traversal filtering and a brute-force
   fallback below a selectivity threshold. Constrained decoding over a prefix
   tree can express a filter in principle, and there is no production recipe for
   doing it at 10M items under a latency budget.
 - **It does not remove the seam, it moves it.** A generative ranker still
   trains on logged feedback produced by its own previous decisions. Every bias
-  in the ranking chapter -- position, selection, delayed feedback -- survives
+  in the ranking chapter — position, selection, delayed feedback — survives
   the architecture change unchanged.
 
 ## Where it would actually go in, and when
@@ -1930,7 +1930,7 @@ first.
   structurally cannot reach. That is the experiment the theorem predicts should
   pay, and it costs you one offline evaluation rather than a rearchitecture.
 
-!push "It sounds like you just do not want to use LLMs." -- No. I want the LLM where it is affordable and decisive, which in this system is offline: as the cross-encoder teacher, as the relevance judge for the tail judgement set, and as catalogue enrichment on marketplace listings with bad seller text. What I will not do is put autoregressive decoding on the blocking path of a mobile search bar to buy expressiveness I can get from a reranker over 50 candidates for 10 milliseconds.
+!push "It sounds like you just do not want to use LLMs." — No. I want the LLM where it is affordable and decisive, which in this system is offline: as the cross-encoder teacher, as the relevance judge for the tail judgement set, and as catalogue enrichment on marketplace listings with bad seller text. What I will not do is put autoregressive decoding on the blocking path of a mobile search bar to buy expressiveness I can get from a reranker over 50 candidates for 10 milliseconds.
 
 ## What would change my mind
 
