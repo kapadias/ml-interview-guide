@@ -239,6 +239,10 @@ def main():
     L = [PREAMBLE]
     L.append(convert(open(os.path.join(C, "brief.md")).read(), "brief.md"))
     L.append(convert(open(os.path.join(C, "deepdive.md")).read(), "deepdive.md"))
+    L.append(convert(open(os.path.join(C, "deepdive_ai_search.md")).read(),
+                     "deepdive_ai_search.md"))
+    L.append(convert(open(os.path.join(C, "deepdive_vector_retrieval.md")).read(),
+                     "deepdive_vector_retrieval.md"))
     L += qa(deck["depth"], "The ML depth round", DEPTH_INTRO)
     L.append(convert(open(os.path.join(C, "breadth_round.md")).read(),
                      "breadth_round.md"))
