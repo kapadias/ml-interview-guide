@@ -25,6 +25,11 @@ def main():
     data = {
         "brief": convert(open(os.path.join(C, "brief.md")).read(), "brief.md"),
         "deepdive": convert(open(os.path.join(C, "deepdive.md")).read(), "deepdive.md"),
+        "aiSearch": convert(open(os.path.join(C, "deepdive_ai_search.md")).read(),
+                            "deepdive_ai_search.md"),
+        "vectorRetrieval": convert(
+            open(os.path.join(C, "deepdive_vector_retrieval.md")).read(),
+            "deepdive_vector_retrieval.md"),
         "breadthRound": convert(open(os.path.join(C, "breadth_round.md")).read(),
                                 "breadth_round.md"),
         "project": convert(open(os.path.join(C, "project.md")).read(), "project.md"),

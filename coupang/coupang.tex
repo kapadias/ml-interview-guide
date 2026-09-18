@@ -788,6 +788,503 @@ Numbers to have in your head, not on a slide:\par
 \item Spending fifteen minutes on sharding a 10M-item index that fits in RAM.
 \item Treating retrieval and ranking as two independent problems, and having nothing to say when a recall win produces a flat A/B.
 \end{itemize}
+\cchapter{The AI-powered search question}
+This is the sibling of the set-piece. Nobody has reported Siwen asking it, so treat the wording below as constructed rather than verbatim --- but it is the question her round turns into the moment you say the word ``LLM'' out loud, and every org running a 10M-product search stack in 2026 is being asked some version of it internally.\par
+\begin{callout}\textbf{Take the same search stack and make it AI-powered.} Same catalogue and traffic as before --- 10M products, 200 QPS, 100 ms end-to-end p99, six months of logs --- but now you have an LLM budget. Where does the LLM go: query understanding, retrieval, ranking, relevance judgement, or the answer surface? What do you refuse to let it touch, and how do you prove any of it worked?\end{callout}
+\csection{What is actually being tested}
+Not whether you can name a model. Four things:\par
+\textbf{Can you place an LLM by latency tier rather than by enthusiasm.} The single discriminating question in this round is \textit{where the call happens}. Offline, near-line, online-from-cache, and online-blocking are four different systems with four different cost models, and most candidates collapse them into one.\par
+\textbf{Do you know that the highest-leverage LLM use in search is not in the serving path at all.} It is the catalogue and the judgement set. Both are offline, both are unbounded in latency, and both move tail recall more than any reranker will.\par
+\textbf{Do you know what not to do.} Generative retrieval over a 10M-item catalogue that changes daily, a listwise LLM reranker inside a 100 ms budget, an answer surface on a transactional query --- each of these is a plausible-sounding answer that a senior person rules out in one sentence with a number attached.\par
+\textbf{Can you prove it worked.} ``The LLM judge says relevance is up 8\%'' is not a result, and knowing why is most of the difference between an L5 and an L6 answer here.\par
+\begin{callouttrap}The phrase ``AI-powered search'' tempts you into putting the model in the serving path, because that is where it is visible. The best answers spend the first twenty minutes offline -- on the catalogue and on labels -- and only then ask what is left that has to happen at query time.\end{callouttrap}
+\csection{The first five minutes: what to ask}
+\begin{enumerate}
+\item \textbf{''Is the 100 ms budget unchanged?''} If yes, then no LLM call happens in the blocking path except as a cache lookup, and I will design around that. \textit{Assume unchanged unless told otherwise, and say you are assuming it.}
+\item \textbf{''What is the cost envelope --- per query, or per month?''} At 200 QPS a per-query call is \textasciitilde{}520M calls a year. A per-item offline pass is 10M calls, once. Those are different businesses and the answer changes with it.
+\item \textbf{''Is the deliverable better products, or an answer?''} A ranked grid and a generated answer are different surfaces with different metrics, and in commerce the answer surface can cannibalise the grid.
+\item \textbf{''Do we own the catalogue text, and can we write back to it?''} This decides whether the biggest lever is available at all.
+\end{enumerate}
+If you get a fifth: ask what languages. Multilingual query understanding is where LLMs are most clearly better than the pipeline they replace, and it is the easiest win to under-claim.\par
+\csection{Numbers you derive from the prompt, out loud}
+Say the token math before anyone asks for it. Rates vary by model and vendor and change often, so carry the \textit{formula} and one worked example at a stated assumption rather than a memorised price.\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Workload} & \textbf{Derivation} & \textbf{Volume} \\ \hline
+Catalogue enrichment, one pass & 10M items, \textasciitilde{}600 in + 150 out & 6B in, 1.5B out \\
+Re-enrichment, steady state & \textasciitilde{}1\% of catalogue changes daily & 60M in, 15M out per day \\
+Judgement set, 50k pairs & 50k, \textasciitilde{}400 in + 80 out & 20M in, 4M out \\
+Distillation labels, 5M pairs & 5M, \textasciitilde{}400 in + 20 out & 2B in, 100M out \\
+Query rewrite, every query & 200 QPS, \textasciitilde{}150 in + 60 out & 2.6B in per 6 months \\
+Query rewrite, cached head+torso & Precompute top 200k queries once & 30M in, 12M out \\
+\hline\end{tabularx}}\par\medskip
+The last two rows are the whole argument. Rewriting every query costs roughly a thousand times what precomputing the queries that matter costs, for a gain that lands almost entirely on the tail --- which is exactly the part a cache misses. The resolution is not ``cache or not'', it is a tiered policy, below.\par
+\begin{calloutnum}A per-query LLM call at 200 QPS is \textasciitilde{}17M calls a day. A one-time catalogue pass is 10M calls, ever. If the per-query call is not measurably better than a distilled student model, it does not ship.\end{calloutnum}
+\csection{The sixty minutes}
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Minutes} & \textbf{What} & \textbf{Why} \\ \hline
+0-5 & Clarify, state the latency tier framing & Establishes the organising idea immediately \\
+5-12 & The tier table and the system diagram & Everything later is ``which tier is this in'' \\
+12-25 & \textbf{Offline: catalogue enrichment and the judgement flywheel} & The two biggest levers, and the ones most candidates skip \\
+25-35 & Query understanding, cached, with the fallback & Where the prompt's tail example actually gets fixed \\
+35-45 & \textbf{Retrieval and reranking: teacher offline, student online} & The distillation answer is the whole point \\
+45-52 & The answer surface, and when not to build it & Product judgement, not modelling \\
+52-60 & Evaluation, cost, what you would build first & Staff signal \\
+\hline\end{tabularx}}\par\medskip
+\cchapter{The system: five tiers, and everything goes in one of them}
+Draw this table before you draw any boxes. It is the answer to the question, and every later section is an instance of it.\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYYY}\hline
+\textbf{Tier} & \textbf{Budget} & \textbf{What belongs here} & \textbf{What it costs} \\ \hline
+Offline batch & Hours to days & Catalogue enrichment, synthetic queries, judgement sets, distillation labels & Pipelines and versioning \\
+Near-line & Seconds to minutes & New-item enrichment, warming the rewrite cache for emerging queries & A queue and a staleness budget \\
+Online, cached & Under 1 ms & Rewrites and expansions for head and torso queries, looked up & Cache size, and a fallback \\
+Online, blocking & 10-30 ms & A distilled cross-encoder. Not an LLM API call & GPU or a quantised CPU model \\
+Never & --- & Ungrounded generation about price, stock, safety or sizing & Trust, and in commerce, liability \\
+\hline\end{tabularx}}\par\medskip
+\par\vspace{6pt}\noindent\includegraphics[width=\linewidth]{figures/funnel.pdf}\par\vspace{3pt}
+\nopagebreak{\footnotesize\color{muted}Figure 1. The funnel, unchanged. The point of this round is that almost nothing in the serving path becomes an LLM call. What changes is the quality of the inputs each box receives.\par}\medskip
+\begin{decide}{Where does the LLM go first?}
+\drow{CHOSE}{Offline -- catalogue enrichment and the judgement set}
+\drow{OVER}{Online, as a query rewriter or a reranker, which is what the phrase ``AI-powered search'' tempts you into}
+\drow{WHY}{both are unbounded in latency, both are paid once per item rather than once per query, and both move tail recall -- which is the stated problem -- while a reranker only reorders a candidate set that was already missing the item}
+\drow{COST}{enrichment pipelines, a re-enrichment story every time the prompt or the model version changes, and a human audit sample you have to keep funding}
+\drow{DROP IT IF}{the catalogue text is already clean and structured, in which case the labels are the only offline lever left and you skip straight to the judgement flywheel}
+\end{decide}
+Three things to say while you draw it.\par
+\textbf{The serving path barely changes.} Query understanding, three retrieval arms, fusion, L1, L2, slate policy. What changes is that every box gets better inputs: cleaner item text, better labels, better teachers.\par
+\textbf{Recall is still set at the top and never recovered.} An LLM reranker cannot retrieve an item the retriever did not return. If the tail query in the prompt fails because the word ``lightweight'' appears nowhere in the item's text, no amount of reranking fixes it --- writing that attribute into the item does.\par
+\textbf{Every online LLM call must beat its own distilled student.} That is the bar, and stating it early is what stops the rest of the answer becoming a wish list.\par
+\cchapter{Offline, part one: the catalogue is the biggest lever}
+Go back to the prompt's own example: \textit{''durable lightweight winter boots for toddlers.''} Four constraints. Ask why the current system fails on it, and the honest answer is usually not a modelling failure at all. The item that should win is a toddler snow boot whose title is \textit{''Kids Winter Snow Boots Waterproof Non-Slip 2024 New''} --- it is 340 grams, it is durable, and neither fact appears anywhere a retrieval system can see. The seller wrote a title for a keyword search engine in 2016.\par
+\textbf{So extract the attributes.} For each item, run one pass over title, description, structured seller fields, images and the review text, and emit a constrained JSON record against a fixed, closed attribute vocabulary: age band, weight class, material, water resistance, sole type, closure, and so on.\par
+Three places the output lands, and all three matter:\par
+\begin{itemize}
+\item \textbf{Fielded lexical index.} New BM25F fields with their own weights. This is what fixes ``toddlers'' as a facet rather than a token.
+\item \textbf{Item text for the dense encoder.} The two-tower item tower now reads a normalised, attribute-bearing document instead of seller keyword soup, which is a larger quality change to the embedding than any encoder swap.
+\item \textbf{Facets and filters in the product surface.} Free, and often the thing the PM notices first.
+\end{itemize}
+\textbf{Then generate queries for the items nobody searches for.} Synthetic query generation --- doc2query, in the old naming --- asks the model for the 10 to 20 queries a shopper would plausibly type to find this item, and indexes them as an extra field. This is aimed squarely at the zero-engagement tail: the items that have no clicks, therefore no behavioural signal, therefore no presence in any query-to-item table, and, as the set-piece document notes, are never even sampled as negatives. Synthetic queries give the lexical arm something to match and the dense arm something to train on.\par
+\begin{decide}{How far do you trust extracted attributes?}
+\drow{CHOSE}{Closed vocabulary, confidence-thresholded, verified against the seller's structured fields where they exist, with a human-audited sample every batch}
+\drow{OVER}{Free-text extraction written straight into the index}
+\drow{WHY}{in commerce a hallucinated attribute is not a relevance bug -- ``waterproof'', ``flame retardant'', ``BPA free'' and a size chart are claims, and a wrong one is a return, a complaint, and sometimes a regulator}
+\drow{COST}{coverage is lower than free extraction, and the vocabulary needs maintenance}
+\drow{FALLBACK}{when confidence is below threshold, emit nothing rather than a guess, and let the item keep its old behaviour}
+\end{decide}
+\begin{calloutsay}The cheapest way to improve tail retrieval on a marketplace is usually not a better retriever. It is writing the attributes the shopper searched for into the item, because on a third-party catalogue they are genuinely absent, not merely hard to match.\end{calloutsay}
+\textbf{How you measure it, so it is not vibes:} attribute coverage (share of items with a non-null value per attribute), precision on a human-audited sample per attribute, and then the only one that counts --- recall on tail queries, measured by frequency decile, before and after. If coverage goes up and tail recall does not move, the attributes you extracted are not the ones shoppers search with, and the fix is to mine the vocabulary from the query logs rather than from the taxonomy.\par
+\cchapter{Offline, part two: the judgement flywheel}
+The bottleneck in search quality is almost never model capacity. It is labels. Human relevance judgement costs dollars per pair and takes days; a search team with 5,000 judged pairs makes decisions with error bars wider than every change it ships. This is the part of ``AI-powered search'' that actually compounds.\par
+\textbf{The mechanism.} Graded relevance rubric, three or four points, written down and versioned. The model sees the query, the item's enriched text, and the rubric, and returns a grade with a one-line justification. You now have 500,000 judged pairs for what 5,000 used to cost.\par
+\textbf{Calibrate it before you believe it.} Keep a human gold set --- a few thousand pairs, stratified by query frequency decile and by grade --- that the judge never sees during prompt development. Report the judge's agreement with human on that set against the right ceiling, which is \textit{human-human agreement}, not perfect. On graded commerce relevance, human-human Cohen's kappa in the 0.6 to 0.7 range is normal, and a judge at 0.6 is therefore at the ceiling, not failing.\par
+\textbf{What the judgements buy you, in order of value:}\par
+\begin{itemize}
+\item \textbf{Training data for the cross-encoder}, which is the model that actually serves. This is the distillation path, below.
+\item \textbf{False-negative filtering for the retriever.} The set-piece answer calls this out: a mined hard negative that is actually relevant teaches the model the opposite of what you want. A judge over mined negatives removes them at a scale a human panel never could.
+\item \textbf{A regression set you can run on every change}, segmented by query frequency, which is what lets you see that a launch won the tail and lost the head.
+\end{itemize}
+\textbf{Where the judge is not allowed.} Two places, and naming them unprompted is worth a lot:\par
+\begin{itemize}
+\item \textbf{Shipping decisions.} Offline judged relevance is a leading indicator, not the outcome. Interleaving and A/B decide, because the judge cannot see whether the customer bought anything.
+\item \textbf{Any comparison where the judge shares a failure mode with the thing judged.} If an LLM rewrote the query and an LLM judges whether the results match the rewritten intent, the loop is closed and the number means nothing. Judge against the \textit{original} user query, always.
+\end{itemize}
+\begin{callouttrap}``Our LLM judge says relevance improved 8\%'' is not a result. The questions are: which prompt and model version, what was its agreement with the human gold set, was the gold set refreshed after the change, and what did interleaving say. A metric whose definition includes a model version is a metric that silently drifts when someone upgrades the model.\end{callouttrap}
+\textbf{Version the judge as part of the metric.} Pin model and prompt; a judge upgrade is a metric redefinition and needs a re-baseline of every historical number, exactly like changing the NDCG cutoff. Teams that skip this discover six months of trend line that reflects model releases.\par
+\cchapter{Online: query understanding, cached, with an honest fallback}
+Now the serving path. The query in the prompt is ambiguous and long-tail, which is precisely the population a cache cannot help and precisely where an LLM helps most. That tension is the content of this section.\par
+\textbf{The tiered policy.}\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYYY}\hline
+\textbf{Segment} & \textbf{Share of traffic} & \textbf{Policy} & \textbf{Latency} \\ \hline
+Head, top \textasciitilde{}10k queries & Roughly half & Precomputed rewrite, reviewed, served from cache & Lookup \\
+Torso, next \textasciitilde{}200k & A further quarter or so & Precomputed offline, refreshed weekly & Lookup \\
+Tail, everything else & The remainder, and where the money is & Deterministic pipeline now; LLM enrichment queued near-line & No LLM in path \\
+Emerging, rising fast & Small but urgent & Near-line: detected by frequency delta, enriched within minutes & No LLM in path \\
+\hline\end{tabularx}}\par\medskip
+The tail row is the one to defend. You do \textit{not} make a blocking LLM call for a tail query. You serve it with the existing pipeline --- spell correction, segmentation, the attribute gazetteer that the catalogue enrichment just made much better --- and you enqueue the query. The second person to type it, minutes later, gets the enriched version. Tail queries are unique per session but not unique per week, and the repeat rate is high enough that near-line enrichment captures most of the value at none of the latency cost.\par
+\textbf{What the model actually emits.} Constrained JSON against a schema, not prose: normalised tokens, extracted attributes mapped to the closed vocabulary, an intent label, a category distribution with confidence. A validator parses it; if it does not parse, you fall back, and the fallback is the current pipeline, not an error.\par
+\begin{decide}{Does the rewrite replace the query or join it?}
+\drow{CHOSE}{The rewrite becomes an additional retrieval arm, fused}
+\drow{OVER}{Replacing the user's query with the rewrite}
+\drow{WHY}{a rewrite that drops a constraint is invisible and catastrophic -- ``boots for toddlers'' retrieved for ``winter boots for toddlers size 8'' looks fine in a demo and is a wrong answer. Fusing keeps the original arm's recall as a floor}
+\drow{COST}{an extra arm to serve and a fusion layer that has to be learned, not constant}
+\drow{DROP IT IF}{measurement shows the rewrite arm's unique contribution is negligible, which does happen on head queries where the original is already precise}
+\end{decide}
+\textbf{Guard the head.} Almost every LLM query-understanding launch wins the tail and loses the head, because head queries are short, precise, and already handled, so any rewrite is at best neutral and at worst adds a constraint the shopper did not ask for. Make ``no regression on the top 10k queries'' a launch gate, and note that an aggregate metric can sit flat while both segments moved a lot in opposite directions.\par
+\cchapter{Retrieval: what ``AI-powered'' does and does not change}
+\textbf{Hybrid stays.} Three arms --- lexical, dense, behavioural --- is still the answer, and an LLM does not retire BM25. What changes is that the lexical arm now indexes extracted attributes and synthetic queries, and the dense arm now trains on enriched item text and judge-filtered negatives. Both arms got better without either becoming an LLM.\par
+\textbf{Learned sparse is the most underrated option in this round.} SPLADE-style models expand a query and a document into weighted term distributions over the vocabulary and serve out of an ordinary inverted index. You get semantic matching with lexical infrastructure, exact-match behaviour preserved, and --- the part that matters in an interview --- full interpretability, because you can read which expanded terms fired. The cost is real and you should name it: posting lists get much denser, so index size and query latency both rise, which is why the models carry a FLOPS regulariser to keep expansion sparse. On a catalogue with heavy identifier traffic (part numbers, model codes, sizes), this is often the highest ratio of quality gained to infrastructure changed.\par
+\textbf{Generative retrieval and semantic IDs: know it, and decline it here.} The framing is seductive --- quantise each item into a short code, then have a sequence model emit the code directly, so retrieval becomes decoding and the ANN index disappears. Three reasons it is not the first thing to ship on this system:\par
+\begin{itemize}
+\item \textbf{New items.} 10M products on a marketplace with continuous listings. A new item's identifier has no presence in the decoder until you retrain or graft it in; the cold-start story is exactly the population you most need to serve.
+\item \textbf{Cost of decoding.} Beam search per query against a 100 ms budget is a much harder sell than one HNSW traversal.
+\item \textbf{Evaluation.} Recall at a fixed latency against a strong hybrid baseline, at this corpus size, is not a comparison the published results have settled.
+\end{itemize}
+Say where it \textit{does} earn its place --- recommendation over a stable corpus, and as a complementary head-query arm --- and move on. Knowing the boundary is the signal.\par
+\textbf{Multimodal is a real fourth arm, and it is optional.} Product images carry attributes the text never will, and commerce tail queries are full of visual language. Add a vision-embedding arm only after you have measured the dense arm's unique contribution, and hold it to the same bar: clicked items that only this arm retrieved.\par
+\cchapter{Reranking: the teacher is offline, the student serves}
+This is where the round is won, and the answer is one sentence: \textbf{an LLM makes the labels, a cross-encoder makes the latency.}\par
+The three forms of LLM reranking, and what each costs:\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYYY}\hline
+\textbf{Form} & \textbf{What it does} & \textbf{Quality} & \textbf{Cost per query} \\ \hline
+Pointwise & Score each item for relevance independently & Good, calibratable & 50 calls, parallelisable \\
+Pairwise & Compare two at a time & Better, quadratic & Impractical online \\
+Listwise permutation & Emit a reordering of a window, sliding over the list & Best & Hundreds of ms to seconds \\
+\hline\end{tabularx}}\par\medskip
+Listwise is the strongest and it has two properties people forget. It is \textbf{position-biased inside its own prompt} --- the model over-favours items placed early in the list it is shown --- which is mitigated by permuting and aggregating, and that multiplies an already large cost. And it is \textbf{non-deterministic}, which makes an A/B harder to reason about and makes caching partial.\par
+Against a 100 ms end-to-end budget where the cross-encoder gets roughly 10 to 15 ms for 50 candidates, a listwise LLM pass is one to two orders of magnitude out. It does not go in the blocking path. It goes in the teacher seat:\par
+\begin{enumerate}
+\item Teacher scores a large sample of (query, candidate) pairs offline, drawn from real logged candidate sets so the distribution matches serving.
+\item Distil into the \textbf{cross-encoder} --- train on the teacher's scores or its pairwise preferences rather than on clicks, which removes position bias from the label at the source.
+\item Distil again into the \textbf{bi-encoder}, which is how teacher quality reaches recall rather than only order.
+\item Serve the students. Refresh the teacher's labels quarterly, or whenever the candidate distribution shifts --- which, per the seam section, is every time retrieval changes.
+\end{enumerate}
+\begin{decide}{Any LLM call at all in the blocking path?}
+\drow{CHOSE}{No. Students only, with an asynchronous refresh for a narrow slice}
+\drow{OVER}{A listwise LLM reranker on the top 20}
+\drow{WHY}{100 ms p99 end to end, and the distilled cross-encoder recovers most of the teacher's ordering at a fiftieth of the latency}
+\drow{COST}{a distillation pipeline, and a ceiling set by the teacher rather than by the student}
+\drow{FALLBACK}{for low-confidence tail queries, serve the student immediately and stream a re-ordered grid a second later if the async teacher disagrees -- but only if the surface can tolerate re-ordering, which on mobile it usually cannot}
+\end{decide}
+\begin{calloutpush}``What if I give you 500 ms?'' Then the listwise reranker becomes arguable for the tail only -- route by L1 confidence, cap the window at 20, cache the result keyed on the normalised query so the second occurrence is free, and keep the student as the fallback on timeout. I would still spend the first 500 ms of budget on retrieval breadth rather than reordering, because reordering cannot recover recall.\end{calloutpush}
+\cchapter{The answer surface: RAG over your own catalogue}
+Product judgement, not modelling, and a senior answer starts by refusing most of the surface area.\par
+\textbf{When it helps.} Informational and comparison intent --- \textit{''which toddler winter boots are warmest?''}, \textit{''is this jacket machine washable?''} --- where the shopper is doing research the product grid answers badly. Grounded in the retrieved items and their reviews, it is genuinely better than ten blue products.\par
+\textbf{When it hurts.} Navigational and transactional intent, which on a commerce search bar is most of the traffic. Someone typing a brand and a model number wants the item, and putting a paragraph above it costs them a scroll.\par
+\textbf{How it plugs in.} It consumes the funnel's output; it is a \textit{rendering} of the retrieved set, not a second retrieval stack. Every claim cites the item or the review it came from. When the retrieved set does not support an answer, the surface says so and shows products instead --- a refusal path that exists and is measured is the difference between a demo and a system.\par
+\textbf{The commerce-specific constraints}, which are the part that shows you have shipped one:\par
+\begin{itemize}
+\item \textbf{Never generate price, stock or delivery claims.} They change between generation and impression, and a cached answer asserting a price that no longer holds is a consumer-protection problem, not a quality problem.
+\item \textbf{Never generate safety, medical, or compliance claims} --- flame retardancy, allergen content, age safety ratings. Quote the seller's structured field or say nothing.
+\item \textbf{Never block the grid on the answer.} Render products at 100 ms and stream the answer alongside. The answer's latency budget is a rendering concern, not a search concern.
+\end{itemize}
+\textbf{Measure cannibalisation, not just satisfaction.} The metric set is clicks, add-to-cart, purchase, \textit{and} reformulation rate. An answer that satisfies the shopper without a purchase is a loss for this business unless it demonstrably reduces returns --- which is a real and defensible win, and worth saying, because a well-grounded answer about sizing is one of the few things that does.\par
+\cchapter{Evaluation: the part that makes it AI-powered rather than AI-flavoured}
+Three layers, each answering a different question, and the failure mode is using one to answer another's question.\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYYY}\hline
+\textbf{Layer} & \textbf{Question it answers} & \textbf{Speed} & \textbf{What it cannot tell you} \\ \hline
+LLM-judged relevance & Did the results get more relevant & Hours & Whether anyone bought anything \\
+Interleaving & Do users prefer B's ordering to A's & Days & Anything about a non-ranking change \\
+A/B & Did the business metric move & Weeks & Anything at all on the tail, usually \\
+\hline\end{tabularx}}\par\medskip
+\textbf{Interleaving is the workhorse for ranking changes} and is dramatically more sensitive than an A/B for the same traffic, because it compares two rankings within a single user's result set rather than across populations. Use it for every reordering change. It does not apply to changes in what is retrieved or in the surface itself, which is the honest caveat.\par
+\textbf{Segment everything by query frequency decile.} An aggregate is dominated by the head, where none of this work helps. The entire thesis of an AI-powered search programme is tail quality, and a flat aggregate is the expected result even from a large win.\par
+\textbf{The guardrail set that catches the actual failures:} zero-result rate by segment, head-query regression, latency p99 including cache misses, and --- the one people forget --- the share of queries where the rewrite changed the retrieved set at all. If the rewrite fires on 3\% of traffic, then a 20\% improvement on those queries is a 0.6\% improvement, and you should have said so before the readout rather than after.\par
+\cchapter{Cost engineering}
+The arithmetic that decides the design, stated as a formula so it survives whatever this year's rates are. Let $R_{in}$ and $R_{out}$ be the price per million input and output tokens.\par
+\begin{mathbox}\[\text{cost}_{\text{online}} \;=\; \text{QPS}\times 86400 \times p(\text{miss})
+\times \left(\frac{t_{in}}{10^6}R_{in} + \frac{t_{out}}{10^6}R_{out}\right)\]\end{mathbox}
+At 200 QPS, 150 input and 60 output tokens, a 100\% miss rate is 17.3M calls a day and 2.6B input tokens a day. Push $p(\text{miss})$ to 5\% with the tiered cache and it is 130M input tokens a day --- the same design, a twentieth of the bill. That factor, not the choice of model, is where the cost lives.\par
+The levers, in the order they pay:\par
+\begin{itemize}
+\item \textbf{Cache by normalised query.} The largest single factor, by far.
+\item \textbf{Distil.} A student that recovers most of the teacher's quality at a fiftieth of the cost is a cost lever before it is a latency lever.
+\item \textbf{Route by segment.} Head queries do not need the big model; they barely need a model.
+\item \textbf{Batch the offline work}, and reuse a shared prompt prefix across calls so the rubric and the vocabulary are paid for once rather than per call.
+\item \textbf{Small model plus verifier.} Cheap model proposes the extraction, the expensive one adjudicates only the low-confidence tail.
+\end{itemize}
+\cchapter{The seam, in this version}
+The set-piece document's seam is that the ranker is trained on the retriever's output. This system has a second one, and it is worse because it is invisible.\par
+\textbf{The judge's blind spots become the system's blind spots.} The LLM judges relevance, which trains the cross-encoder, which filters the retriever's negatives and supplies its distillation targets, which changes what is retrieved, which changes what the judge is asked about next. It is a closed loop with no external signal in it. Two things break the loop: a \textbf{human gold set the judge never trains on and that is refreshed on a schedule}, and \textbf{online metrics as the only shipping authority}. Say this unprompted.\par
+\textbf{The rewrite moves the training distribution.} Your retriever was trained on six months of logged raw queries. If the serving path now sends it rewritten, attribute-normalised queries, it is being evaluated off-distribution. Either train on rewritten queries --- which means rewriting the historical log, offline, which you can afford --- or keep the raw query as an arm so the retriever still sees what it knows. This is the same class of bug as the ranker's candidate shift, and almost nobody raises it.\par
+\cchapter{The follow-up tree}
+\textbf{''Why not just use a big model for everything and cache aggressively?''} Because the cache hit rate on the segment that needs help is low by construction. Head queries cache beautifully and do not need the model; tail queries need the model and do not cache. The tiered policy exists precisely because those two facts point in opposite directions.\par
+\textbf{''How do you know the extracted attributes are right?''} Human-audited sample per attribute per batch, with an accuracy bar that is higher for claim-like attributes (waterproof, flame retardant, age rating) than for descriptive ones (colour family, closure type). Below threshold, emit nothing. And cross-check against the seller's structured fields where they exist --- disagreement is a signal about the seller as much as about the model.\par
+\textbf{''Your judge agrees with humans only 65\% of the time. Isn't that too low?''} It depends entirely on human-human agreement on the same rubric, which on graded commerce relevance is commonly in that range. If two trained humans agree 68\% of the time, a judge at 65\% is at the ceiling. If they agree 90\%, it is failing. Measuring the ceiling first is the whole answer.\par
+\textbf{''Would you fine-tune a model for this?''} For the judge, usually not --- the rubric changes and a prompt is cheaper to iterate. For the cross-encoder and the bi-encoder, absolutely, and that is what distillation is. For query understanding, fine-tune once the schema stabilises, mostly to cut cost rather than to raise quality.\par
+\textbf{''What breaks first when you ship all of this?''} The head. Every time. The rewrite fires on a query that was already precise, adds a constraint, and drops the item everyone clicks. Which is why the launch gate is a head-query regression check and why the rewrite is an extra arm rather than a replacement.\par
+\textbf{''How would you handle a new attribute the taxonomy doesn't have?''} Mine it from the query logs rather than from the taxonomy: cluster unmatched query tokens by co-occurrence with clicked items, surface the top clusters, and add the vocabulary term. The taxonomy is a lagging indicator of what shoppers search for, and on a marketplace it lags badly.\par
+\textbf{''What if latency dropped to 50 ms?''} Nothing in the offline half changes, which is the point. The cross-encoder budget is the first casualty: drop to adaptive-depth reranking on the visible slots only, or quantise the student and cut the candidate set from 50 to 25. The tiered cache and the enrichment are untouched, and that robustness is the argument for the architecture.\par
+\textbf{''Is there anything you would not use an LLM for here at all?''} Ranking. The ranking objective is expected value over calibrated probabilities estimated from biased feedback, and that is a job for models trained on your logs with propensity corrections, not for a language model's judgement. An LLM can supply a relevance \textit{feature} and a relevance \textit{gate}. It should not supply the score.\par
+\cchapter{What I would build first}
+\textbf{Q1 --- the judgement flywheel and the measurement it unlocks.} Rubric, human gold set, calibrated judge, 100k judged pairs stratified by query frequency. Stand up per-decile recall reporting and interleaving. Nothing else on this list is provable without it, and it is weeks of work rather than quarters.\par
+\textbf{Q2 --- catalogue enrichment.} Attribute extraction into a closed vocabulary, fielded BM25F weights, enriched item text for the dense tower, synthetic queries for the zero-engagement tail. Measure tail recall by decile. This is the biggest single expected move on the stated problem, and it needs Q1 to be visible.\par
+\textbf{Q3 --- the serving path, cheaply.} Precomputed rewrites for head and torso, near-line enrichment for emerging queries, the rewrite as a fused arm with a head-regression gate. In parallel, distil the teacher into the cross-encoder using Q1's labels, and use the judge to strip false negatives from the retriever's hard-negative mining.\par
+\textbf{Q4 --- the surface, if the data says so.} Learned sparse as a fourth arm if identifier traffic is hurting, and the answer surface \textit{only} for the informational query segment, gated behind a cannibalisation readout.\par
+With one engineer for one month instead: the judge and the human gold set, and the tail-recall-by-decile report. It costs almost nothing and it is what makes every subsequent argument fundable.\par
+\cchapter{The whiteboard, in order}
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Minute} & \textbf{Draw} & \textbf{Say while drawing} \\ \hline
+5 & \textbf{The five tiers} & Every later answer is ``which tier is this in'' \\
+8 & \textbf{The funnel} (Fig 1) & Note how little of it becomes an LLM call \\
+14 & \textbf{The enrichment pipeline} & Item text in, closed-vocabulary JSON out, three destinations \\
+20 & \textbf{The judgement flywheel} & Judge, gold set, cross-encoder, negatives -- and where the loop closes \\
+30 & \textbf{The tiered query policy} & Head cached, tail deferred to near-line, fallback always the old pipeline \\
+38 & \textbf{Teacher and student} & The one sentence that answers the reranking question \\
+50 & \textbf{The three evaluation layers} & And which question each one cannot answer \\
+\hline\end{tabularx}}\par\medskip
+\begin{calloutnum}10M items x \textasciitilde{}750 tokens is one 7.5B-token offline pass, paid once. 200 QPS is 17M calls a day if you do it per query. Head+torso is \textasciitilde{}200k distinct queries covering most traffic. Cross-encoder over 50 candidates is 10-15 ms; a listwise LLM pass over the same 50 is hundreds of ms. Human-human kappa on graded commerce relevance is \textasciitilde{}0.6-0.7, and that is your judge's ceiling.\end{calloutnum}
+\cchapter{Ten things that would lose this round}
+\textbf{On placement}\par
+\begin{itemize}
+\item Putting an LLM call in the blocking path without doing the latency arithmetic.
+\item Treating ``cache it'' as a complete answer when the segment that needs the model is the segment that does not cache.
+\item Never mentioning the catalogue, which is where the prompt's own example fails.
+\end{itemize}
+\textbf{On evidence}\par
+\begin{itemize}
+\item Quoting an LLM judge's score as a result, with no human gold set and no agreement number.
+\item Not knowing that human-human agreement is the ceiling you measure against.
+\item Letting the judge evaluate results for a query the same family of model rewrote.
+\end{itemize}
+\textbf{On judgement}\par
+\begin{itemize}
+\item Proposing generative retrieval for a 10M-item catalogue with daily listings and having no answer for new items.
+\item Building an answer surface over transactional queries and calling the resulting drop in clicks a success.
+\item Generating price or stock into a cached answer.
+\end{itemize}
+\textbf{On both rounds}\par
+\begin{itemize}
+\item Forgetting that reranking cannot recover recall, so no amount of LLM at the bottom of the funnel fixes a tail miss at the top.
+\end{itemize}
+\cchapter{The vector retrieval question}
+The third set-piece, and the one that is least about machine learning. Like the AI-powered search document, this wording is constructed rather than reported --- but it is the question that falls out of the set-piece the moment you say ``HNSW over 10M int8 vectors'' and the interviewer decides to find out whether you know what you just said.\par
+\begin{callout}\textbf{Design and size the vector index.} 100M items, 768-dimensional embeddings, 2000 QPS, p99 20 ms for the retrieval stage alone. Every query carries hard filters --- category, in stock, ships to region. The catalogue changes continuously, roughly 1M updates a day. Pick the index family, size it, defend the recall number you claim, and tell me how you would evaluate it.\end{callout}
+The numbers are deliberately an order of magnitude above the set-piece. At 10M and 200 QPS almost any index works and the interesting content is in training the embeddings; at 100M with filters and continuous updates, the index \textit{is} the problem, and the answer separates people who have run one from people who have called one.\par
+\csection{What is actually being tested}
+\textbf{Arithmetic, out loud.} Every claim in this round has a number behind it and you are expected to produce it unprompted. Memory per representation, candidates touched per query, bytes scanned, cache misses, requests in flight. A candidate who says ``HNSW, obviously'' without sizing it has answered nothing.\par
+\textbf{Do you know why any of this works.} The theory has a punchline that changes what you do: nearest neighbour is provably unstable in high dimensions for independent data, real embeddings escape that only because they have low intrinsic dimension and cluster structure, and therefore \textbf{your recall numbers are a property of your data, not of your index}. Everything about evaluation follows from that one sentence.\par
+\textbf{Filters.} This is the part that decides the architecture and the part that tutorials skip. A design that is correct at 100M and wrong at 2\% filter selectivity is wrong.\par
+\textbf{Freshness.} Graph indexes do not really support deletion. Knowing that, and knowing what you do about it, is a strong signal.\par
+\begin{callouttrap}The question looks like ``which index would you pick'', so people answer with a name. It is actually ``show me the recall-latency-memory triangle for this specific corpus, and then tell me what your filters and your update rate do to it.'' Pick the index last.\end{callouttrap}
+\csection{The first five minutes: what to ask}
+\begin{enumerate}
+\item **''What recall, at what $k$, against what ground truth?''** Recall@10 at 0.95 against exact search is a completely different budget from recall@100 at 0.99. And ``against exact search'' matters: recall measured against logged clicks is not recall, it is a relevance metric wearing recall's clothes.
+\item \textbf{''What does the filter selectivity distribution look like?''} Not the average --- the distribution. A filter that keeps 40\% of the corpus and one that keeps 0.05\% need different strategies, and most catalogues have both.
+\item \textbf{''Is 20 ms the index's own budget, or does it include fan-out and merge?''} Across eight shards, serialisation, network and merge are real milliseconds before any search runs.
+\item \textbf{''How often does the embedding model change?''} Item updates are an insert-delete problem. A new \textit{model} is a full rebuild, and if that happens monthly it dominates the operational design.
+\end{enumerate}
+\csection{Numbers you derive from the prompt, out loud}
+Write this table before you choose anything. It is the round.\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Representation} & \textbf{Derivation} & \textbf{Size} \\ \hline
+fp32 vectors & 100e6 x 768 x 4 & 307 GB \\
+fp16 & 100e6 x 768 x 2 & 154 GB \\
+int8, scalar-quantised & 100e6 x 768 x 1 & 76.8 GB \\
+PQ, 96 subvectors x 8 bit & 100e6 x 96 & 9.6 GB \\
+PQ, 192 subvectors x 8 bit & 100e6 x 192 & 19.2 GB \\
+HNSW graph, M = 32 & 100e6 x 64 links x 4 B & 25.6 GB \\
+IVF centroids, C = 10,000 & 10e3 x 768 x 4 & 30 MB \\
+Ids and payload, 8 B each & 100e6 x 8 & 0.8 GB \\
+\hline\end{tabularx}}\par\medskip
+Three consequences, said immediately:\par
+\begin{itemize}
+\item \textbf{fp32 in RAM is off the table} at 307 GB plus a 25.6 GB graph unless you are willing to buy very large machines to hold data you have no reason to keep at that precision.
+\item \textbf{int8 plus a graph is 102 GB}, which is eight shards of 13 GB --- ordinary machines, and the design I will defend.
+\item \textbf{PQ plus IVF is 9.6 GB}, which fits on \textit{one} machine with room to spare, and buys that with a recall ceiling. Whether that trade is right depends entirely on the recall number nobody has told me yet, which is why I asked first.
+\end{itemize}
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{From} & \textbf{Derivation} & \textbf{Number} \\ \hline
+2000 QPS at 20 ms & Little's law: 2000 x 0.02 & 40 requests in flight \\
+8 shards & 2000 x 8 & 16,000 shard-queries per second \\
+1M updates a day & 1e6 / 86400 & \textasciitilde{}12 writes per second, trivially absorbed \\
+1M updates a day & 1e6 x 365 / 100e6 & the corpus fully turns over in \textasciitilde{}9 months \\
+\hline\end{tabularx}}\par\medskip
+\begin{calloutnum}100M x 768 is 307 GB fp32, 76.8 GB int8, 9.6 GB at 96-byte PQ codes. An HNSW graph at M=32 costs 256 bytes per vector, which is more than the int8 vector for low dimensions and a third of it here. 40 requests in flight. 16,000 shard-queries per second across 8 shards.\end{calloutnum}
+\csection{The sixty minutes}
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Minutes} & \textbf{What} & \textbf{Why} \\ \hline
+0-5 & Clarify recall, selectivity, budget boundary, model churn & All four change the answer \\
+5-10 & The memory table and the brute-force baseline & Establishes the arithmetic habit \\
+10-18 & What problem this is: NN, cosine, MIPS, and the reductions & Cheap to say, and it is the theory the rest rests on \\
+18-30 & \textbf{The index families and the sizing} & The core \\
+30-42 & \textbf{Filters and freshness} & Where the design is actually decided \\
+42-52 & Evaluation, and why recall is a property of your data & The senior differentiator \\
+52-60 & Serving, sharding, tail latency, what to build first &  \\
+\hline\end{tabularx}}\par\medskip
+\cchapter{First, what problem is this actually?}
+Thirty seconds, and it earns its place because the wrong answer here is expensive later.\par
+Three flavours of top-$k$ retrieval, distinguished only by the score: **$k$-NN\textbf{ under Euclidean distance, }$k$-MCS\textbf{ under cosine, and }$k$-MIPS** under inner product. They reduce to each other, and you should be able to write the reductions on the board:\par
+\textbf{Cosine to inner product.} L2-normalise the corpus once, offline. Then $\arg\max \langle q,u\rangle / \lVert u \rVert = \arg\max \langle q, u/\lVert u \rVert\rangle$. The query's norm never matters --- it is a positive constant across all candidates.\par
+\textbf{Euclidean to inner product.} Expand $\lVert q-u\rVert^2 = \lVert q\rVert^2 - 2\langle q,u\rangle + \lVert u\rVert^2$, drop the query term, and append one dimension:\par
+\begin{mathbox}\[q' = [\,q;\; -\tfrac{1}{2}\,], \qquad u' = [\,u;\; \lVert u\rVert^2\,]
+\;\in\; \mathbb{R}^{d+1}\]\end{mathbox}
+\textbf{Inner product to cosine}, which is the direction you need when your vector database only offers a cosine index and your model was trained with dot product. Rescale so $\max \lVert u \rVert \leq 1$, then send $u \mapsto [u; \sqrt{1-\lVert u\rVert^2}]$ and $q \mapsto [q; 0]$. The augmented item vectors are unit norm, so a cosine index over them ranks by the original inner product. One extra dimension, no exotic hashing required.\par
+\textbf{Why MIPS is genuinely harder, in one line each.} Inner product is not a metric: no triangle inequality, so every bound a tree or a pivot relies on is gone. And it has no \textit{coincidence} --- a point need not maximise inner product with itself. If $p = 2v$ then $\langle v,p\rangle > \langle v,v\rangle$. Some items can therefore never be the answer for any query, which is a statement no distance metric permits.\par
+\begin{calloutsay}Before I pick an index I want to know whether the embeddings are normalised, because it decides whether this is a metric problem or not -- and if they are not normalised, whether the norm carries signal. In commerce it usually does: norm correlates with popularity, and normalising quietly deletes it.\end{calloutsay}
+The practical consequence people miss: \textbf{normalising embeddings changes the ranking} whenever norms carry information. If your two-tower model learned to give popular items larger norms, L2-normalising to use a cosine index throws that away and you will see it as a ranking regression that looks like an index bug.\par
+\cchapter{Why high dimensions are hard, and why this works anyway}
+The theory, compressed to what changes your behaviour.\par
+\textbf{The instability result.} If the ratio of the variance of the query-to-point distance to its squared mean goes to zero as dimension grows, then for any $\epsilon > 0$ \textit{every} point in the corpus becomes an $\epsilon$-approximate nearest neighbour. The nearest-neighbour question stops being well posed: the furthest point is within a whisker of the nearest, and a tiny perturbation of the query flips the answer. For independent coordinates this ratio is $d\sigma^2 / (d\mu)^2 \to 0$, so it applies.\par
+\textbf{Two operational consequences}, and they are the reason to mention this at all:\par
+\begin{itemize}
+\item \textbf{Never benchmark an ANN index on synthetic independent random vectors.} The ground truth there is meaningless, and so is any recall number measured against it. This is a real and common evaluation bug.
+\item \textbf{Real embeddings escape the result because they are not independent.} They are clustered and they have low \textit{intrinsic} dimension --- a ball of radius $2r$ can be covered by a modest number of balls of radius $r$, far fewer than the ambient $2^{768}$. Everything that works in practice, graphs and clustering alike, is exploiting that structure and nothing else.
+\end{itemize}
+\textbf{Why not just project down first?} Because the Johnson-Lindenstrauss bound says you need $d' = O(\epsilon^{-2}\ln(m/\delta))$ dimensions to preserve pairwise distances. At $m = 10^8$ and $\epsilon = 0.1$ that is roughly $18.4/0.01 \approx 1{,}840$ dimensions --- \textit{more} than the 768 you started with. Random projection is not why your 768-d embeddings are searchable. Low intrinsic dimensionality is.\par
+\begin{calloutpush}``So what does that mean for my recall target?'' That recall is a property of my data, not of the index. I cannot promise 0.95 recall at a latency from a datasheet, because the published curves were measured on SIFT and GloVe. I can promise a measured curve on a sample of our own corpus and our own query distribution, within a week.\end{calloutpush}
+\cchapter{The baseline you must compute before choosing anything}
+Exhaustive search. Not as a strawman --- as the number that tells you whether you need an index at all, and per shard it often says you do not.\par
+A modern core scans memory for a dot product at roughly 10 GB/s with SIMD. In 10 ms that is about 100 MB, which at 768 int8 bytes per vector is \textbf{roughly 130,000 vectors per core per 10 ms}, or about 2M vectors on a 16-core box. So:\par
+\begin{itemize}
+\item \textbf{Under \textasciitilde{}1M vectors per shard: do not build an index.} Flat scan, perfect recall, no parameters, no rebuild story, no filter problem. Enormous amounts of engineering have been spent on indexes for corpora that fit in this box.
+\item \textbf{At 100M: exhaustive is 77 GB per query scanned}, seconds per core. Out of the question, and now you know by how much --- three orders of magnitude, which is what tells you an approximate method with a 100x speedup is not enough on its own and you will also be sharding.
+\end{itemize}
+\begin{decide}{Index or no index?}
+\drow{CHOSE}{Index, because 100M is three orders of magnitude past the flat-scan ceiling}
+\drow{OVER}{Flat scan with more machines, which is cheaper to operate and gives exact answers}
+\drow{WHY}{recovering 77 GB of scan per query would take roughly 800 cores at 10 ms, which is an absurd fleet for a retrieval stage}
+\drow{COST}{every parameter below, plus a rebuild pipeline and a recall number that is now empirical rather than exact}
+\drow{DROP IT IF}{the corpus is ever partitioned such that a query only ever touches a few million vectors -- a hard category partition can do this, and then flat scan inside the partition is both simpler and exact}
+\end{decide}
+\cchapter{The families, and the one thing to know about each}
+\textbf{Trees.} k-d trees, and their descendants. They die in high dimensions for a precise reason worth stating: certifying that a cell cannot contain a better neighbour requires visiting a number of cells exponential in dimension, so exact tree search degenerates to a full scan somewhere around 20 dimensions. What survives is \textit{defeatist} search --- descend to one leaf, do not backtrack, accept the miss --- repeated over a randomised forest, which is what Annoy is. Verdict: know the failure mode, because ``why not a k-d tree'' is a standard probe. Do not propose one.\par
+\textbf{Locality-sensitive hashing.} The one family with real guarantees. A family is $(r, cr, p_1, p_2)$-sensitive if close points collide with probability at least $p_1$ and far points at most $p_2$; amplify with $\text{AND}$ over $L$ bands of $K$ hashes; the exponent $\rho = \ln p_1 / \ln p_2$ then gives query time $O(d\,m^{\rho})$ and space $O(m^{1+\rho})$. The families to know: \textbf{SimHash} (random hyperplane, collision probability $1 - \theta/\pi$, the one for cosine), \textbf{E2LSH} via $p$-stable distributions for $L_2$, and cross-polytope for the better exponent. Verdict: the guarantees are real, the constants are bad, and graphs beat it empirically at every operating point anyone cares about. Its space bound is the quiet killer --- superlinear space at 100M is not a thing you want.\par
+\textbf{Graphs.} The production default, and the theory is worth two sentences. Greedy traversal on the Delaunay graph is \textit{exact}, but the Delaunay graph's degree explodes with dimension, so every practical graph is an approximation of it: a $k$-NN graph plus pruning. Pruning by the relative neighbourhood rule keeps the graph navigable while cutting degree; \textbf{HNSW} adds a hierarchy of long-range links, which is Kleinberg's small-world construction and buys logarithmic hop counts; \textbf{Vamana/DiskANN} prunes with a slack factor $\alpha > 1$ and is the only practical graph with worst-case guarantees, plus the only one designed to live on SSD. Parameters you must be able to explain: $M$ (degree, memory and recall), $efConstruction$ (build quality, build time), $efSearch$ (the recall-latency knob at query time, and the only one you can turn without a rebuild).\par
+\textbf{Clustering, i.e. IVF.} Partition with k-means into $C$ clusters, keep centroids, and at query time scan the $nprobe$ nearest clusters exhaustively. The cost is $C + nprobe \cdot m / C$ distance computations, which is minimised at $C = \sqrt{m}$ --- so 10,000 clusters at 100M, or about 3,500 per 12.5M shard. The pathologies, which is the part that shows experience: \textbf{cluster imbalance} (k-means on real catalogue data produces clusters that differ by orders of magnitude in size, so $nprobe$ buys wildly different amounts of work per query and your p99 is set by the fat clusters), \textbf{boundary queries} (a query near a Voronoi boundary needs a much larger $nprobe$ than one at a centroid, and nothing in the index knows which you have), and \textbf{norm imbalance under MIPS}, where plain k-means clusters by direction while the answer depends on magnitude.\par
+\textbf{Quantization.} Scalar to int8 is the free 4x --- do it always, and calibrate per dimension, not globally. \textbf{Product quantization} splits the vector into $M$ subvectors, k-means each subspace to 256 centroids, and stores $M$ bytes; scoring uses asymmetric distance computation, precomputing a $M \times 256$ lookup table per query and summing $M$ table lookups per candidate. \textbf{OPQ} adds a learned rotation first so that variance is spread evenly across subspaces, which is nearly free at query time and worth several points of recall. \textbf{Anisotropic (ScaNN-style)} quantization is the one to name if the objective is MIPS: the key result is that the component of the quantization error \textit{parallel} to the vector damages the inner product much more than the orthogonal component, so the loss should weight them differently rather than minimising plain reconstruction error.\par
+\textbf{Sketching.} JL and random projections. Covered above: at this corpus size the bound asks for more dimensions than you have, so its role here is as the argument for why you \textit{do not} project, plus the vocabulary for talking about sketch variance if pushed.\par
+\cchapter{The sizing, worked}
+This is the centre of the round. Do it out loud.\par
+\textbf{The design: eight shards, HNSW over int8, flat re-ranking on top.}\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Component} & \textbf{Per shard (12.5M)} & \textbf{Total} \\ \hline
+int8 vectors, 768-d & 9.6 GB & 76.8 GB \\
+HNSW graph, M = 32 & 3.2 GB & 25.6 GB \\
+Ids and filter payload & 0.1 GB & 0.8 GB \\
+\textbf{Working set} & \textbf{\textasciitilde{}13 GB} & \textbf{\textasciitilde{}103 GB} \\
+\hline\end{tabularx}}\par\medskip
+Thirteen gigabytes per shard fits comfortably on a 32 GB machine with the page cache, the fresh tier and the rebuild headroom that the freshness section needs. Replicate each shard twice for availability and you have a 16-machine fleet, which is unremarkable.\par
+\textbf{Now the latency, and the important part is \textit{what it is bound by}.} An HNSW search at $efSearch = 128$ touches a few thousand candidate vectors. Each one is a \textbf{random} memory access:\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Step} & \textbf{Derivation} & \textbf{Time} \\ \hline
+Distance computations & \textasciitilde{}3,000 candidates x 768 int8 with SIMD & \textasciitilde{}30 us of arithmetic \\
+Cache misses & \textasciitilde{}3,000 random accesses x \textasciitilde{}80 ns & \textasciitilde{}240 us \\
+Per-shard search & dominated by the misses & \textbf{\textasciitilde{}0.3 ms} \\
+Fan-out, merge, network & 8 shards in parallel, serialise and merge & \textasciitilde{}2-4 ms \\
+Re-rank top 200 with int8 exact & 200 x 768 B, sequential & negligible \\
+\textbf{Total} &  & \textbf{\textasciitilde{}5 ms typical} \\
+\hline\end{tabularx}}\par\medskip
+\begin{calloutsay}Graph search is memory-latency bound, not FLOP bound. The arithmetic is thirty microseconds and the pointer chasing is a quarter of a millisecond, which is why quantising to int8 helps more than the 4x memory saving suggests -- it is also a 4x reduction in bytes per cache miss -- and why adding cores stops helping long before it should.\end{calloutsay}
+Against a 20 ms p99 budget, 5 ms typical leaves genuine headroom, and you need it: filters cost over-fetch, the tail is worse than the mean, and the fan-out amplifies it, per the serving section.\par
+\textbf{Capacity.} 16,000 shard-queries per second at \textasciitilde{}0.3 ms of CPU each is about 5 core-seconds per second --- five busy cores, on a fleet of 16 machines. This is not a CPU problem. It is a memory-footprint and tail-latency problem, and saying so out loud is the right framing.\par
+\textbf{The alternative, for contrast.} IVF-PQ with 96-byte codes: 9.6 GB total, single machine, no shards. At $C = 10{,}000$ and $nprobe = 32$ it scans $32/10{,}000 \times 100\text{M} \approx 320{,}000$ candidates, which at 96 bytes each is \textasciitilde{}31 MB of sequential ADC scan per query --- several milliseconds per core, and worse than the graph. You would buy a tenth of the memory with roughly ten times the CPU and a recall ceiling set by the quantizer. That is a good trade if memory is the binding constraint and a bad one here.\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYYYY}\hline
+\textbf{Option} & \textbf{Memory} & \textbf{Typical latency} & \textbf{Recall ceiling} & \textbf{When it wins} \\ \hline
+Flat int8 & 76.8 GB & seconds & exact & Under \textasciitilde{}1M per shard \\
+HNSW int8, 8 shards & 103 GB & \textasciitilde{}5 ms & very high & The default here \\
+IVF-PQ, 1 box & 9.6 GB & \textasciitilde{}10 ms & capped by PQ & Memory-bound, recall-tolerant \\
+DiskANN, PQ in RAM & 9.6 GB + SSD & \textasciitilde{}2-5 ms & high & One box, 100M+, SSD available \\
+\hline\end{tabularx}}\par\medskip
+\begin{decide}{Which index family?}
+\drow{CHOSE}{HNSW over int8 vectors, sharded eight ways, with exact re-ranking of the top few hundred}
+\drow{OVER}{IVF-PQ on a single machine, which is a tenth of the memory}
+\drow{WHY}{the recall target is the binding constraint, and PQ puts a ceiling on it that no amount of nprobe recovers; 13 GB per shard on commodity machines is not an expensive way to remove a ceiling}
+\drow{COST}{10x the memory, a fleet instead of a box, and a fan-out tail problem to manage}
+\drow{DROP IT IF}{the recall target turns out to be 0.9 rather than 0.99, or memory is priced such that ten boxes is genuinely painful -- then IVF-PQ with OPQ, or DiskANN if SSDs are available}
+\end{decide}
+\cchapter{Filters: the part that decides the design}
+This is where most designs are actually wrong, and the interviewer knows it.\par
+The problem in one sentence: \textbf{a graph index searches the whole graph, but the answer must come from a filtered subset, and the two have nothing to do with each other.} Three strategies, and the right answer is that selectivity picks between them.\par
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Selectivity} & \textbf{Strategy} & \textbf{Why} \\ \hline
+Above \textasciitilde{}10\% & Post-filter with over-fetch & Fetch $k/s$ and discard; cheap and simple \\
+\textasciitilde{}0.1\% to \textasciitilde{}10\% & Filtered traversal, or a partitioned index & Over-fetch factor becomes absurd; the graph must be filter-aware \\
+Below \textasciitilde{}0.1\% & Pre-filter and brute-force the subset & The subset is small enough to scan exactly \\
+\hline\end{tabularx}}\par\medskip
+\textbf{Post-filtering} fetches $k/s$ candidates for selectivity $s$ and drops the ones that fail. At $s = 0.4$ you fetch 2.5x --- fine. At $s = 0.02$ you fetch 50x, and at $s = 0.002$ you fetch 500 candidates for every one you keep, which blows the latency budget and \textit{still} silently returns fewer than $k$ results when the over-fetch was not enough. That last failure is the one that reaches production: the system does not error, it just quietly returns eight results instead of fifty.\par
+\textbf{Pre-filtering} resolves the filter first, then scans the surviving set exactly. This is excellent when the survivor count is small --- and note the baseline arithmetic above says ``small'' means up to about 130,000 vectors per core per 10 ms, which covers far more filters than people expect. For \textit{''this category, in stock, ships to this region''} on a 100M catalogue, the survivor set is frequently in the tens of thousands, and an exact scan is both faster and exactly right.\par
+\textbf{Filtered traversal} is the middle band: the graph search itself is made filter-aware, so the traversal keeps expanding through non-matching nodes for connectivity but only admits matching nodes to the result heap. The failure mode to name is \textbf{graph disconnection} --- if you prune the traversal to matching nodes only, the filtered subgraph is often disconnected and greedy search gets trapped in one component, which shows up as recall that collapses for certain filters and is fine for others.\par
+\textbf{Partitioning is the pragmatic answer for low-cardinality, high-traffic filters.} If nearly every query filters by a top-level category and there are 30 of them, build 30 indexes. Each is smaller, each search is exact with respect to the filter, and the memory cost is the same total. This does not generalise to conjunctions of many filters, which is why it is a complement to the above and not a replacement.\par
+\begin{decide}{How do filters interact with the index?}
+\drow{CHOSE}{A policy chosen per query by estimated selectivity -- pre-filter and exact scan when it is tiny, filtered traversal in the middle, post-filter with over-fetch when it is loose}
+\drow{OVER}{One strategy for all filters, usually post-filtering, because it is what the library gives you}
+\drow{WHY}{over-fetch cost scales as 1/selectivity, so a single strategy is guaranteed wrong at one end of the distribution, and the failure at the tight end is silent under-delivery rather than an error}
+\drow{COST}{a cardinality estimator you have to maintain, and three code paths instead of one}
+\drow{DROP IT IF}{the selectivity distribution is genuinely narrow -- if every filter keeps 30-60\% of the corpus, post-filter and go home}
+\end{decide}
+\begin{calloutpush}``How do you estimate selectivity?'' The same way a query planner does. Maintain per-value counts for the low-cardinality fields and a sketch for the rest, combine assuming independence, and correct the pairs you know are correlated -- in-stock and category are not independent on a marketplace. Then measure the estimator's error, because the cost of under-estimating is a silent short result set and the cost of over-estimating is a wasted exact scan.\end{calloutpush}
+\cchapter{Freshness: inserts, deletes, and the rebuild you will not avoid}
+1M updates a day is \textasciitilde{}12 writes per second, which sounds trivial and is not, because of what a delete means to a graph.\par
+\textbf{Inserts are fine.} HNSW supports incremental insertion by construction --- the insert is itself a search plus a link. Quality degrades slowly as the distribution drifts away from what the graph was built on, but 12 per second is nothing.\par
+\textbf{Deletes are the problem.} You cannot really remove a node from an HNSW graph: other nodes route \textit{through} it, so removing it severs paths and degrades recall for queries that have nothing to do with the deleted item. So everyone tombstones --- mark deleted, keep the node for routing, filter it from results. The consequences, which are the things to say:\par
+\begin{itemize}
+\item The index only grows. Memory rises with churn rather than with corpus size.
+\item Effective $efSearch$ silently falls, because some fraction of the candidates you examine are tombstones that cannot be returned. At 20\% tombstones you are doing 20\% more work for the same recall.
+\item \textbf{Therefore you rebuild on a schedule}, sized from the churn rate. At 1M updates a day against 100M items, a tombstone share of 10\% accumulates in roughly ten days, so a rebuild cadence of one to two weeks per shard, rolled across shards so no shard rebuild is ever on the serving path.
+\end{itemize}
+\textbf{The two-tier trick, which is what actually gets you to seconds of freshness.} A large static index rebuilt on a schedule, plus a small flat (exact) index holding everything written since the last rebuild. Query both, merge the results. The fresh tier holds a few hundred thousand vectors at most, so a flat scan of it is sub-millisecond and exact, and new items are searchable the moment they are written. This is the standard design and it is worth drawing.\par
+\textbf{Embedding model changes are a different animal entirely.} You cannot mix vectors from two model versions in one index --- they are not in the same space, and the distances between them are meaningless rather than merely inaccurate. A new model means re-encoding all 100M items and building a whole new index, then swapping. Which means:\par
+\begin{itemize}
+\item Plan for \textbf{double the memory} during a migration, or migrate shard by shard.
+\item Re-encoding 100M items is a batch inference job that takes real hours on real GPUs, and it is the long pole, not the index build.
+\item Run the two indexes side by side and A/B them. The one thing you must never do is a partial migration that leaves both versions live in the same index --- and people do this, usually by accident, when a backfill fails halfway.
+\end{itemize}
+\begin{callouttrap}``We upgraded the embedding model and recall dropped'' is, nine times out of ten, an index that contains two model versions. The vectors are all valid, the index is healthy, every monitor is green, and the distances are nonsense.\end{callouttrap}
+\cchapter{Evaluation without fooling yourself}
+\textbf{Recall is measured against exact search, on your own data.} Take a sample of real queries --- stratified, because the head and the tail behave differently --- compute exact top-$k$ by brute force offline, and measure what fraction the index returns. This is the only definition of recall that means anything here.\par
+Three ways this is done wrong, and naming them is the senior signal:\par
+\begin{itemize}
+\item \textbf{Against logged clicks.} That measures relevance, which the embeddings control. It tells you nothing about the index, and it will happily report that a broken index is fine because the clicked item was popular enough to be returned anyway.
+\item \textbf{On synthetic random vectors.} Per the instability result, the ground truth is meaningless. A friend's benchmark on \texttt{numpy.random.randn} has told them nothing.
+\item \textbf{At a single operating point.} Recall without a latency is not a number. Report the \textbf{curve}: recall@10 against p99 latency as $efSearch$ sweeps, on your corpus, at your filter distribution. Two indexes that both claim ``0.95 recall'' can differ 5x in latency at that recall.
+\end{itemize}
+\textbf{Then check that recall is the thing you should be optimising.} Run the end-to-end metric at two or three points on the curve. It is extremely common to find that recall@100 from 0.92 to 0.98 does not move NDCG at all, because the ranker reorders the candidates anyway and the six items you were missing were never going to be shown. That finding is worth a lot of money --- it is permission to take the cheaper index --- and you only get it by looking.\par
+\textbf{What to monitor in production}, which is a different list from what to measure offline: p99 by shard (a single slow shard sets the fan-out tail), tombstone share, recall on a fixed golden query set replayed hourly against a stored exact ground truth, and the share of queries returning fewer than $k$ results, which is the canary for the filter problem.\par
+\cchapter{Serving: sharding, tails, and the fan-out multiplier}
+\textbf{Shard by hash, not by category.} Category sharding is tempting because it makes the common filter free, and it is a trap: the load is as skewed as the category distribution, and a query without a category filter has to hit everything anyway. Hash sharding gives uniform load and uniform fan-out, and the filter problem is solved per shard.\par
+\textbf{The fan-out tail multiplier is the number to have ready.} A query that waits for 8 shards experiences the \textit{maximum} of 8 latencies. If a single shard's p99 is 10 ms, then roughly 8\% of queries have at least one shard in its p99 tail, so the \textit{system's} p99 is close to the shard's p99.9 --- not its p99. This is why the 5 ms typical figure above needs 20 ms of budget, and it is the single most common sizing error in this round.\par
+Mitigations, in the order they pay: \textbf{hedged requests} (fire to the replica if the first has not answered by the p95, cancel the loser --- a few percent extra load buys most of the tail back), \textbf{fewer shards} if memory permits, and \textbf{pinning memory} so the index never touches swap.\par
+\textbf{Warm-up is not optional.} A freshly started replica with a cold page cache serves its first thousand queries at disk latency. Take replicas out of rotation until a synthetic query set has walked the index.\par
+\cchapter{The follow-up tree}
+\textbf{''Why HNSW and not IVF-PQ?''} Recall ceiling. PQ's reconstruction error puts a cap on achievable recall that more probing does not remove, and at 13 GB per shard I am not memory-constrained enough to accept the cap. If the target were 0.9 rather than 0.99, or if this had to run on one machine, I would flip.\par
+\textbf{''Why not DiskANN, then? One box, 9.6 GB of RAM.''} It is the right answer for a single-machine deployment at this scale and I would take it seriously. PQ codes in memory for the traversal, full vectors on SSD for re-ranking, beam search so the SSD reads are batched --- a handful of NVMe reads at \textasciitilde{}80 us each, so a millisecond or two. What it costs is operational: the build is much more expensive, and you are now exposed to SSD tail latency, which is far less predictable than DRAM.\par
+**''What does $M$ do?''** Graph degree. Memory is $2M \times 4$ bytes per vector at the base layer. Higher $M$ raises recall at a given $efSearch$ and raises both memory and build time. 16 to 48 is the usual range; 32 for 768-d data is a reasonable default and I would tune it on the recall-latency curve rather than from a blog post.\par
+**''And $efSearch$ versus $efConstruction$?''** $efConstruction$ is build-time quality --- it costs build time only, and you cannot change it without rebuilding. $efSearch$ is the query-time knob, it is the recall-latency dial, and it can be changed per query. Which means you can set it \textit{per segment}: a higher $efSearch$ for tail queries where recall matters and a lower one for head queries that are easy, spending your latency where it buys something.\par
+\textbf{''The recall is 0.99 offline and users complain. What do you check?''} In order: whether the index has two embedding versions in it; whether queries are being short-changed by the filter path (share of queries returning fewer than $k$); whether the offline sample was drawn from the head while the complaints are about the tail; and only then the index parameters. The first three are more often the cause than the fourth.\par
+\textbf{''What if the embeddings were not normalised?''} Then it is MIPS, not NN, and three things change: I check whether the library's ``inner product'' index is genuinely MIPS-aware or is cosine underneath; I use anisotropic quantization if I quantize at all, because plain PQ minimises the wrong loss for inner product; and I watch for norm-imbalanced clusters if I use IVF, since k-means partitions by direction while the answer depends on magnitude.\par
+\textbf{''How would you halve the memory tomorrow?''} OPQ plus PQ on the base vectors, keeping the graph, and re-rank the top few hundred with int8 vectors fetched from a second tier. That is the standard two-tier compression trick: cheap approximate distances to traverse, accurate distances to order. Expect a point or two of recall and measure it before committing.\par
+\textbf{''Would you ever use LSH?''} For this, no --- graphs dominate it empirically and its space bound is superlinear. Where I would: when I need provable guarantees for a contractual reason, when the data is streaming and I cannot afford a build, or for near-duplicate detection, where SimHash over shingles is still the right tool and is not really the same problem.\par
+\cchapter{What I would build first}
+\textbf{Week 1 --- measure before building.} Sample a few million vectors, compute exact ground truth for a stratified query sample, and produce the recall-latency curve for three candidates: flat, HNSW, IVF-PQ. On our data, at our filter distribution. Every argument after this is grounded or it is a preference.\par
+\textbf{Weeks 2-4 --- the simplest thing that hits the target.} Eight shards, HNSW over int8, post-filter with over-fetch, no fresh tier, daily rebuilds. Ship it behind the existing system and compare end-to-end metrics, not just recall.\par
+\textbf{Month 2 --- the two things production will demand.} The fresh tier, because ``new items are searchable in seconds'' is a product requirement disguised as an infrastructure one; and the selectivity-aware filter policy, because by then you will have found the tight-filter queries returning short result sets.\par
+\textbf{Month 3 --- economise.} Now that the target is being hit and measured, ask whether the end metric actually distinguishes 0.99 from 0.95 recall. If it does not, move to OPQ-PQ and take the memory back. This is the sequencing that separates senior from thorough: you buy the expensive version first to establish the ceiling, then you find out how much of it you actually needed.\par
+\cchapter{The whiteboard, in order}
+\par\noindent{\small\setlength{\tabcolsep}{4pt}%
+\begin{tabularx}{\linewidth}{YYY}\hline
+\textbf{Minute} & \textbf{Draw} & \textbf{Say while drawing} \\ \hline
+5 & \textbf{The memory table} & Five rows, one per representation. Everything hangs off it \\
+8 & \textbf{The flat-scan ceiling} & 130k vectors per core per 10 ms, so under 1M per shard needs no index \\
+12 & \textbf{The three reductions} & NN, cosine, MIPS, and the +1 dimension \\
+20 & \textbf{HNSW: layers and a greedy path} & Then M, efConstruction, efSearch, and what each one costs \\
+25 & \textbf{The latency chain} & 3,000 candidates, 80 ns a miss, 0.3 ms a shard, and why it is memory-bound \\
+32 & \textbf{The selectivity bands} & Three strategies and the 1/s over-fetch curve \\
+38 & \textbf{The two-tier freshness index} & Static plus fresh, merged, with the rebuild cadence \\
+45 & \textbf{The recall-latency curve} & Two indexes at ``0.95 recall'' differing 5x in latency \\
+\hline\end{tabularx}}\par\medskip
+\cchapter{Ten things that would lose this round}
+\textbf{On arithmetic}\par
+\begin{itemize}
+\item Naming an index before sizing the corpus.
+\item Not knowing that 100M x 768 fp32 is 307 GB, or being unable to derive it.
+\item Forgetting the graph's own memory, which at M = 32 is 256 bytes a vector.
+\item Sizing to the mean latency and being surprised by the fan-out tail.
+\end{itemize}
+\textbf{On theory}\par
+\begin{itemize}
+\item Not knowing that recall is a property of the data, and quoting a datasheet number for your corpus.
+\item Benchmarking on random vectors.
+\item Treating normalisation as free when the norms carry popularity signal.
+\end{itemize}
+\textbf{On operations}\par
+\begin{itemize}
+\item Claiming HNSW supports deletion.
+\item Having no rebuild cadence, and no answer for where tombstones go.
+\item Designing a single filter strategy and having nothing to say when a 0.1\% selective filter silently returns four results.
+\end{itemize}
 \chapter{The ML depth round}
 The round is organised the way the funnel runs, front to back: query understanding, retrieval, ranking, evaluation. Interviewers rarely walk it in order, but you should be able to, because ``which stage are we in'' is the question behind most follow-ups.\par
 Answers here run longer than in breadth --- this is the round where you are allowed to take three minutes. What you are not allowed to do is stop at the first level. Every answer below carries the follow-up that is actually coming.\par
