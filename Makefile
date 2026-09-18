@@ -63,9 +63,11 @@ coupang/deck.json: drill/questions.json coupang/depth_new_*.json \
 	python3 tools/build_coding.py
 	python3 tools/build_coupang.py
 
-coupang-pdf: coupang/deck.json coupang/brief.md coupang/project.md
+coupang-pdf: coupang/deck.json coupang/brief.md coupang/deepdive.md \
+             coupang/breadth_round.md coupang/parth_round.md coupang/project.md
 	python3 tools/render_coupang_pdf.py
 	cd coupang && $(ENGINE) coupang.tex
 
-coupang-web: coupang/deck.json coupang/brief.md coupang/project.md
+coupang-web: coupang/deck.json coupang/brief.md coupang/deepdive.md \
+             coupang/breadth_round.md coupang/parth_round.md coupang/project.md
 	python3 tools/render_coupang_web.py

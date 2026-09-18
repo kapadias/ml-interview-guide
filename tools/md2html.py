@@ -82,7 +82,7 @@ def convert(md, where=""):
                     not re.match(r"^!(say|trap|push|num)\s|^@|^#|^\||^>|^```|^\s*[-*] ", lines[i]):
                 body += " " + lines[i].strip(); i += 1
             LBL = {"say": "Say this", "trap": "The trap",
-                   "push": "She pushes", "num": "Numbers"}
+                   "push": "The push", "num": "Numbers"}
             out.append('<div class="co %s"><span class="col">%s</span>%s</div>'
                        % (kind, LBL[kind], inline(body)))
             continue

@@ -63,7 +63,7 @@ PREAMBLE = r"""\documentclass[10pt,twoside]{book}
   before upper={{\sffamily\bfseries\footnotesize\color{#2}#3\par\vspace{2pt}}}}
 \newenvironment{calloutsay}{\begin{co@box}{saybg}{accent}{SAY THIS}}{\end{co@box}}
 \newenvironment{callouttrap}{\begin{co@box}{trapbg}{flag}{THE TRAP}}{\end{co@box}}
-\newenvironment{calloutpush}{\begin{co@box}{pushbg}{pushfg}{SHE PUSHES}}{\end{co@box}}
+\newenvironment{calloutpush}{\begin{co@box}{pushbg}{pushfg}{THE PUSH}}{\end{co@box}}
 \newenvironment{calloutnum}{\begin{co@box}{numbg}{numfg}{NUMBERS}}{\end{co@box}}
 \newtcolorbox{mathboxtc}{colback=white,colframe=rulec,boxrule=0.6pt,arc=3pt,
   left=6pt,right=6pt,top=2pt,bottom=2pt}
@@ -242,6 +242,8 @@ def main():
     L += qa(deck["depth"], "The ML depth round", DEPTH_INTRO)
     L.append(convert(open(os.path.join(C, "breadth_round.md")).read(),
                      "breadth_round.md"))
+    L.append(convert(open(os.path.join(C, "parth_round.md")).read(),
+                     "parth_round.md"))
     L += qa(deck["breadth"], "The ML breadth round", BREADTH_INTRO)
     L.append(convert(open(os.path.join(C, "project.md")).read(), "project.md"))
     L += coding(deck["coding"], CODING_INTRO)

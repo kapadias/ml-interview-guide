@@ -27,6 +27,8 @@ def main():
         "deepdive": convert(open(os.path.join(C, "deepdive.md")).read(), "deepdive.md"),
         "breadthRound": convert(open(os.path.join(C, "breadth_round.md")).read(),
                                 "breadth_round.md"),
+        "parthWorked": convert(open(os.path.join(C, "parth_round.md")).read(),
+                               "parth_round.md"),
         "project": convert(open(os.path.join(C, "project.md")).read(), "project.md"),
         "codingIntro": convert(CODING_INTRO, "coding intro"),
         "depth": slim(deck["depth"]),

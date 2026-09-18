@@ -1,13 +1,26 @@
 # Parth's round: breadth, hiring manager, and team fit at once
 
 This is not three rounds. It is one slot carrying three evaluations, run by the
-person who decides. He has **two headcount and four candidates at onsite**, one
-requisition at L6-1 and one at L6-2, and the recruiter puts you at the L6-2 end.
-So this round decides not only whether you get an offer but which one.
+person who decides.
+
+The requisition is settled: **Staff Machine Learning Engineer, Search &
+Discovery**, req R0073340, Mountain View. So none of this round is about which
+level you land at, and you should not spend a second of it negotiating that.
+What is still open is the comparison: he has **two headcount and four candidates
+at onsite**. The bar is not the question. Being one of the two is.
+
+That changes what the round is for. A round that decides pass/fail rewards
+coverage. A round that picks two out of four rewards being *specific* — about
+what you would own, what you would not do, and what you have already been wrong
+about. Coverage is the price of entry here, not the differentiator.
 
 It is also your **second** conversation with him — he screened every candidate
 himself before the loop. That changes the opening more than people expect, and
 there is a section on it below.
+
+> The worked version of this document is `parth_round.md`: the sweep answers
+> written out, the behavioural half answered end to end, and his follow-up tree.
+> This one is the map — read it first, then rehearse against that one.
 
 ## How it differs from Siwen's round
 
@@ -63,7 +76,10 @@ principles in front of him is a *better* signal than having memorised it.
 ## The hiring-manager half
 
 Somewhere in the middle he stops sampling and starts deciding. The questions
-shift from "what do you know" to "what would you own." Have these ready.
+shift from "what do you know" to "what would you own," and shortly after that
+into behavioural territory scored against the 15 leadership principles. Have
+these ready — each one is worked out fully, with the follow-up, in
+`parth_round.md`.
 
 - **"What would you want to work on here?"** Not a pleasantry — it is a scope
   question. Answer with a specific problem from their stack, not a technology.
@@ -81,21 +97,32 @@ shift from "what do you know" to "what would you own." Have these ready.
 - **"What would you need from me?"** Answer it honestly and specifically.
   Vagueness here reads as not having thought about the job.
 
-## Level calibration: L6-1 versus L6-2
+## What Staff actually sounds like
 
-He is deciding which requisition you fit. The difference is not how much you
-know; it is the radius of what you talk about owning.
+The level is decided; the question is whether you sound like it. The difference
+between a strong senior answer and a Staff answer is almost never how much you
+know. It is the **radius** of what you talk about owning, and it shows up in
+five places.
 
-| | Reads as L6-1 | Reads as L6-2 |
+| | Reads as senior | Reads as Staff |
 |---|---|---|
 | **Scope** | "I owned the ranking model" | "I owned ranking quality, which meant fixing the labelling pipeline two teams upstream" |
-| **Problem choice** | Given a problem, solved it well | Chose the problem, and can say what you gave up |
-| **Failure** | Describes a bug you fixed | Describes a bad call you made and what it cost |
-| **Others** | Worked well with the team | Named a person who is better because of you |
-| **Numbers** | Model metrics | Business metrics, and the cost side of the ledger |
+| **Problem choice** | Given a problem, solved it well | Chose the problem, and can say what you gave up to take it |
+| **Failure** | Describes a bug you fixed | Describes a bad call you made, what it cost, and the guardrail that now prevents it |
+| **Others** | Worked well with the team | Names a person who is better because of you, and what specifically they can do now |
+| **Numbers** | Model metrics | Business metrics, plus the cost side of the ledger |
+
+The job description says the three things out loud, and they are the three
+things a Staff answer keeps returning to: *"drive innovation with large language
+models, embedding-based retrieval and multi-modal learning"*, *"define and track
+performance metrics for model impact"*, and *"mentor engineering talent."*
+Innovation direction, measurement, and people. Notice that two of the three are
+not modelling.
 
 None of this means inflating. It means that when you have a choice between the
-narrow true answer and the wider true answer, take the wider one.
+narrow true answer and the wider true answer, take the wider one — and that the
+wider one has to still be true four levels down, because this is the same
+company whose leadership principle for detail is *Dive Deep*.
 
 ## Team fit runs in both directions
 
@@ -111,8 +138,6 @@ delivery speed, does more than any statement of enthusiasm.
 
 **Questions worth asking him**, in rough priority:
 
-- Which requisition is this, and what does the first year look like differently
-  at L6-1 versus L6-2? *Ask it directly. He has two, you may as well know.*
 - What is the split between search and recommendations on this team, and where
   is the bigger gap right now?
 - How much of the ranking objective is relevance versus attractiveness, and who
@@ -122,11 +147,15 @@ delivery speed, does more than any statement of enthusiasm.
   telling you where your first ninety days go.*
 - Who else would I work with most closely, and what do they need that they are
   not getting?
+- Which of the three directions in the job description — LLMs, embedding-based
+  retrieval, multi-modal — is actually funded next year, and which is aspiration?
+  *A long-tenured manager will answer this honestly, and the answer tells you
+  what you would really be doing.*
 - What is the thing about this team you would change if you could?
 
-Avoid asking about work-life balance, promotion timelines, or whether the team
-uses a particular framework. None of them are bad questions; all of them are
-better asked of the recruiter.
+Avoid asking about work-life balance, promotion timelines, levelling, or
+whether the team uses a particular framework. None of them are bad questions;
+all of them are better asked of the recruiter.
 
 ## The second-conversation problem
 

@@ -2,13 +2,16 @@
 
 A targeted cut of the four-volume corpus for one specific interview: **ML
 depth**, **ML breadth**, a **leadership round that is really a technical project
-deep-dive**, and **DS&A coding**, at the Staff / L6 bar.
+deep-dive**, and **DS&A coding**. The requisition is **Staff Machine Learning
+Engineer, Search & Discovery** (R0073340, Mountain View) — two headcount, four
+onsite candidates, so the loop is a comparison rather than a bar check.
 
 | Part | What it is | Count |
 |---|---|---|
 | `brief.md` | What the org is, what each round tests, the 15 leadership principles | — |
 | `deepdive.md` | The set-piece ML-depth question, worked end to end | — |
-| `breadth_round.md` | Parth's round: breadth + hiring manager + team fit in one slot | — |
+| `breadth_round.md` | Parth's round: breadth + hiring manager + team fit in one slot — how to play it | — |
+| `parth_round.md` | The same round worked end to end: sweep answers, the behavioural half, his follow-up tree | — |
 | ML depth | The search funnel front to back: query understanding, retrieval, ranking, evaluation | 44 |
 | ML breadth | Foundations, embeddings, tabular, evaluation, production craft | 34 |
 | `project.md` | Narrative spine, the numbers to know cold, the interrogation bank, LP mapping | — |
